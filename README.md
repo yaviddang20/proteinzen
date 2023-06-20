@@ -15,6 +15,14 @@ Substrate-conditioned diffusion for ligand-binding protein generation
 - jaxtyping
 - hydra-zen
 
+For code-style we use
+- pylint
+- black
+- isort
+- darglint
+- autoflake
+
+
 ### Copyright
 
 Copyright (c) 2023, Alex J Li
