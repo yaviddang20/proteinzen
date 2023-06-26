@@ -14,6 +14,9 @@ Substrate-conditioned diffusion for ligand-binding protein generation
 - biopython
 - jaxtyping
 - hydra-zen
+- pytest
+- e3nn
+- [SE(3)-Transformers as implemented by NVIDIA](https://github.com/NVIDIA/DeepLearningExamples/tree/master/DGLPyTorch/DrugDiscovery/SE3Transformer)
 
 For code-style we use
 - pylint
@@ -29,6 +32,6 @@ Copyright (c) 2023, Alex J Li
 
 
 #### Acknowledgements
- 
-Project based on the 
+
+Project based on the
 [Computational Molecular Science Python Cookiecutter](https://github.com/molssi/cookiecutter-cms) version 1.1.
