@@ -8,15 +8,19 @@ import torch
 import scipy.special
 
 
+
+
 class Hyp2f1(torch.autograd.Function):
-    """ A wrapper for scipy.special.hyp2f1 """
+    """ A wrapper for scipy.special.hyp2f1
+        Only tracks gradients through z """
     @staticmethod
     def forward(ctx, a, b, c, z):
         """ Forward pass for the ordinary hypergeometric function
 
         See scipy.special.hyp2f1 for usage
         """
-        ctx.save_for_backward(a, b, c, z)
+        a_, b_, c_ = map(torch.tensor, [a, b, c])
+        ctx.save_for_backward(a_, b_, c_, z)
         z = z.numpy(force=True)
         return torch.from_numpy(scipy.special.hyp2f1(a, b, c, z))
 
@@ -28,7 +32,6 @@ class Hyp2f1(torch.autograd.Function):
         """
         a, b, c, z = ctx.saved_tensors
         prefactor = a * b / c
-
         a, b, c, z = map(lambda x: x.numpy(force=True), [a, b, c, z])
         forward = scipy.special.hyp2f1(a+1, b+1, c+1, z)
 
@@ -81,6 +84,7 @@ def zernike_radial(n, l, r_scale):
         return radial_out  # (n_batch x n_res x n_points)
     return radial
 
+
 class ZernikeTransform:
     """ A cache for Zernike radial polynomials """
     def __init__(self, n_max=None, r_scale=None):
@@ -119,13 +123,14 @@ class ZernikeTransform:
         if point_value is None:
             point_value = 1
         points_mask = points_mask.unsqueeze(-2)  # add channel
-        points_mask = points_mask.unsqueeze(-1)  # fix mask for broadcasting
 
         Z = {}
         for n in range(self.n_max):
             for l in range(n+1):
-                if (n-l) % 1 == 1:
-                    continue
+                # we retain the zeros since they're used in se3 transformers
+                if (n-l) % 2 == 1:
+                    Z[(n, l)] = torch.zeros(list(points_mask.shape[:-1]) + [2*l+1])
+
                 R = self.get(n, l)
                 y = o3.spherical_harmonics(l, points, normalize=True)  # (n_batch x n_res x n_points x 2l+1)
                 r = R(points)  # (n_batch x n_res x n_points)
@@ -135,10 +140,16 @@ class ZernikeTransform:
                 r = r.unsqueeze(-2)
                 # fix shapes for broadcasting
                 r = r.unsqueeze(-1)
+                c_nl = (y * r * point_value)  # n_batch x n_res x n_channel x n_points x 2l+1
+                c_nl[points_mask] = 0
+                if c_nl.isnan().any():
+                    select = c_nl.isnan().any(dim=-1)
+                    print(points[select.squeeze()])
+                    print(y[select])
+                    print(r[select])
+                    print(points_mask[select])
+                    exit()
 
-                c_nl = (y * r * points_mask * point_value)  # n_batch x n_res x n_channel x n_points x 2l+1
-                print(y.shape, r.shape, points_mask.shape)
-                print(n, l, c_nl.shape)
                 Z[(n, l)] = c_nl.sum(-2)
 
         return Z  # Dict[Tuple[int, int], Tensor[n_batch x n_res x n_channel x 2l+1]]
@@ -164,13 +175,12 @@ class ZernikeTransform:
             """
             ret = 0
             for (n, l), c_nl in Z.items():
+                if (n-l) % 2 == 1:
+                    continue
                 R = self.get(n, l)
                 y = o3.spherical_harmonics(l, x, normalize=True)  # (n_batch x n_res x n_channel x n_points x 2l+1)
                 r = R(x)  # (n_batch x n_res x n_channel x n_points)
-
                 r = r.unsqueeze(-1)
-                print(y.shape, r.shape, c_nl.shape)
-                print((c_nl * y * r).shape)
 
                 ret = ret + torch.sum(c_nl * y * r, dim=-1) # (n_batch x n_res x n_channel x n_points)
             return ret
@@ -178,7 +188,7 @@ class ZernikeTransform:
 
 
 if __name__ == "__main__":
-    import numpy as np
+    """ Perform a forward and backward Zernike transform and plot on a grid """
     import matplotlib.pyplot as plt
 
     zt = ZernikeTransform(5, 1)
@@ -189,9 +199,7 @@ if __name__ == "__main__":
     x, y, z = np.meshgrid(x, y, z)
     r = np.sqrt(x*x + y*y + z*z)
     theta = np.arccos(z / r)
-    # print(theta[np.abs(theta) > np.pi])
     phi = np.sign(y) * np.arccos(x / np.sqrt(x*x + y*y))
-    # print(theta[np.abs(phi) > np.pi * 2])
 
     r_filter = (r < 1)
     r = r[r_filter]
@@ -208,13 +216,15 @@ if __name__ == "__main__":
     ax.set_facecolor('darkgrey')
 
     dirac = torch.tensor([[0.5, 0.5, 0.5],
-                          [-0.5, -0.5, -0.5]]
-                        ).view([1, 1, 2, 3])
+                          [-0.5, -0.5, -0.5]],
+                         requires_grad=True).view([1, 1, 2, 3])
     Z = zt.forward_transform(dirac, torch.ones(dirac.shape[:-1]))
     rho = zt.back_transform(Z)
 
     print(xyz.shape)
-    density = rho(xyz).numpy()
+    density = rho(xyz)
+    print(density)
+    density = density.numpy(force=True)
     p = ax.scatter(x, y, z, c=density, alpha=0.5)
     fig.colorbar(p)
     ax.set_xlabel("x")

@@ -9,13 +9,15 @@ Substrate-conditioned diffusion for ligand-binding protein generation
 
 ### Requirements
 - pytorch (2.0.1)
-- pytorch-geometric
-- pytorch-lightning
+- torch_geometric
+- torch_cluster
+- pytorch-lightning (specifically, lightning fabric)
 - biopython
 - jaxtyping
 - hydra-zen
 - pytest
 - e3nn
+- dgl
 - [SE(3)-Transformers as implemented by NVIDIA](https://github.com/NVIDIA/DeepLearningExamples/tree/master/DGLPyTorch/DrugDiscovery/SE3Transformer)
 
 For code-style we use
