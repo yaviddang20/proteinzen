@@ -12,7 +12,7 @@ import torch.nn.functional as F
 import torch_geometric
 import torch_cluster
 
-from ligbinddiff.utils.atom_reps import atom37_atom_label, atom37_to_atom14, atom14_to_atom91, letter_to_num
+from ligbinddiff.utils.atom_reps import atom37_atom_label, atom37_to_atom14, atom14_to_atom91, letter_to_num, atom91_atom_masks
 from ligbinddiff.utils.fiber import nl_to_fiber
 from ligbinddiff.utils.zernike import ZernikeTransform
 
@@ -165,7 +165,8 @@ class ProteinGraphDataset(data.Dataset):
                  num_positional_embeddings=16,
                  top_k=30, num_rbf=16, device="cpu",
                  density_nmax=5,
-                 density_rmax=10):
+                 density_rmax=10,
+                 channel_atoms=False):
 
         super(ProteinGraphDataset, self).__init__()
 
@@ -178,10 +179,21 @@ class ProteinGraphDataset(data.Dataset):
 
         self.density_nmax = density_nmax
         self.density_rmax = density_rmax
+        self.channel_atoms = channel_atoms
         self.zernike_transform = ZernikeTransform(density_nmax, density_rmax)
 
         self.letter_to_num = letter_to_num
         self.num_to_letter = {v:k for k, v in self.letter_to_num.items()}
+
+        if channel_atoms:
+            self.channel_values = np.array([
+                atom91_atom_masks[atom] for atom in ['C', 'N', 'O', 'S']
+            ])
+            self.num_channels = len(atom91_atom_masks)
+        else:
+            self.channel_values = None
+            self.num_channels = 1
+
 
     def __len__(self): return len(self.data_list)
 
@@ -205,6 +217,7 @@ class ProteinGraphDataset(data.Dataset):
                                   device=self.device, dtype=torch.long)
             # backbone coords
             coords = atom14[:, :4]
+            X_cb = self._ideal_virtual_Cb(coords)
 
             x_mask = torch.isfinite(coords.sum(dim=(1,2)))
             x_mask = ~x_mask
@@ -232,31 +245,34 @@ class ProteinGraphDataset(data.Dataset):
                     (node_s, node_v, edge_s, edge_v))
 
             graph = dgl.graph((edge_index[0], edge_index[1]), num_nodes=len(protein['seq']))
+            graph.name = name
             graph.ndata['x'] = X_ca
             graph.ndata['x_mask'] = x_mask
+            graph.ndata['x_cb'] = X_cb
             graph.ndata['seq'] = seq
             graph.ndata['backbone_s'] = node_s
             graph.ndata['backbone_v'] = node_v
             graph.ndata['atom91'] = atom91
+            graph.ndata['atom91_centered'] = atom91 - X_ca.unsqueeze(-2)
             graph.ndata['atom91_mask'] = atom91_mask
             graph.edata['edge_s'] = edge_s
             graph.edata['edge_v'] = edge_v
             graph.edata['rel_pos'] = torch.nan_to_num(E_vectors)
 
-            # densities should be computed centered at C_alpha
-            atom14_centered = atom14 - X_ca.unsqueeze(-2)
-            # if (atom14_centered.abs() > 10e3).any():
-            #     select = (atom14_centered.abs() > 10e3).any(dim=-1)
-            #     print(atom14[select])
-            #     print(X_ca[select.any(dim=-1)])
-            #     print(atom14_centered[select])
-            #     exit()
-            atom_mask = atom14_mask.any(dim=-1)
-            Z = self.zernike_transform.forward_transform(atom14_centered, atom_mask)
+            # densities should be computed centered at C_beta
+            if self.channel_atoms:
+                # we could do this using atom14 but it's not clear to me that's any faster
+                # since we can't take advantage of double masking to avoid taking sequence as input
+                atom_mask = atom91_mask.any(dim=-1)
+                channel_values = torch.as_tensor(self.channel_values, device=self.device, dtype=torch.float)
+                Z = self.zernike_transform.forward_transform(atom91, X_cb, atom_mask, point_value=channel_values)
+            else:
+                atom_mask = atom14_mask.any(dim=-1)
+                Z = self.zernike_transform.forward_transform(atom14, X_cb, atom_mask)
             fiber_dict = nl_to_fiber(Z)
 
             for l, coeffs in fiber_dict.items():
-                graph.ndata[l] = coeffs.squeeze(1)
+                graph.ndata[l] = coeffs
 
         return graph
 
@@ -316,3 +332,12 @@ class ProteinGraphDataset(data.Dataset):
         perp = _normalize(torch.cross(c, n))
         vec = -bisector * math.sqrt(1 / 3) - perp * math.sqrt(2 / 3)
         return vec
+
+    def _ideal_virtual_Cb(self, X_bb):
+        # from ProteinMPNN paper computation of Cb
+        N, Ca, C = [X_bb[..., i, :] for i in range(3)]
+        b = Ca - N
+        c = C- Ca
+        a = torch.cross(b, c)
+        Cb = -0.58273431*a + 0.56802827*b - 0.54067466*c + Ca
+        return Cb

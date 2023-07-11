@@ -112,3 +112,4 @@ ENV/
 # custom
 data/cath/mmtf
 scripts/submit_scripts/autogen_scripts
+outputs/

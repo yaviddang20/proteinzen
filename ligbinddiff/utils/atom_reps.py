@@ -84,6 +84,12 @@ atom91_carbon_mask = [atom.startswith('C') for atom in atom91_atom_label]
 atom91_nitrogen_mask = [atom.startswith('N') for atom in atom91_atom_label]
 atom91_oxygen_mask = [atom.startswith('O') for atom in atom91_atom_label]
 atom91_sulfur_mask = [atom.startswith('S') for atom in atom91_atom_label]
+atom91_atom_masks = {
+    "C": atom91_carbon_mask,
+    "N": atom91_nitrogen_mask,
+    "O": atom91_oxygen_mask,
+    "S": atom91_sulfur_mask,
+}
 
 
 atom91_start_end = {}

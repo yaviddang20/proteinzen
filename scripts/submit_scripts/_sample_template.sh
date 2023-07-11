@@ -10,7 +10,7 @@
 #$ -l h_rt=24:00:00
 #$ -l compute_cap=61,gpu_mem=40G
 
-echo $JOB_ID
+echo "Job ID ${JOB_ID}"
 conda activate binderdiff
 
 export CUDA_VISIBLE_DEVICES=$SGE_GPU
@@ -24,7 +24,7 @@ dcgmi stats -g $gpuprof -e
 dcgmi stats -g $gpuprof -s $JOB_ID
 
 cd ~/projects/ligbinddiff
-python train.py "$@" job_id=${JOB_ID}
+python sample.py "$@" job_id=${JOB_ID}
 # args = ARGS
 
 dcgmi stats -g $gpuprof -x $JOB_ID

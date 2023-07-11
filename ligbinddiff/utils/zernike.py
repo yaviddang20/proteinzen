@@ -87,8 +87,9 @@ def zernike_radial(n, l, r_scale):
 
 class ZernikeTransform:
     """ A cache for Zernike radial polynomials """
-    def __init__(self, n_max=None, r_scale=None):
+    def __init__(self, n_max=None, r_scale=None, compact=True):
         self.cache = None
+        self.compact = compact
         if n_max and r_scale:
             self.init(n_max, r_scale)
 
@@ -101,60 +102,73 @@ class ZernikeTransform:
         self.cache = {}
         self.n_max = n_max
         self.r_scale = r_scale
-        for n in range(n_max):
+        for n in range(n_max+1):
             for l in range(n+1):
+                if (n - l) % 2 == 1 and self.compact:
+                    continue
                 self.cache[(n, l)] = zernike_radial(n, l, r_scale)
 
-    def forward_transform(self, points, points_mask, point_value=None):
+    def forward_transform(self, points, center, points_mask, point_value=None):
         """ Compute the zernike polynomial expansion coefficients for a point cloud.
         The points are treated as a sum of Dirac distributions.
 
         Args
         -----
-        points : torch.Tensor (n_batch x n_res x n_points x 3)
+        points : torch.Tensor ([n_batch x] n_res x n_points x 3)
             point cloud to encode
-        n_mask : int
-            max n value to expand to. larger n = higher resolution approximation
-        points_mask : torch.Tensor (n_batch x n_res x n_points)
+        center : torch.Tensor ([n_batch x] n_res x 3)
+            the origin around which to encode each point
+        points_mask : torch.Tensor ([n_batch x] n_res x n_points)
             point cloud mask
-        point_value: None, int, or torch.Tensor (n_batch x n_res x n_channel x n_points)
+        point_value: None, int, or torch.Tensor ([n_batch x n_res x] n_channel x n_points)
             scalr value per point, can be channeled
         """
+
+        points = points - center.unsqueeze(-2)
+
         if point_value is None:
             point_value = 1
-        points_mask = points_mask.unsqueeze(-2)  # add channel
+            n_channels = 1
+        elif len(point_value.shape) == 2:
+            n_channels = point_value.shape[0]
+            n_res = points.shape[-3]
+
+            point_value = point_value.unsqueeze(-1)
+            point_value = point_value.unsqueeze(0)
+            point_value = point_value.expand(n_res, -1, -1, -1)
+        else:
+            n_channels = point_value.shape[1]
+            assert len(points.shape) == len(point_value.shape)
+
+        points_mask = points_mask.unsqueeze(-2).expand(-1, n_channels, -1)  # add channel
 
         Z = {}
-        for n in range(self.n_max):
+        for n in range(self.n_max+1):
             for l in range(n+1):
                 # we retain the zeros since they're used in se3 transformers
                 if (n-l) % 2 == 1:
-                    Z[(n, l)] = torch.zeros(list(points_mask.shape[:-1]) + [2*l+1])
+                    if not self.compact:
+                        Z[(n, l)] = torch.zeros(list(points_mask.shape[:-1]) + [2*l+1])
+                    continue
 
                 R = self.get(n, l)
-                y = o3.spherical_harmonics(l, points, normalize=True)  # (n_batch x n_res x n_points x 2l+1)
-                r = R(points)  # (n_batch x n_res x n_points)
+                y = o3.spherical_harmonics(l, points, normalize=True)  # ([n_batch x] n_res x n_points x 2l+1)
+                r = R(points)  # ([n_batch x] n_res x n_points)
 
                 # add channel
-                y = y.unsqueeze(-3)
-                r = r.unsqueeze(-2)
+                y = y.unsqueeze(-3)  # ([n_batch x] n_res x n_channel x n_points x 2l+1)
+                r = r.unsqueeze(-2)  # ([n_batch x] n_res x n_channel x n_points)
                 # fix shapes for broadcasting
-                r = r.unsqueeze(-1)
-                c_nl = (y * r * point_value)  # n_batch x n_res x n_channel x n_points x 2l+1
+                r = r.unsqueeze(-1)  # ([n_batch x] n_res x n_channel x n_points x 1)
+                y = y.expand(-1, n_channels, -1, -1)
+                r = r.expand(-1, n_channels, -1, -1)
+                c_nl = (y * r * point_value)  # [n_batch x] n_res x n_channel x n_points x 2l+1
                 c_nl[points_mask] = 0
-                if c_nl.isnan().any():
-                    select = c_nl.isnan().any(dim=-1)
-                    print(points[select.squeeze()])
-                    print(y[select])
-                    print(r[select])
-                    print(points_mask[select])
-                    exit()
 
                 Z[(n, l)] = c_nl.sum(-2)
-
         return Z  # Dict[Tuple[int, int], Tensor[n_batch x n_res x n_channel x 2l+1]]
 
-    def back_transform(self, Z):
+    def back_transform(self, Z, X_ca):
         """ Reverse a zernike transform
 
         Args
@@ -166,24 +180,37 @@ class ZernikeTransform:
         -------
         rho : func: R^3 -> R
             density function
+        X_ca : torch.Tensor (n_res x 3)
         """
         def rho(x):
             """ Density function
             Args
             ----
-            x : torch.Tensor (n_batch x n_res x n_channel x n_points x 3)
+            x : torch.Tensor (... x 3)
             """
-            ret = 0
+            # compute the queried point relative to each C_alpha
+            x_rel = x.unsqueeze(-2) - X_ca.to(x.device)  # (... x n_res x 3)
+            # for numerical stability reasons, ignore all contributions
+            # where the query is outside the ball of support per residue
+            x_rel_mag = torch.linalg.vector_norm(x_rel, dim=-1)
+            x_rel_mask = (x_rel_mag > self.r_scale)  # (... x n_res)
+
+            ret = torch.tensor([0.], device=x.device)
             for (n, l), c_nl in Z.items():
                 if (n-l) % 2 == 1:
                     continue
                 R = self.get(n, l)
-                y = o3.spherical_harmonics(l, x, normalize=True)  # (n_batch x n_res x n_channel x n_points x 2l+1)
-                r = R(x)  # (n_batch x n_res x n_channel x n_points)
-                r = r.unsqueeze(-1)
+                y = o3.spherical_harmonics(l, x_rel, normalize=True)  # (... x n_res x 2l+1)
+                r = R(x_rel)  # (... x n_res)
+                r = r.unsqueeze(-1)  # (... x n_res x 1)
 
-                ret = ret + torch.sum(c_nl * y * r, dim=-1) # (n_batch x n_res x n_channel x n_points)
-            return ret
+                y = y.unsqueeze(-2)  # (... x n_res x 1 x 2l+1)
+                r = r.unsqueeze(-2)  # (... x n_res x 1 x 1)
+                c_nl_contrib = c_nl * y * r  # (... x n_res x n_channel x 2l+1)
+                c_nl_contrib[x_rel_mask] = 0
+
+                ret = ret + c_nl_contrib.sum(dim=-1) # (...)
+            return ret.max(dim=-2)[0]
         return rho
 
 
@@ -193,37 +220,78 @@ if __name__ == "__main__":
 
     zt = ZernikeTransform(5, 1)
 
-    x = np.linspace(-1, 1, 20)
-    y = np.linspace(-1, 1, 20)
-    z = np.linspace(-1, 1, 20)
+    x = np.linspace(-1, 1, 10)
+    y = np.linspace(-1, 1, 10)
+    z = np.linspace(-1, 1, 10)
     x, y, z = np.meshgrid(x, y, z)
-    r = np.sqrt(x*x + y*y + z*z)
-    theta = np.arccos(z / r)
-    phi = np.sign(y) * np.arccos(x / np.sqrt(x*x + y*y))
 
+    center = np.array([0., 0., 0.])
+    x_center = x - center[0]
+    y_center = y - center[1]
+    z_center = z - center[2]
+
+    r = np.sqrt(x_center*x_center + y_center*y_center + z_center*z_center)
     r_filter = (r < 1)
-    r = r[r_filter]
-    theta = theta[r_filter]
-    phi = phi[r_filter]
     x = x[r_filter]
     y = y[r_filter]
     z = z[r_filter]
 
-    xyz = torch.from_numpy(np.array([x, y, z])).T.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+    xyz = torch.from_numpy(np.array([x, y, z])).T
 
     fig = plt.figure(figsize=plt.figaspect(1.))
     ax = fig.add_subplot(projection='3d')
     ax.set_facecolor('darkgrey')
 
-    dirac = torch.tensor([[0.5, 0.5, 0.5],
-                          [-0.5, -0.5, -0.5]],
-                         requires_grad=True).view([1, 1, 2, 3])
-    Z = zt.forward_transform(dirac, torch.ones(dirac.shape[:-1]))
-    rho = zt.back_transform(Z)
+    dirac = torch.tensor([
+        [[0.5, 0.5, 0.5],
+         [-0.5, -0.5, -0.5]]
+    ], requires_grad=True)
+    Z = zt.forward_transform(dirac, torch.zeros(dirac.shape[:-1]).bool())
+    rho = zt.back_transform(Z, X_ca=torch.from_numpy(center))
 
     print(xyz.shape)
     density = rho(xyz)
-    print(density)
+    print(density.shape)
+    density = density.numpy(force=True)
+    p = ax.scatter(x, y, z, c=density, alpha=0.5)
+    fig.colorbar(p)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_zlabel("z")
+    plt.show()
+
+    x = np.linspace(0, 2, 10)
+    y = np.linspace(0, 2, 10)
+    z = np.linspace(0, 2, 10)
+    x, y, z = np.meshgrid(x, y, z)
+
+    center = np.array([1., 1., 1.])
+    x_center = x - center[0]
+    y_center = y - center[1]
+    z_center = z - center[2]
+
+    r = np.sqrt(x_center*x_center + y_center*y_center + z_center*z_center)
+    r_filter = (r < 1)
+    x = x[r_filter]
+    y = y[r_filter]
+    z = z[r_filter]
+
+    xyz = torch.from_numpy(np.array([x, y, z])).T
+
+    fig = plt.figure(figsize=plt.figaspect(1.))
+    ax = fig.add_subplot(projection='3d')
+    ax.set_facecolor('darkgrey')
+
+    dirac = torch.tensor([
+        [[1.5, 1.5, 1.5],
+         [0.5, 0.5, 0.5]]
+    ], requires_grad=True)
+    Z = zt.forward_transform(dirac, torch.from_numpy(center), torch.zeros(dirac.shape[:-1]).bool())
+    rho = zt.back_transform(Z, X_ca=torch.from_numpy(center))
+
+    print(xyz.shape)
+    density = rho(xyz)
+    print(density.shape)
     density = density.numpy(force=True)
     p = ax.scatter(x, y, z, c=density, alpha=0.5)
     fig.colorbar(p)

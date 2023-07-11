@@ -44,7 +44,7 @@ def seq_recov(ref_seq, seq_logits, mask):
     seq_logits = seq_logits[~mask]
 
     pred_seq = seq_logits.argmax(dim=-1)
-    return (pred_seq == ref_seq).mean()
+    return (pred_seq == ref_seq).type(torch.float).mean()
 
 
 def atom91_rmsd_loss(ref_atom91, pred_atom91, atom91_mask):
@@ -54,7 +54,7 @@ def atom91_rmsd_loss(ref_atom91, pred_atom91, atom91_mask):
     return sd.mean().sqrt()
 
 
-def cath_inference_loop(diffuser, dataloader, device):
+def cath_inference_loop(diffuser, dataloader, num_steps, device):
     epoch_denoising_loss = []
     epoch_seq_loss = []
     epoch_atom91_rmsd = []
@@ -80,7 +80,7 @@ def cath_inference_loop(diffuser, dataloader, device):
             1: edge_v
         }
 
-        denoised_density, seq_logits, pred_atom91 = diffuser.sample(node_features, edge_features, batch)
+        denoised_density, seq_logits, pred_atom91 = zip(*diffuser.sample(node_features, edge_features, batch, steps=num_steps, return_trajectory=True))
 
         int_keys = [key for key in batch.ndata.keys() if isinstance(key, int)]
         density_dict = {
@@ -88,10 +88,14 @@ def cath_inference_loop(diffuser, dataloader, device):
             for l in int_keys
         }
 
-        denoising_loss = zernike_coeff_loss(density_dict, denoised_density, x_mask)
-        seq_loss = seq_recov_loss(seq, seq_logits, x_mask)
-        atom91_rmsd = atom91_rmsd_loss(atom91, pred_atom91, atom91_mask)
-        per_seq_recov = seq_recov(seq, seq_logits, x_mask)
+        denoising_loss = [zernike_coeff_loss(density_dict, d, x_mask) for d in denoised_density[1:]]
+        seq_loss = [seq_recov_loss(seq, s, x_mask) for s in seq_logits[1:]]
+        per_seq_recov = [seq_recov(seq, s, x_mask) for s in seq_logits[1:]]
+        print(denoised_density, seq_logits)
+        for d, s, r in zip(denoising_loss, seq_loss, per_seq_recov):
+            print(d, s, r)
+        exit()
+        atom91_rmsd = [atom91_rmsd_loss(atom91, pred_atom91, atom91_mask)]
 
         epoch_denoising_loss.append(denoising_loss.item())
         epoch_seq_loss.append(seq_loss.item())

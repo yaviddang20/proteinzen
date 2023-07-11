@@ -19,25 +19,28 @@ from se3_transformer.model.fiber import Fiber
 
 from ligbinddiff.data.dataloaders.cath import CATHDataset, ProteinGraphDataset, BatchSampler
 from ligbinddiff.diffusion.density_diff import DensityDiffuser
-from ligbinddiff.model.density.seq_des import DensityDenoiser
+from ligbinddiff.model.seq_des.density.se3_transformer import DensityDenoiser
 from ligbinddiff.runtime.training import cath_train_loop
 
-from ligbinddiff.utils.fiber import gen_nmax_fiber, gen_full_n_channel_fiber
+from ligbinddiff.utils.fiber import gen_compact_nmax_fiber, gen_full_n_channel_fiber
 
 # A logger for this file
 log = logging.getLogger(__name__)
 
 pbuilds = make_custom_builds_fn(zen_partial=True, populate_full_signature=True)
 ExperimentConfig = make_config(
-    n_max=4,
-    l_max=4,
-    n_h_channels=8,
+    job_id=-1,
+    n_max=5,
+    l_max=1,
+    n_h_channels=32,
     denoiser_init=pbuilds(DensityDenoiser),
     diffuser_init=pbuilds(DensityDiffuser),
     optimizer_init=pbuilds(optim.Adam),
     batch_size=1500,
     num_workers=4,
     num_epoch=100,
+    num_warmup_epoch=0,
+    comment="",
     training_curve_path="training_curve.json",
     checkpoint_prefix="diffuser",
     resume_path=None
@@ -51,6 +54,7 @@ def build_model_and_optim(
         optimizer_init,
         l_max,
         n_max,
+        n_input_channels,
         n_h_channels,
         resume_path
     ):
@@ -64,7 +68,7 @@ def build_model_and_optim(
         1: 1
     })
     fiber_node = gen_full_n_channel_fiber(l_max, n_h_channels)
-    fiber_density = gen_nmax_fiber(n_max-1)
+    fiber_density = gen_compact_nmax_fiber(n_max) * n_input_channels
 
     denoiser = denoiser_init(
         fiber_in=fiber_in,
@@ -82,6 +86,7 @@ def build_model_and_optim(
         optimizer.load_state_dict(state_dict["optimizer"])
 
     diffuser, optimizer = fabric.setup(diffuser, optimizer)
+    # fabric.clip_gradients(diffuser, optimizer, clip_val=2.0)
     return diffuser, optimizer
 
 
@@ -112,6 +117,7 @@ def main(denoiser_init,
          batch_size,
          num_workers,
          num_epoch=100,
+         num_warmup_epoch=0,
          training_curve_path="training_curve.json",
          checkpoint_prefix="diffuser",
          resume_path=None
@@ -125,6 +131,8 @@ def main(denoiser_init,
     fabric = Fabric(accelerator=device)
     fabric.launch()
 
+    train_dataloader, val_dataloader = build_dataloaders(fabric, n_max, batch_size, num_workers)
+    n_input_channels = train_dataloader.dataset.num_channels
     diffuser, optimizer = build_model_and_optim(
         fabric,
         denoiser_init,
@@ -132,10 +140,10 @@ def main(denoiser_init,
         optimizer_init,
         l_max,
         n_max,
+        n_input_channels,
         n_h_channels,
         resume_path
     )
-    train_dataloader, val_dataloader = build_dataloaders(fabric, n_max, batch_size, num_workers)
 
     if resume_path:
         with open(training_curve_path) as fp:
@@ -150,12 +158,23 @@ def main(denoiser_init,
 
     for epoch in range(start_epoch, num_epoch):
         log.info(f"Epoch {epoch}")
-        train_loss, train_denoise, train_seq, train_rmsd = cath_train_loop(
-            diffuser, train_dataloader, optimizer, fabric, train=True)
-        log.info(f"Epoch {epoch}: train {train_loss} {train_denoise} {train_seq} {train_rmsd}")
-        val_loss, val_denoise, val_seq, val_rmsd = cath_train_loop(
+        train_dict = cath_train_loop(
+            diffuser, train_dataloader, optimizer, fabric, train=True, warmup=(epoch < num_warmup_epoch))
+        train_loss = train_dict["epoch_loss"]
+        train_denoise = train_dict["denoising_loss"]
+        train_ref_noise = train_dict["ref_noise"]
+        train_seq = train_dict["seq_loss"]
+        train_rmsd = train_dict["rmsd_loss"]
+        log.info(f"Epoch {epoch}: train {train_loss} {train_denoise} {train_seq} {train_rmsd} | ref noise {train_ref_noise}")
+
+        val_dict = cath_train_loop(
             diffuser, val_dataloader, optimizer, fabric, train=False)
-        log.info(f"Epoch {epoch}: val {val_loss} {val_denoise} {val_seq} {val_rmsd}")
+        val_loss = val_dict["epoch_loss"]
+        val_denoise = val_dict["denoising_loss"]
+        val_ref_noise = val_dict["ref_noise"]
+        val_seq = val_dict["seq_loss"]
+        val_rmsd = val_dict["rmsd_loss"]
+        log.info(f"Epoch {epoch}: val {val_loss} {val_denoise} {val_seq} {val_rmsd} | ref noise {val_ref_noise}")
 
         epoch_dict = {
             "epoch": epoch,
@@ -163,10 +182,12 @@ def main(denoiser_init,
             "train_loss_denoise": train_denoise,
             "train_loss_seq": train_seq,
             "train_loss_atom91_rmsd": train_rmsd,
+            "train_ref_noise": train_ref_noise,
             "val_loss": val_loss,
             "val_loss_denoise": val_denoise,
             "val_loss_seq": val_seq,
             "val_loss_atom91_rmsd": val_rmsd,
+            "val_ref_noise": val_ref_noise,
         }
 
         training_curve.append(epoch_dict)

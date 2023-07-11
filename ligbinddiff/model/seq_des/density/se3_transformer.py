@@ -28,10 +28,22 @@ def is_bad(t):
     return torch.isnan(t).any() or not torch.isfinite(t).any()
 
 
+class FeedForwardSE3(nn.Module):
+    def __init__(self, fiber_in, fiber_hidden):
+        super().__init__()
+        self.W_in = LinearSE3(fiber_in, fiber_hidden)
+        self.nonlin = NormSE3(fiber_hidden)
+        self.W_out = LinearSE3(fiber_hidden, fiber_in)
+
+    def forward(self, features):
+        return self.W_out(self.nonlin(self.W_in(features)))
+
+
 class AttentionSE3(nn.Module):
     """ Multi-headed sparse graph self-attention (SE(3)-equivariant) """
 
     def __init__(
+
             self,
             num_heads: int,
             key_fiber: Fiber,
@@ -106,7 +118,7 @@ class AttentionBlockSE3(nn.Module):
             num_heads: int = 4,
             channels_div: int = 2,
             use_layer_norm: bool = False,
-            max_degree: bool = 4,
+            max_degree: int = 4,
             fuse_level: ConvSE3FuseLevel = ConvSE3FuseLevel.FULL,
             low_memory: bool = False,
             **kwargs
@@ -138,7 +150,7 @@ class AttentionBlockSE3(nn.Module):
         self.to_query = LinearSE3(fiber_in, key_query_fiber)
         self.attention = AttentionSE3(num_heads, key_query_fiber, value_fiber)
         self.project_node = LinearSE3(value_fiber + fiber_in, fiber_out)
-        self.project_edge = LinearSE3(fiber_edge_plus + Fiber({0: fiber_out[0] // channels_div}), fiber_edge_plus)
+        self.project_edge = LinearSE3(fiber_edge_plus + Fiber({0: num_heads}), fiber_edge_plus)
 
     def forward(
             self,
@@ -181,7 +193,7 @@ class DensityUpdate(nn.Module):
     """ Layer to perform a gated update on the density """
     def __init__(self, fiber_node, fiber_density, fiber_edge, max_degree=5):
         super().__init__()
-        print(fiber_node, fiber_density)
+        # print(fiber_node, fiber_density)
         self.update = ConvSE3(fiber_in=fiber_node,
                               fiber_out=fiber_density,
                               fiber_edge=fiber_edge,
@@ -192,17 +204,19 @@ class DensityUpdate(nn.Module):
                             fiber_edge=fiber_edge,
                             self_interaction=True,
                             max_degree=max_degree)
+        self.transition = LinearSE3(fiber_density, fiber_density)
+        self.update_norm = NormSE3(fiber_density)
 
     def forward(self, node_features, density_features, edge_features, graph, basis):
         update = self.update(node_features, edge_features, graph, basis)
-        print({k: v.shape for k, v in update.items()})
-        gate = self.gate(node_features, edge_features, graph, basis)
-        print({k: v.shape for k, v in gate.items()})
-        gate = type_l_apply(torch.sigmoid, gate)
-        update = type_l_mult(gate, update)
+        update = self.update_norm(update)
+        update = self.transition(update)
 
-        print({k: v.shape for k, v in update.items()})
-        print({k: v.shape for k, v in density_features.items()})
+        # gate = self.gate(node_features, edge_features, graph, basis)
+        # gate = type_l_apply(torch.sigmoid, gate)
+
+        # update = type_l_mult(gate, update)
+
         return type_l_add(density_features, update)
 
 
@@ -230,8 +244,14 @@ class DensityDenoisingLayer(nn.Module):
             fiber_edge=fiber_edge,
             max_degree=max_degree
         )
-        self.norm_nodes = NormSE3(fiber_node)
-        self.norm_edges = NormSE3(fiber_edge + Fiber({0:1}))
+        fiber_edge_p1 = fiber_edge + Fiber({0:1})
+        self.norm_nodes_att = NormSE3(fiber_node)
+        self.norm_edges_att = NormSE3(fiber_edge_p1)
+
+        self.ff_node = FeedForwardSE3(fiber_node, fiber_node * 2)
+        self.ff_edge = FeedForwardSE3(fiber_edge_p1, fiber_edge_p1 * 2)
+        self.norm_nodes_ff = NormSE3(fiber_node)
+        self.norm_edges_ff = NormSE3(fiber_edge_p1)
 
     def forward(
             self,
@@ -241,9 +261,24 @@ class DensityDenoisingLayer(nn.Module):
             graph: DGLGraph,
             basis: Dict[str, Tensor]
     ):
-        node_features, edge_features = self.attention(node_features, edge_features, graph, basis)
-        node_features = self.norm_nodes(node_features)
-        edge_features = self.norm_edges(edge_features)
+        node_update, edge_update = self.attention(node_features, edge_features, graph, basis)
+        node_features = type_l_add(node_features, node_update)
+        edge_features = type_l_add(edge_features, edge_update)
+        node_features = self.norm_nodes_att(node_features)
+        edge_features = self.norm_edges_att(edge_features)
+
+        node_features = self.norm_nodes_ff(
+            type_l_add(
+                self.ff_node(node_features),
+                node_features
+                )
+        )
+        edge_features = self.norm_edges_ff(
+            type_l_add(
+                self.ff_edge(edge_features),
+                edge_features
+                )
+        )
 
         density_features = self.density_update(node_features, density_features, edge_features, graph, basis)
         return density_features, node_features, edge_features
@@ -258,6 +293,7 @@ class SequenceHead(nn.Module):
                                 fiber_out=fiber_out,
                                 fiber_edge=fiber_edge,
                                 self_interaction=True)
+        self.norm = nn.LayerNorm(h_dim)
         self.mlp = nn.Sequential(
             nn.Linear(h_dim, h_dim),
             nn.ReLU(),
@@ -266,29 +302,48 @@ class SequenceHead(nn.Module):
 
     def forward(self, density_features, edge_features, graph, basis):
         density_scalars = self.collapse(density_features, edge_features, graph, basis)
-        prelogits = self.mlp(density_scalars['0'].squeeze(-1))
+        density_scalars = density_scalars['0'].squeeze(-1)
+        # density_scalars = self.norm(density_scalars)
+        prelogits = self.mlp(density_scalars)
         logits = torch.log_softmax(prelogits, dim=-1)
         return logits
 
 
 class Atom91Head(nn.Module):
     """ Layer to predict sidechain atom positions from density """
-    def __init__(self, fiber_density, fiber_edge, num_aa=20):
+    def __init__(self,
+                 fiber_density,
+                 fiber_edge,
+                 num_aa=20,
+                 num_layers=3):
         super().__init__()
         fiber_aa = Fiber({0: num_aa})
         fiber_out = Fiber({1: 91})
         self.transition = LinearSE3(fiber_density+fiber_aa, fiber_density)
-        self.norm = NormSE3(fiber_density)
+        self.transition_norm = NormSE3(fiber_density)
         self.collapse = ConvSE3(fiber_in=fiber_density,
                                 fiber_out=fiber_out,
                                 fiber_edge=fiber_edge,
                                 self_interaction=True)
+        self.collapse_norm = NormSE3(fiber_out)
+        self.refine = nn.ModuleList([
+            nn.Sequential(
+                LinearSE3(fiber_out, fiber_out*2),
+                NormSE3(fiber_out*2),
+                LinearSE3(fiber_out*2, fiber_out)
+            )
+            for _ in range(num_layers)
+        ])
 
     def forward(self, density_features, sequence_features, edge_features, graph, basis):
         in_features = type_l_partial_cat(density_features, sequence_features)
         transition = self.transition(in_features)
-        norm = self.norm(transition)
+        norm = self.transition_norm(transition)
         atoms = self.collapse(norm, edge_features, graph, basis)
+        atoms = self.collapse_norm(atoms)
+        for layer in self.refine:
+            atoms = type_l_add(atoms, layer(atoms))
+
         return atoms
 
 
@@ -326,7 +381,7 @@ class DensityDenoiser(nn.Module):
                  fiber_edge,
                  scalar_h_dim=128,
                  h_time=64,
-                 n_layers=2,
+                 n_layers=4,
                  low_memory=False,
                  tensor_cores=False):
         super().__init__()
@@ -376,11 +431,33 @@ class DensityDenoiser(nn.Module):
                                   max_degree=self.max_degree)
             for _ in range(n_layers)
         ])
-        self.output = ConvSE3(fiber_in=fiber_density,
-                              fiber_out=fiber_density,
-                              fiber_edge=fiber_edge,
-                              self_interaction=True,
-                              max_degree=self.max_degree)
+
+        self.coalesce = ConvSE3(fiber_in=fiber_density,
+                                fiber_out=fiber_density,
+                                fiber_edge=fiber_edge,
+                                self_interaction=True,
+                                max_degree=self.max_degree)
+        self.coalesce_gate = ConvSE3(fiber_in=fiber_node,
+                                     fiber_out=fiber_density,
+                                     fiber_edge=fiber_edge,
+                                     self_interaction=True,
+                                     max_degree=self.max_degree)
+        self.coalesce_norm = NormSE3(fiber_density)
+
+        self.output_refine = nn.Sequential(
+            LinearSE3(fiber_density, fiber_density*2),
+            NormSE3(fiber_density*2),
+            LinearSE3(fiber_density*2, fiber_density*2),
+            NormSE3(fiber_density*2),
+            LinearSE3(fiber_density*2, fiber_density)
+        )
+        self.output_gate = nn.Sequential(
+            LinearSE3(fiber_density, fiber_density*2),
+            NormSE3(fiber_density*2),
+            LinearSE3(fiber_density*2, fiber_density*2),
+            NormSE3(fiber_density*2),
+            LinearSE3(fiber_density*2, fiber_density)
+        )
 
         self.seq_head = SequenceHead(fiber_density, fiber_edge, scalar_h_dim)
         self.atom91 = Atom91Head(fiber_density, fiber_edge)
@@ -443,7 +520,18 @@ class DensityDenoiser(nn.Module):
         # print({k: is_bad(v) for k, v in f_V.items()})
         # print({k: is_bad(v) for k, v in f_E.items()})
 
-        f_D = self.output(f_D, f_E, graph, basis)
+        f_D_update = self.coalesce(f_D, f_E, graph, basis)
+        f_D_update = self.coalesce_norm(f_D_update)
+        f_D_gate = self.coalesce_gate(f_V, f_E, graph, basis)
+        f_D_gate = type_l_apply(torch.sigmoid, f_D_gate)
+        f_D_update = type_l_mult(f_D_update, f_D_gate)
+        f_D = type_l_add(f_D, f_D_update)
+
+        f_D_update = self.output_refine(f_D)
+        f_D_gate = self.output_gate(f_D)
+        f_D_gate = type_l_apply(torch.sigmoid, f_D_gate)
+        f_D_update = type_l_mult(f_D_update, f_D_gate)
+        f_D = type_l_add(f_D, f_D_update)
         # print("Final conv")
         # print({k: is_bad(v) for k, v in f_D.items()})
 
