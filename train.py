@@ -18,9 +18,10 @@ from torch.utils.data import SequentialSampler
 from se3_transformer.model.fiber import Fiber
 
 from ligbinddiff.data.dataloaders.cath import CATHDataset, ProteinGraphDataset, BatchSampler
-from ligbinddiff.diffusion.density_diff import DensityDiffuser
-from ligbinddiff.model.seq_des.density.se3_transformer import DensityDenoiser
+from ligbinddiff.diffusion.density_diff import LearnableVPDensityDiffuser, LinearDiscreteVPDensityDiffuser
+from ligbinddiff.model.seq_des.density.se3_transformer.se3_transformer import DensityDenoiser
 from ligbinddiff.runtime.training import cath_train_loop
+from ligbinddiff.runtime.inference import cath_inference_loop
 
 from ligbinddiff.utils.fiber import gen_compact_nmax_fiber, gen_full_n_channel_fiber
 
@@ -33,10 +34,11 @@ ExperimentConfig = make_config(
     n_max=5,
     l_max=1,
     n_h_channels=32,
+    dataset_init=pbuilds(ProteinGraphDataset),
     denoiser_init=pbuilds(DensityDenoiser),
-    diffuser_init=pbuilds(DensityDiffuser),
+    diffuser_init=pbuilds(LinearDiscreteVPDensityDiffuser),
     optimizer_init=pbuilds(optim.Adam),
-    batch_size=1500,
+    batch_size=500,
     num_workers=4,
     num_epoch=100,
     num_warmup_epoch=0,
@@ -56,7 +58,8 @@ def build_model_and_optim(
         n_max,
         n_input_channels,
         n_h_channels,
-        resume_path
+        resume_path,
+        checkpoint_prefix
     ):
     # pre-set based on input features set
     fiber_in = Fiber({
@@ -76,21 +79,21 @@ def build_model_and_optim(
         fiber_density=fiber_density,
         fiber_edge=fiber_edge,
     )
-    diffuser = diffuser_init(denoiser=denoiser)
+    diffuser = diffuser_init(denoiser=denoiser, n_channels=n_input_channels)
     optimizer = optimizer_init(diffuser.parameters())
+    diffuser, optimizer = fabric.setup(diffuser, optimizer)
 
     if resume_path:
         log.info(f"Loading state dict from {resume_path}")
-        state_dict = torch.load(resume_path)
+        state_dict = torch.load(os.path.join(resume_path, f"{checkpoint_prefix}_last.pt"))
         diffuser.load_state_dict(state_dict["diffuser"])
         optimizer.load_state_dict(state_dict["optimizer"])
 
-    diffuser, optimizer = fabric.setup(diffuser, optimizer)
     # fabric.clip_gradients(diffuser, optimizer, clip_val=2.0)
     return diffuser, optimizer
 
 
-def build_dataloaders(fabric, n_max, batch_size, num_workers):
+def build_dataloaders(fabric, n_max, dataset_init, batch_size, num_workers):
     dataloader = lambda x: DataLoader(
         x,
         num_workers=num_workers,
@@ -99,7 +102,7 @@ def build_dataloaders(fabric, n_max, batch_size, num_workers):
     top_folder = get_original_cwd()
     cath = CATHDataset(path=os.path.join(top_folder, "data/cath/chain_set.jsonl"),
                        splits_path=os.path.join(top_folder, "data/cath/chain_set_splits.json"))
-    dataset = partial(ProteinGraphDataset, density_nmax=n_max)
+    dataset = partial(ProteinGraphDataset, density_nmax=n_max, channel_atoms=True, bb_density=False)
     trainset, valset = map(dataset,
                            (cath.train, cath.val))
     train_dataloader, val_dataloader = map(dataloader,
@@ -114,6 +117,7 @@ def main(denoiser_init,
          n_h_channels,
          diffuser_init,
          optimizer_init,
+         dataset_init,
          batch_size,
          num_workers,
          num_epoch=100,
@@ -128,10 +132,12 @@ def main(denoiser_init,
     else:
         device = "cpu"
 
+    # torch.autograd.set_detect_anomaly(True)
+
     fabric = Fabric(accelerator=device)
     fabric.launch()
 
-    train_dataloader, val_dataloader = build_dataloaders(fabric, n_max, batch_size, num_workers)
+    train_dataloader, val_dataloader = build_dataloaders(fabric, n_max, dataset_init, batch_size, num_workers)
     n_input_channels = train_dataloader.dataset.num_channels
     diffuser, optimizer = build_model_and_optim(
         fabric,
@@ -142,11 +148,12 @@ def main(denoiser_init,
         n_max,
         n_input_channels,
         n_h_channels,
-        resume_path
+        resume_path,
+        checkpoint_prefix=checkpoint_prefix
     )
 
     if resume_path:
-        with open(training_curve_path) as fp:
+        with open(os.path.join(resume_path, training_curve_path)) as fp:
             training_curve = json.load(fp)
             start_epoch = max((e["epoch"] for e in training_curve)) + 1
             best_val_loss = min((e["val_loss"] for e in training_curve))
@@ -167,14 +174,23 @@ def main(denoiser_init,
         train_rmsd = train_dict["rmsd_loss"]
         log.info(f"Epoch {epoch}: train {train_loss} {train_denoise} {train_seq} {train_rmsd} | ref noise {train_ref_noise}")
 
-        val_dict = cath_train_loop(
-            diffuser, val_dataloader, optimizer, fabric, train=False)
-        val_loss = val_dict["epoch_loss"]
+        state_dict = {
+            "diffuser": diffuser.state_dict(),
+            "optimizer": optimizer.state_dict()
+        }
+        torch.save(state_dict, f"{checkpoint_prefix}_last.pt")
+
+        with torch.no_grad():
+            val_dict = cath_inference_loop(
+                diffuser, val_dataloader, num_steps=100, truncate=10)
+        # val_loss = val_dict["epoch_loss"]
         val_denoise = val_dict["denoising_loss"]
-        val_ref_noise = val_dict["ref_noise"]
+        # val_ref_noise = val_dict["ref_noise"]
         val_seq = val_dict["seq_loss"]
+        val_seq_recov = val_dict["seq_recov"]
         val_rmsd = val_dict["rmsd_loss"]
-        log.info(f"Epoch {epoch}: val {val_loss} {val_denoise} {val_seq} {val_rmsd} | ref noise {val_ref_noise}")
+        log.info(f"Epoch {epoch}: val {val_denoise} {val_seq} {val_seq_recov}  {val_rmsd}")
+        val_loss = val_denoise + val_seq + val_rmsd
 
         epoch_dict = {
             "epoch": epoch,
@@ -186,8 +202,8 @@ def main(denoiser_init,
             "val_loss": val_loss,
             "val_loss_denoise": val_denoise,
             "val_loss_seq": val_seq,
+            "val_seq_recov": val_seq_recov,
             "val_loss_atom91_rmsd": val_rmsd,
-            "val_ref_noise": val_ref_noise,
         }
 
         training_curve.append(epoch_dict)
@@ -198,7 +214,6 @@ def main(denoiser_init,
             "diffuser": diffuser.state_dict(),
             "optimizer": optimizer.state_dict()
         }
-        torch.save(state_dict, f"{checkpoint_prefix}_last.pt")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
