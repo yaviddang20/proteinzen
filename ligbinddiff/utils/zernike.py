@@ -2,12 +2,41 @@
 
 Parts adapted from https://github.com/StatPhysBio/protein_holography/blob/main/protein_holography/hologram/hologram.py """
 
-import e3nn.o3 as o3
+import ligbinddiff.utils.o3 as o3
 import numpy as np
 import torch
 import scipy.special
 
 
+# def _log_binom(x, y):
+#     """ Compute the generalized binomial coefficient """
+#     x = torch.as_tensor(x)
+#     y = torch.as_tensor(y)
+#     log_fac_x = torch.lgamma(x+1)  # log n!
+#     log_fac_y = torch.lgamma(y+1)  # log k!
+#     log_fac_xmy = torch.lgamma(x-y+1)  # log (n-k)!
+#     return log_fac_x - log_fac_y - log_fac_xmy  # binom(x, y)
+#
+# def _log_poch(a, n):
+#     a = torch.as_tensor(a)
+#     n = torch.as_tensor(n)
+#     log_fac_a = torch.lgamma(a+1)
+#     log_fac_amn = torch.lgamma(a-n+1)
+#     return log_fac_a - log_fac_amn
+#
+# # see https://en.wikipedia.org/wiki/Hypergeometric_function
+# def hyp2f1(a, b, c, z):
+#     assert int(a) == a, "a must be of integer type"
+#     assert a <= 0, "a must be a nonnegative integer"
+#
+#     ret = torch.tensor([0], device=z.device)
+#     m = -int(a)
+#     for n in range(m):
+#         ret = ret + (-1)**n * torch.exp(
+#             _log_binom(m, n) + _log_poch(b, n) - _log_poch(c, n)
+#             ) * torch.pow(z, n)
+#
+#     return ret
 
 
 class Hyp2f1(torch.autograd.Function):
@@ -41,13 +70,6 @@ class Hyp2f1(torch.autograd.Function):
 hyp2f1 = Hyp2f1.apply
 
 
-def _binom(x, y):
-    """ Compute the generalized binomial coefficient """
-    log_fac_x = torch.lgamma(x+1)  # log n!
-    log_fac_y = torch.lgamma(y+1)  # log k!
-    log_fac_xmy = torch.lgamma(x-y+1)  # log (n-k)!
-    return torch.exp(log_fac_x - log_fac_y - log_fac_xmy)  # binom(x, y)
-
 
 # adapted from https://github.com/StatPhysBio/protein_holography/blob/main/protein_holography/hologram/hologram.py
 def zernike_radial(n, l, r_scale):
@@ -78,6 +100,10 @@ def zernike_radial(n, l, r_scale):
                    norm_r*norm_r)
         F = torch.pow(norm_r,l)
 
+        # hack for now
+        E = E.to(F.device)
+
+        # print("radial", n, l, E.isnan().any(), F.isnan().any())
         # assemble coefficients
         radial_out = A * B * C * E * F
 
@@ -168,7 +194,7 @@ class ZernikeTransform:
                 Z[(n, l)] = c_nl.sum(-2)
         return Z  # Dict[Tuple[int, int], Tensor[n_batch x n_res x n_channel x 2l+1]]
 
-    def back_transform(self, Z, X_ca):
+    def back_transform(self, Z, X_cb, device='cpu'):
         """ Reverse a zernike transform
 
         Args
@@ -180,8 +206,10 @@ class ZernikeTransform:
         -------
         rho : func: R^3 -> R
             density function
-        X_ca : torch.Tensor (n_res x 3)
+        X_cb : torch.Tensor (n_res x 3)
         """
+        X_cb_mask = ~(X_cb.isnan()).any(dim=-1)
+
         def rho(x):
             """ Density function
             Args
@@ -189,16 +217,19 @@ class ZernikeTransform:
             x : torch.Tensor (... x 3)
             """
             # compute the queried point relative to each C_alpha
-            x_rel = x.unsqueeze(-2) - X_ca.to(x.device)  # (... x n_res x 3)
+            x_rel = x.unsqueeze(-2).to(device) - X_cb[X_cb_mask].to(device)  # (... x n_res x 3)
             # for numerical stability reasons, ignore all contributions
             # where the query is outside the ball of support per residue
             x_rel_mag = torch.linalg.vector_norm(x_rel, dim=-1)
             x_rel_mask = (x_rel_mag > self.r_scale)  # (... x n_res)
 
-            ret = torch.tensor([0.], device=x.device)
+            ret = torch.tensor([0.], device=device)
             for (n, l), c_nl in Z.items():
                 if (n-l) % 2 == 1:
                     continue
+
+                c_nl = c_nl.to(device)
+
                 R = self.get(n, l)
                 y = o3.spherical_harmonics(l, x_rel, normalize=True)  # (... x n_res x 2l+1)
                 r = R(x_rel)  # (... x n_res)
@@ -206,11 +237,63 @@ class ZernikeTransform:
 
                 y = y.unsqueeze(-2)  # (... x n_res x 1 x 2l+1)
                 r = r.unsqueeze(-2)  # (... x n_res x 1 x 1)
-                c_nl_contrib = c_nl * y * r  # (... x n_res x n_channel x 2l+1)
+                c_nl_contrib = y * r  # (... x n_res x 1 x 2l+1)
+                c_nl_contrib = c_nl[X_cb_mask] * c_nl_contrib  # (... x n_res x n_channel x 2l+1)
                 c_nl_contrib[x_rel_mask] = 0
+                # print(c_nl_contrib.shape)
 
                 ret = ret + c_nl_contrib.sum(dim=-1) # (...)
             return ret.max(dim=-2)[0]
+        return rho
+
+    def reswise_back_transform(self, Z, device='cpu'):
+        """ Reverse a zernike transform per residue
+
+        Args
+        -----
+        Z : Dict
+            a dictionary of zernike polynomial expansion coefficients
+
+        Returns
+        -------
+        rho : func: R^3 -> R
+            density function
+        """
+        def rho(x_rel, x_mask, channel_mask):
+            """ Density function
+            Args
+            ----
+            x_rel : torch.Tensor (... x n_res x n_atom x 3)
+
+            x_mask : torch.Tensor (... x n_res x n_atom)
+
+            channel_mask : torch.Tensor (n_atom x n_channel)
+            """
+            ret = torch.tensor([0.], device=device)
+            x_mask = x_mask.to(x_rel.device)
+            channel_mask = channel_mask.to(x_rel.device)
+            for (n, l), c_nl in Z.items():
+                if (n-l) % 2 == 1:
+                    continue
+
+                c_nl = c_nl.to(device)
+
+                R = self.get(n, l)
+                y = o3.spherical_harmonics(l, x_rel, normalize=True)  # (... x n_res x n_atom x 2l+1)
+                r = R(x_rel)  # (... x n_res x n_atom)
+                r = r.unsqueeze(-1)  # (... x n_res x n_atom x 1)
+
+                y = y.unsqueeze(-2)  # (... x n_res x n_atom x 1 x 2l+1)
+                r = r.unsqueeze(-2)  # (... x n_res x n_atom x 1 x 1)
+                c_nl_contrib = y * r  # (... x n_res x n_atom x 1 x 2l+1)
+                c_nl_contrib[x_mask] = 0
+                c_nl = c_nl.unsqueeze(-3)
+
+                c_nl_contrib = c_nl * c_nl_contrib  # (... x n_res x n_atom x n_channel x 2l+1)
+                c_nl_contrib[..., channel_mask, :] = 0
+
+                ret = ret + c_nl_contrib.sum(dim=-1) # (... x n_res x n_atom x n_channel)
+            return ret
         return rho
 
 
@@ -246,48 +329,8 @@ if __name__ == "__main__":
         [[0.5, 0.5, 0.5],
          [-0.5, -0.5, -0.5]]
     ], requires_grad=True)
-    Z = zt.forward_transform(dirac, torch.zeros(dirac.shape[:-1]).bool())
-    rho = zt.back_transform(Z, X_ca=torch.from_numpy(center))
-
-    print(xyz.shape)
-    density = rho(xyz)
-    print(density.shape)
-    density = density.numpy(force=True)
-    p = ax.scatter(x, y, z, c=density, alpha=0.5)
-    fig.colorbar(p)
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_zlabel("z")
-    plt.show()
-
-    x = np.linspace(0, 2, 10)
-    y = np.linspace(0, 2, 10)
-    z = np.linspace(0, 2, 10)
-    x, y, z = np.meshgrid(x, y, z)
-
-    center = np.array([1., 1., 1.])
-    x_center = x - center[0]
-    y_center = y - center[1]
-    z_center = z - center[2]
-
-    r = np.sqrt(x_center*x_center + y_center*y_center + z_center*z_center)
-    r_filter = (r < 1)
-    x = x[r_filter]
-    y = y[r_filter]
-    z = z[r_filter]
-
-    xyz = torch.from_numpy(np.array([x, y, z])).T
-
-    fig = plt.figure(figsize=plt.figaspect(1.))
-    ax = fig.add_subplot(projection='3d')
-    ax.set_facecolor('darkgrey')
-
-    dirac = torch.tensor([
-        [[1.5, 1.5, 1.5],
-         [0.5, 0.5, 0.5]]
-    ], requires_grad=True)
     Z = zt.forward_transform(dirac, torch.from_numpy(center), torch.zeros(dirac.shape[:-1]).bool())
-    rho = zt.back_transform(Z, X_ca=torch.from_numpy(center))
+    rho = zt.back_transform(Z, X_cb=torch.from_numpy(center))
 
     print(xyz.shape)
     density = rho(xyz)
@@ -299,3 +342,43 @@ if __name__ == "__main__":
     ax.set_ylabel("y")
     ax.set_zlabel("z")
     plt.show()
+
+    # x = np.linspace(0, 2, 10)
+    # y = np.linspace(0, 2, 10)
+    # z = np.linspace(0, 2, 10)
+    # x, y, z = np.meshgrid(x, y, z)
+
+    # center = np.array([1., 1., 1.])
+    # x_center = x - center[0]
+    # y_center = y - center[1]
+    # z_center = z - center[2]
+
+    # r = np.sqrt(x_center*x_center + y_center*y_center + z_center*z_center)
+    # r_filter = (r < 1)
+    # x = x[r_filter]
+    # y = y[r_filter]
+    # z = z[r_filter]
+
+    # xyz = torch.from_numpy(np.array([x, y, z])).T
+
+    # fig = plt.figure(figsize=plt.figaspect(1.))
+    # ax = fig.add_subplot(projection='3d')
+    # ax.set_facecolor('darkgrey')
+
+    # dirac = torch.tensor([
+    #     [[1.5, 1.5, 1.5],
+    #      [0.5, 0.5, 0.5]]
+    # ], requires_grad=True)
+    # Z = zt.forward_transform(dirac, torch.from_numpy(center), torch.zeros(dirac.shape[:-1]).bool())
+    # rho = zt.back_transform(Z, X_ca=torch.from_numpy(center))
+
+    # print(xyz.shape)
+    # density = rho(xyz)
+    # print(density.shape)
+    # density = density.numpy(force=True)
+    # p = ax.scatter(x, y, z, c=density, alpha=0.5)
+    # fig.colorbar(p)
+    # ax.set_xlabel("x")
+    # ax.set_ylabel("y")
+    # ax.set_zlabel("z")
+    # plt.show()

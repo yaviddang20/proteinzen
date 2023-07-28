@@ -1,11 +1,15 @@
-""" Utils for handling sidechain atomic representations """
+""" Utils for handling sidechain atomic representations
+
+Many parts adapted from from https://github.com/deepmind/alphafold/blob/main/alphafold/common/residue_constants.py
+"""
 import numpy as np
+import torch
 
 alphabet = "ACDEFGHIKLMNPQRSTVWY"
 letter_to_num = {letter: alphabet.index(letter) for letter in alphabet}
+num_to_letter = {v: k for k,v in letter_to_num.items()}
 
 ### Canonical AA constants
-### many parts adapted from from https://github.com/deepmind/alphafold/blob/main/alphafold/common/residue_constants.py
 restype_1to3 = {
     'A': 'ALA',
     'R': 'ARG',
@@ -61,6 +65,45 @@ sidechain_atoms = {
     'VAL': ['CB', 'CG1', 'CG2'],
 }
 
+# Bonds in sidechains, in form (src, dst)
+sidechain_bonds = {
+    'ALA': [('CA', 'CB')],
+    'ARG': [
+        ('CA', 'CB'), ('CB', 'CG'), ('CG', 'CD'), ('CD', 'NE'),
+        ('NE', 'CZ'), ('CZ', 'NH1'), ('CZ', 'NH2')
+    ],
+    'ASN': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'OD1'), ('CG', 'ND2')],
+    'ASP': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'OD1'), ('CG', 'OD2')],
+    'CYS': [('CA', 'CB'), ('CB', 'SG')],
+    'GLN': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'CD'), ('CD', 'OE1'), ('CG', 'NE2')],
+    'GLU': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'CD'), ('CD', 'OE1'), ('CG', 'OE2')],
+    'GLY': [],
+    'HIS': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'ND1'), ('CG', 'CD2'), ('ND1', 'CE1'), ('CD2', 'NE2')],
+    'ILE': [('CA', 'CB'), ('CB', 'CG1'), ('CB', 'CG2'), ('CG1', 'CD1')],
+    'LEU': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'CD1'), ('CG', 'CD2')],
+    'LYS': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'CD'), ('CD', 'CE'), ('CE', 'NZ')],
+    'MET': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'SD'), ('SD', 'CE')],
+    'PHE': [
+        ('CA', 'CB'), ('CB', 'CG'), ('CG', 'CD1'), ('CG', 'CD2'),
+        ('CD1', 'CE1'), ('CD2', 'CE2'), ('CE1', 'CZ'), ('CE2', 'CZ')
+    ],
+    'PRO': [('CA', 'CB'), ('CB', 'CG'), ('CG', 'CD'), ('CD', 'N')],
+    'SER': [('CA', 'CB'), ('CB', 'OG')],
+    'THR': [('CA', 'CB'), ('CB', 'OG1'), ('CB', 'CG2')],
+    'TRP': [
+        ('CA', 'CB'), ('CB', 'CG'), ('CG', 'CD1'), ('CG', 'CD2'),
+        ('CD1', 'NE1'), ('CD2', 'CE2'), ('NE1', 'CE2'),
+        ('CD2', 'CE3'), ('CE2', 'CZ2'), ('CE3', 'CZ3'),
+        ('CZ2', 'CH2'), ('CZ3', 'CH2')
+    ],
+    'TYR': [
+        ('CA', 'CB'), ('CB', 'CG'), ('CG', 'CD1'), ('CG', 'CD2'),
+        ('CD1', 'CE1'), ('CD2', 'CE2'), ('CE1', 'CZ'), ('CE2', 'CZ'),
+        ('CZ', 'OH')
+    ],
+    'VAL': [('CA', 'CB'), ('CB', 'CG1'), ('CB', 'CG2')],
+}
+
 
 atom37_atom_label = [
     "N", "CA", "C", "O",
@@ -98,6 +141,26 @@ for res, atom_list in sidechain_atoms.items():
     atom91_start_end[res] = (_start, _start + len(atom_list))
     _start += len(atom_list)
 assert _start == 91,  f"error in generating atom91 lookup 'atom91_start_end', _start={_start}"
+
+
+atom91_bonds = {}
+for res_3lt, bonds in sidechain_bonds.items():
+    bond_idxs = []
+    offset = atom91_start_end[res_3lt][0]
+    atom_order = sidechain_atoms[res_3lt]
+    for (atom1, atom2) in bonds:
+        if atom1 == 'CA':  # initial bond
+            idx1 = atom91_atom_label.index(atom1)
+        else:
+            idx1 = atom_order.index(atom1) + offset
+
+        if atom2 == 'N':  # proline
+            idx2 = atom91_atom_label.index(atom2)
+        else:
+            idx2 = atom_order.index(atom2) + offset
+
+        bond_idxs.append((idx1, idx2))
+    atom91_bonds[res_3lt] = bond_idxs
 
 
 # A compact atom encoding with 14 columns

@@ -66,6 +66,10 @@ class CATHDataset:
         for line in tqdm.tqdm(lines):
             entry = json.loads(line)
             name = entry['name']
+
+            if name in ['3k7a.M']:  # this is backbone-only somehow...
+                continue
+
             coords = entry['coords']
 
             atom37 = list(zip(
@@ -165,8 +169,9 @@ class ProteinGraphDataset(data.Dataset):
                  num_positional_embeddings=16,
                  top_k=30, num_rbf=16, device="cpu",
                  density_nmax=5,
-                 density_rmax=10,
-                 channel_atoms=False):
+                 density_rmax=8,
+                 channel_atoms=False,
+                 bb_density=True):
 
         super(ProteinGraphDataset, self).__init__()
 
@@ -180,6 +185,7 @@ class ProteinGraphDataset(data.Dataset):
         self.density_nmax = density_nmax
         self.density_rmax = density_rmax
         self.channel_atoms = channel_atoms
+        self.bb_density = bb_density
         self.zernike_transform = ZernikeTransform(density_nmax, density_rmax)
 
         self.letter_to_num = letter_to_num
@@ -252,6 +258,7 @@ class ProteinGraphDataset(data.Dataset):
             graph.ndata['seq'] = seq
             graph.ndata['backbone_s'] = node_s
             graph.ndata['backbone_v'] = node_v
+            graph.ndata['atom14'] = atom14
             graph.ndata['atom91'] = atom91
             graph.ndata['atom91_centered'] = atom91 - X_ca.unsqueeze(-2)
             graph.ndata['atom91_mask'] = atom91_mask
@@ -265,6 +272,10 @@ class ProteinGraphDataset(data.Dataset):
                 # since we can't take advantage of double masking to avoid taking sequence as input
                 atom_mask = atom91_mask.any(dim=-1)
                 channel_values = torch.as_tensor(self.channel_values, device=self.device, dtype=torch.float)
+                if not self.bb_density:
+                    atom91 = atom91[..., 4:, :]
+                    atom_mask = atom_mask[..., 4:]
+                    channel_values = channel_values[..., 4:]
                 Z = self.zernike_transform.forward_transform(atom91, X_cb, atom_mask, point_value=channel_values)
             else:
                 atom_mask = atom14_mask.any(dim=-1)

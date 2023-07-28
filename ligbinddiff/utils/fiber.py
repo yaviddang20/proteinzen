@@ -74,8 +74,11 @@ def fiber_to_nl(fiber_dict, n_channels=1):
 
     nl_dict = {}
     for l, coeffs in fiber_dict.items():
-        for i, n in enumerate(range(n_max, l-1, -1)):
+        i = 0
+        for n in range(n_max, l-1, -1):
             nl_dict[(n,l)] = coeffs[..., i:i+n_channels, :]
+            i += n_channels
+
 
     return nl_dict
 
@@ -87,9 +90,11 @@ def compact_fiber_to_nl(fiber_dict, n_channels=1):
 
     nl_dict = {}
     for l, coeffs in fiber_dict.items():
-        for i, n in enumerate(range(n_max, l-1, -1)):
+        i = 0
+        for n in range(n_max, l-1, -1):
             if (n - l) % 2 == 0:
                 nl_dict[(n,l)] = coeffs[..., i:i+n_channels, :]
+                i += n_channels
 
     return nl_dict
 
@@ -103,10 +108,10 @@ def rand_fiber_density(num_nodes, n_max, device='cpu'):
     return density
 
 
-def rand_compact_fiber_density(num_nodes, n_max, device='cpu'):
+def rand_compact_fiber_density(num_nodes, n_max, num_channels=1, device='cpu'):
     fiber = gen_compact_nmax_fiber(n_max)
     density = {}
     for l, num_vecs in fiber.items():
         m_tot = 2*l+1
-        density[l] = torch.randn((num_nodes, num_vecs, m_tot), device=device)
+        density[l] = torch.randn((num_nodes, num_vecs * num_channels, m_tot), device=device)
     return density

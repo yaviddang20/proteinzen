@@ -1,8 +1,10 @@
 """ Methods for outputting density files for visualization """
 
+import warnings
+import torch
+
 import mrcfile
 import numpy as np
-import torch
 import tqdm
 
 import matplotlib.pyplot as plt
@@ -16,19 +18,25 @@ def density_to_mrc(rho,
                    coord_bounds: tuple,
                    out_prefix="out",
                    overwrite=True,
-                   memory_mode=0):
+                   memory_mode=0,
+                   device='cpu'):
     # sample the density on a grid
     coord_min, coord_max = coord_bounds
     steps = int((coord_max - coord_min) / voxel_size)
-    x = torch.linspace(coord_min, coord_max, steps)
-    y = torch.linspace(coord_min, coord_max, steps)
-    z = torch.linspace(coord_min, coord_max, steps)
+    x = torch.linspace(coord_min, coord_max, steps).to(device)
+    y = torch.linspace(coord_min, coord_max, steps).to(device)
+    z = torch.linspace(coord_min, coord_max, steps).to(device)
     z, y, x = torch.meshgrid(z, y, x)
     zyx = torch.stack([z, y, x], dim=-1)
     xyz = torch.stack([x, y, z], dim=-1)
     if memory_mode == 1:
         print("Iterate over x")
-        density = [rho(xyz[i]).numpy(force=True) for i in tqdm.tqdm(range(steps))]
+        density = []
+        for i in tqdm.tqdm(range(steps)):
+            slice = rho(xyz[i]).numpy(force=True)
+            density.append(slice)
+            if np.isnan(slice).any():
+                print(slice)
         density = np.array(density)
     elif memory_mode == 2:
         density = []
@@ -47,6 +55,11 @@ def density_to_mrc(rho,
         raise ValueError("memory_mode must be either 0, 1, or 2")
     print(density.shape)
 
+    if np.isnan(density).any():
+        density[np.isnan(density)] = 0
+        warnings.warn("NaNs detected in density. We'll set them to 0, but you might wanna get that checked")
+
+
     # fig = plt.figure(figsize=plt.figaspect(1.))
     # ax = fig.add_subplot(projection='3d')
 
@@ -58,6 +71,7 @@ def density_to_mrc(rho,
     # ax.set_xlabel("x")
     # ax.set_ylabel("y")
     # ax.set_zlabel("z")
+
 
     num_channels = density.shape[-1]
     density = density.astype(np.float32)
@@ -217,10 +231,11 @@ if __name__ == '__main__':
         return Cb + Cb_vec
 
     from ligbinddiff.utils.zernike import ZernikeTransform
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     points = torch.as_tensor(entry['coords'], dtype=torch.float32)
     points_mask = torch.from_numpy(entry['coords_mask']).any(dim=-1)
-    zt = ZernikeTransform(5, 8)
+    zt = ZernikeTransform(16, 8)
     X_ca = torch.from_numpy(entry['coords'][:, 1])
     X_cb = ideal_virtual_Cb(torch.from_numpy(entry["coords"]))
     print(X_cb.shape)
@@ -233,7 +248,9 @@ if __name__ == '__main__':
     atom91, atom91_mask = atom14_to_atom91(entry['seq'], atom14)
     atom91 = torch.as_tensor(atom91)
     atom91_mask = torch.as_tensor(atom91_mask).any(dim=-1)
-    Z = zt.forward_transform(atom91, X_cb, atom91_mask, point_value=channel_atoms)
+    Z = zt.forward_transform(atom91[..., 4:, :], X_cb, atom91_mask[..., 4:], point_value=channel_atoms[..., 4:])
+    # Z = zt.forward_transform(atom91, X_cb, atom91_mask, point_value=channel_atoms)
+    print(sum([v.numel() for v in Z.values()]) / 13)
 
     from ligbinddiff.utils.type_l import type_l_randn_like, type_l_sub, type_l_apply, type_l_add, type_l_mult
     from ligbinddiff.utils.fiber import compact_fiber_to_nl
@@ -254,28 +271,28 @@ if __name__ == '__main__':
             numel += mags.numel()
             # print((n, l), mags.sum()/mags.numel())
 
-        #print(numel)
+        # print(numel)
 
         return loss / numel
 
     noise = type_l_randn_like(Z)
 
-    for alpha_t in torch.linspace(0, 1, 100):
-        noised_density = type_l_add(
-            type_l_mult(1-alpha_t, Z),
-            type_l_mult(alpha_t, noise)
-        )
-        if zernike_coeff_loss(noised_density, Z, mask=None) > 0.3:
-            print(zernike_coeff_loss(noised_density, Z, mask=None))
-            Z = noised_density
-            break
+    # for alpha_t in torch.linspace(0, 1, 100):
+    #     noised_density = type_l_add(
+    #         type_l_mult(1-alpha_t, Z),
+    #         type_l_mult(alpha_t, noise)
+    #     )
+    #     if zernike_coeff_loss(noised_density, Z, mask=None) > 0.3:
+    #         print(zernike_coeff_loss(noised_density, Z, mask=None))
+    #         Z = noised_density
+    #         break
 
-    rho = zt.back_transform(Z, X_cb)
+    rho = zt.back_transform(Z, X_cb, device=device)
 
     min_coord = int(points[~points_mask].min() - 1)
     max_coord = int(points[~points_mask].max() + 1)
 
-    density_to_mrc(rho, voxel_size=0.5, coord_bounds=(min_coord, max_coord), memory_mode=1, out_prefix=entry['name'])
+    density_to_mrc(rho, voxel_size=0.5, coord_bounds=(min_coord, max_coord), memory_mode=1, out_prefix=entry['name']+"n16")
     # points = points[~points_mask] # - X_ca
     # print(points)
     # ax.scatter(points[..., 0], points[..., 1], points[..., 2], c="black", alpha=1)
