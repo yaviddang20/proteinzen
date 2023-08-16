@@ -115,3 +115,4 @@ data/cath/*.json
 data/cath/*.jsonl
 scripts/submit_scripts/autogen_scripts
 outputs/
+_debug/

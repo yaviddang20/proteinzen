@@ -51,7 +51,10 @@ class LinearDiscreteVPDensityDiffuser(nn.Module):
             one single protein coord set
         """
         t_idx = self.t_dist.sample()
+        # t_idx = torch.zeros_like(t_idx)
         ts = t_idx / self.N
+
+        # t_idx = torch.zeros_like(t_idx)
 
         noise = type_l_randn_like(density)
         scaled_noise = type_l_mult(self.sqrt_1m_alphas_cumprod[t_idx], noise)

@@ -4,7 +4,7 @@ import tqdm
 import numpy as np
 import torch
 
-from ligbinddiff.runtime.loss import zernike_coeff_loss, seq_cce_loss, atom91_rmsd_loss, density_consistency, bond_length_loss
+from ligbinddiff.runtime.loss import zernike_coeff_loss, seq_cce_loss, atom91_rmsd_loss, density_consistency, bond_length_loss, torsion_loss
 from ligbinddiff.utils.fiber import compact_fiber_to_nl
 from ligbinddiff.utils.atom_reps import atom91_atom_masks
 
@@ -26,7 +26,7 @@ def cath_train_loop(diffuser,
                     train=True,
                     warmup=False,
                     consistency_loss=False,
-                    use_channel_weights=False):
+                    use_channel_weights=True):
     epoch_loss = []
     epoch_ref_noise = []
     epoch_denoising_loss = []
@@ -89,10 +89,13 @@ def cath_train_loop(diffuser,
             channel_weights[channel_atom_count == 0] = 1  # retain pushing weights towards 0 for no density
         else:
             channel_weights = None
+
         denoising_loss = zernike_coeff_loss(density_dict, denoised_density, x_mask, n_channels=n_channels, channel_weights=channel_weights)
         ref_noise = zernike_coeff_loss(density_dict, noised_density_dict, x_mask, n_channels=n_channels, channel_weights=channel_weights)
         seq_loss = seq_cce_loss(seq, seq_logits, x_mask)
         atom91_rmsd = atom91_rmsd_loss(atom91_centered, pred_atom91, atom91_mask)
+        bond_length_mse = bond_length_loss(atom91_centered, pred_atom91, atom91_mask.any(dim=-1))
+        chi_loss = torsion_loss(atom91_centered, pred_atom91, atom91_mask.any(dim=-1))
 
         if consistency_loss:
             channel_values = torch.as_tensor([
@@ -119,9 +122,10 @@ def cath_train_loop(diffuser,
         else:
             denoise_consistency_loss = torch.zeros(1, device=denoising_loss.device)
 
-        bond_length_mse = bond_length_loss(atom91_centered, pred_atom91, atom91_mask.any(dim=-1))
-
-        unscaled_loss = denoising_loss + (not warmup) * (seq_loss + atom91_rmsd) + (consistency_loss) * denoise_consistency_loss + bond_length_mse
+        unscaled_loss = (
+            denoising_loss + (not warmup) * (seq_loss + atom91_rmsd) + (consistency_loss) * denoise_consistency_loss +
+            bond_length_mse + chi_loss
+        )
         loss = -0.5 * tau_ts * (
             unscaled_loss #+ torch.maximum(denoising_loss - ref_noise, torch.zeros_like(denoising_loss))
         )
@@ -132,7 +136,8 @@ def cath_train_loop(diffuser,
             print(
                 (f"Epoch loss {np.mean(epoch_loss):.4f}, point loss {loss.item():.4f}, "
                 f"denoise {denoising_loss.item():.4f}, ref noise {ref_noise.item():.4f}, denoise consist {denoise_consistency_loss.item():.4f}, "
-                f"seq {seq_loss.item():.4f}, rmsd {atom91_rmsd.item():.4f}, ts {ts.item():.4f}"))
+                f"seq {seq_loss.item():.4f}, rmsd {atom91_rmsd.item():.4f}, bond l mse {bond_length_mse.item():.4f}, "
+                f"chi {chi_loss.item():.4f}, ts {ts.item():.4f}"))
 
             state_dict = {
                 "diffuser": diffuser.state_dict(),
@@ -316,8 +321,9 @@ def cath_train_loop(diffuser,
         epoch_atom91_rmsd.append(atom91_rmsd.item())
         pbar.set_description((
             f"Epoch loss {np.mean(epoch_loss):.4f}, point loss {loss.item():.4f}, "
-            f"denoise {denoising_loss.item():.4f}, ref noise {ref_noise.item():.4f}, denoise consist {denoise_consistency_loss.item():.4f}, "
-            f"seq {seq_loss.item():.4f}, rmsd {atom91_rmsd.item():.4f}, bond l mse {bond_length_mse.item():.4f}, ts {ts.item():.4f}"))
+            f"denoise {denoising_loss.item():.4f}, ref noise {ref_noise.item():.4f}, " # denoise consist {denoise_consistency_loss.item():.4f}, "
+            f"seq {seq_loss.item():.4f}, rmsd {atom91_rmsd.item():.4f}, bond l mse {bond_length_mse.item():.4f}, "
+            f"chi {chi_loss.item():.4f}, ts {ts.item():.4f}"))
 
         if torch.isnan(loss).any():
             exit()

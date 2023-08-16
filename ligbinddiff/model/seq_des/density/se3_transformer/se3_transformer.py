@@ -367,33 +367,100 @@ class Atom91Head(nn.Module):
         super().__init__()
         fiber_aa = Fiber({0: scalar_in})
         fiber_out = Fiber({1: 91})
-        self.transition = LinearSE3(fiber_density+fiber_aa, fiber_density)
-        self.transition_norm = NormSE3(fiber_density)
-        self.collapse = ConvSE3(fiber_in=fiber_density,
-                                fiber_out=fiber_out,
-                                fiber_edge=fiber_edge,
-                                self_interaction=True,
-                                low_memory=low_memory)
-        self.collapse_norm = NormSE3(fiber_out)
-        self.refine = nn.ModuleList([
-            FeedForwardSE3(fiber_out, fiber_out * 2)
-            for _ in range(num_layers)
-        ])
+
+        self.transitions = nn.ModuleList(
+            [
+                LinearSE3(fiber_density + (fiber_aa * (idx == 0)), fiber_density)
+                for idx in range(num_layers)
+            ]
+        )
+        self.transition_norms = nn.ModuleList(
+            [
+                NormSE3(fiber_density)
+                for _ in range(num_layers)
+            ]
+        )
+        self.collapses = nn.ModuleList(
+            [
+                ConvSE3(fiber_in=fiber_density,
+                        fiber_out=fiber_out,
+                        fiber_edge=fiber_edge,
+                        self_interaction=True,
+                        low_memory=low_memory)
+                for _ in range(num_layers)
+            ]
+        )
+        self.updates = nn.ModuleList(
+            [
+                ConvSE3(fiber_in=fiber_out,
+                        fiber_out=fiber_density,
+                        fiber_edge=fiber_edge,
+                        self_interaction=True,
+                        low_memory=low_memory)
+                for _ in range(num_layers)
+            ]
+        )
+        self.norms = nn.ModuleList(
+            [
+                NormSE3(fiber_out)
+                for _ in range(num_layers)
+            ]
+        )
+        self.projects = nn.ModuleList(
+            [
+                LinearSE3(fiber_out, fiber_out)
+                for _ in range(num_layers)
+            ]
+        )
+
+        # self.transition = LinearSE3(fiber_density+fiber_aa, fiber_density)
+        # self.transition_norm = NormSE3(fiber_density)
+        # self.collapse = ConvSE3(fiber_in=fiber_density,
+        #                         fiber_out=fiber_out,
+        #                         fiber_edge=fiber_edge,
+        #                         self_interaction=True,
+        #                         low_memory=low_memory)
+
+        # self.collapse_norm = NormSE3(fiber_out)
+
+        # self.refine = nn.ModuleList([
+        #     FeedForwardSE3(fiber_out, fiber_out * 2)
+        #     for _ in range(num_layers)
+        # ])
 
     def forward(self, density_features, sequence_features, edge_features, graph, basis):
         in_features = type_l_partial_cat(density_features, sequence_features)
-        # print("in features", in_features)
-        transition = self.transition(in_features)
-        # print("transition", transition)
-        norm = self.transition_norm(transition)
-        # print("norm", norm)
-        atoms = self.collapse(norm, edge_features, graph, basis)
-        # print("collapse", atoms)
-        atoms = self.collapse_norm(atoms)
-        # print("collapse norm", atoms)
-        for layer in self.refine:
-            atoms = type_l_add(atoms, layer(atoms))
-            # print("atoms", atoms)
+
+        f_D = in_features
+        atoms = None
+        for idx, (transition, trans_norm, collapse, norm, proj) in enumerate(zip(
+                self.transitions, self.transition_norms, self.collapses, self.norms, self.projects)):
+            if idx == 0:
+                f_D = trans_norm(transition(f_D))
+            else:
+                f_D = type_l_add(f_D, trans_norm(transition(f_D)))
+
+            atoms_update = collapse(f_D, edge_features, graph, basis)
+            if atoms is None:
+                atoms = norm(atoms_update)
+            else:
+                atoms = type_l_add(atoms, norm(atoms_update))
+            atoms = proj(atoms)
+
+        # # print("in features", in_features)
+        # transition = self.transition(in_features)
+        # # print("transition", transition)
+        # norm = self.transition_norm(transition)
+        # # print("norm", norm)
+        # atoms = self.collapse(norm, edge_features, graph, basis)
+        # # print("collapse", atoms)
+        # atoms = self.collapse_norm(atoms)
+        # # print("collapse norm", atoms)
+        # f_D = density_features
+        # for layer in self.refine:
+
+        #     atoms = type_l_add(atoms, layer(atoms))
+        #     # print("atoms", atoms)
 
         return atoms
 

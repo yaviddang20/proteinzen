@@ -104,6 +104,18 @@ sidechain_bonds = {
     'VAL': [('CA', 'CB'), ('CB', 'CG1'), ('CB', 'CG2')],
 }
 
+sidechain_bond_angles = {
+    aa: [] for aa in sidechain_bonds.keys()
+}
+
+for aa, store in sidechain_bond_angles.items():
+    bonds = sidechain_bonds[aa]
+    for b1 in bonds:
+        for b2 in bonds:
+            if b1[-1] == b2[0]:
+                store.append((b1[0], b1[1], b2[1]))
+
+
 
 atom37_atom_label = [
     "N", "CA", "C", "O",
@@ -161,6 +173,103 @@ for res_3lt, bonds in sidechain_bonds.items():
 
         bond_idxs.append((idx1, idx2))
     atom91_bonds[res_3lt] = bond_idxs
+
+atom91_angles = {}
+for res_3lt, angles in sidechain_bond_angles.items():
+    angle_idxs = []
+    offset = atom91_start_end[res_3lt][0]
+    atom_order = sidechain_atoms[res_3lt]
+    for (atom1, atom2, atom3) in angles:
+        if atom1 == 'CA':  # initial bond
+            idx1 = atom91_atom_label.index(atom1)
+        else:
+            idx1 = atom_order.index(atom1) + offset
+
+        idx2 = atom_order.index(atom2) + offset
+        if atom3 == 'N':  # proline
+            idx3 = atom91_atom_label.index(atom3)
+        else:
+            idx3 = atom_order.index(atom3) + offset
+
+        angle_idxs.append((idx1, idx2, idx3))
+    atom91_angles[res_3lt] = angle_idxs
+
+
+# Format: The list for each AA type contains chi1, chi2, chi3, chi4 in
+# this order (or a relevant subset from chi1 onwards). ALA and GLY don't have
+# chi angles so their chi angle lists are empty.
+chi_angles_atoms = {
+    'ALA': [],
+    # Chi5 in arginine is always 0 +- 5 degrees, so ignore it.
+    'ARG': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'CD'],
+            ['CB', 'CG', 'CD', 'NE'], ['CG', 'CD', 'NE', 'CZ']],
+    'ASN': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'OD1']],
+    'ASP': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'OD1']],
+    'CYS': [['N', 'CA', 'CB', 'SG']],
+    'GLN': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'CD'],
+            ['CB', 'CG', 'CD', 'OE1']],
+    'GLU': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'CD'],
+            ['CB', 'CG', 'CD', 'OE1']],
+    'GLY': [],
+    'HIS': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'ND1']],
+    'ILE': [['N', 'CA', 'CB', 'CG1'], ['CA', 'CB', 'CG1', 'CD1']],
+    'LEU': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'CD1']],
+    'LYS': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'CD'],
+            ['CB', 'CG', 'CD', 'CE'], ['CG', 'CD', 'CE', 'NZ']],
+    'MET': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'SD'],
+            ['CB', 'CG', 'SD', 'CE']],
+    'PHE': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'CD1']],
+    'PRO': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'CD']],
+    'SER': [['N', 'CA', 'CB', 'OG']],
+    'THR': [['N', 'CA', 'CB', 'OG1']],
+    'TRP': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'CD1']],
+    'TYR': [['N', 'CA', 'CB', 'CG'], ['CA', 'CB', 'CG', 'CD1']],
+    'VAL': [['N', 'CA', 'CB', 'CG1']],
+}
+
+# The following chi angles are pi periodic: they can be rotated by a multiple
+# of pi without affecting the structure.
+chi_pi_periodic = [
+    [],  # ALA
+    [0.0, 0.0, 0.0, 0.0],  # ARG
+    [0.0, 0.0],  # ASN
+    [0.0, 1.0],  # ASP
+    [0.0],  # CYS
+    [0.0, 0.0, 0.0],  # GLN
+    [0.0, 0.0, 1.0],  # GLU
+    [],  # GLY
+    [0.0, 0.0],  # HIS
+    [0.0, 0.0],  # ILE
+    [0.0, 0.0],  # LEU
+    [0.0, 0.0, 0.0, 0.0],  # LYS
+    [0.0, 0.0, 0.0],  # MET
+    [0.0, 1.0],  # PHE
+    [0.0, 0.0],  # PRO
+    [0.0],  # SER
+    [0.0],  # THR
+    [0.0, 0.0],  # TRP
+    [0.0, 1.0],  # TYR
+    [0.0],  # VAL
+]
+for chi_atoms, chi_angles in zip(chi_angles_atoms.values(), chi_pi_periodic):
+    assert len(chi_atoms) == len(chi_angles)
+
+chi_atom_idxs = {}
+_bb_atoms = ['N', 'CA', 'C', 'O']
+for res_3lt, chi_atoms_list in chi_angles_atoms.items():
+    atom_idxs = []
+    offset = atom91_start_end[res_3lt][0]
+    atom_order = sidechain_atoms[res_3lt]
+    for atoms in chi_atoms_list:
+        idxs = []
+        for atom in atoms:
+            if atom in _bb_atoms:
+                idxs.append(_bb_atoms.index(atom))
+            else:
+                idxs.append(atom_order.index(atom) + offset)
+
+        atom_idxs.append(tuple(idxs))
+    chi_atom_idxs[res_3lt] = atom_idxs
 
 
 # A compact atom encoding with 14 columns

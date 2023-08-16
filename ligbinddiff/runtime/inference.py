@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from ligbinddiff.utils.fiber import compact_fiber_to_nl
-from ligbinddiff.runtime.loss import zernike_coeff_loss, seq_cce_loss, atom91_rmsd_loss, bond_length_loss
+from ligbinddiff.runtime.loss import zernike_coeff_loss, seq_cce_loss, atom91_rmsd_loss, bond_length_loss, torsion_loss
 from ligbinddiff.utils.atom_reps import num_to_letter, atom91_atom_masks
 from ligbinddiff.data.io.pdb_utils import atom91_to_pdb
 
@@ -81,11 +81,9 @@ def cath_inference_loop(diffuser, dataloader, num_steps, device=None, save=False
         seq_loss = [seq_cce_loss(seq, s, x_mask) for s in seq_logits[1:]]
         per_seq_recov = [seq_recov(seq, s, x_mask) for s in seq_logits[1:]]
         atom91_rmsd = [atom91_rmsd_loss(atom91_centered, a, atom91_mask) for a in pred_atom91[1:]]
-
-        for p_atom91 in pred_atom91[1:]:
-            p_atom91[..., 4:, :] = atom91_centered[..., 4:, :]
-        # bond_length_mse = [bond_length_loss(atom91_centered, a, atom91_mask.any(dim=-1)) for a in pred_atom91[1:]]
         bond_length_mse = bond_length_loss(atom91_centered, pred_atom91[-1], atom91_mask.any(dim=-1))
+        chi_loss = torsion_loss(atom91_centered, pred_atom91[-1], atom91_mask.any(dim=-1))
+
         # print(denoised_density, seq_logits)
         # for d, s, sr, r in zip(denoising_loss, seq_loss, per_seq_recov, atom91_rmsd):
         #     print(d, s, sr, r)
@@ -103,7 +101,8 @@ def cath_inference_loop(diffuser, dataloader, num_steps, device=None, save=False
         epoch_seq_recov.append(per_seq_recov[-1].item())
         pbar.set_description((
             f"Denoising loss {denoising_loss[-1].item():.4f}, seq loss {seq_loss[-1].item():.4f}, "
-            f"atom91 rmsd {atom91_rmsd[-1].item():.4f}, bond l mse {bond_length_mse.item():.4f}, % seq recov {per_seq_recov[-1].item():.4f}"))
+            f"atom91 rmsd {atom91_rmsd[-1].item():.4f}, bond l mse {bond_length_mse.item():.4f}, "
+            f"chi {chi_loss.item():.4f}, % seq recov {per_seq_recov[-1].item():.4f}"))
 
         if save:
             assert device is not None, "device cannot be None for saving densities"
