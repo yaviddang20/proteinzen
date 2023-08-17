@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from ligbinddiff.utils.type_l import type_l_add, type_l_sub, type_l_apply
 from ligbinddiff.utils.fiber import compact_fiber_to_nl
-from ligbinddiff.utils.atom_reps import atom91_start_end, atom91_bonds, atom91_angles, chi_atom_idxs, chi_pi_periodic
+from ligbinddiff.utils.atom_reps import atom91_atom_masks, atom91_start_end, atom91_bonds, atom91_angles, chi_atom_idxs, chi_pi_periodic
 
 
 def zernike_coeff_loss(ref_density, pred_density, mask, n_channels=1, channel_weights=None, eps=1e-6):
@@ -261,3 +261,62 @@ def distance_loss(ref_atom91, pred_atom91, atom91_mask, eps=1e-6):
     dist_mse = dist_diff[~total_mask].square().sum() / (~total_mask).long().sum()
 
     return dist_mse
+
+
+def cath_loss_fn(noised_batch, model_outputs, n_channels=4, use_channel_weights=False):
+    density_dict = noised_batch['density']
+    noised_density_dict = noised_batch['noised_density']
+
+    seq = noised_batch['seq']
+    x_mask = noised_batch['x_mask']
+    atom91_centered = noised_batch['atom91_centered']
+    atom91_mask = noised_batch['atom91_mask']
+
+    denoised_density = model_outputs['density']
+    seq_logits = model_outputs['seq_logits']
+    pred_atom91 = model_outputs['atom91']
+
+    if use_channel_weights:
+        # compute channel weights for zernike loss
+        channel_values = torch.as_tensor([
+            atom91_atom_masks[atom][4:] for atom in ['C', 'N', 'O', 'S']
+        ], dtype=torch.bool).T  # n_atom x 4
+        atom_mask = ~atom91_mask.any(dim=-1, keepdim=True)  # n_res x n_atom x 1
+
+        channel_atom_mask = channel_values.unsqueeze(0).to(atom_mask.device) * atom_mask[..., 4:, :]
+        channel_atom_count = channel_atom_mask.float().sum(dim=-2)
+
+        # normalize channel contribution across atom type
+        channel_atom_count_per_channel = channel_atom_count.sum(dim=-2)
+        total_atoms = channel_atom_count.sum()
+        # to avoid divide-by-zero
+        channel_atom_count_per_channel[channel_atom_count_per_channel == 0] = 1
+        # normalize channel contribution across atom type
+        channel_weights = channel_atom_count / channel_atom_count_per_channel * total_atoms
+        channel_weights[channel_atom_count == 0] = 1  # retain pushing weights towards 0 for no density
+    else:
+        channel_weights = None
+
+    denoising_loss = zernike_coeff_loss(density_dict, denoised_density, x_mask, n_channels=n_channels, channel_weights=channel_weights)
+    ref_noise = zernike_coeff_loss(density_dict, noised_density_dict, x_mask, n_channels=n_channels, channel_weights=channel_weights)
+    seq_loss = seq_cce_loss(seq, seq_logits, x_mask)
+    atom91_rmsd = atom91_rmsd_loss(atom91_centered, pred_atom91, atom91_mask)
+    bond_length_mse = bond_length_loss(atom91_centered, pred_atom91, atom91_mask.any(dim=-1))
+    bond_angle_loss = angle_loss(atom91_centered, pred_atom91, atom91_mask.any(dim=-1))
+    chi_loss = torsion_loss(atom91_centered, pred_atom91, atom91_mask.any(dim=-1))
+
+    unscaled_loss = (
+        denoising_loss + seq_loss + atom91_rmsd +
+        bond_length_mse + bond_angle_loss + chi_loss
+    )
+    loss = noised_batch['loss_weight'] * unscaled_loss
+    return {
+        "loss": loss,
+        "denoising_loss": denoising_loss,
+        "ref_noise": ref_noise,
+        "seq_loss": seq_loss,
+        "atom91_rmsd": atom91_rmsd,
+        "bond_length_mse": bond_length_mse,
+        "bond_angle_loss": bond_angle_loss,
+        "chi_loss": chi_loss
+    }

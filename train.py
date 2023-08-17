@@ -16,8 +16,10 @@ from torch.utils.data import DataLoader
 from torch.utils.data import SequentialSampler
 
 from se3_transformer.model.fiber import Fiber
+from ligbinddiff.data.datasets.dataset import ProteinGraphDataset
+from ligbinddiff.data.sampler import BatchSampler
 
-from ligbinddiff.data.dataloaders.cath import CATHDataset, ProteinGraphDataset, BatchSampler
+from ligbinddiff.data.datasets.cath import CATHDataset
 from ligbinddiff.diffusion.density_diff import LearnableVPDensityDiffuser, LinearDiscreteVPDensityDiffuser
 from ligbinddiff.model.seq_des.density.se3_transformer.se3_transformer import DensityDenoiser
 from ligbinddiff.runtime.training import cath_train_loop

@@ -1,4 +1,6 @@
 """ utils for SO3 embeddings """
+import operator
+
 import torch
 
 from ligbinddiff.model.modules.equiformer_v2.so3 import SO3_Embedding
@@ -83,3 +85,23 @@ def so3_to_density(so3):
         density[l] = torch.cat(density[l], dim=-2)
 
     return density
+
+
+def gen_so3_unop(fn):
+    def op(a):
+        ret = a.clone()
+        ret.embedding = fn(ret.embedding)
+        return ret
+    return op
+
+def gen_so3_binop(fn):
+    def op(a, b):
+        ret = a.clone()
+        ret.embedding = fn(ret.embedding, b.embedding)
+        return ret
+    return op
+
+so3_add=gen_so3_binop(operator.add)
+so3_sub=gen_so3_binop(operator.sub)
+so3_mult=gen_so3_binop(operator.mul)
+so3_randn_like=gen_so3_unop(torch.randn_like)

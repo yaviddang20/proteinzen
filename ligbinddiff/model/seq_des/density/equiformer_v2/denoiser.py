@@ -11,6 +11,7 @@ from ligbinddiff.model.modules.equiformer_v2.transformer_block import FeedForwar
 from ligbinddiff.model.modules.equiformer_v2.edge_rot_mat import init_edge_rot_mat
 
 from ligbinddiff.utils.atom_reps import atom91_start_end
+from ligbinddiff.utils.so3_embedding import type_l_to_so3, density_to_so3, so3_to_density
 
 
 class EdgeUpdate(nn.Module):
@@ -28,10 +29,10 @@ class EdgeUpdate(nn.Module):
         )
         self.norm = nn.LayerNorm(h_dim)
 
-    def forward(self, node_features, edge_features, graph):
-        node_src = node_features.expand_edge(graph.edges()[0])
+    def forward(self, node_features, edge_features, edge_index):
+        node_src = node_features.expand_edge(edge_index[0])
         node_src_invariant = node_src.get_invariant_features(flat=True)
-        node_dst = node_features.expand_edge(graph.edges()[1])
+        node_dst = node_features.expand_edge(edge_index[1])
         node_dst_invariant = node_dst.get_invariant_features(flat=True)
         in_features = torch.cat([node_src_invariant, node_dst_invariant, edge_features], dim=-1)
         update = self.ff(in_features)
@@ -155,14 +156,14 @@ class DensityDenoisingLayer(nn.Module):
             density_features: SO3_Embedding,
             node_features: SO3_Embedding,
             edge_features: torch.Tensor,
-            graph
+            edge_index
     ):
         # update nodes from density
         density_features_super = density_features.to_resolutions(self.super_lmax_list, self.super_lmax_list)
         density_to_node_update = self.density_to_nodes(
             density_features_super,
             edge_features,
-            graph.edges()
+            edge_index
         )
         density_to_node_update = density_to_node_update.to_resolutions(self.node_lmax_list, self.node_lmax_list)
         norm_d2n_update = self.norm_node_update(density_to_node_update.embedding)
@@ -171,7 +172,6 @@ class DensityDenoisingLayer(nn.Module):
         node_features.embedding = node_features.embedding + node_update
 
         # transformer block
-        edge_index = torch.stack(graph.edges(), dim=0)
         node_features = node_features.condense_resolutions()
         # transformer block
         node_features = self.attention(
@@ -185,7 +185,7 @@ class DensityDenoisingLayer(nn.Module):
         edge_features = self.edge_update(
             node_features,
             edge_features,
-            graph
+            edge_index
         )
 
         # update density from nodes
@@ -193,7 +193,7 @@ class DensityDenoisingLayer(nn.Module):
         density_update = self.nodes_to_density(
             node_features_super,
             edge_features,
-            graph.edges()
+            edge_index
         )
 
         density_update = density_update.to_resolutions(self.density_lmax_list, self.density_lmax_list)
@@ -238,8 +238,7 @@ class SequenceHead(nn.Module):
             nn.Linear(h_dim, num_aa)
         )
 
-    def forward(self, density_features, edge_features, graph):
-        edge_index = torch.stack(graph.edges(), dim=0)
+    def forward(self, density_features, edge_features, edge_index):
         _, density_scalars = self.collapse(density_features, edge_features, edge_index)
         hidden = self.transition(density_scalars.squeeze(-1))
         hidden = self.norm(hidden)
@@ -300,39 +299,39 @@ class Atom91Head(nn.Module):
             num_channels=num_atoms
         )
 
-        # self.refine = nn.ModuleList(
-        #     [
-        #         TransBlockV2(
-        #             sphere_channels=num_atoms,
-        #             attn_hidden_channels=h_channels,
-        #             num_heads=num_heads,
-        #             attn_alpha_channels=h_channels // 2,
-        #             attn_value_channels=h_channels // 4,
-        #             ffn_hidden_channels=h_channels,
-        #             output_channels=num_atoms,
-        #             lmax_list=self.atom_lmax_list,
-        #             mmax_list=self.atom_lmax_list,
-        #             SO3_rotation=self.atom_SO3_rotation,
-        #             SO3_grid=self.atom_SO3_grid,
-        #             edge_channels_list=edge_channels_list,
-        #             mappingReduced=mappingReduced_atoms
-        #         )
-        #         for _ in range(num_layers)
-        #     ]
-        # )
         self.refine = nn.ModuleList(
             [
-                FeedForwardNetwork(
+                TransBlockV2(
                     sphere_channels=num_atoms,
-                    hidden_channels=num_atoms*2,
+                    attn_hidden_channels=h_channels,
+                    num_heads=num_heads,
+                    attn_alpha_channels=h_channels // 2,
+                    attn_value_channels=h_channels // 4,
+                    ffn_hidden_channels=h_channels,
                     output_channels=num_atoms,
                     lmax_list=self.atom_lmax_list,
                     mmax_list=self.atom_lmax_list,
-                    SO3_grid=self.atom_SO3_grid
+                    SO3_rotation=self.atom_SO3_rotation,
+                    SO3_grid=self.atom_SO3_grid,
+                    edge_channels_list=edge_channels_list,
+                    mappingReduced=mappingReduced_atoms
                 )
                 for _ in range(num_layers)
             ]
         )
+        # self.refine = nn.ModuleList(
+        #     [
+        #         FeedForwardNetwork(
+        #             sphere_channels=num_atoms,
+        #             hidden_channels=num_atoms*2,
+        #             output_channels=num_atoms,
+        #             lmax_list=self.atom_lmax_list,
+        #             mmax_list=self.atom_lmax_list,
+        #             SO3_grid=self.atom_SO3_grid
+        #         )
+        #         for _ in range(num_layers)
+        #     ]
+        # )
         self.proj = SO3_LinearV2(
             num_atoms,
             num_atoms,
@@ -340,7 +339,7 @@ class Atom91Head(nn.Module):
         )
 
 
-    def forward(self, density_features, seq_features, edge_features, graph):
+    def forward(self, density_features, seq_features, edge_features, edge_index):
         # fuse seq features into density features
         num_l0 = len(self.density_lmax_list)
         density_l0 = density_features.get_invariant_features()
@@ -350,7 +349,6 @@ class Atom91Head(nn.Module):
         density_features.set_invariant_features(density_l0)
 
         # collapse density to atoms
-        edge_index = torch.stack(graph.edges(), dim=0)
         density_collapsed = self.collapse(density_features, edge_features, edge_index)
         density_collapsed.embedding = self.collapse_norm(density_collapsed.embedding)
         atoms = SO3_Embedding(
@@ -373,12 +371,10 @@ class Atom91Head(nn.Module):
         atoms.set_embedding(atom_subset)
         # print(atoms.embedding.shape, edge_features.shape)
 
-        # transformer block
-        edge_index = torch.stack(graph.edges(), dim=0)
         # refine atoms
         for layer in self.refine:
-            atoms.embedding = atoms.embedding + layer(atoms).embedding
-            # atoms = layer(atoms, edge_features, edge_index)
+            # atoms.embedding = atoms.embedding + layer(atoms).embedding
+            atoms = layer(atoms, edge_features, edge_index)
 
         return self.proj(atoms)
 
@@ -549,13 +545,23 @@ class DensityDenoiser(nn.Module):
         )
 
 
-    def forward(self, node_features, edge_features, density_features, ts, graph):
+    def forward(self, graph):
+        ## prep features
+        node_features = {
+            0: graph['bb_s'].unsqueeze(-1),
+            1: graph['bb_v']
+        }
+        node_features = type_l_to_so3(node_features)
+        edge_features = graph['edge_s']
+        density_features = density_to_so3(graph['noised_density'])
+        ts = graph['t']
+
         # init SO3_rotation and SO3_grid
-        edges = graph.edges()
-        X_ca = graph.ndata['x']
-        X_cb = graph.ndata['x_cb']
-        node_edge_distance_vec = X_ca[edges[1]] - X_ca[edges[0]]
-        density_edge_distance_vec = X_cb[edges[1]] - X_cb[edges[0]]
+        edge_index = graph.edge_index
+        X_ca = graph['x']
+        X_cb = graph['x_cb']
+        node_edge_distance_vec = X_ca[edge_index[1]] - X_ca[edge_index[0]]
+        density_edge_distance_vec = X_cb[edge_index[1]] - X_cb[edge_index[0]]
         node_edge_rot_mat = init_edge_rot_mat(node_edge_distance_vec)
         density_edge_rot_mat = init_edge_rot_mat(density_edge_distance_vec)
         for rot in self.density_SO3_rotation_list:
@@ -569,7 +575,7 @@ class DensityDenoiser(nn.Module):
 
         # embed node features
         node_features = node_features.to_resolutions(self.node_lmax_list, self.node_lmax_list)
-        node_features = self.embed_node(node_features, edge_features, edges)
+        node_features = self.embed_node(node_features, edge_features, edge_index)
 
         ## create time embedding
         fourier_time = self.time_rbf(ts)  # (h_time,)
@@ -592,7 +598,7 @@ class DensityDenoiser(nn.Module):
         f_V = node_features
 
         for layer in self.denoiser:
-            f_D, f_V, f_E = layer(f_D, f_V, f_E, graph)
+            f_D, f_V, f_E = layer(f_D, f_V, f_E, edge_index)
 
         ## aux heads
         density = f_D.clone()
@@ -614,13 +620,17 @@ class DensityDenoiser(nn.Module):
         seq_logits, seq_features = self.seq_head(
             density_da_features,
             f_E,
-            graph
+            edge_index
         )
         atom91 = self.atom91(
             density_da_features,
             seq_features,
             f_E,
-            graph
+            edge_index
         )
 
-        return density, seq_logits, atom91.embedding[..., 1:, :].transpose(-1, -2)
+        return {
+            "density": so3_to_density(density),
+            "seq_logits": seq_logits,
+            "atom91": atom91.embedding[..., 1:, :].transpose(-1, -2)
+        }

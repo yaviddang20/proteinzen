@@ -3,6 +3,8 @@
 from Bio.PDB import Atom, Residue, Polypeptide, Chain, Model, Structure
 from Bio.PDB.PDBIO import PDBIO
 import numpy as np
+from ligbinddiff.data.datasets.dataset import ProteinGraphDataset
+from ligbinddiff.data.sampler import BatchSampler
 
 from ligbinddiff.utils.atom_reps import restype_1to3, sidechain_atoms, atom91_start_end
 
@@ -87,7 +89,7 @@ if __name__ == '__main__':
 
     import torch
     from torch.utils.data import DataLoader, SequentialSampler
-    from ligbinddiff.data.dataloaders.cath import CATHDataset, ProteinGraphDataset, BatchSampler
+    from ligbinddiff.data.datasets.cath import CATHDataset
     from ligbinddiff.utils.atom_reps import num_to_letter
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
