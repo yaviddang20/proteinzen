@@ -1,10 +1,8 @@
 """ Utils for loading and editing PDBs """
 
-from Bio.PDB import Atom, Residue, Polypeptide, Chain, Model, Structure
+from Bio.PDB import Atom, Residue, Chain, Model, Structure
 from Bio.PDB.PDBIO import PDBIO
 import numpy as np
-from ligbinddiff.data.datasets.dataset import ProteinGraphDataset
-from ligbinddiff.data.sampler import BatchSampler
 
 from ligbinddiff.utils.atom_reps import restype_1to3, sidechain_atoms, atom91_start_end
 
@@ -91,6 +89,8 @@ if __name__ == '__main__':
     from torch.utils.data import DataLoader, SequentialSampler
     from ligbinddiff.data.datasets.cath import CATHDataset
     from ligbinddiff.utils.atom_reps import num_to_letter
+    from ligbinddiff.data.datasets.dataset import ProteinGraphDataset
+    from ligbinddiff.data.sampler import BatchSampler
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(device)

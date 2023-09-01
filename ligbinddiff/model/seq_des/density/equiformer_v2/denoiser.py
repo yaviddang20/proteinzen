@@ -554,7 +554,7 @@ class DensityDenoiser(nn.Module):
         node_features = type_l_to_so3(node_features)
         edge_features = graph['edge_s']
         density_features = density_to_so3(graph['noised_density'])
-        ts = graph['t']
+        ts = graph['t']  # (B,)
 
         # init SO3_rotation and SO3_grid
         edge_index = graph.edge_index
@@ -578,10 +578,13 @@ class DensityDenoiser(nn.Module):
         node_features = self.embed_node(node_features, edge_features, edge_index)
 
         ## create time embedding
-        fourier_time = self.time_rbf(ts)  # (h_time,)
-        num_nodes = node_features.embedding.shape[0]
-        embedded_time = self.time_mlp(fourier_time.unsqueeze(0))  # (1 x h_time)
-        embedded_time = fourier_time.expand(num_nodes, -1)
+        fourier_time = self.time_rbf(ts.unsqueeze(-1))  # (B x h_time,)
+        embedded_time = self.time_mlp(fourier_time)  # (B x h_time)
+        data_splits = graph._slice_dict['x']
+        data_lens = data_splits[1:] - data_splits[:-1]
+        embedded_time = torch.cat([
+            embedded_time[i].view(1, -1).expand(l, -1) for i, l in enumerate(data_lens)
+        ])  # n_res x h_time
 
         # fuse time embedding into node features
         node_num_l0 = len(self.node_lmax_list)
@@ -629,8 +632,12 @@ class DensityDenoiser(nn.Module):
             edge_index
         )
 
-        return {
-            "density": so3_to_density(density),
-            "seq_logits": seq_logits,
-            "atom91": atom91.embedding[..., 1:, :].transpose(-1, -2)
-        }
+        graph['denoised_density'] = so3_to_density(density)
+        graph['seq_logits'] = seq_logits
+        graph['decoded_atom91'] = atom91.embedding[..., 1:, :].transpose(-1, -2)
+        return graph
+        # {
+        #     "density": so3_to_density(density),
+        #     "seq_logits": seq_logits,
+        #     "atom91": atom91.embedding[..., 1:, :].transpose(-1, -2)
+        # }

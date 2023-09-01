@@ -28,10 +28,10 @@ class EdgeUpdate(nn.Module):
         )
         self.norm = nn.LayerNorm(h_dim)
 
-    def forward(self, node_features, edge_features, graph):
-        node_src = node_features.expand_edge(graph.edges()[0])
+    def forward(self, node_features, edge_features, edge_index):
+        node_src = node_features.expand_edge(edge_index[0])
         node_src_invariant = node_src.get_invariant_features(flat=True)
-        node_dst = node_features.expand_edge(graph.edges()[1])
+        node_dst = node_features.expand_edge(edge_index[1])
         node_dst_invariant = node_dst.get_invariant_features(flat=True)
         in_features = torch.cat([node_src_invariant, node_dst_invariant, edge_features], dim=-1)
         update = self.ff(in_features)
@@ -90,8 +90,7 @@ class LatentDenoisingLayer(nn.Module):
             graph
     ):
         # transformer block
-        edge_index = torch.stack(graph.edges(), dim=0)
-        node_features = node_features.condense_resolutions()
+        edge_index = graph.edge_index
         # transformer block
         node_features = self.attention(
             node_features,
@@ -104,7 +103,7 @@ class LatentDenoisingLayer(nn.Module):
         edge_features = self.edge_update(
             node_features,
             edge_features,
-            graph
+            graph.edge_index
         )
         return node_features, edge_features
 
@@ -122,7 +121,7 @@ class RBF(nn.Module):
         return torch.cat([torch.cos(tp), torch.sin(tp)], dim=-1)
 
 
-class DensityDenoiser(nn.Module):
+class LatentDenoiser(nn.Module):
     """ Denoising model on sidechain densities """
     def __init__(self,
                  node_lmax_list,
@@ -141,8 +140,7 @@ class DensityDenoiser(nn.Module):
         self.node_lmax_list = node_lmax_list
 
         self.mappingReduced_nodes = mappingReduced_nodes
-
-        self.node_SO3_rotation = node_SO3_rotation
+        self.node_SO3_rotation_list = node_SO3_rotation
         self.node_SO3_grid_list = node_SO3_grid
 
         self.h_time = h_time
@@ -172,33 +170,29 @@ class DensityDenoiser(nn.Module):
         ])
 
 
-    def forward(self, node_features, edge_features, density_features, ts, graph):
-        # init SO3_rotation and SO3_grid
-        edges = graph.edges()
-        X_ca = graph.ndata['x']
-        X_cb = graph.ndata['x_cb']
-        node_edge_distance_vec = X_ca[edges[1]] - X_ca[edges[0]]
-        density_edge_distance_vec = X_cb[edges[1]] - X_cb[edges[0]]
-        node_edge_rot_mat = init_edge_rot_mat(node_edge_distance_vec)
-        density_edge_rot_mat = init_edge_rot_mat(density_edge_distance_vec)
-        for rot in self.density_SO3_rotation_list:
-            rot.set_wigner(density_edge_rot_mat)
-        for rot in self.node_SO3_rotation_list:
-            rot.set_wigner(node_edge_rot_mat)
-        for rot in self.super_SO3_rotation_list:
-            rot.set_wigner(node_edge_rot_mat)
-        for rot in self.atom_SO3_rotation_list:
-            rot.set_wigner(density_edge_rot_mat)
+    def forward(self, graph):
+        ## prep features
+        num_nodes = graph['x'].shape[0]
+        node_features = graph['noised_latent']
+        edge_features = graph['edge_s']
+        ts = graph['t']  # (B, 1, 1)
 
-        # embed node features
-        node_features = node_features.to_resolutions(self.node_lmax_list, self.node_lmax_list)
-        node_features = self.embed_node(node_features, edge_features, edges)
+        # init SO3_rotation and SO3_grid
+        edge_index = graph.edge_index
+        X_ca = graph['x']
+        edge_distance_vec = X_ca[edge_index[1]] - X_ca[edge_index[0]]
+        edge_rot_mat = init_edge_rot_mat(edge_distance_vec)
+        for rot in self.node_SO3_rotation_list:
+            rot.set_wigner(edge_rot_mat)
 
         ## create time embedding
-        fourier_time = self.time_rbf(ts)  # (h_time,)
-        num_nodes = node_features.embedding.shape[0]
-        embedded_time = self.time_mlp(fourier_time.unsqueeze(0))  # (1 x h_time)
-        embedded_time = fourier_time.expand(num_nodes, -1)
+        fourier_time = self.time_rbf(ts.unsqueeze(-1))  # (B x h_time,)
+        embedded_time = self.time_mlp(fourier_time)  # (B x h_time)
+        data_splits = graph._slice_dict['x']
+        data_lens = data_splits[1:] - data_splits[:-1]
+        embedded_time = torch.cat([
+            embedded_time[i].view(1, -1).expand(l, -1) for i, l in enumerate(data_lens)
+        ])  # n_res x h_time
 
         # fuse time embedding into node features
         node_num_l0 = len(self.node_lmax_list)
@@ -210,11 +204,12 @@ class DensityDenoiser(nn.Module):
         node_features.set_invariant_features(node_l0)
 
         ## denoising
-        f_D = density_features
-        f_E = edge_features
         f_V = node_features
+        f_E = edge_features
 
         for layer in self.denoiser:
-            f_D, f_V, f_E = layer(f_D, f_V, f_E, graph)
+            f_V, f_E = layer(f_V, f_E, graph)
 
-        return density, seq_logits, atom91.embedding[..., 1:, :].transpose(-1, -2)
+        graph['denoised_latent'] = f_V
+        # graph['latent_edge'] = f_E
+        return graph

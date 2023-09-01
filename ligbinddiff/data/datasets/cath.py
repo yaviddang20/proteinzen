@@ -39,6 +39,23 @@ class CATHDataset:
             if name in ['3k7a.M']:  # this is backbone-only somehow...
                 continue
 
+            if name in [
+                '1i94.H',
+                '1i94.M',
+                '1rws.A',
+                '1jb0.K',
+                '1fka.D',
+                '1fka.G',
+                '4dt0.A',
+                '5adx.V',
+                '5dn6.I',
+                '5dn6.J',
+            ]:  # these are ALA only somehow...
+                continue
+
+            if name in ['1din.A', '2j6v.A']:  # weird coord business (122 == 235 coord-wise?)
+                continue
+
             coords = entry['coords']
 
             atom37 = list(zip(

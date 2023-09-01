@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import torch.distributions as dist
 
 
-class Scheduler(abc.ABC):
+class Scheduler(abc.ABC, nn.Module):
     def __init__(self, T, discrete):
         super().__init__()
         self.T = T
@@ -39,32 +39,53 @@ class DiscreteLinearScheduler(Scheduler):
 
         self.beta_0 = beta_min
         self.beta_1 = beta_max
-        self.discrete_betas = torch.linspace(beta_min / N, beta_max / N, N)
-        self.alphas = 1. - self.discrete_betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
-        self.sqrt_1m_alphas_cumprod = torch.sqrt(1. - self.alphas_cumprod)
+        discrete_betas = torch.linspace(beta_min / N, beta_max / N, N)
+        alphas = 1. - discrete_betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+        sqrt_1m_alphas_cumprod = torch.sqrt(1. - alphas_cumprod)
+
+        # so these go to the same device as the scheduler
+        self.register_buffer("discrete_betas", discrete_betas, persistent=False)
+        self.register_buffer("alphas", alphas, persistent=False)
+        self.register_buffer("alphas_cumprod", alphas_cumprod, persistent=False)
+        self.register_buffer("sqrt_alphas_cumprod", sqrt_alphas_cumprod, persistent=False)
+        self.register_buffer("sqrt_1m_alphas_cumprod", sqrt_1m_alphas_cumprod, persistent=False)
 
         self.t_dist = dist.Categorical(torch.ones(N) / N)
 
+    def _sanitize_t(self, t):
+        if isinstance(t, (tuple, list)):
+            return t.__class__([self._sanitize_t(elem) for elem in t])
+        elif isinstance(t, int):
+            return t
+        elif isinstance(t, float):
+            assert int(t) == t
+            return int(t)
+        elif isinstance(t, torch.Tensor):
+            assert (t.long() == t).all()
+            return t.long()
+        else:
+            raise ValueError("t must either be castable to an int type")
+
     def alphabar(self, t):
-        assert int(t) == t
-        return self.alphas_cumprod[int(t)]
+        t = self._sanitize_t(t)
+        return self.alphas_cumprod[t]
 
     def beta(self, t):
-        assert int(t) == t
-        return self.discrete_betas[int(t)]
+        t = self._sanitize_t(t)
+        return self.discrete_betas[t]
 
     def noising_coeffs(self, t):
-        assert int(t) == t
-        return self.sqrt_alphas_cumprod[int(t)], self.sqrt_1m_alphas_cumprod[int(t)]
+        t = self._sanitize_t(t)
+        return self.sqrt_alphas_cumprod[t], self.sqrt_1m_alphas_cumprod[t]
 
-    def sample_t(self):
-        return self.t_dist.sample()
+    def sample_t(self, n_samples=[1]):
+        return self.t_dist.sample(n_samples)
 
     def weight(self, t):
-        assert int(t) == t
-        return 0.5 / self.discrete_betas[int(t)]
+        t = self._sanitize_t(t)
+        return 0.5 / self.discrete_betas[t]
 
 
 class PositiveLinear(nn.Module):
@@ -72,7 +93,7 @@ class PositiveLinear(nn.Module):
         return torch.abs(weight)
 
 
-class LearnedScheduler(Scheduler, nn.Module):
+class LearnedScheduler(Scheduler):
     def __init__(self,
                  gamma_0=-7,
                  gamma_1=13.5,

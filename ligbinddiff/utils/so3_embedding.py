@@ -96,8 +96,27 @@ def gen_so3_unop(fn):
 
 def gen_so3_binop(fn):
     def op(a, b):
-        ret = a.clone()
-        ret.embedding = fn(ret.embedding, b.embedding)
+        is_a_so3 = isinstance(a, SO3_Embedding)
+        is_b_so3 = isinstance(b, SO3_Embedding)
+        if is_a_so3:
+            ret = a.clone()
+        elif is_b_so3:
+            ret = b.clone()
+        else:
+            raise ValueError("neither a nor b is an SO3 Embedding!")
+
+        if is_a_so3:
+            arg1 = a.embedding
+        else:
+            arg1 = a
+
+        if is_b_so3:
+            arg2 = b.embedding
+        else:
+            arg2 = b
+
+        ret.embedding = fn(arg1, arg2)
+
         return ret
     return op
 
@@ -105,3 +124,4 @@ so3_add=gen_so3_binop(operator.add)
 so3_sub=gen_so3_binop(operator.sub)
 so3_mult=gen_so3_binop(operator.mul)
 so3_randn_like=gen_so3_unop(torch.randn_like)
+so3_ones_like=gen_so3_unop(torch.ones_like)

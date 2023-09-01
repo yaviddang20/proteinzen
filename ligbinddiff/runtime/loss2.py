@@ -3,31 +3,9 @@
 import torch
 import torch.nn.functional as F
 
-from ligbinddiff.utils.type_l import type_l_add, type_l_sub, type_l_apply
-# from ligbinddiff.utils.fiber import compact_fiber_to_nl
 from ligbinddiff.utils.atom_reps import atom91_atom_masks, atom91_start_end, atom91_bonds, atom91_angles, chi_atom_idxs, chi_pi_periodic
+from .loss import zernike_coeff_loss
 
-
-# TODO: brought this in to avoid importing dgl in the utils, do this in a less hacky way
-def compact_fiber_to_nl(fiber_dict, n_channels=1):
-    """ Convert from Fiber dict (no n) to Zernike coeffs.
-        n_max is inferred from the fiber structure """
-    n_max = max([int(l) for l in fiber_dict.keys()])
-
-    nl_dict = {}
-    for l, coeffs in fiber_dict.items():
-        i = 0
-        for n in range(n_max, l-1, -1):
-            if (n - l) % 2 == 0:
-                nl_dict[(n,l)] = coeffs[..., i:i+n_channels, :]
-                i += n_channels
-
-    return nl_dict
-
-def _mask(tensor, mask):
-    ret = tensor.clone()
-    ret[mask] = 0
-    return ret
 
 def vec_norm(tensor, mask_nans=True, eps=1e-6, dim=-1):
     if mask_nans:
@@ -38,53 +16,23 @@ def vec_norm(tensor, mask_nans=True, eps=1e-6, dim=-1):
     # return torch.nan_to_num(norm)
 
 
-def _nodewise_to_graphwise(tensor, num_nodes, nodewise_numel):
-    per_graph_t = tensor.split(num_nodes, dim=0)
-    per_graph_t = torch.cat([t.sum().unsqueeze(-1) for t in per_graph_t])
-    per_graph_numel = nodewise_numel.split(num_nodes)
-    per_graph_numel = torch.cat([t.sum().unsqueeze(-1) for t in per_graph_numel])
+def _elemwise_to_graphwise(elemwise_tensor, nodes_per_graph, node_elem_mask):
+    if len(nodes_per_graph) == 1:
+        return elemwise_tensor.mean().unsqueeze(0)
 
-    return per_graph_t / per_graph_numel
+    reswise_num_elem = (~node_elem_mask).long().sum(dim=-1)
+    num_elem_per_graph = [t.sum().item() for t in torch.split(reswise_num_elem, nodes_per_graph)]
+    graphwise_tensor = torch.cat([t.mean().unsqueeze(0) for t in elemwise_tensor.split(num_elem_per_graph)])
+    return graphwise_tensor
 
 
-def zernike_coeff_loss(ref_density,
-                       pred_density,
-                       num_nodes,
-                       mask,
-                       n_channels=1,
-                       channel_weights=None,
-                       eps=1e-6):
-    """ Invariant MSE loss on Zernike coeffs
-    Average of norms of the difference between all type-l vectors """
-    ref_density = compact_fiber_to_nl(ref_density, n_channels=n_channels)
-    pred_density = compact_fiber_to_nl(pred_density, n_channels=n_channels)
-
-    # only compute residues where all atoms are present
-    ref_density = type_l_apply(lambda x: _mask(x, mask), ref_density)
-    pred_density = type_l_apply(lambda x: _mask(x, mask), pred_density)
-
-    # print({k: v.abs().max() for k, v in ref_density.items()})
-    # print({k: v.abs().max() for k, v in pred_density.items()})
-    diff = type_l_sub(ref_density, pred_density)
-
-    # eps for numerical stability
-    diff = type_l_apply(lambda t: t + eps, diff)
-
-    square_diff = type_l_apply(torch.square, diff)
-    loss = 0
-    numel = 0
-    for (n, l), elems in square_diff.items():
-        if (n - l) % 2 == 1:
-            continue
-        mags = elems.sum(dim=-1).sqrt()
-        if channel_weights is not None:
-            # print(mags.shape, channel_weights[~mask].shape)
-            mags = mags * _mask(channel_weights, mask)
-        loss = loss + mags#.sum()
-        numel = numel + (~mask).long()
-
-    per_graph_loss = _nodewise_to_graphwise(loss, num_nodes, numel)
-    return per_graph_loss
+def _nodewise_to_graphwise(nodewise_tensor, nodes_per_graph, node_mask):
+    if len(nodes_per_graph) == 1:
+        return nodewise_tensor.mean().unsqueeze(0)
+    reswise_num = (~node_mask).long()
+    num_node_per_graph = [t.sum().item() for t in torch.split(reswise_num, nodes_per_graph)]
+    graphwise_tensor = torch.cat([t.mean().unsqueeze(0) for t in nodewise_tensor.split(num_node_per_graph)])
+    return graphwise_tensor
 
 
 def seq_cce_loss(ref_seq,
@@ -92,13 +40,10 @@ def seq_cce_loss(ref_seq,
                  num_nodes,
                  mask):
     """ CCE loss on logits """
-    # ref_seq = _mask(ref_seq, mask)
-    # seq_logits = _mask(seq_logits, mask)
-
+    ref_seq = ref_seq[~mask]
+    seq_logits = seq_logits[~mask]
     cce = F.cross_entropy(seq_logits, ref_seq, reduction='none')
-    cce = _mask(cce, mask)
-
-    return _nodewise_to_graphwise(cce, num_nodes, (~mask).long())
+    return _nodewise_to_graphwise(cce, num_nodes, mask)
 
 
 def atom91_rmsd_loss(ref_atom91,
@@ -113,30 +58,35 @@ def atom91_rmsd_loss(ref_atom91,
         pred_atom91 = pred_atom91[..., 4:, :]
         atom91_mask = atom91_mask[..., 4:, :]
 
-    ref_atom91 = _mask(ref_atom91, atom91_mask)
-    pred_atom91 = _mask(pred_atom91, atom91_mask)
-    diff = ref_atom91 - pred_atom91
+    select_sidechain_atom = (~atom91_mask).any(dim=-1)
+    diff = ref_atom91[select_sidechain_atom] - pred_atom91[select_sidechain_atom]
     # eps for numerical stability
     diff = diff + eps
-    sd = torch.square(diff)
-    sum_sd = torch.sum(sd, dim=(-2, -1))
-    numel = (~atom91_mask.any(dim=-1)).long()
-    msd = _nodewise_to_graphwise(sum_sd, num_nodes, numel)
+    sd = torch.square(diff).sum(dim=-1)
+    msd = _elemwise_to_graphwise(sd, num_nodes, ~select_sidechain_atom)
     rmsd = torch.sqrt(msd + eps)
     return rmsd
 
 
-def density_consistency(pred_density, atoms, atom_mask, channel_mask, zt):
-    """ Compute the value of the density at the given atomic coordinates
+def atom91_mse_loss(ref_atom91,
+                     pred_atom91,
+                     num_nodes,
+                     atom91_mask,
+                     no_bb=True,
+                     eps=1e-4):
+    """ RMSD on relevant atom91 atoms """
+    if no_bb:
+        ref_atom91 = ref_atom91[..., 4:, :]
+        pred_atom91 = pred_atom91[..., 4:, :]
+        atom91_mask = atom91_mask[..., 4:, :]
 
-    NOTE: density cannot be in batched form, since otherwise you might get
-    competing contributions from residues in other batches """
-
-    pred_rho = zt.reswise_back_transform(pred_density, device=atoms.device)
-    print("density consistency ins", atoms.shape, atom_mask.shape, channel_mask.shape)
-    poswise_rho = pred_rho(atoms, atom_mask, channel_mask)
-    print("density consistency out", poswise_rho.shape)
-    return poswise_rho.sum()
+    select_sidechain_atom = (~atom91_mask).any(dim=-1)
+    diff = ref_atom91[select_sidechain_atom] - pred_atom91[select_sidechain_atom]
+    # eps for numerical stability
+    diff = diff + eps
+    se = torch.square(diff).sum(dim=-1)
+    mse = _elemwise_to_graphwise(se, num_nodes, ~select_sidechain_atom)
+    return mse
 
 
 def bond_length_loss(ref_atom91,
@@ -149,34 +99,23 @@ def bond_length_loss(ref_atom91,
         bonds += b_list
     bonds = torch.as_tensor(bonds).T  # 2 x n_bond
     bonds = bonds.to(ref_atom91.device)
-    # torch.set_printoptions(threshold=100000)
-    # print("bonds", bonds)
-    # print("atom91_mask", atom91_mask)
 
     src_mask = atom91_mask[:, bonds[0]]  # n_res x n_bond
     dst_mask = atom91_mask[:, bonds[1]]
     bond_mask = src_mask | dst_mask
-    # print("bond_mask", bond_mask)
 
-    ref_src = ref_atom91[:, bonds[0]]  # n_res x n_bond x 3
-    ref_dst = ref_atom91[:, bonds[1]]
-    ref_dist = vec_norm(ref_dst - ref_src, dim=-1)  # n_bond x n_res
-    # print("ref_dist no mask", ref_dist)
-    # print("ref_dist mask", ref_dist)
-    # print(ref_dist.shape)
+    ref_src = ref_atom91[:, bonds[0]][~bond_mask]  # (n_res x n_bond) x 3
+    ref_dst = ref_atom91[:, bonds[1]][~bond_mask]
+    ref_dist = vec_norm(ref_dst - ref_src, dim=-1)  # (n_bond x n_res)
 
-    pred_src = pred_atom91[:, bonds[0]]  # n_res x n_bond x 3
-    pred_dst = pred_atom91[:, bonds[1]]
-    pred_dist = vec_norm(pred_dst - pred_src, dim=-1)  # n_bond x n_res
-    # print("pred_dist no mask", pred_dist)
-    # print(pred_dist.shape)
-    # print("pred_dist mask", pred_dist)
+    pred_src = pred_atom91[:, bonds[0]][~bond_mask]  # (n_res x n_bond) x 3
+    pred_dst = pred_atom91[:, bonds[1]][~bond_mask]
+    pred_dist = vec_norm(pred_dst - pred_src, dim=-1)  # (n_bond x n_res)
 
     bond_length_diff = ref_dist - pred_dist
-    bond_length_diff = _mask(bond_length_diff, bond_mask)
-    bond_length_se = bond_length_diff.square()
-    bond_numel = (~bond_mask).long().sum(dim=-1)
-    return _nodewise_to_graphwise(bond_length_se, num_nodes, bond_numel)
+    bond_length_mse = _elemwise_to_graphwise(bond_length_diff.square(), num_nodes, bond_mask)
+
+    return bond_length_mse
 
 
 ### TODO: move this somewhere better
@@ -187,65 +126,40 @@ def _normalize(tensor, dim=-1):
     return torch.nan_to_num(
         torch.div(tensor, torch.norm(tensor, dim=dim, keepdim=True)))
 
-def atoms_to_torsions(chi_atom_coords, chi_mask, eps=1e-8):
+
+def atoms_to_torsions(chi_atom_coords, eps=1e-8):
     # Based on https://en.wikipedia.org/wiki/Dihedral_angle
-    # torch.set_printoptions(threshold=10000000)
-    # print("chi_atom_coords", chi_atom_coords)
 
     # absolute atom positions
     c1 = chi_atom_coords[..., 0, :]
     c2 = chi_atom_coords[..., 1, :]
     c3 = chi_atom_coords[..., 2, :]
     c4 = chi_atom_coords[..., 3, :]
-    # torch.save(chi_atom_coords, "tmp/chi_atom_coords.pt")
 
     # relative atom positions
     a1 = c2 - c1
     a2 = c3 - c2
     a3 = c4 - c3
-    # print("a1", a1)
-    # print("a2", a2)
-    # print("a3", a3)
-    # torch.save(a1, "tmp/a1.pt")
-    # torch.save(a2, "tmp/a2.pt")
-    # torch.save(a3, "tmp/a3.pt")
 
     # backbone normals
     v1 = torch.cross(a1, a2)
     v2 = torch.cross(a2, a3)
-    # torch.save(v1, "tmp/v1.pt")
-    # torch.save(v2, "tmp/v2.pt")
-    # print("v1", v1)
-    # print("v2", v2)
 
     # Angle between normals
     x = torch.sum(v1 * v2, -1)
     a2_norm = vec_norm(a2, mask_nans=False)
     y = torch.sum(a1 * v2, dim=-1) * a2_norm
-    # torch.save(x, "tmp/x.pt")
-    # torch.save(a2_norm, "tmp/a2_norm.pt")
-    # torch.save(y, "tmp/y.pt")
-    # print("x", x)
-    # print("y", y)
 
     angle_vec = torch.stack([x, y], dim=-1)
     norm = vec_norm(angle_vec, mask_nans=False).unsqueeze(-1)
-    # torch.save(angle_vec, "tmp/angle_vec.pt")
-    # print("angle vec", angle_vec)
-    # print("norm", norm)
-
-    angle_vec = angle_vec.clone()
-    angle_vec[chi_mask] = eps  # not sure if necessary but trying to avoid in-place gradient cutoffs
-    norm = norm.clone()
-    norm[chi_mask] = 1
 
     if (angle_vec / norm).isnan().any():
-        torch.set_printoptions(threshold=10000000)
         print("angle vec", angle_vec)
         print("norm", norm)
 
     angle_vec = angle_vec / norm
     return angle_vec
+
 
 def torsion_loss(ref_atom91,   # n_res x n_atom x 3
                  pred_atom91,  # n_res x n_atom x 3
@@ -267,26 +181,41 @@ def torsion_loss(ref_atom91,   # n_res x n_atom x 3
     # print("chi_periodic", chi_periodic.shape)
 
     chi_mask = atom91_mask[:, chi_atom_idx_select].any(dim=-1)  # n_res x n_chi
+    # print("chi_mask", chi_mask.shape)
+    # print(chi_mask)
 
     ref_chi_atoms = ref_atom91[:, chi_atom_idx_select]  # n_res x n_chi x 4 x 3
-    ref_chi_angles = atoms_to_torsions(ref_chi_atoms, chi_mask)
+    ref_chi_angles = atoms_to_torsions(ref_chi_atoms[~chi_mask])
+    # print("ref_chi_atoms", ref_chi_atoms.shape)
+    # print("ref_chi_angles", ref_chi_angles.shape)
     pred_chi_atoms = pred_atom91[:, chi_atom_idx_select]  # n_res x n_chi x 4 x 3
-    pred_chi_angles = atoms_to_torsions(pred_chi_atoms, chi_mask)  # n_res x n_chi x 2
-    pred_chi_angles_p_pi = atoms_to_torsions(pred_chi_atoms, chi_mask)  # n_res x n_chi x 2
-    pred_chi_angles_p_pi = pred_chi_angles_p_pi * chi_periodic.unsqueeze(0).unsqueeze(-1)
+    pred_chi_angles = atoms_to_torsions(pred_chi_atoms[~chi_mask])
+    # print("pred_chi_atoms", pred_chi_atoms.shape)
+    # print("pred_chi_angles", pred_chi_angles.shape)
+    pred_chi_angles_p_pi = atoms_to_torsions(pred_chi_atoms)
+    # print(pred_chi_angles_p_pi.shape, chi_periodic.shape, chi_mask.shape)
+    pred_chi_angles_p_pi = (pred_chi_angles_p_pi * chi_periodic.unsqueeze(0).unsqueeze(-1))[~chi_mask]
 
-    # print(ref_chi_angles - pred_chi_angles + eps)
-    diff = vec_norm(ref_chi_angles - pred_chi_angles)
-    pi_diff = vec_norm(ref_chi_angles - pred_chi_angles_p_pi)
-    loss = torch.minimum(diff, pi_diff)  # n_res x n_chi
+    diff = vec_norm(ref_chi_angles - pred_chi_angles, dim=-1)
+    pi_diff = vec_norm(ref_chi_angles - pred_chi_angles_p_pi, dim=-1)
+    # print(diff, pi_diff)
+    # print("diff", diff)
+    # print("pi diff", pi_diff)
 
-    loss = _mask(loss, chi_mask)
-    num_chi = (~chi_mask).long().sum(dim=-1)
-    num_chi[num_chi == 0] = 1
-    # print("loss", loss)
-    loss = _nodewise_to_graphwise(loss, num_nodes, num_chi)
+    loss = torch.minimum(diff, pi_diff)
+    graphwise_loss = _elemwise_to_graphwise(loss, num_nodes, chi_mask)
+    # reswise_num_elem = (~chi_mask).long().sum(dim=-1)
+    # num_elem_per_graph = [t.sum().item() for t in torch.split(reswise_num_elem, num_nodes)]
+    # print("chi loss", loss.shape, num_elem_per_graph, num_nodes, graphwise_loss.shape)
+    # if graphwise_loss.isnan().any():
+    #     torch.set_printoptions(threshold=1000000)
+    #     print("loss", loss)
+    #     print("num_nodes", num_nodes)
+    #     print("graphwise_loss", graphwise_loss)
+    #     raise Exception
+    #     # print("chi_mask", chi_mask)
 
-    return loss
+    return graphwise_loss
 
 
 def atoms_to_angles(bond_atom_coords, eps=1e-8):
@@ -329,56 +258,52 @@ def angle_loss(ref_atom91,   # n_res x n_atom x 3
         angle_atom_idx_select += atom_list
     angle_atom_idx_select = torch.as_tensor(angle_atom_idx_select, device=ref_atom91.device).long() # n_chi x 4
 
-    angle_mask = atom91_mask[:, angle_atom_idx_select].any(dim=-1)  # n_res x n_angle
+    angle_mask = atom91_mask[:, angle_atom_idx_select].any(dim=-1)  # n_res x n_chi
 
-    ref_angle_atoms = ref_atom91[:, angle_atom_idx_select]  # n_res x n_angle x 3 x 3
-    ref_angles = atoms_to_angles(ref_angle_atoms)
-    pred_angle_atoms = pred_atom91[:, angle_atom_idx_select]  # n_res x n_angle x 3 x 3
-    pred_angles = atoms_to_angles(pred_angle_atoms)
+    ref_angle_atoms = ref_atom91[:, angle_atom_idx_select]  # n_res x n_chi x 4 x 3
+    ref_angles = atoms_to_angles(ref_angle_atoms[~angle_mask])
+    pred_angle_atoms = pred_atom91[:, angle_atom_idx_select]  # n_res x n_chi x 4 x 3
+    pred_angles = atoms_to_angles(pred_angle_atoms[~angle_mask])
+
     diff = vec_norm(ref_angles - pred_angles, dim=-1)
+    graphwise_loss = _elemwise_to_graphwise(diff, num_nodes, angle_mask)
 
-    diff = _mask(diff, angle_mask)
-    num_bonds = (~angle_mask).long().sum(dim=-1)
-    num_bonds[num_bonds == 0] = 1
-    diff = _nodewise_to_graphwise(diff, num_nodes, num_bonds)
-    return diff
+    return graphwise_loss
 
 
-# def distance_loss(ref_atom91,
-#                   pred_atom91,
-#                   atom91_mask,
-#                   num_nodes,
-#                   eps=1e-6):
-#     dist_idxs = []
-#     for start, end in atom91_start_end.values():
-#         l = end - start
-#         idxs = torch.arange(start, end)
-#         src = idxs.unsqueeze(0).expand(l, -1).reshape(-1)
-#         dst = idxs.repeat_interleave(l)
-#         dist_idxs.append(torch.stack([src, dst], dim=0))
-#
-#     dist_idxs = torch.cat(dist_idxs, dim=-1)
-#     src = dist_idxs[0]
-#     dst = dist_idxs[1]
-#
-#     ref_src = ref_atom91[:, src]
-#     ref_dst = ref_atom91[:, dst]
-#     ref_dist = torch.linalg.vector_norm(ref_src - ref_dst, dim=-1)
-#
-#     pred_src = pred_atom91[:, src]
-#     pred_dst = pred_atom91[:, dst]
-#     pred_dist = torch.linalg.vector_norm(pred_src - pred_dst, dim=-1)
-#
-#     atom91_src_mask = atom91_mask[:, src]
-#     atom91_dst_mask = atom91_mask[:, dst]
-#     total_mask = atom91_src_mask | atom91_dst_mask
-#
-#     dist_diff = ref_dist - pred_dist
-#     dist_se = dist_diff.square()
-#     dist_mse = dist_diff[~total_mask].square().sum() / (~total_mask).long().sum()
-#
-#     dist_mse = _nodewise_to_graphwise(dist_se, num_nodes, (~total_mask).long().sum(dim=-1))
-#     return dist_mse
+def distance_loss(ref_atom91,
+                  pred_atom91,
+                  num_nodes,
+                  atom91_mask,
+                  eps=1e-6):
+    dist_idxs = []
+    for start, end in atom91_start_end.values():
+        l = end - start
+        idxs = torch.arange(start, end)
+        src = idxs.unsqueeze(0).expand(l, -1).reshape(-1)
+        dst = idxs.repeat_interleave(l)
+        dist_idxs.append(torch.stack([src, dst], dim=0))
+
+    dist_idxs = torch.cat(dist_idxs, dim=-1)
+    src = dist_idxs[0]
+    dst = dist_idxs[1]
+
+    atom91_src_mask = atom91_mask[:, src]
+    atom91_dst_mask = atom91_mask[:, dst]
+    total_mask = atom91_src_mask | atom91_dst_mask
+
+    ref_src = ref_atom91[:, src][~total_mask]
+    ref_dst = ref_atom91[:, dst][~total_mask]
+    ref_dist = vec_norm(ref_src - ref_dst, dim=-1)
+
+    pred_src = pred_atom91[:, src][~total_mask]
+    pred_dst = pred_atom91[:, dst][~total_mask]
+    pred_dist = vec_norm(pred_src - pred_dst, dim=-1)
+
+    dist_diff = (ref_dist - pred_dist).square()
+    graphwise_loss = _elemwise_to_graphwise(dist_diff, num_nodes, total_mask)
+
+    return graphwise_loss
 
 
 def cath_density_loss_fn(noised_batch, model_outputs, n_channels=4, use_channel_weights=False):
@@ -390,9 +315,9 @@ def cath_density_loss_fn(noised_batch, model_outputs, n_channels=4, use_channel_
     atom91_centered = noised_batch['atom91_centered']
     atom91_mask = noised_batch['atom91_mask']
 
-    denoised_density = model_outputs['density']
+    denoised_density = model_outputs['denoised_density']
     seq_logits = model_outputs['seq_logits']
-    pred_atom91 = model_outputs['atom91']
+    pred_atom91 = model_outputs['decoded_atom91']
 
     if use_channel_weights:
         # compute channel weights for zernike loss
@@ -421,14 +346,61 @@ def cath_density_loss_fn(noised_batch, model_outputs, n_channels=4, use_channel_
     denoising_loss = zernike_coeff_loss(density_dict, denoised_density, data_lens, x_mask, n_channels=n_channels, channel_weights=channel_weights)
     ref_noise = zernike_coeff_loss(density_dict, noised_density_dict, data_lens, x_mask, n_channels=n_channels, channel_weights=channel_weights)
     seq_loss = seq_cce_loss(seq, seq_logits, data_lens, x_mask)
+    atom91_mse = atom91_mse_loss(atom91_centered, pred_atom91, data_lens, atom91_mask)
     atom91_rmsd = atom91_rmsd_loss(atom91_centered, pred_atom91, data_lens, atom91_mask)
     bond_length_mse = bond_length_loss(atom91_centered, pred_atom91, data_lens, atom91_mask.any(dim=-1))
+    sidechain_dists_mse = distance_loss(atom91_centered, pred_atom91, data_lens, atom91_mask.any(dim=-1))
     bond_angle_loss = angle_loss(atom91_centered, pred_atom91, data_lens, atom91_mask.any(dim=-1))
     chi_loss = torsion_loss(atom91_centered, pred_atom91, data_lens, atom91_mask.any(dim=-1))
+    # try:
+    # except Exception as e:
+    #     import ligbinddiff.utils.atom_reps as atom_reps
+    #     import numpy as np
+    #     chi_atom_idx_select = []
+    #     for atom_list in chi_atom_idxs.values():
+    #         chi_atom_idx_select += atom_list
+    #     chi_atom_idx_select = torch.as_tensor(chi_atom_idx_select).long() # n_chi x 4
+
+    #     seq = "".join([atom_reps.num_to_letter[i] for i in seq.tolist()])
+    #     seq_3lt = [atom_reps.restype_1to3[c] for c in seq]
+    #     num_chi = torch.tensor([len(atom_reps.chi_angles_atoms[aa]) for aa in seq_3lt])
+    #     num_chi[x_mask] = 0
+    #     chi_mask = atom91_mask.any(dim=-1)[:, chi_atom_idx_select].any(dim=-1)  # n_res x n_chi
+    #     chi_mask_num = (~chi_mask).sum(dim=-1)
+    #     print()
+    #     chi_match = (num_chi == chi_mask_num.to(num_chi.device))
+    #     print("expected num chi?", chi_match.all())
+    #     if not chi_match.all():
+    #         print(noised_batch.name)
+    #         # print("coords", atom91_centered[~chi_match.cuda()])
+    #         # print("coords mask", atom91_mask[~chi_match.cuda()])
+    #         print(np.array([c for c in seq])[(~chi_match).numpy(force=True)])
+    #         print(torch.arange(len(chi_match))[~chi_match.cpu()])
+    #         print(torch.stack([num_chi, chi_mask_num.cpu()])[:, ~chi_match.cpu()])
+    #         print(chi_mask[~chi_match])
+
+    #     raise e
+
+    with torch.no_grad():
+        correct_label_atom91_mask = atom91_mask.clone()
+        pred_seq = seq_logits.argmax(dim=-1)
+        same = (pred_seq == seq)
+        correct_label_atom91_mask[~same] = True
+
+        correct_label_x_mask = x_mask.clone()
+        correct_label_x_mask[~same] = True
+
+        cl_denoising_loss = zernike_coeff_loss(density_dict, denoised_density, data_lens, correct_label_x_mask, n_channels=n_channels, channel_weights=channel_weights)
+        cl_atom91_rmsd = atom91_rmsd_loss(atom91_centered, pred_atom91, data_lens, correct_label_atom91_mask)
+        cl_bond_length_mse = bond_length_loss(atom91_centered, pred_atom91, data_lens, correct_label_atom91_mask.any(dim=-1))
+        cl_bond_angle_loss = angle_loss(atom91_centered, pred_atom91, data_lens, correct_label_atom91_mask.any(dim=-1))
+        cl_chi_loss = torsion_loss(atom91_centered, pred_atom91, data_lens, correct_label_atom91_mask.any(dim=-1))
+        cl_sidechain_dists_mse = distance_loss(atom91_centered, pred_atom91, data_lens, correct_label_atom91_mask.any(dim=-1))
 
     unscaled_loss = (
-        denoising_loss + seq_loss + atom91_rmsd +
-        bond_length_mse + bond_angle_loss + chi_loss
+        denoising_loss + seq_loss + atom91_mse +
+        bond_length_mse + sidechain_dists_mse +
+        bond_angle_loss + chi_loss
     )
     loss = (noised_batch['loss_weight'] * unscaled_loss).mean()
     return {
@@ -438,8 +410,15 @@ def cath_density_loss_fn(noised_batch, model_outputs, n_channels=4, use_channel_
         "seq_loss": seq_loss,
         "atom91_rmsd": atom91_rmsd,
         "bond_length_mse": bond_length_mse,
+        "sidechain_dists_mse": sidechain_dists_mse,
         "bond_angle_loss": bond_angle_loss,
-        "chi_loss": chi_loss
+        "chi_loss": chi_loss,
+        "cl_denoising_loss": cl_denoising_loss,
+        "cl_atom91_rmsd": cl_atom91_rmsd,
+        "cl_sidechain_dists_mse": cl_sidechain_dists_mse,
+        "cl_bond_length_mse": cl_bond_length_mse,
+        "cl_bond_angle_loss": cl_bond_angle_loss,
+        "cl_chi_loss": cl_chi_loss
     }
 
 
@@ -451,30 +430,38 @@ def cath_superposition_loss_fn(noised_batch, model_outputs, use_channel_weights=
     x_mask = noised_batch['x_mask']
     atom91_mask = noised_batch['atom91_mask']
 
-    denoised_atom91 = model_outputs['atom91_centered']
+    denoised_atom91 = model_outputs['denoised_atom91']
     seq_logits = model_outputs['seq_logits']
 
     data_splits = noised_batch._slice_dict['x']
     data_lens = (data_splits[1:] - data_splits[:-1]).tolist()
 
-    denoising_loss = atom91_rmsd_loss(atom91_centered, denoised_atom91, data_lens, atom91_mask)
+    denoising_loss = atom91_mse_loss(atom91_centered, denoised_atom91, data_lens, atom91_mask)
     ref_noise = atom91_rmsd_loss(atom91_centered, noised_atom91, data_lens, atom91_mask)
     seq_loss = seq_cce_loss(seq, seq_logits, data_lens, x_mask)
-    atom91_rmsd = denoising_loss
-    # correct_label_rmsd(seq,
-    #                                 seq_logits,
-    #                                 atom91_centered,
-    #                                 denoised_atom91,
-    #                                 data_lens,
-    #                                 x_mask,
-    #                                 atom91_mask.any(dim=-1)).detach()
+    atom91_rmsd = atom91_rmsd_loss(atom91_centered, denoised_atom91, data_lens, atom91_mask)
     bond_length_mse = bond_length_loss(atom91_centered, denoised_atom91, data_lens, atom91_mask.any(dim=-1))
+    sidechain_dists_mse = distance_loss(atom91_centered, denoised_atom91, data_lens, atom91_mask.any(dim=-1))
     bond_angle_loss = angle_loss(atom91_centered, denoised_atom91, data_lens, atom91_mask.any(dim=-1))
     chi_loss = torsion_loss(atom91_centered, denoised_atom91, data_lens, atom91_mask.any(dim=-1))
 
+    with torch.no_grad():
+        correct_label_atom91_mask = atom91_mask.clone()
+        pred_seq = seq_logits.argmax(dim=-1)
+        same = (pred_seq == seq)
+        correct_label_atom91_mask[~same] = True
+
+        cl_denoising_loss = atom91_mse_loss(atom91_centered, denoised_atom91, data_lens, correct_label_atom91_mask)
+        cl_atom91_rmsd = atom91_rmsd_loss(atom91_centered, denoised_atom91, data_lens, correct_label_atom91_mask)
+        cl_bond_length_mse = bond_length_loss(atom91_centered, denoised_atom91, data_lens, correct_label_atom91_mask.any(dim=-1))
+        cl_bond_angle_loss = angle_loss(atom91_centered, denoised_atom91, data_lens, correct_label_atom91_mask.any(dim=-1))
+        cl_chi_loss = torsion_loss(atom91_centered, denoised_atom91, data_lens, correct_label_atom91_mask.any(dim=-1))
+        cl_sidechain_dists_mse = distance_loss(atom91_centered, denoised_atom91, data_lens, correct_label_atom91_mask.any(dim=-1))
+
     unscaled_loss = (
-        denoising_loss + seq_loss + atom91_rmsd +
-        bond_length_mse + bond_angle_loss + chi_loss
+        denoising_loss + seq_loss + # atom91_rmsd +
+        bond_length_mse + sidechain_dists_mse +
+        bond_angle_loss + chi_loss
     )
     loss = (noised_batch['loss_weight'] * unscaled_loss).mean()
     return {
@@ -484,13 +471,20 @@ def cath_superposition_loss_fn(noised_batch, model_outputs, use_channel_weights=
         "seq_loss": seq_loss,
         "atom91_rmsd": atom91_rmsd,
         "bond_length_mse": bond_length_mse,
+        "sidechain_dists_mse": sidechain_dists_mse,
         "bond_angle_loss": bond_angle_loss,
-        "chi_loss": chi_loss
+        "chi_loss": chi_loss,
+        "cl_denoising_loss": cl_denoising_loss,
+        "cl_atom91_rmsd": cl_atom91_rmsd,
+        "cl_sidechain_dists_mse": cl_sidechain_dists_mse,
+        "cl_bond_length_mse": cl_bond_length_mse,
+        "cl_bond_angle_loss": cl_bond_angle_loss,
+        "cl_chi_loss": cl_chi_loss
     }
 
 
 def so3_embedding_mse(ref_so3, pred_so3, num_nodes, x_mask):
-    vec_diff = ref_so3.embedding - pred_so3.embedding
+    vec_diff = ref_so3.embedding[~x_mask] - pred_so3.embedding[~x_mask]
     splits = []
     for lmax in ref_so3.lmax_list:
         for l in range(lmax+1):
@@ -498,10 +492,8 @@ def so3_embedding_mse(ref_so3, pred_so3, num_nodes, x_mask):
     vec_diffs = vec_diff.split(splits, dim=1)
     vec_diff_norms = [vec_norm(v.transpose(-1, -2)) for v in vec_diffs]  # vector dim as final dim
     nodewise_loss = torch.cat(vec_diff_norms, dim=-1).sum(dim=-1)
-    nodewise_loss = _mask(nodewise_loss, x_mask)
-    numel = (~x_mask).long()
 
-    return _nodewise_to_graphwise(nodewise_loss, num_nodes, numel)
+    return _nodewise_to_graphwise(nodewise_loss, num_nodes, x_mask)
 
 
 def so3_embedding_kl(so3_mu, so3_logvar, num_nodes, x_mask):
@@ -509,16 +501,23 @@ def so3_embedding_kl(so3_mu, so3_logvar, num_nodes, x_mask):
     for lmax in so3_mu.lmax_list:
         for l in range(lmax+1):
             splits.append(2*l+1)
-    split_mu = so3_mu.embedding.split(splits, dim=1)
-    split_logvar = so3_logvar.embedding.split(splits, dim=1)
+    split_mu = so3_mu.embedding[~x_mask].split(splits, dim=1)
+    split_logvar = so3_logvar.embedding[~x_mask].split(splits, dim=1)
     kl_div = 0
     for m, mu, logvar in zip(splits, split_mu, split_logvar):
         comp_kl_div = -0.5 * (logvar.sum(dim=-2) - mu.square().sum(dim=-2) - logvar.exp().sum(dim=-2) + m)
-        # print(comp_kl_div, comp_kl_div.max())
         kl_div = kl_div + comp_kl_div.mean(dim=-1)
 
-    numel = (~x_mask).long()
-    return _nodewise_to_graphwise(kl_div, num_nodes, numel)
+    return _nodewise_to_graphwise(kl_div, num_nodes, x_mask)
+
+
+def generator_loss(model_outputs, num_nodes, x_mask):
+    discrim_logits_real = model_outputs['discrim_logits_real'][~x_mask]
+    discrim_logits_fake = model_outputs['discrim_logits_fake'][~x_mask]
+    logprobs_real_incorrect = discrim_logits_real[:, 0]
+    logprobs_fake_incorrect = discrim_logits_fake[:, 1]
+    total_logprobs = logprobs_real_incorrect + logprobs_fake_incorrect
+    return -_nodewise_to_graphwise(total_logprobs, num_nodes, x_mask)
 
 
 def cath_latent_loss_fn(noised_batch, model_outputs, use_channel_weights=None, warmup=False, ae_loss_weight=1):
@@ -537,21 +536,20 @@ def cath_latent_loss_fn(noised_batch, model_outputs, use_channel_weights=None, w
     data_splits = noised_batch._slice_dict['x']
     data_lens = (data_splits[1:] - data_splits[:-1]).tolist()
 
-    autoencoder_loss = atom91_rmsd_loss(atom91_centered, decoded_atom91, data_lens, atom91_mask)
+    autoencoder_loss = atom91_mse_loss(atom91_centered, decoded_atom91, data_lens, atom91_mask)
     seq_loss = seq_cce_loss(seq, seq_logits, data_lens, x_mask)
-    atom91_rmsd = autoencoder_loss
-    # correct_label_rmsd(seq,
-    #                                 seq_logits,
-    #                                 atom91_centered,
-    #                                 denoised_atom91,
-    #                                 data_lens,
-    #                                 x_mask,
-    #                                 atom91_mask.any(dim=-1)).detach()
+    atom91_rmsd = autoencoder_loss.sqrt()
+    sidechain_dists_mse = distance_loss(atom91_centered, decoded_atom91, data_lens, atom91_mask.any(dim=-1))
     bond_length_mse = bond_length_loss(atom91_centered, decoded_atom91, data_lens, atom91_mask.any(dim=-1))
     bond_angle_loss = angle_loss(atom91_centered, decoded_atom91, data_lens, atom91_mask.any(dim=-1))
     chi_loss = torsion_loss(atom91_centered, decoded_atom91, data_lens, atom91_mask.any(dim=-1))
     kl_div = so3_embedding_kl(latent_mu, latent_logvar, data_lens, x_mask)
     # print(kl_div)
+
+    if 'discrim_logits_real' in model_outputs:
+        gen_loss = generator_loss(model_outputs, data_lens, x_mask)
+    else:
+        gen_loss = torch.zeros(1, device=chi_loss.device)
 
     correct_label_atom91_mask = atom91_mask.clone()
     pred_seq = seq_logits.argmax(dim=-1)
@@ -561,6 +559,7 @@ def cath_latent_loss_fn(noised_batch, model_outputs, use_channel_weights=None, w
     with torch.no_grad():
         cl_atom91_rmsd = atom91_rmsd_loss(atom91_centered, decoded_atom91, data_lens, correct_label_atom91_mask)
         cl_bond_length_mse = bond_length_loss(atom91_centered, decoded_atom91, data_lens, correct_label_atom91_mask.any(dim=-1))
+        cl_sidechain_dists_mse = distance_loss(atom91_centered, decoded_atom91, data_lens, correct_label_atom91_mask.any(dim=-1))
         cl_bond_angle_loss = angle_loss(atom91_centered, decoded_atom91, data_lens, correct_label_atom91_mask.any(dim=-1))
         cl_chi_loss = torsion_loss(atom91_centered, decoded_atom91, data_lens, correct_label_atom91_mask.any(dim=-1))
 
@@ -581,9 +580,11 @@ def cath_latent_loss_fn(noised_batch, model_outputs, use_channel_weights=None, w
         cl_denoising_loss = torch.zeros(1, device=chi_loss.device)
         ref_noise = torch.zeros(1, device=chi_loss.device)
 
-    vae_loss = (autoencoder_loss + 1 * kl_div +
+    vae_loss = (
+        autoencoder_loss + 1e-6 * kl_div +
         seq_loss +  # atom91_rmsd +
-        bond_length_mse + bond_angle_loss + chi_loss
+        bond_length_mse + sidechain_dists_mse +
+        bond_angle_loss + chi_loss + gen_loss #+ discrim_loss
     )
     if not warmup:
         loss = (noised_batch['loss_weight'] * denoising_loss + vae_loss * ae_loss_weight).mean()
@@ -596,13 +597,30 @@ def cath_latent_loss_fn(noised_batch, model_outputs, use_channel_weights=None, w
         "denoising_loss": denoising_loss,
         "ref_noise": ref_noise,
         "seq_loss": seq_loss,
+        "atom91_mse": autoencoder_loss,
         "atom91_rmsd": atom91_rmsd,
+        "sidechain_dists_mse": sidechain_dists_mse,
         "bond_length_mse": bond_length_mse,
         "bond_angle_loss": bond_angle_loss,
+        "gen_loss": gen_loss,
         "chi_loss": chi_loss,
         "cl_denoising_loss": cl_denoising_loss,
         "cl_atom91_rmsd": cl_atom91_rmsd,
+        "cl_sidechain_dists_mse": cl_sidechain_dists_mse,
         "cl_bond_length_mse": cl_bond_length_mse,
         "cl_bond_angle_loss": cl_bond_angle_loss,
         "cl_chi_loss": cl_chi_loss
     }
+
+
+def discriminator_loss(model_outputs):
+    data_splits = model_outputs._slice_dict['x']
+    data_lens = (data_splits[1:] - data_splits[:-1]).tolist()
+    x_mask = model_outputs['x_mask']
+
+    discrim_logits_real = model_outputs['discrim_logits_real'][~x_mask]
+    discrim_logits_fake = model_outputs['discrim_logits_fake'][~x_mask]
+    logprobs_real_correct = discrim_logits_real[:, 1]
+    logprobs_fake_correct = discrim_logits_fake[:, 0]
+    total_logprobs = logprobs_real_correct + logprobs_fake_correct
+    return -_nodewise_to_graphwise(total_logprobs, data_lens, x_mask)

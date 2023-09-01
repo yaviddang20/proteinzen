@@ -1,5 +1,6 @@
 """ Featurize only the sidechains """
 import math
+from functools import partial
 
 import numpy as np
 import torch
@@ -8,7 +9,23 @@ import torch_cluster
 from torch_geometric.data import Data
 
 from ligbinddiff.utils.atom_reps import atom14_to_atom91, atom91_atom_masks, letter_to_num
-from ligbinddiff.utils.fiber import nl_to_fiber
+# from ligbinddiff.utils.fiber import nl_to_fiber
+
+# TODO: brought this in to avoid importing dgl in the utils, do this in a less hacky way
+def nl_to_fiber(Z):
+    """ Convert from Zernike coeffs to a Fiber dict (no n) """
+    fiber_dict = {}
+    for (n,l), coeffs in Z.items():
+        if l not in fiber_dict:
+            fiber_dict[l] = []
+        fiber_dict[l].append((n, coeffs))
+
+    for l, coeff_list in fiber_dict.items():
+        coeff_list = sorted(coeff_list, key=lambda p: p[0], reverse=True)  # order from largest to smallest n
+        coeff_list = list(zip(*coeff_list))[1]  # take only coeffs
+        fiber_dict[l] = torch.cat(coeff_list, dim=-2)  # fuse coeffs into one tensor
+
+    return fiber_dict
 
 
 def _normalize(tensor, dim=-1):
@@ -243,19 +260,21 @@ def featurize_atomic(protein,
         edge_s = torch.cat([rbf, pos_embeddings], dim=-1)
         edge_v = _normalize(E_vectors).unsqueeze(-2)
 
-        node_s, node_v, edge_s, edge_v = map(torch.nan_to_num,
+        nan_to_num = partial(torch.nan_to_num, neginf=0.0, posinf=0.0)
+
+        node_s, node_v, edge_s, edge_v = map(nan_to_num,
                 (node_s, node_v, edge_s, edge_v))
 
-        graph = Data(x=X_ca,
+        graph = Data(x=nan_to_num(X_ca),
                      x_mask=x_mask,
-                     x_cb=X_cb,
+                     x_cb=nan_to_num(X_cb),
                      seq=seq,
-                     bb_s=node_s,
-                     bb_v=node_v,
+                     bb_s=nan_to_num(node_s),
+                     bb_v=nan_to_num(node_v),
                      edge_index=edge_index,
-                     edge_s=edge_s,
-                     edge_v=edge_v,
-                     atom91_centered=atom91 - X_ca.unsqueeze(-2),
+                     edge_s=nan_to_num(edge_s),
+                     edge_v=nan_to_num(edge_v),
+                     atom91_centered=nan_to_num(atom91 - X_ca.unsqueeze(-2)),
                      atom91_mask=atom91_mask,
                      name=name)
 

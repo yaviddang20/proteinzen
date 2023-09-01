@@ -104,17 +104,26 @@ sidechain_bonds = {
     'VAL': [('CA', 'CB'), ('CB', 'CG1'), ('CB', 'CG2')],
 }
 
+
 sidechain_bond_angles = {
     aa: [] for aa in sidechain_bonds.keys()
 }
-
 for aa, store in sidechain_bond_angles.items():
     bonds = sidechain_bonds[aa]
     for b1 in bonds:
         for b2 in bonds:
             if b1[-1] == b2[0]:
                 store.append((b1[0], b1[1], b2[1]))
-
+            elif b1[0] == b2[0] and b1[-1] != b2[-1]:
+                forward = (b1[1], b1[0], b2[1])
+                reverse = (b2[1], b1[0], b1[1])
+                if forward not in store and reverse not in store:
+                    store.append(forward)
+            elif b1[1] == b2[1] and b1[0] != b2[0]:
+                forward = (b1[0], b1[1], b2[0])
+                reverse = (b2[0], b1[1], b1[0])
+                if forward not in store and reverse not in store:
+                    store.append(forward)
 
 
 atom37_atom_label = [
@@ -270,6 +279,35 @@ for res_3lt, chi_atoms_list in chi_angles_atoms.items():
 
         atom_idxs.append(tuple(idxs))
     chi_atom_idxs[res_3lt] = atom_idxs
+
+
+# all_torsions = {
+#     # if we do all sidechain torsions, we still need the chi1 reference to ensure
+#     # everything's in the right reference frame
+#     aa: [chis[0]] if len(chis) > 0 else [] for aa, chis in chi_angles_atoms.items()
+# }
+# for aa, store in all_torsions.items():
+#     bonds = sidechain_bonds[aa]
+#     for b1, b2, b3 in zip(bonds, bonds, bonds):
+#         b1 = tuple(b1)
+#         b2 = tuple(b2)
+#         b3 = tuple(b3)
+#         if len(set((b1, b2, b3))) != 3:
+#             continue
+#
+#         if b1[-1] == b2[0] and b2[0] == b3[-1]:
+#             store.append((b1[0], b1[1], b2[1], b3[1]))
+#         elif b1[0] == b2[0] and b2[0] == b3[-1]:
+#             forward = (b1[1], b1[0], b2[1], b3[1])
+#             reverse = (b3[1], b2[1], b1[0], b1[1])
+#             if forward not in store and reverse not in store:
+#                 store.append(forward)
+#         elif b1[1] == b2[1] and b1[0] != b2[0]:
+#             forward = (b1[0], b1[1], b2[0])
+#             reverse = (b2[0], b1[1], b1[0])
+#             if forward not in store and reverse not in store:
+#                 store.append(forward)
+
 
 
 # A compact atom encoding with 14 columns

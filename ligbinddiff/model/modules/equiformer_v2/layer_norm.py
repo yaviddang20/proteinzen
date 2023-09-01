@@ -308,12 +308,12 @@ class EquivariantRMSNormArraySphericalHarmonicsV2(nn.Module):
 
 
     @torch.cuda.amp.autocast(enabled=False)
-    def forward(self, node_input):
+    def forward(self, node_input, eps=1e-6):
         '''
             Assume input is of shape [N, sphere_basis, C]
         '''
 
-        feature = node_input
+        feature = torch.clamp(node_input, min=eps)
 
         if self.centering:
             feature_l0 = feature.narrow(1, 0, 1)
