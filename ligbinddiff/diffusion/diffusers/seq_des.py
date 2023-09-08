@@ -354,7 +354,7 @@ class LatentDiffuser(Diffuser):
         atom_super_SO3_rotation_list = nn.ModuleList()
         bb_super_SO3_rotation_list = nn.ModuleList()
         node_SO3_rotation_list = nn.ModuleList()
-        for lmax in atom_lmax_list:
+        for lmax in atom_super_lmax_list:
             atom_super_SO3_rotation_list.append(
                 SO3_Rotation(lmax)
             )
@@ -372,14 +372,14 @@ class LatentDiffuser(Diffuser):
         node_SO3_grid_list = nn.ModuleList()
         for l in range(max(atom_super_lmax_list) + 1):
             SO3_m_grid = nn.ModuleList()
-            for m in range(max(atom_lmax_list) + 1):
+            for m in range(l + 1):
                 SO3_m_grid.append(
                     SO3_Grid(l, m)
                 )
             atom_super_SO3_grid_list.append(SO3_m_grid)
         for l in range(max(bb_super_lmax_list) + 1):
             SO3_m_grid = nn.ModuleList()
-            for m in range(max(node_lmax_list) + 1):
+            for m in range(l + 1):
                 SO3_m_grid.append(
                     SO3_Grid(l, m)
                 )
@@ -387,7 +387,7 @@ class LatentDiffuser(Diffuser):
         bb_super_SO3_grid_list = nn.ModuleList()
         for l in range(max(node_lmax_list) + 1):
             SO3_m_grid = nn.ModuleList()
-            for m in range(max(atom_lmax_list) + 1):
+            for m in range(l + 1):
                 SO3_m_grid.append(
                     SO3_Grid(l, m)
                 )
@@ -541,8 +541,11 @@ class LatentDiffuser(Diffuser):
                                                device)
         latent_outputs['latent'] = latent_outputs['noised_latent']
         decoded_outputs = self.decoder(latent_outputs)
-        decoded_outputs['latent_mu'] = latent_outputs['latent']
-        decoded_outputs['latent_logvar'] = self._apply_so3(torch.zeros_like)(latent_outputs['latent'])
+        # we do this to recover the "ground truth" encoding
+        decoded_outputs = self.encoder(decoded_outputs)
+        decoded_outputs['latent'] = decoded_outputs['latent_mu']
+        # decoded_outputs['latent_mu'] = latent_outputs['latent']
+        # decoded_outputs['latent_logvar'] = self._apply_so3(torch.zeros_like)(latent_outputs['latent'])
         decoded_outputs['seq_logits'] = decoded_outputs['decoded_seq_logits']
 
         return decoded_outputs, denoiser_output

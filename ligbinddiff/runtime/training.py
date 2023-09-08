@@ -156,3 +156,111 @@ def cath_train_loop(diffuser,
         "angle_loss": np.mean(epoch_angle_loss),
         "chi_loss": np.mean(epoch_chi_loss)
     }
+
+
+def inpaint_train_loop(diffuser,
+                       dataloader,
+                       optimizer,
+                       fabric,
+                       loss_fn,
+                       train=True,
+                       use_channel_weights=True,
+                       warmup=False,
+                       debug=False,
+                       debug_device='cpu',
+                       ):
+    epoch_loss = []
+    epoch_x_ca_ref_noise = []
+    epoch_latent_ref_noise = []
+    epoch_x_ca_denoising_loss = []
+    epoch_latent_denoising_loss = []
+    epoch_seq_loss = []
+    epoch_atom91_rmsd = []
+    epoch_bond_len_mse = []
+    epoch_sidechain_dists_mse = []
+    epoch_angle_loss = []
+    epoch_chi_loss = []
+
+    for batch in (pbar := tqdm.tqdm(dataloader)):
+
+        try:
+            # print(batch.name)
+            if train:
+                optimizer.zero_grad()
+
+            if debug:
+                batch = batch.to(debug_device)
+            latent_data, decoder_outputs = diffuser.forward(batch, warmup=warmup)
+
+            loss_dict = loss_fn(batch, latent_data, decoder_outputs, use_channel_weights=use_channel_weights)#, ae_loss_weight=diffuser.scheduler.weight(0))
+            loss = loss_dict["loss"]
+            x_ca_denoising_loss = loss_dict["x_ca_denoising_loss"]
+            latent_denoising_loss = loss_dict["latent_denoising_loss"]
+            x_ca_ref_noise = loss_dict["x_ca_ref_noise"]
+            latent_ref_noise = loss_dict["latent_ref_noise"]
+            seq_loss = loss_dict["seq_loss"]
+            atom91_rmsd = loss_dict["atom91_rmsd"]
+            bond_length_mse = loss_dict["bond_length_mse"]
+            sidechain_dists_mse = loss_dict["sidechain_dists_mse"]
+            bond_angle_loss = loss_dict["bond_angle_loss"]
+            chi_loss = loss_dict["chi_loss"]
+            t = latent_data['t']
+
+            if train:
+                if debug:
+                    loss.backward()
+                else:
+                    fabric.backward(loss)
+
+                for name, param in diffuser.named_parameters():
+                    if param.grad is not None and not param.grad.isfinite().all():
+                        torch.set_printoptions(threshold=1000000)
+                        print("nan in", name, "grad")
+                        print("param", param)
+                        print("param grad", param.grad)
+
+                optimizer.step()
+
+            epoch_loss.append(loss.item())
+            epoch_x_ca_denoising_loss += x_ca_denoising_loss.tolist()
+            epoch_latent_denoising_loss += latent_denoising_loss.tolist()
+            epoch_x_ca_ref_noise += x_ca_ref_noise.tolist()
+            epoch_latent_ref_noise += latent_ref_noise.tolist()
+            epoch_seq_loss += seq_loss.tolist()
+            epoch_atom91_rmsd += atom91_rmsd.tolist()
+            epoch_bond_len_mse += bond_length_mse.tolist()
+            epoch_sidechain_dists_mse += sidechain_dists_mse.tolist()
+            epoch_angle_loss += bond_angle_loss.tolist()
+            epoch_chi_loss += chi_loss.tolist()
+            pbar.set_description((
+                f"Epoch loss {np.mean(epoch_loss):.4f}, point loss {loss.item():.4f}, "
+                f"x_ca denoise {format_list(x_ca_denoising_loss.tolist(), '{:.4f}')}, x_ca ref noise {format_list(x_ca_ref_noise.tolist(), '{:.4f}')}, "
+                f"latent denoise {format_list(latent_denoising_loss.tolist(), '{:.4f}')}, latent ref noise {format_list(latent_ref_noise.tolist(), '{:.4f}')}, "
+                f"seq {format_list(seq_loss.tolist(), '{:.4f}')}, rmsd {format_list(atom91_rmsd.tolist(), '{:.4f}')}, "
+                f"bond l mse {format_list(bond_length_mse.tolist(), '{:.4f}')}, dists {format_list(sidechain_dists_mse.tolist(), '{:.4f}')}, "
+                f"angle {format_list(bond_angle_loss.tolist(), '{:.4f}')}, chi {format_list(chi_loss.tolist(), '{:.4f}')}, t {t.tolist()}, "))
+
+            if torch.isnan(loss).any():
+                exit()
+        except Exception as e:
+            torch.save(batch, "problematic_inputs.pt")
+            torch.save(latent_data, "latent_outputs.pt")
+            torch.save(decoder_outputs, "decoder_outputs.pt")
+            raise e
+        # print("Done")
+        # exit()
+
+
+    return {
+        "epoch_loss": np.mean(epoch_loss),
+        "x_ca_denoising_loss": np.mean(epoch_x_ca_denoising_loss),
+        "latent_denoising_loss": np.mean(epoch_latent_denoising_loss),
+        "ref_noise": np.mean(epoch_x_ca_ref_noise),
+        "ref_noise": np.mean(epoch_latent_ref_noise),
+        "seq_loss": np.mean(epoch_seq_loss),
+        "rmsd_loss": np.mean(epoch_atom91_rmsd),
+        "bond_len_mse": np.mean(epoch_bond_len_mse),
+        "sidechain_dists_mse": np.mean(epoch_sidechain_dists_mse),
+        "angle_loss": np.mean(epoch_angle_loss),
+        "chi_loss": np.mean(epoch_chi_loss)
+    }

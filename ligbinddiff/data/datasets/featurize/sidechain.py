@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import torch_cluster
 from torch_geometric.data import Data
 
-from ligbinddiff.utils.atom_reps import atom14_to_atom91, atom91_atom_masks, letter_to_num
+from ligbinddiff.utils.atom_reps import atom14_to_atom91, atom91_atom_masks, letter_to_num, atom14_bonds
 # from ligbinddiff.utils.fiber import nl_to_fiber
 
 # TODO: brought this in to avoid importing dgl in the utils, do this in a less hacky way
@@ -264,6 +264,81 @@ def featurize_atomic(protein,
 
         node_s, node_v, edge_s, edge_v = map(nan_to_num,
                 (node_s, node_v, edge_s, edge_v))
+
+        graph = Data(x=nan_to_num(X_ca),
+                     x_mask=x_mask,
+                     x_cb=nan_to_num(X_cb),
+                     seq=seq,
+                     bb_s=nan_to_num(node_s),
+                     bb_v=nan_to_num(node_v),
+                     edge_index=edge_index,
+                     edge_s=nan_to_num(edge_s),
+                     edge_v=nan_to_num(edge_v),
+                     atom91_centered=nan_to_num(atom91 - X_ca.unsqueeze(-2)),
+                     atom91_mask=atom91_mask,
+                     name=name)
+
+    return graph
+
+def featurize_cross_scale_atomic(protein,
+                                 letter_to_num,
+                                 num_rbf=16,
+                                 num_positional_embeddings=16,
+                                 top_k=30,
+                                 device='cpu'):
+    name = protein['name']
+    with torch.no_grad():
+        atom14 = protein['coords']
+        atom14_mask = protein['coords_mask']
+        atom91, atom91_mask = atom14_to_atom91(protein['seq'], atom14)
+        atom14 = torch.as_tensor(atom14,
+                                    device=device, dtype=torch.float32)
+        atom14_mask = torch.as_tensor(atom14_mask,
+                                        device=device, dtype=torch.bool)
+        atom91 = torch.as_tensor(atom91,
+                                    device=device, dtype=torch.float32)
+        atom91_mask = torch.as_tensor(atom91_mask,
+                                        device=device, dtype=torch.bool)
+        seq = torch.as_tensor([letter_to_num[a] for a in protein['seq']],
+                                device=device, dtype=torch.long)
+        # backbone coords
+        coords = atom14[:, :4]
+        X_cb = _ideal_virtual_Cb(coords)
+
+        x_mask = torch.isfinite(coords.sum(dim=(1,2)))
+        x_mask = ~x_mask
+        coords[x_mask] = np.inf
+        atom14_mask[x_mask] = True
+        atom91_mask[x_mask] = True
+
+        X_ca = coords[:, 1]
+        edge_index = torch_cluster.knn_graph(X_ca, k=top_k)
+
+        pos_embeddings = _positional_embeddings(edge_index, num_positional_embeddings)
+        E_vectors = X_ca[edge_index[0]] - X_ca[edge_index[1]]
+        rbf = _rbf(E_vectors.norm(dim=-1), D_count=num_rbf, device=device)
+
+        dihedrals = _dihedrals(coords)
+        orientations = _orientations(X_ca)
+        sidechains = _sidechains(coords)
+
+        node_s = dihedrals
+        node_v = torch.cat([orientations, sidechains.unsqueeze(-2)], dim=-2)
+        edge_s = torch.cat([rbf, pos_embeddings], dim=-1)
+        edge_v = _normalize(E_vectors).unsqueeze(-2)
+
+        nan_to_num = partial(torch.nan_to_num, neginf=0.0, posinf=0.0)
+
+        node_s, node_v, edge_s, edge_v = map(nan_to_num,
+                (node_s, node_v, edge_s, edge_v))
+
+
+        sidechain_bonds = []
+        for b_list in atom14_bonds.values():
+            sidechain_bonds.append(b_list)
+        sidechain_bonds = torch.as_tensor(sidechain_bonds, device=device).T
+        sidechain_lens = (~atom14_mask).long().sum(dim=-1)
+
 
         graph = Data(x=nan_to_num(X_ca),
                      x_mask=x_mask,

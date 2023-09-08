@@ -1,9 +1,19 @@
 """ Utils for handling sidechain atomic representations
 
 Many parts adapted from from https://github.com/deepmind/alphafold/blob/main/alphafold/common/residue_constants.py
+
+TODO: generate all constants that are procedurally generated to outputs of generating functions
 """
 import numpy as np
-import torch
+
+# i'm roughly using https://physlab.lums.edu.pk/images/f/f6/Franck_ref2.pdf values for now
+# but i should really figure out which reference to use
+van_der_waals_radius = {
+    'C': 1.70,
+    'N': 1.80,
+    'O': 1.50,
+    'S': 1.80,
+}
 
 alphabet = "ACDEFGHIKLMNPQRSTVWY"
 letter_to_num = {letter: alphabet.index(letter) for letter in alphabet}
@@ -41,6 +51,9 @@ restype_1to3 = {
 restype_3to1 = {v: k for k, v in restype_1to3.items()}
 
 
+### Atom quantities
+
+
 # A list of atoms (excluding hydrogen) for each AA sidechain. PDB naming convention.
 sidechain_atoms = {
     'ALA': ['CB'],
@@ -64,6 +77,10 @@ sidechain_atoms = {
     'TYR': ['CB', 'CG',  'CD1', 'CD2', 'CE1', 'CE2', 'CZ',  'OH'],
     'VAL': ['CB', 'CG1', 'CG2'],
 }
+
+
+### Bond quantities
+
 
 # Bonds in sidechains, in form (src, dst)
 sidechain_bonds = {
@@ -105,6 +122,10 @@ sidechain_bonds = {
 }
 
 
+### Bond angle quantities
+
+
+
 sidechain_bond_angles = {
     aa: [] for aa in sidechain_bonds.keys()
 }
@@ -126,82 +147,7 @@ for aa, store in sidechain_bond_angles.items():
                     store.append(forward)
 
 
-atom37_atom_label = [
-    "N", "CA", "C", "O",
-    "CB",
-    "CG", "CG1", "CG2", "OG", "OG1", "SG",
-    "CD", "CD1", "CD2", "ND1", "ND2", "OD1", "OD2", "SD",
-    "CE", "CE1", "CE2", "CE3", "NE", "NE1", "NE2", "OE1", "OE2",
-    "CZ", "CZ2", "CZ3", "NZ",
-    "CH2", "NH1", "NH2", "OH"
-]
-
-
-# atom91 ordering constants and atom masks
-atom91_atom_label = ['N', 'C', 'CA', 'O']
-atom91_res_order = []
-for res, atom_list in sidechain_atoms.items():
-    atom91_res_order.append(res)
-    atom91_atom_label += atom_list
-
-atom91_carbon_mask = [atom.startswith('C') for atom in atom91_atom_label]
-atom91_nitrogen_mask = [atom.startswith('N') for atom in atom91_atom_label]
-atom91_oxygen_mask = [atom.startswith('O') for atom in atom91_atom_label]
-atom91_sulfur_mask = [atom.startswith('S') for atom in atom91_atom_label]
-atom91_atom_masks = {
-    "C": atom91_carbon_mask,
-    "N": atom91_nitrogen_mask,
-    "O": atom91_oxygen_mask,
-    "S": atom91_sulfur_mask,
-}
-
-
-atom91_start_end = {}
-_start = 4  # first 4 slots are N C CA O
-for res, atom_list in sidechain_atoms.items():
-    atom91_start_end[res] = (_start, _start + len(atom_list))
-    _start += len(atom_list)
-assert _start == 91,  f"error in generating atom91 lookup 'atom91_start_end', _start={_start}"
-
-
-atom91_bonds = {}
-for res_3lt, bonds in sidechain_bonds.items():
-    bond_idxs = []
-    offset = atom91_start_end[res_3lt][0]
-    atom_order = sidechain_atoms[res_3lt]
-    for (atom1, atom2) in bonds:
-        if atom1 == 'CA':  # initial bond
-            idx1 = atom91_atom_label.index(atom1)
-        else:
-            idx1 = atom_order.index(atom1) + offset
-
-        if atom2 == 'N':  # proline
-            idx2 = atom91_atom_label.index(atom2)
-        else:
-            idx2 = atom_order.index(atom2) + offset
-
-        bond_idxs.append((idx1, idx2))
-    atom91_bonds[res_3lt] = bond_idxs
-
-atom91_angles = {}
-for res_3lt, angles in sidechain_bond_angles.items():
-    angle_idxs = []
-    offset = atom91_start_end[res_3lt][0]
-    atom_order = sidechain_atoms[res_3lt]
-    for (atom1, atom2, atom3) in angles:
-        if atom1 == 'CA':  # initial bond
-            idx1 = atom91_atom_label.index(atom1)
-        else:
-            idx1 = atom_order.index(atom1) + offset
-
-        idx2 = atom_order.index(atom2) + offset
-        if atom3 == 'N':  # proline
-            idx3 = atom91_atom_label.index(atom3)
-        else:
-            idx3 = atom_order.index(atom3) + offset
-
-        angle_idxs.append((idx1, idx2, idx3))
-    atom91_angles[res_3lt] = angle_idxs
+### Torision quantities
 
 
 # Format: The list for each AA type contains chi1, chi2, chi3, chi4 in
@@ -263,22 +209,6 @@ chi_pi_periodic = [
 for chi_atoms, chi_angles in zip(chi_angles_atoms.values(), chi_pi_periodic):
     assert len(chi_atoms) == len(chi_angles)
 
-chi_atom_idxs = {}
-_bb_atoms = ['N', 'CA', 'C', 'O']
-for res_3lt, chi_atoms_list in chi_angles_atoms.items():
-    atom_idxs = []
-    offset = atom91_start_end[res_3lt][0]
-    atom_order = sidechain_atoms[res_3lt]
-    for atoms in chi_atoms_list:
-        idxs = []
-        for atom in atoms:
-            if atom in _bb_atoms:
-                idxs.append(_bb_atoms.index(atom))
-            else:
-                idxs.append(atom_order.index(atom) + offset)
-
-        atom_idxs.append(tuple(idxs))
-    chi_atom_idxs[res_3lt] = atom_idxs
 
 
 # all_torsions = {
@@ -309,6 +239,130 @@ for res_3lt, chi_atoms_list in chi_angles_atoms.items():
 #                 store.append(forward)
 
 
+### Atom37 Quantities
+
+
+atom37_atom_label = [
+    "N", "CA", "C", "O",
+    "CB",
+    "CG", "CG1", "CG2", "OG", "OG1", "SG",
+    "CD", "CD1", "CD2", "ND1", "ND2", "OD1", "OD2", "SD",
+    "CE", "CE1", "CE2", "CE3", "NE", "NE1", "NE2", "OE1", "OE2",
+    "CZ", "CZ2", "CZ3", "NZ",
+    "CH2", "NH1", "NH2", "OH"
+]
+
+
+### Atom91 quantities
+
+
+# atom91 ordering constants and atom masks
+atom91_atom_label = ['N', 'C', 'CA', 'O']
+atom91_res_order = []
+for res, atom_list in sidechain_atoms.items():
+    atom91_res_order.append(res)
+    atom91_atom_label += atom_list
+
+atom91_carbon_mask = [atom.startswith('C') for atom in atom91_atom_label]
+atom91_nitrogen_mask = [atom.startswith('N') for atom in atom91_atom_label]
+atom91_oxygen_mask = [atom.startswith('O') for atom in atom91_atom_label]
+atom91_sulfur_mask = [atom.startswith('S') for atom in atom91_atom_label]
+atom91_atom_masks = {
+    "C": atom91_carbon_mask,
+    "N": atom91_nitrogen_mask,
+    "O": atom91_oxygen_mask,
+    "S": atom91_sulfur_mask,
+}
+
+
+atom91_start_end = {}
+_start = 4  # first 4 slots are N C CA O
+for res, atom_list in sidechain_atoms.items():
+    atom91_start_end[res] = (_start, _start + len(atom_list))
+    _start += len(atom_list)
+assert _start == 91,  f"error in generating atom91 lookup 'atom91_start_end', _start={_start}"
+
+
+atom91_bonds = {}
+for res_3lt, bonds in sidechain_bonds.items():
+    bond_idxs = []
+    offset = atom91_start_end[res_3lt][0]
+    atom_order = sidechain_atoms[res_3lt]
+    for (atom1, atom2) in bonds:
+        if atom1 == 'CA':  # initial bond
+            idx1 = atom91_atom_label.index(atom1)
+        else:
+            idx1 = atom_order.index(atom1) + offset
+
+        if atom2 == 'N':  # proline
+            idx2 = atom91_atom_label.index(atom2)
+        else:
+            idx2 = atom_order.index(atom2) + offset
+
+        bond_idxs.append((idx1, idx2))
+    atom91_bonds[res_3lt] = bond_idxs
+
+
+def _gen_nonbonded_atom_pairs():
+    bonds = []
+    for b_list in atom91_bonds.values():
+        bonds += [tuple(b) for b in b_list]
+    bonds = set(bonds)
+
+    nonbonded_pairs = []
+    for start, end in atom91_start_end.values():
+        for i in range(start, end):
+            for j in range(start, end):
+                if i == j:
+                    continue
+                if (i, j) not in bonds and (j, i) not in bonds:
+                    nonbonded_pairs.append((i, j))
+
+    return nonbonded_pairs
+nonbonded_sidechain_atom_pairs = _gen_nonbonded_atom_pairs()
+
+
+atom91_angles = {}
+for res_3lt, angles in sidechain_bond_angles.items():
+    angle_idxs = []
+    offset = atom91_start_end[res_3lt][0]
+    atom_order = sidechain_atoms[res_3lt]
+    for (atom1, atom2, atom3) in angles:
+        if atom1 == 'CA':  # initial bond
+            idx1 = atom91_atom_label.index(atom1)
+        else:
+            idx1 = atom_order.index(atom1) + offset
+
+        idx2 = atom_order.index(atom2) + offset
+        if atom3 == 'N':  # proline
+            idx3 = atom91_atom_label.index(atom3)
+        else:
+            idx3 = atom_order.index(atom3) + offset
+
+        angle_idxs.append((idx1, idx2, idx3))
+    atom91_angles[res_3lt] = angle_idxs
+
+
+chi_atom_idxs = {}
+_bb_atoms = ['N', 'CA', 'C', 'O']
+for res_3lt, chi_atoms_list in chi_angles_atoms.items():
+    atom_idxs = []
+    offset = atom91_start_end[res_3lt][0]
+    atom_order = sidechain_atoms[res_3lt]
+    for atoms in chi_atoms_list:
+        idxs = []
+        for atom in atoms:
+            if atom in _bb_atoms:
+                idxs.append(_bb_atoms.index(atom))
+            else:
+                idxs.append(atom_order.index(atom) + offset)
+
+        atom_idxs.append(tuple(idxs))
+    chi_atom_idxs[res_3lt] = atom_idxs
+
+
+### Atom14 quantities
+
 
 # A compact atom encoding with 14 columns
 # pylint: disable=line-too-long
@@ -336,6 +390,27 @@ restype_name_to_atom14_names = {
     'VAL': ['N', 'CA', 'C', 'O', 'CB', 'CG1', 'CG2', '',    '',    '',    '',    '',    '',    ''],
     'UNK': ['',  '',   '',  '',  '',   '',    '',    '',    '',    '',    '',    '',    '',    ''],
 }
+
+atom14_bonds = {}
+for res_3lt, bonds in sidechain_bonds.items():
+    bond_idxs = []
+    atom_order = sidechain_atoms[res_3lt]
+    for (atom1, atom2) in bonds:
+        if atom1 == 'CA':  # initial bond
+            idx1 = 1
+        else:
+            idx1 = atom_order.index(atom1) + 4
+
+        if atom2 == 'N':  # proline
+            idx2 = 0
+        else:
+            idx2 = atom_order.index(atom2) + 4
+
+        bond_idxs.append((idx1, idx2))
+    atom14_bonds[res_3lt] = bond_idxs
+
+
+### Conversion functions
 
 
 def atom14_to_atom91(seq, atom14):
