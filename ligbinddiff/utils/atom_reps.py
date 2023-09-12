@@ -53,6 +53,7 @@ restype_3to1 = {v: k for k, v in restype_1to3.items()}
 
 ### Atom quantities
 
+backbone_atoms = ['N', 'CA', 'C', 'O']
 
 # A list of atoms (excluding hydrogen) for each AA sidechain. PDB naming convention.
 sidechain_atoms = {
@@ -81,6 +82,14 @@ sidechain_atoms = {
 
 ### Bond quantities
 
+
+# Backbond bonds, in form (src, dst)
+
+backbone_bonds = [
+    ('CA', 'N'),
+    ('CA', 'C'),
+    ('C',  'O')
+]
 
 # Bonds in sidechains, in form (src, dst)
 sidechain_bonds = {
@@ -121,9 +130,13 @@ sidechain_bonds = {
     'VAL': [('CA', 'CB'), ('CB', 'CG1'), ('CB', 'CG2')],
 }
 
+residue_bonds = {
+    aa: backbone_bonds + bonds
+    for aa, bonds in sidechain_bonds.items()
+}
+
 
 ### Bond angle quantities
-
 
 
 sidechain_bond_angles = {
@@ -131,6 +144,26 @@ sidechain_bond_angles = {
 }
 for aa, store in sidechain_bond_angles.items():
     bonds = sidechain_bonds[aa]
+    for b1 in bonds:
+        for b2 in bonds:
+            if b1[-1] == b2[0]:
+                store.append((b1[0], b1[1], b2[1]))
+            elif b1[0] == b2[0] and b1[-1] != b2[-1]:
+                forward = (b1[1], b1[0], b2[1])
+                reverse = (b2[1], b1[0], b1[1])
+                if forward not in store and reverse not in store:
+                    store.append(forward)
+            elif b1[1] == b2[1] and b1[0] != b2[0]:
+                forward = (b1[0], b1[1], b2[0])
+                reverse = (b2[0], b1[1], b1[0])
+                if forward not in store and reverse not in store:
+                    store.append(forward)
+
+residue_bond_angles = {
+    aa: [] for aa in residue_bonds.keys()
+}
+for aa, store in residue_bond_angles.items():
+    bonds = residue_bonds[aa]
     for b1 in bonds:
         for b2 in bonds:
             if b1[-1] == b2[0]:
@@ -210,7 +243,6 @@ for chi_atoms, chi_angles in zip(chi_angles_atoms.values(), chi_pi_periodic):
     assert len(chi_atoms) == len(chi_angles)
 
 
-
 # all_torsions = {
 #     # if we do all sidechain torsions, we still need the chi1 reference to ensure
 #     # everything's in the right reference frame
@@ -283,7 +315,7 @@ for res, atom_list in sidechain_atoms.items():
 assert _start == 91,  f"error in generating atom91 lookup 'atom91_start_end', _start={_start}"
 
 
-atom91_bonds = {}
+atom91_sidechain_bonds = {}
 for res_3lt, bonds in sidechain_bonds.items():
     bond_idxs = []
     offset = atom91_start_end[res_3lt][0]
@@ -300,12 +332,31 @@ for res_3lt, bonds in sidechain_bonds.items():
             idx2 = atom_order.index(atom2) + offset
 
         bond_idxs.append((idx1, idx2))
-    atom91_bonds[res_3lt] = bond_idxs
+    atom91_sidechain_bonds[res_3lt] = bond_idxs
+
+atom91_residue_bonds = {}
+for res_3lt, bonds in residue_bonds.items():
+    bond_idxs = []
+    offset = atom91_start_end[res_3lt][0]
+    atom_order = sidechain_atoms[res_3lt]
+    for (atom1, atom2) in bonds:
+        if atom1 in backbone_atoms:
+            idx1 = backbone_atoms.index(atom1)
+        else:
+            idx1 = atom_order.index(atom1) + offset
+
+        if atom2 in backbone_atoms:
+            idx2 = backbone_atoms.index(atom2)
+        else:
+            idx2 = atom_order.index(atom2) + offset
+
+        bond_idxs.append((idx1, idx2))
+    atom91_residue_bonds[res_3lt] = bond_idxs
 
 
-def _gen_nonbonded_atom_pairs():
+def _gen_nonbonded_sidechain_atom_pairs():
     bonds = []
-    for b_list in atom91_bonds.values():
+    for b_list in atom91_sidechain_bonds.values():
         bonds += [tuple(b) for b in b_list]
     bonds = set(bonds)
 
@@ -319,28 +370,56 @@ def _gen_nonbonded_atom_pairs():
                     nonbonded_pairs.append((i, j))
 
     return nonbonded_pairs
-nonbonded_sidechain_atom_pairs = _gen_nonbonded_atom_pairs()
+nonbonded_sidechain_atom_pairs = _gen_nonbonded_sidechain_atom_pairs()
 
 
-atom91_angles = {}
+atom91_sidechain_angles = {}
 for res_3lt, angles in sidechain_bond_angles.items():
     angle_idxs = []
     offset = atom91_start_end[res_3lt][0]
     atom_order = sidechain_atoms[res_3lt]
     for (atom1, atom2, atom3) in angles:
-        if atom1 == 'CA':  # initial bond
-            idx1 = atom91_atom_label.index(atom1)
+        if atom1 in backbone_atoms:
+            idx1 = backbone_atoms.index(atom1)
         else:
             idx1 = atom_order.index(atom1) + offset
 
-        idx2 = atom_order.index(atom2) + offset
-        if atom3 == 'N':  # proline
-            idx3 = atom91_atom_label.index(atom3)
+        if atom2 in backbone_atoms:
+            idx2 = backbone_atoms.index(atom2)
+        else:
+            idx2 = atom_order.index(atom2) + offset
+
+        if atom3 in backbone_atoms:
+            idx3 = backbone_atoms.index(atom3)
         else:
             idx3 = atom_order.index(atom3) + offset
 
         angle_idxs.append((idx1, idx2, idx3))
-    atom91_angles[res_3lt] = angle_idxs
+    atom91_sidechain_angles[res_3lt] = angle_idxs
+
+
+atom91_residue_angles = {}
+for res_3lt, angles in residue_bond_angles.items():
+    angle_idxs = []
+    offset = atom91_start_end[res_3lt][0]
+    atom_order = sidechain_atoms[res_3lt]
+    for (atom1, atom2, atom3) in angles:
+        if atom1 in backbone_atoms:
+            idx1 = backbone_atoms.index(atom1)
+        else:
+            idx1 = atom_order.index(atom1) + offset
+
+        if atom2 in backbone_atoms:
+            idx2 = backbone_atoms.index(atom2)
+        else:
+            idx2 = atom_order.index(atom2) + offset
+
+        if atom3 in backbone_atoms:
+            idx3 = backbone_atoms.index(atom3)
+        else:
+            idx3 = atom_order.index(atom3) + offset
+        angle_idxs.append((idx1, idx2, idx3))
+    atom91_residue_angles[res_3lt] = angle_idxs
 
 
 chi_atom_idxs = {}
@@ -391,7 +470,7 @@ restype_name_to_atom14_names = {
     'UNK': ['',  '',   '',  '',  '',   '',    '',    '',    '',    '',    '',    '',    '',    ''],
 }
 
-atom14_bonds = {}
+atom14_sidechain_bonds = {}
 for res_3lt, bonds in sidechain_bonds.items():
     bond_idxs = []
     atom_order = sidechain_atoms[res_3lt]
@@ -407,7 +486,25 @@ for res_3lt, bonds in sidechain_bonds.items():
             idx2 = atom_order.index(atom2) + 4
 
         bond_idxs.append((idx1, idx2))
-    atom14_bonds[res_3lt] = bond_idxs
+    atom14_sidechain_bonds[res_3lt] = bond_idxs
+
+atom14_residue_bonds = {}
+for res_3lt, bonds in residue_bonds.items():
+    bond_idxs = []
+    atom_order = sidechain_atoms[res_3lt]
+    for (atom1, atom2) in bonds:
+        if atom1 in backbone_atoms:
+            idx1 = backbone_atoms.index(atom1)
+        else:
+            idx1 = atom_order.index(atom1) + 4
+
+        if atom2 in backbone_atoms:
+            idx2 = backbone_atoms.index(atom2)
+        else:
+            idx2 = atom_order.index(atom2) + 4
+
+        bond_idxs.append((idx1, idx2))
+    atom14_residue_bonds[res_3lt] = bond_idxs
 
 
 ### Conversion functions

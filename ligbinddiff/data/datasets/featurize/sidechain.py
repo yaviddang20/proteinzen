@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import torch_cluster
 from torch_geometric.data import Data
 
-from ligbinddiff.utils.atom_reps import atom14_to_atom91, atom91_atom_masks, letter_to_num, atom14_bonds
+from ligbinddiff.utils.atom_reps import atom14_to_atom91, atom91_atom_masks, letter_to_num, atom14_sidechain_bonds
 # from ligbinddiff.utils.fiber import nl_to_fiber
 
 # TODO: brought this in to avoid importing dgl in the utils, do this in a less hacky way
@@ -28,12 +28,12 @@ def nl_to_fiber(Z):
     return fiber_dict
 
 
-def _normalize(tensor, dim=-1):
+def _normalize(tensor, dim=-1, eps=1e-8):
     '''
     Normalizes a `torch.Tensor` along dimension `dim` without `nan`s.
     '''
     return torch.nan_to_num(
-        torch.div(tensor, torch.norm(tensor, dim=dim, keepdim=True)))
+        torch.div(tensor, torch.norm(tensor+eps, dim=dim, keepdim=True)))
 
 
 def _rbf(D, D_min=0., D_max=20., D_count=16, device='cpu'):
@@ -265,10 +265,12 @@ def featurize_atomic(protein,
         node_s, node_v, edge_s, edge_v = map(nan_to_num,
                 (node_s, node_v, edge_s, edge_v))
 
+
         graph = Data(x=nan_to_num(X_ca),
                      x_mask=x_mask,
                      x_cb=nan_to_num(X_cb),
                      seq=seq,
+                     bb=nan_to_num(coords),
                      bb_s=nan_to_num(node_s),
                      bb_v=nan_to_num(node_v),
                      edge_index=edge_index,
@@ -334,7 +336,7 @@ def featurize_cross_scale_atomic(protein,
 
 
         sidechain_bonds = []
-        for b_list in atom14_bonds.values():
+        for b_list in atom14_sidechain_bonds.values():
             sidechain_bonds.append(b_list)
         sidechain_bonds = torch.as_tensor(sidechain_bonds, device=device).T
         sidechain_lens = (~atom14_mask).long().sum(dim=-1)

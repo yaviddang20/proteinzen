@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from ligbinddiff.utils.type_l import type_l_add, type_l_sub, type_l_apply
 # from ligbinddiff.utils.fiber import compact_fiber_to_nl
-from ligbinddiff.utils.atom_reps import atom91_atom_masks, atom91_start_end, atom91_bonds, atom91_angles, chi_atom_idxs, chi_pi_periodic
+from ligbinddiff.utils.atom_reps import atom91_atom_masks, atom91_start_end, atom91_sidechain_bonds, atom91_sidechain_angles, chi_atom_idxs, chi_pi_periodic
 
 
 # TODO: brought this in to avoid importing dgl in the utils, do this in a less hacky way
@@ -145,7 +145,7 @@ def bond_length_loss(ref_atom91,
                      atom91_mask,
                      eps=1e-6):
     bonds = []
-    for b_list in atom91_bonds.values():
+    for b_list in atom91_sidechain_bonds.values():
         bonds += b_list
     bonds = torch.as_tensor(bonds).T  # 2 x n_bond
     bonds = bonds.to(ref_atom91.device)
@@ -325,7 +325,7 @@ def angle_loss(ref_atom91,   # n_res x n_atom x 3
                atom91_mask,  # n_res x n_atom
                eps=1e-6):
     angle_atom_idx_select = []
-    for atom_list in atom91_angles.values():
+    for atom_list in atom91_sidechain_angles.values():
         angle_atom_idx_select += atom_list
     angle_atom_idx_select = torch.as_tensor(angle_atom_idx_select, device=ref_atom91.device).long() # n_chi x 4
 

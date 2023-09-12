@@ -68,7 +68,7 @@ class LatentDenoisingLayer(nn.Module):
                  node_SO3_grid,
                  num_heads=8,
                  h_channels=32,
-                 bb_channels=4,
+                 bb_channels=1,
                  k=30,
                  ):
         """
@@ -145,10 +145,7 @@ class LatentDenoisingLayer(nn.Module):
         one_hot_residx_select = residx_select.float()
 
         # compute graph with knn + inv cubic edges
-        bb = intermediates['denoised_bb']
-        X_ca = bb[..., 1, :]
-        bb_rel = bb - X_ca.unsqueeze(-2)
-
+        X_ca = intermediates['denoised_x']
         x_mask = data['x_mask']
         edge_index = sample_inv_cubic_edges(X_ca, x_mask, data.batch)
         edge_dist_vec = X_ca[edge_index[0]] - X_ca[edge_index[1]]
@@ -167,22 +164,20 @@ class LatentDenoisingLayer(nn.Module):
             dtype=node_features.dtype
         )
         bb_node_fused.embedding[..., :self.h_channels] = node_features.embedding
-        bb_node_fused.embedding[..., 1:4, -self.bb_channels:] = bb_rel.transpose(-1, -2)
-        bb_node_fused.embedding[..., 0:1, -1:] = one_hot_residx_select[:, None, None] # is node editable or not
+        bb_node_fused.embedding[..., 1:4, -self.bb_channels:] = X_ca.unsqueeze(-1)
+        bb_node_fused.embedding[..., 0:1, -self.bb_channels:] = one_hot_residx_select[:, None, None] # is node editable or not
         edge_dist_rbf = _rbf(edge_dist, device=edge_dist.device)  # edge_channels_list
         edge_dist_rel_pos = _positional_embeddings(edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
         edge_features = torch.cat([edge_dist_rbf, edge_dist_rel_pos], dim=-1)
 
-        update_bb = self.lrange_attention(
+        update_X_ca = self.lrange_attention(
             bb_node_fused,
             edge_features,
             edge_index
         )
-        update_bb = update_bb.embedding[..., 1:4, :].transpose(-1, -2)
-        new_bb = bb.clone()
-        new_bb[noised_residx] = new_bb[noised_residx] + update_bb[noised_residx]
-        new_X_ca = new_bb[..., 1, :]
-        new_bb_rel = new_bb - new_X_ca.unsqueeze(-2)
+        update_X_ca = update_X_ca.embedding[..., 1:4, :].squeeze(-1)
+        new_X_ca = X_ca.clone()
+        new_X_ca[noised_residx] = update_X_ca[noised_residx]
 
         # compute local knn graph
         edge_index = knn_graph(new_X_ca, self.k, data.batch)
@@ -209,8 +204,8 @@ class LatentDenoisingLayer(nn.Module):
             dtype=node_features.dtype
         )
         bb_node_fused.embedding[..., :self.h_channels] = node_features.embedding
-        bb_node_fused.embedding[..., 1:4, -self.bb_channels:] = new_bb_rel.transpose(-1, -2)
-        bb_node_fused.embedding[..., 0:1, -1:] = one_hot_residx_select[:, None, None] # is node editable or not
+        bb_node_fused.embedding[..., 1:4, -self.bb_channels:] = new_X_ca.unsqueeze(-1)
+        bb_node_fused.embedding[..., 0:1, -self.bb_channels:] = one_hot_residx_select[:, None, None] # is node editable or not
 
         edge_dist_rbf = _rbf(edge_dist, device=edge_dist.device)  # edge_channels_list
         edge_dist_rel_pos = _positional_embeddings(edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
@@ -224,7 +219,7 @@ class LatentDenoisingLayer(nn.Module):
         new_node_features = node_features.clone()
         new_node_features.embedding[noised_residx] = update_node_features.embedding[noised_residx]
 
-        return new_bb, new_node_features
+        return new_X_ca, new_node_features
 
 
 # adapted from https://github.com/jmclong/random-fourier-features-pytorch/blob/main/rff/layers.py
@@ -318,7 +313,7 @@ class LatentDenoiser(nn.Module):
         for i in range(data.batch.max().item() + 1):
             select = (data.batch == i)
             num_nodes = select.long().sum()
-            subset_x_ca = intermediates['noised_bb'][..., 1, :]
+            subset_x_ca = intermediates['noised_x']
             subset_mean = subset_x_ca.mean(dim=0)
             center.append(subset_mean[None, :].expand(num_nodes, -1))
         center = torch.cat(center, dim=0)
@@ -326,13 +321,13 @@ class LatentDenoiser(nn.Module):
 
         ## denoising
         f_V = node_features
-        intermediates['denoised_bb'] = intermediates['noised_bb'] - center.unsqueeze(-2)
+        intermediates['denoised_x'] = intermediates['noised_x'] - center
 
         for layer in self.denoiser:
             f_ca, f_V = layer(f_V, data, intermediates)
-            intermediates['denoised_bb'] = f_ca
+            intermediates['denoised_x'] = f_ca
 
-        intermediates['denoised_bb'] = intermediates['denoised_bb'] + center.unsqueeze(-2)
+        intermediates['denoised_x'] = intermediates['denoised_x'] + center
 
         intermediates['denoised_latent_sidechain'] = f_V
         return intermediates

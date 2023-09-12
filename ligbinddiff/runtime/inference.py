@@ -153,16 +153,19 @@ def cath_inference_loop(diffuser,
 
 
 def inpaint_inference_loop(diffuser,
-                        dataloader,
-                        num_steps,
-                        loss_fn,
-                        device=None,
-                        save=False,
-                        truncate=None,
-                        use_channel_weights=True,
-                        show_progress=False):
-    epoch_x_ca_denoising_loss = []
+                           dataloader,
+                           num_steps,
+                           loss_fn,
+                           device=None,
+                           save=False,
+                           truncate=None,
+                           use_channel_weights=True,
+                           show_progress=False):
+    epoch_bb_denoising_loss = []
     epoch_latent_denoising_loss = []
+    epoch_bb_dihedrals_loss = []
+    epoch_bb_connection_dist_mse = []
+    epoch_bb_connection_angle_loss = []
     epoch_seq_loss = []
     epoch_atom91_rmsd = []
     epoch_seq_recov = []
@@ -191,8 +194,11 @@ def inpaint_inference_loop(diffuser,
         loss_dict = loss_fn(batch, latent_outputs, denoiser_outputs, use_channel_weights=use_channel_weights)
         print(batch.name)
         print(loss_dict)
-        x_ca_denoising_loss = loss_dict["x_ca_denoising_loss"]
+        bb_denoising_loss = loss_dict["bb_denoising_loss"]
         latent_denoising_loss = loss_dict["latent_denoising_loss"]
+        bb_dihedrals_loss = loss_dict["bb_dihedrals_loss"]
+        bb_connection_dist_mse = loss_dict["bb_connection_dist_mse"]
+        bb_connection_angle_loss = loss_dict["bb_connection_angle_loss"]
         seq_loss = loss_dict["seq_loss"]
         atom91_rmsd = loss_dict["atom91_rmsd"]
         bond_length_mse = loss_dict["bond_length_mse"]
@@ -216,8 +222,11 @@ def inpaint_inference_loop(diffuser,
         cl_bond_angle_loss = loss_dict["cl_bond_angle_loss"]
         cl_chi_loss = loss_dict["cl_chi_loss"]
 
-        epoch_x_ca_denoising_loss += x_ca_denoising_loss.tolist()
+        epoch_bb_denoising_loss += bb_denoising_loss.tolist()
         epoch_latent_denoising_loss += latent_denoising_loss.tolist()
+        epoch_bb_dihedrals_loss += bb_dihedrals_loss.tolist()
+        epoch_bb_connection_dist_mse += bb_connection_dist_mse.tolist()
+        epoch_bb_connection_angle_loss += bb_connection_angle_loss.tolist()
         epoch_seq_loss += seq_loss.tolist()
         epoch_atom91_rmsd += atom91_rmsd.tolist()
         epoch_seq_recov += per_seq_recov.tolist()
@@ -232,13 +241,15 @@ def inpaint_inference_loop(diffuser,
         epoch_cl_chi_loss += cl_chi_loss[cl_chi_loss.isfinite()].tolist()
 
         pbar.set_description((
-            f"x_ca denoise {format_list(x_ca_denoising_loss.tolist(), '{:.4f}')}, latent denoise {format_list(latent_denoising_loss.tolist(), '{:.4f}')}, "
+            f"bb denoise {format_list(bb_denoising_loss.tolist(), '{:.4f}')}, latent denoise {format_list(latent_denoising_loss.tolist(), '{:.4f}')}, "
+            f"bb dihedrals {format_list(bb_dihedrals_loss.tolist(), '{:.4f}')}, bb conn lens {format_list(bb_connection_dist_mse.tolist(), '{:.4f}')}, bb conn angles {format_list(bb_connection_angle_loss.tolist(), '{:.4f}')}, "
             f"seq {format_list(seq_loss.tolist(), '{:.4f}')}, seq_recov {format_list(per_seq_recov.tolist(), '{:.4f}')}, rmsd {format_list(atom91_rmsd.tolist(), '{:.4f}')}, bond l mse {format_list(bond_length_mse.tolist(), '{:.4f}')}, "
             f"angle {format_list(bond_angle_loss.tolist(), '{:.4f}')}, chi {format_list(chi_loss.tolist(), '{:.4f}')}"))
 
         if save:
-            denoiser_outputs['decoded_latent'][..., :4, :] = batch['atom91_centered'][..., :4, :]  # we don't train on the backbone atoms
-            atom91_uncentered = denoiser_outputs['decoded_latent'] + denoiser_outputs['x'].unsqueeze(-2)
+            denoised_x_ca = latent_outputs['denoised_bb'][..., 1, :]
+            atom91_uncentered = denoiser_outputs['decoded_latent'] + denoised_x_ca.unsqueeze(-2)
+            atom91_uncentered[..., :4, :] = latent_outputs['denoised_bb']  # set backbone atoms to those from denoiser
             atom91_to_pdb(ref_seq, atom91_uncentered.numpy(force=True), batch.name[0] + "_native_seq")
             atom91_to_pdb(pred_seq, atom91_uncentered.numpy(force=True), batch.name[0] + "_designed_seq")
 
@@ -261,7 +272,10 @@ def inpaint_inference_loop(diffuser,
         #     atom91_to_pdb(ref_seq, atom91_uncentered.numpy(force=True), batch.name)
 
     return {
-        "x_ca_denoising_loss": np.mean(epoch_x_ca_denoising_loss),
+        "bb_denoising_loss": np.mean(epoch_bb_denoising_loss),
+        "bb_dihedrals_loss": np.mean(epoch_bb_dihedrals_loss),
+        "bb_connection_dist_mse": np.mean(epoch_bb_connection_dist_mse),
+        "bb_connection_angle_loss": np.mean(epoch_bb_connection_angle_loss),
         "latent_denoising_loss": np.mean(epoch_latent_denoising_loss),
         "seq_loss": np.mean(epoch_seq_loss),
         "seq_recov": np.mean(epoch_seq_recov),

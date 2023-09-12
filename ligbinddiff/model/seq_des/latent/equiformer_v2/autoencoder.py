@@ -385,6 +385,8 @@ class LatentDecoder(nn.Module):
         #)
         self.seq_head = nn.Sequential(
             nn.LayerNorm(atom_channels),
+            nn.Linear(atom_channels, atom_channels),
+            nn.ReLU(),
             nn.Linear(atom_channels, 20),
             nn.LogSoftmax(dim=-1)
         )

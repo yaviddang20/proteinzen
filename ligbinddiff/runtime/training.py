@@ -170,10 +170,13 @@ def inpaint_train_loop(diffuser,
                        debug_device='cpu',
                        ):
     epoch_loss = []
-    epoch_x_ca_ref_noise = []
+    epoch_bb_ref_noise = []
     epoch_latent_ref_noise = []
-    epoch_x_ca_denoising_loss = []
+    epoch_bb_denoising_loss = []
     epoch_latent_denoising_loss = []
+    epoch_bb_dihedrals_loss = []
+    epoch_bb_connection_dist_mse = []
+    epoch_bb_connection_angle_loss = []
     epoch_seq_loss = []
     epoch_atom91_rmsd = []
     epoch_bond_len_mse = []
@@ -192,11 +195,15 @@ def inpaint_train_loop(diffuser,
                 batch = batch.to(debug_device)
             latent_data, decoder_outputs = diffuser.forward(batch, warmup=warmup)
 
-            loss_dict = loss_fn(batch, latent_data, decoder_outputs, use_channel_weights=use_channel_weights)#, ae_loss_weight=diffuser.scheduler.weight(0))
+            loss_dict = loss_fn(batch, latent_data, decoder_outputs, warmup=warmup) # loss_fn(batch, latent_data, decoder_outputs, use_channel_weights=use_channel_weights, warmup=warmup)#, ae_loss_weight=diffuser.scheduler.weight(0))
             loss = loss_dict["loss"]
-            x_ca_denoising_loss = loss_dict["x_ca_denoising_loss"]
+            bb_denoising_loss = loss_dict["bb_denoising_loss"]
             latent_denoising_loss = loss_dict["latent_denoising_loss"]
-            x_ca_ref_noise = loss_dict["x_ca_ref_noise"]
+            bb_dihedrals_loss = loss_dict["bb_dihedrals_loss"]
+            bb_connection_dist_mse = loss_dict["bb_connection_dist_mse"]
+            bb_connection_angle_loss = loss_dict["bb_connection_angle_loss"]
+            latent_denoising_loss = loss_dict["latent_denoising_loss"]
+            bb_ref_noise = loss_dict["bb_ref_noise"]
             latent_ref_noise = loss_dict["latent_ref_noise"]
             seq_loss = loss_dict["seq_loss"]
             atom91_rmsd = loss_dict["atom91_rmsd"]
@@ -222,9 +229,12 @@ def inpaint_train_loop(diffuser,
                 optimizer.step()
 
             epoch_loss.append(loss.item())
-            epoch_x_ca_denoising_loss += x_ca_denoising_loss.tolist()
+            epoch_bb_denoising_loss += bb_denoising_loss.tolist()
             epoch_latent_denoising_loss += latent_denoising_loss.tolist()
-            epoch_x_ca_ref_noise += x_ca_ref_noise.tolist()
+            epoch_bb_dihedrals_loss += bb_dihedrals_loss.tolist()
+            epoch_bb_connection_dist_mse += bb_connection_dist_mse.tolist()
+            epoch_bb_connection_angle_loss += bb_connection_angle_loss.tolist()
+            epoch_bb_ref_noise += bb_ref_noise.tolist()
             epoch_latent_ref_noise += latent_ref_noise.tolist()
             epoch_seq_loss += seq_loss.tolist()
             epoch_atom91_rmsd += atom91_rmsd.tolist()
@@ -234,8 +244,9 @@ def inpaint_train_loop(diffuser,
             epoch_chi_loss += chi_loss.tolist()
             pbar.set_description((
                 f"Epoch loss {np.mean(epoch_loss):.4f}, point loss {loss.item():.4f}, "
-                f"x_ca denoise {format_list(x_ca_denoising_loss.tolist(), '{:.4f}')}, x_ca ref noise {format_list(x_ca_ref_noise.tolist(), '{:.4f}')}, "
+                f"bb denoise {format_list(bb_denoising_loss.tolist(), '{:.4f}')}, bb ref noise {format_list(bb_ref_noise.tolist(), '{:.4f}')}, "
                 f"latent denoise {format_list(latent_denoising_loss.tolist(), '{:.4f}')}, latent ref noise {format_list(latent_ref_noise.tolist(), '{:.4f}')}, "
+                f"bb dihedrals {format_list(bb_dihedrals_loss.tolist(), '{:.4f}')}, bb conn lens {format_list(bb_connection_dist_mse.tolist(), '{:.4f}')}, bb conn angles {format_list(bb_connection_angle_loss.tolist(), '{:.4f}')}, "
                 f"seq {format_list(seq_loss.tolist(), '{:.4f}')}, rmsd {format_list(atom91_rmsd.tolist(), '{:.4f}')}, "
                 f"bond l mse {format_list(bond_length_mse.tolist(), '{:.4f}')}, dists {format_list(sidechain_dists_mse.tolist(), '{:.4f}')}, "
                 f"angle {format_list(bond_angle_loss.tolist(), '{:.4f}')}, chi {format_list(chi_loss.tolist(), '{:.4f}')}, t {t.tolist()}, "))
@@ -253,9 +264,12 @@ def inpaint_train_loop(diffuser,
 
     return {
         "epoch_loss": np.mean(epoch_loss),
-        "x_ca_denoising_loss": np.mean(epoch_x_ca_denoising_loss),
+        "bb_denoising_loss": np.mean(epoch_bb_denoising_loss),
         "latent_denoising_loss": np.mean(epoch_latent_denoising_loss),
-        "ref_noise": np.mean(epoch_x_ca_ref_noise),
+        "bb_dihedrals_loss": np.mean(epoch_bb_dihedrals_loss),
+        "bb_connection_dist_mse": np.mean(epoch_bb_connection_dist_mse),
+        "bb_connection_angle_loss": np.mean(epoch_bb_connection_angle_loss),
+        "ref_noise": np.mean(epoch_bb_ref_noise),
         "ref_noise": np.mean(epoch_latent_ref_noise),
         "seq_loss": np.mean(epoch_seq_loss),
         "rmsd_loss": np.mean(epoch_atom91_rmsd),

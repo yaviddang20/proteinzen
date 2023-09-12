@@ -526,6 +526,10 @@ class LatentDiffuser(Diffuser):
                     )
                 )
             decoded_outputs = self.decoder(latent_data)
+            latent_data['noised_latent'] = latent_data['latent']
+            latent_data['denoised_latent'] = latent_data['latent']
+            latent_data['loss_weight'] = 1
+            latent_data['t'] = torch.zeros(data.num_graphs)
             noised_latent = latent_data
 
         return noised_latent, decoded_outputs
