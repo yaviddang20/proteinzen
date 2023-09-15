@@ -11,7 +11,7 @@ from ligbinddiff.model.modules.equiformer_v2.layer_norm import MultiResEquivaria
 from ligbinddiff.model.modules.equiformer_v2.transformer_block import FeedForwardNetwork, MultiResFeedForwardNetwork, TransBlockV2
 from ligbinddiff.model.modules.equiformer_v2.edge_rot_mat import init_edge_rot_mat
 from ligbinddiff.utils.so3_embedding import type_l_to_so3
-from ligbinddiff.data.datasets.featurize.sidechain import _rbf, _positional_embeddings, _orientations, _sidechains
+from ligbinddiff.data.datasets.featurize.sidechain import _rbf, _positional_embeddings, _orientations, _sidechains, _dihedrals
 
 from ligbinddiff.model.seq_des.latent.equiformer_v2.denoiser import EdgeUpdate
 
@@ -248,7 +248,7 @@ class LatentDecoder(nn.Module):
                  num_heads=8,
                  h_channels=32,
                  num_layers=4,
-                 k=30
+                 k=30,
                  ):
         super().__init__()
         self.node_lmax_list = node_lmax_list
@@ -270,13 +270,13 @@ class LatentDecoder(nn.Module):
         self.transformer = nn.ModuleList(
             [
                 TransBlockV2(
-                    sphere_channels=h_channels,
+                    sphere_channels=h_channels * 2,
                     attn_hidden_channels=h_channels,
                     num_heads=num_heads,
                     attn_alpha_channels=h_channels // 2,
                     attn_value_channels=h_channels // 4,
                     ffn_hidden_channels=h_channels,
-                    output_channels=h_channels,
+                    output_channels=h_channels * 2,
                     lmax_list=node_lmax_list[0:1],
                     mmax_list=node_lmax_list[0:1],
                     SO3_rotation=node_SO3_rotation,
@@ -293,14 +293,30 @@ class LatentDecoder(nn.Module):
                 EdgeUpdate(
                     node_lmax_list=node_lmax_list,
                     edge_channels_list=edge_channels_list,
-                    h_channels=h_channels
+                    h_channels=h_channels * 2
                 )
                 for _ in range(num_layers)
             ]
         )
 
+        self.project = TransBlockV2(
+            sphere_channels=h_channels * 2,
+            attn_hidden_channels=h_channels,
+            num_heads=num_heads,
+            attn_alpha_channels=h_channels // 2,
+            attn_value_channels=h_channels // 4,
+            ffn_hidden_channels=h_channels,
+            output_channels=h_channels,
+            lmax_list=node_lmax_list[0:1],
+            mmax_list=node_lmax_list[0:1],
+            SO3_rotation=node_SO3_rotation,
+            SO3_grid=node_SO3_grid,
+            edge_channels_list=edge_channels_list,
+            mappingReduced=mappingReduced_nodes
+        )
+
         self.output_atoms = ProjectLayer(
-            in_lmax_list=atom_lmax_list,
+            in_lmax_list=node_lmax_list,
             in_channels=h_channels,
             out_lmax_list=atom_lmax_list,
             out_channels=atom_channels,
@@ -332,7 +348,8 @@ class LatentDecoder(nn.Module):
         ## prep features
         num_nodes = graph['x'].shape[0]
         node_features = intermediates['latent_sidechain']
-        X_ca = graph['x']
+        bb = graph['bb']
+        X_ca = bb[..., 1, :]
         masked_X_ca = X_ca.clone()
         masked_X_ca[graph['x_mask']] = torch.inf
 
@@ -349,8 +366,15 @@ class LatentDecoder(nn.Module):
             rot.set_wigner(edge_rot_mat)
 
         orientations = _orientations(X_ca)
+        sidechains = _sidechains(bb)
+        dihedrals = _dihedrals(bb)
         bb_features = {
-            1: torch.nan_to_num(orientations)
+            0: dihedrals.unsqueeze(-1),
+            1: torch.nan_to_num(
+                torch.cat([
+                    orientations,
+                    sidechains.unsqueeze(-2)], dim=-2)
+            )
         }
         bb_features = type_l_to_so3(bb_features)
 
@@ -359,7 +383,7 @@ class LatentDecoder(nn.Module):
         edge_dist_rel_pos = _positional_embeddings(edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
         edge_features = torch.cat([edge_dist_rbf, edge_dist_rel_pos], dim=-1)
 
-        bb_features = self.embed_bb(bb_features, edge_features, graph)
+        bb_features = self.embed_bb(bb_features, edge_features, edge_index)
         res_features = SO3_Embedding(
             num_nodes,
             lmax_list=self.node_lmax_list,
@@ -375,6 +399,7 @@ class LatentDecoder(nn.Module):
             res_features = node_layer(res_features, edge_features, edge_index)
             edge_features = edge_layer(res_features, edge_features, edge_index)
 
+        res_features = self.project(res_features, edge_features, edge_index)
         atom_features = self.output_atoms(res_features, edge_dist_rbf, edge_index)
 
         atom_invariants = atom_features.get_invariant_features(flat=True)
@@ -384,6 +409,3 @@ class LatentDecoder(nn.Module):
         out_dict['decoded_latent'] = atom_features.embedding[..., 1:4, :].transpose(-1, -2)
         out_dict['decoded_seq_logits'] = seq_logits
         return out_dict
-
-
-### graph-based representation for sidechains

@@ -1,12 +1,14 @@
-""" Noise scheduler for SO3
+""" Noise scheduler for latent reps (SO3_Embedding s)
 
 Adapted from FrameDiff, https://github.com/jasonkyuyim/se3_diffusion/blob/master/data/r3_diffuser.py """
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
 from torch import nn
 from ligbinddiff.diffusion.schedulers import LearnedScheduler
+from ligbinddiff.utils.so3_embedding import so3_add, so3_sub, so3_mult, so3_randn_like, so3_ones_like, gen_so3_unop
+from ligbinddiff.model.modules.equiformer_v2.so3 import SO3_Embedding
 
 
 class FixedBetaSchedule:
@@ -42,10 +44,12 @@ class LearnedBetaSchedule(nn.Module):
         return t*self.min_beta + (1/2)*(t**2)*(self.max_beta-self.min_beta)
 
 
-class R3Diffuser(nn.Module):
+class SidechainDiffuser(nn.Module):
     """VP-SDE diffuser class for translations."""
 
     def __init__(self,
+                 lmax_list=[1],
+                 num_channels=32,
                  min_beta=0.1,
                  max_beta=20,
                  schedule='fixed'):
@@ -61,6 +65,10 @@ class R3Diffuser(nn.Module):
             raise NotImplementedError("I haven't implemented this yet")
         else:
             raise ValueError(f"unknown value of schedule {schedule}")
+
+        self.lmax_list = lmax_list
+        self.num_coeffs = sum([(lmax+1) ** 2 for lmax in lmax_list])
+        self.num_channels = num_channels
 
 
     def b_t(self, t):
@@ -79,12 +87,21 @@ class R3Diffuser(nn.Module):
 
     def drift_coef(self, x, t):
         """Time-dependent drift coefficient."""
-        return -1/2 * self.b_t(t) * x
+        return so3_mult(-1/2 * self.b_t(t), x)
 
-    def sample_ref(self, n_samples: int=1):
-        return torch.randn(size=(n_samples, 3))
+    def sample_ref(self, n_samples: int=1, device='cpu', dtype=torch.float) -> SO3_Embedding:
+        sample_embedding = torch.randn(size=(n_samples, self.num_coeffs, self.num_channels))
+        sample = SO3_Embedding(
+            n_samples,
+            self.lmax_list,
+            self.num_channels,
+            device=device,
+            dtype=dtype
+        )
+        sample.set_embedding(sample_embedding)
+        return sample
 
-    def calc_trans_0(self, score_t, x_t, t):
+    def calc_x_0(self, score_t: SO3_Embedding, x_t: SO3_Embedding, t) -> SO3_Embedding:
         """
         Args
         ----
@@ -95,12 +112,16 @@ class R3Diffuser(nn.Module):
         t : torch.Tensor, shape=[...]
 
         """
-        t = t[:, None]
+        t = t[:, None, None]
         beta_t = self.marginal_b_t(t)
         cond_var = self.conditional_var(t)
-        return (score_t * cond_var + x_t) / torch.exp(-1/2*beta_t)
+        x_0_embedding = (score_t.embedding * cond_var + x_t.embedding) / torch.exp(-1/2*beta_t)
 
-    def forward_marginal(self, x_0: torch.Tensor, t: torch.Tensor):
+        x_0 = x_t.clone()
+        x_0.set_embedding(x_0_embedding)
+        return x_0
+
+    def forward_marginal(self, x_0: SO3_Embedding, t: torch.Tensor, noising_mask: torch.Tensor):
         """Samples marginal p(x(t) | x(0)).
 
         Args:
@@ -111,29 +132,37 @@ class R3Diffuser(nn.Module):
             x_t: [..., 3] positions at time t in Angstroms.
             score_t: [..., 3] score at time t in Angstroms.
         """
-        t_ = t[:, None]
-        mu_t = torch.exp(-1/2*self.marginal_b_t(t_)) * x_0
+        t_ = t[:, None, None]
+        mu_t = torch.exp(-1/2*self.marginal_b_t(t_)) * x_0.embedding
         eps_t = torch.randn(mu_t.shape, device=t.device)
         sigma_t = torch.sqrt(1 - torch.exp(-self.marginal_b_t(t_)))
-        x_t = mu_t + eps_t * sigma_t
 
+        x_t = x_0.clone()
+        x_t.set_embedding(mu_t + eps_t * sigma_t)
         score_t = self.score(x_t, x_0, t)
-        return x_t, score_t
+        score_scaling = self.score_scaling(t)
 
-    def score_scaling(self, t: torch.Tensor):
+        x_t.embedding[~noising_mask] = x_0.embedding[~noising_mask]
+        score_t.embedding[~noising_mask] = 0
+        return {
+            "noised_latent_sidechain": x_t,
+            "latent_sidechain_score": score_t,
+            "latent_sidechain_score_scaling": score_scaling
+        }
+
+    def score_scaling(self, t: torch.Tensor) -> torch.Tensor:
         return 1 / torch.sqrt(self.conditional_var(t))
 
     def reverse(
             self,
             *,
-            x_t: torch.Tensor,
-            score_t: torch.Tensor,
+            x_t: SO3_Embedding,
+            score_t: SO3_Embedding,
             t: torch.Tensor,
             dt: float,
             mask: Optional[torch.Tensor]=None,
-            center: bool=True,
             noise_scale: float=1.0,
-        ):
+        ) -> SO3_Embedding:
         """Simulates the reverse SDE for 1 step
 
         Args:
@@ -146,23 +175,22 @@ class R3Diffuser(nn.Module):
         Returns:
             [..., 3] positions at next step t-1.
         """
-        t = t[:, None]
+        t = t[:, None, None]
         g_t = self.diffusion_coef(t)
         f_t = self.drift_coef(x_t, t)
-        z = noise_scale * torch.randn(size=score_t.shape)
-        perturb = (f_t - g_t**2 * score_t) * dt + g_t * np.sqrt(dt) * z
+        z = noise_scale * torch.randn(size=score_t.embedding.shape)
+        perturb = (f_t - g_t**2 * score_t.embedding) * dt + g_t * np.sqrt(dt) * z  # TODO: shouldn't dt be negative? if not shouldn't you subtract noise here?
 
         if mask is not None:
-            perturb *= mask[..., None]
+            perturb *= mask[..., None, None]
         else:
-            mask = torch.ones(x_t.shape[:-1])
-        x_t_1 = x_t - perturb
-        if center:
-            com = torch.sum(x_t_1, dim=-2) / torch.sum(mask, dim=-1)[..., None]
-            x_t_1 -= com[..., None, :]
-        return x_t_1
+            mask = torch.ones(x_t.embedding.shape[:-2])
+        x_tm1_embedding = x_t.embedding - perturb
+        x_tm1 = x_t.clone()
+        x_tm1.set_embedding(x_tm1_embedding)
+        return x_tm1
 
-    def conditional_var(self, t):
+    def conditional_var(self, t: torch.Tensor) -> torch.Tensor:
         """Conditional variance of p(xt|x0).
 
         Var[x_t|x_0] = conditional_var(t)*I
@@ -170,8 +198,9 @@ class R3Diffuser(nn.Module):
         """
         return 1 - torch.exp(-self.marginal_b_t(t))
 
-    def score(self, x_t, x_0, t):
-        t = t[:, None]
-        return -(x_t - torch.exp(-1/2*self.marginal_b_t(t)) * x_0) / self.conditional_var(t)
-
-RnDiffuser = R3Diffuser  # this should work for any R^n?
+    def score(self, x_t: SO3_Embedding, x_0: SO3_Embedding, t: torch.Tensor) -> SO3_Embedding:
+        t = t[:, None, None]
+        score_t = x_t.clone()
+        score_t_embedding = -(x_t.embedding - torch.exp(-1/2*self.marginal_b_t(t)) * x_0.embedding) / self.conditional_var(t)
+        score_t.set_embedding(score_t_embedding)
+        return score_t

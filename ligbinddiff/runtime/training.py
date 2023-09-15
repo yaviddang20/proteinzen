@@ -223,8 +223,8 @@ def inpaint_train_loop(diffuser,
                     if param.grad is not None and not param.grad.isfinite().all():
                         torch.set_printoptions(threshold=1000000)
                         print("nan in", name, "grad")
-                        print("param", param)
-                        print("param grad", param.grad)
+                        # print("param", param)
+                        # print("param grad", param.grad)
 
                 optimizer.step()
 

@@ -4,22 +4,37 @@ Adapted from https://github.com/jasonkyuyim/se3_diffusion/blob/unsupported_refac
 
 from typing import Optional, Tuple
 
-import numpy as np
 import torch
+
+import ligbinddiff.model.modules.openfold.rigid_utils as ru
 from . import so3
 from . import r3
 
 
-class SE3Diffuser:
-    def __init__(self):
-        self._so3_diffuser = so3.SO3Diffuser()
-        self._r3_diffuser = r3.R3Diffuser()
+def _extract_rots_trans(rigid: ru.Rigid):
+    rot = rigid.get_rots().get_rot_mats()
+    tran = rigid.get_trans()
+    return rot, tran
+
+
+def _assemble_rigid(rotmat, trans):
+    return ru.Rigid(
+            rots=ru.Rotation(
+                rot_mats=rotmat),
+            trans=trans)
+
+
+class SE3Diffuser(torch.nn.Module):
+    def __init__(self, se3_conf):
+        super().__init__()
+        self._so3_diffuser = so3.SO3Diffuser()#se3_conf.so3_conf)
+        self._r3_diffuser = r3.R3Diffuser()#)se3_conf.r3_conf)
 
     def forward_marginal(
             self,
-            frames_0: Tuple[torch.Tensor, torch.Tensor],
+            rigids_0: ru.Rigid,
             t: torch.Tensor,
-            diffuse_mask: Optional[np.ndarray] = None,
+            diffuse_mask: Optional[torch.Tensor] = None,
         ):
         """
         Args:
@@ -33,13 +48,13 @@ class SE3Diffuser:
             trans_score_norm: [...] translation score norm
             rot_score_norm: [...] rotation score norm
         """
-        R_0, trans_0 = frames_0
+        R_0, trans_0 = _extract_rots_trans(rigids_0)
 
         R_t, rot_score = self._so3_diffuser.forward_marginal(
-            R_0.numpy(), t)
+            R_0, t)
         rot_score_scaling = self._so3_diffuser.score_scaling(t)
         trans_t, trans_score = self._r3_diffuser.forward_marginal(
-            trans_0.numpy(), t)
+            trans_0, t)
         trans_score_scaling = self._r3_diffuser.score_scaling(t)
 
         if diffuse_mask is not None:
@@ -57,14 +72,13 @@ class SE3Diffuser:
                 rot_score,
                 torch.zeros_like(rot_score),
                 diffuse_mask[..., None, None])
-        R_t = torch.tensor(R_t, dtype=torch.float64)
-        trans_t = torch.tensor(trans_t, dtype=torch.float64)
-        frames_t = (R_t, trans_t)
+        rigids_t = _assemble_rigid(R_t, trans_t)
 
         return {
             'R_t': R_t,
             'trans_t': trans_t,
-            'frames_t': frames_t,
+            'rigids_t': rigids_t,
+            'noised_frames': rigids_t,
             'trans_score': trans_score,
             'rot_score': rot_score,
             'trans_score_scaling': trans_score_scaling,
@@ -81,25 +95,25 @@ class SE3Diffuser:
     def calc_rot_score(self, R_t, R_0, t):
         """Returns conditional score as object in tangent space at R_t"""
         return self._so3_diffuser.score(
-            R_t.cpu(),
-            R_0.cpu(),
-            t.cpu()
+            R_t,
+            R_0,
+            t
         )
 
     def _apply_mask(self, x_diff, x_fixed, diff_mask):
-        return diff_mask * x_diff + (1 - diff_mask) * x_fixed
+        return diff_mask.long() * x_diff + (1 - diff_mask.long()) * x_fixed
 
     def score(self,
-              rigid_0: Tuple[torch.Tensor, torch.Tensor],
-              rigid_t: Tuple[torch.Tensor, torch.Tensor],
+              rigid_0: ru.Rigid,
+              rigid_t: ru.Rigid,
               t: torch.Tensor):
-        R_0, trans_0 = rigid_0
-        R_t, trans_t = rigid_t
+        R_0, trans_0 = _extract_rots_trans(rigid_0)
+        R_t, trans_t = _extract_rots_trans(rigid_t)
 
         rot_score = self._so3_diffuser.score(R_t, R_0, t)
         trans_score = self._r3_diffuser.score(trans_t, trans_0, t)
 
-        return trans_score, rot_score
+        return rot_score, trans_score
 
     def score_scaling(self, t):
         rot_score_scaling = self._so3_diffuser.score_scaling(t)
@@ -108,7 +122,7 @@ class SE3Diffuser:
 
     def reverse(
             self,
-            rigid_t: Tuple[torch.Tensor, torch.Tensor],
+            rigids_t: ru.Rigid,
             rot_score: torch.Tensor,
             trans_score: torch.Tensor,
             t: torch.Tensor,
@@ -131,15 +145,15 @@ class SE3Diffuser:
         Returns:
             rigid_t_1: [..., N] protein rigid objects at time t-1.
         """
-        R_t, trans_t = rigid_t
-        R_t_1 = self._so3_diffuser.reverse(
+        R_t, trans_t = _extract_rots_trans(rigids_t)
+        R_tm1 = self._so3_diffuser.reverse(
             R_t=R_t,
             score_t=rot_score,
             t=t,
             dt=dt,
             noise_scale=noise_scale,
             )
-        trans_t_1 = self._r3_diffuser.reverse(
+        trans_tm1 = self._r3_diffuser.reverse(
             x_t=trans_t,
             score_t=trans_score,
             t=t,
@@ -149,18 +163,18 @@ class SE3Diffuser:
             )
 
         if diffuse_mask is not None:
-            trans_t_1 = self._apply_mask(
-                trans_t_1, trans_t, diffuse_mask[..., None])
-            R_t_1 = self._apply_mask(
-                R_t_1, R_t, diffuse_mask[..., None, None])
+            trans_tm1 = self._apply_mask(
+                trans_tm1, trans_t, diffuse_mask[..., None])
+            R_tm1 = self._apply_mask(
+                R_tm1, R_t, diffuse_mask[..., None, None])
 
-        return (R_t_1, trans_t_1)
+        return _assemble_rigid(R_tm1, trans_tm1)
 
     def sample_ref(
             self,
             n_samples: int,
-            impute: Optional[Tuple[torch.Tensor, torch.Tensor]]=None,
-            diffuse_mask: Optional[np.ndarray]=None
+            impute: Optional[ru.Rigid]=None,
+            diffuse_mask: Optional[torch.Tensor]=None
         ):
         """Samples rigids from reference distribution.
 
@@ -170,7 +184,7 @@ class SE3Diffuser:
                 translations or rotations are not diffused.
         """
         if impute is not None:
-            rot_impute, trans_impute = impute
+            rot_impute, trans_impute = _extract_rots_trans(impute)
             assert rot_impute.shape[0] == n_samples
             rot_impute = rot_impute.reshape((n_samples, 3, 3))
             trans_impute = trans_impute.reshape((n_samples, 3))
@@ -187,5 +201,5 @@ class SE3Diffuser:
             trans_ref = self._apply_mask(
                 trans_ref, trans_impute, diffuse_mask[..., None])
         return {
-            'frames_t': (rot_ref, trans_ref)
+            'rigits_t': _assemble_rigid(rot_ref, trans_ref)
         }

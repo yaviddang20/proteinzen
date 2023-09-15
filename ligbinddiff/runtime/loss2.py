@@ -1,4 +1,5 @@
 """ Utils for loss functions """
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -6,8 +7,9 @@ import torch.nn.functional as F
 from ligbinddiff.utils.atom_reps import (
     alphabet, atom91_atom_masks, atom91_start_end, atom91_sidechain_bonds, atom91_residue_bonds,
     nonbonded_sidechain_atom_pairs, atom91_sidechain_angles, atom91_residue_angles, chi_atom_idxs, chi_pi_periodic, restype_1to3)
-from .loss import zernike_coeff_loss
+from ._loss import zernike_coeff_loss
 from ligbinddiff.data.datasets.featurize.sidechain import _dihedrals
+from ligbinddiff.model.modules.openfold import rigid_utils as ru
 
 
 def vec_norm(tensor, mask_nans=True, eps=1e-6, dim=-1):
@@ -745,7 +747,7 @@ def cath_latent_loss_fn(noised_batch, model_outputs, use_channel_weights=None, w
         ref_noise = torch.zeros(1, device=chi_loss.device)
 
     vae_loss = (
-        autoencoder_loss + 1e-4 * kl_div +
+        autoencoder_loss + 1e-6 * kl_div +
         seq_loss +  # atom91_rmsd +
         bond_length_mse + sidechain_dists_mse +
         bond_angle_loss + chi_loss +
@@ -1037,7 +1039,7 @@ def inpaint_latent_loss_fn(batch,
     ### construct losses
 
     vae_loss = (
-        autoencoder_loss + 1e-6 * kl_div +
+        autoencoder_loss + 1e-4 * kl_div +
         seq_loss +  # atom91_rmsd +
         bond_length_mse + sidechain_dists_mse +
         bond_angle_loss + chi_loss  #+
@@ -1084,3 +1086,303 @@ def inpaint_latent_loss_fn(batch,
         "cl_interres_clash_loss": cl_interres_clash_loss,
         "cl_local_atomic_dist_loss": cl_local_atomic_dist_loss,
     }
+
+
+from ligbinddiff.utils.atom_reps import backbone_frame_atoms
+from .loss.openfold import compute_fape
+
+
+def inpaint_frame_latent_loss_fn(batch,
+                           latent_outputs,
+                           decoder_outputs,
+                           use_channel_weights=None,
+                           warmup=False,
+                           ae_loss_weight=1,
+                           inpaint_k=30,
+                           absolute_error=False):
+    ### extract important values
+
+    residx = latent_outputs['noised_residx']
+
+    atom91_centered = batch['atom91_centered']
+    bb = batch['bb'][:, :3]  # we're moving O to the sidechain
+    seq = batch['seq']
+    X_ca = batch['x']
+    x_mask = batch['x_mask']
+    atom91_mask = batch['atom91_mask']
+    bb_frames = batch['frames']
+
+    latent = latent_outputs['latent_sidechain']
+    latent_mu = latent_outputs['latent_mu']
+    latent_logvar = latent_outputs['latent_logvar']
+    denoised_bb_frames = latent_outputs['denoised_frames']
+
+    # a kinda jenk way of reconstructing the backbone atoms from the frames
+    backbone_base = torch.as_tensor(backbone_frame_atoms, device=X_ca.device)
+    backbone_base = backbone_base[None, ...].expand(batch.num_nodes, -1, -1)
+    denoised_bb_N = denoised_bb_frames.apply(backbone_base[:, 0])
+    denoised_bb_CA = denoised_bb_frames.apply(backbone_base[:, 1])
+    denoised_bb_C = denoised_bb_frames.apply(backbone_base[:, 2])
+    denoised_bb = torch.stack([denoised_bb_N, denoised_bb_CA, denoised_bb_C], dim=-2)
+
+
+    ### autoencoder loss
+
+    if absolute_error:
+        atom91 = atom91_centered + X_ca.unsqueeze(-2)
+        denoised_x_ca = denoised_bb[..., 1, :]
+        decoded_atom91 = decoder_outputs['decoded_latent'] + denoised_x_ca.unsqueeze(-2)
+        decoded_atom91[..., :3, :] = denoised_bb
+        seq_logits = decoder_outputs['decoded_seq_logits']
+    else:
+        atom91 = atom91_centered
+        decoded_atom91 = decoder_outputs['decoded_latent']
+        bb_rel = bb - X_ca.unsqueeze(-2)
+        decoded_atom91[..., :3, :] = bb_rel
+        seq_logits = decoder_outputs['decoded_seq_logits']
+
+    data_splits = batch._slice_dict['x']
+    data_lens = (data_splits[1:] - data_splits[:-1]).tolist()
+
+    autoencoder_loss = atom91_mse_loss(atom91, decoded_atom91, data_lens, atom91_mask, no_bb=False)
+    seq_loss = seq_cce_loss(seq, seq_logits, data_lens, x_mask)
+    atom91_rmsd = autoencoder_loss.sqrt()
+    sidechain_dists_mse = distance_loss(atom91_centered, decoded_atom91, data_lens, atom91_mask.any(dim=-1), no_bb=False)
+    bond_length_mse = bond_length_loss(atom91_centered, decoded_atom91, data_lens, atom91_mask.any(dim=-1), no_bb=False)
+    bond_angle_loss = angle_loss(atom91_centered, decoded_atom91, data_lens, atom91_mask.any(dim=-1), no_bb=False)
+    chi_loss = torsion_loss(atom91_centered, decoded_atom91, data_lens, atom91_mask.any(dim=-1))
+    kl_div = so3_embedding_kl(latent_mu, latent_logvar, data_lens, x_mask)
+
+    edge_splits = batch._slice_dict['edge_index']
+    num_edges = (edge_splits[1:] - edge_splits[:-1]).tolist()
+
+    intrares_clash_loss = intrasidechain_clash_loss(decoded_atom91, data_lens, atom91_mask.any(dim=-1))
+    interres_clash_loss = intersidechain_clash_loss(
+        decoded_atom91,
+        seq,
+        batch.edge_index,
+        num_edges,
+        x_mask
+    )
+    local_atomic_dist_loss = atomic_neighborhood_dist_loss(
+        atom91,
+        decoded_atom91,
+        seq,
+        batch.edge_index,
+        num_edges,
+        x_mask
+    )
+    # print(kl_div)
+
+    correct_label_atom91_mask = atom91_mask.clone()
+    pred_seq = seq_logits.argmax(dim=-1)
+    same = (pred_seq == seq)
+    correct_label_atom91_mask[~same] = True
+
+    with torch.no_grad():
+        cl_atom91_rmsd = atom91_rmsd_loss(atom91, decoded_atom91, data_lens, correct_label_atom91_mask, no_bb=False)
+        cl_bond_length_mse = bond_length_loss(atom91_centered, decoded_atom91, data_lens, correct_label_atom91_mask.any(dim=-1), no_bb=False)
+        cl_sidechain_dists_mse = distance_loss(atom91_centered, decoded_atom91, data_lens, correct_label_atom91_mask.any(dim=-1), no_bb=False)
+        cl_bond_angle_loss = angle_loss(atom91_centered, decoded_atom91, data_lens, correct_label_atom91_mask.any(dim=-1))
+        cl_chi_loss = torsion_loss(atom91_centered, decoded_atom91, data_lens, correct_label_atom91_mask.any(dim=-1))
+        cl_intrares_clash_loss = intrasidechain_clash_loss(decoded_atom91, data_lens, correct_label_atom91_mask.any(dim=-1))
+        cl_interres_clash_loss = intersidechain_clash_loss(
+            decoded_atom91 + X_ca.unsqueeze(-2),
+            seq,
+            batch.edge_index,
+            num_edges,
+            x_mask | (~same)
+        )
+        cl_local_atomic_dist_loss = atomic_neighborhood_dist_loss(
+            atom91,
+            decoded_atom91,
+            seq,
+            batch.edge_index,
+            num_edges,
+            x_mask | (~same)
+        )
+
+
+    ### diffusion losses
+
+    noised_latent = latent_outputs['noised_latent_sidechain']
+    denoised_latent = latent_outputs['denoised_latent_sidechain']
+
+    latent_denoising_loss = so3_embedding_mse(latent, denoised_latent, data_lens, x_mask)
+    latent_ref_noise = so3_embedding_mse(latent, noised_latent, data_lens, x_mask)
+
+    noising_mask = latent_outputs['noising_mask']
+    bb_denoising_loss = compute_fape(
+        denoised_bb_frames,
+        bb_frames,
+        (~x_mask).long(),
+        denoised_bb,
+        bb,
+        noising_mask.long()[:, None].expand(-1, 3),
+        l1_clamp_distance=10
+    )
+    residx_mask = x_mask[residx]
+    residx_num_nodes = [inpaint_k + 1 for _ in range(len(residx)//(inpaint_k+1))]
+    bb_denoising_loss = bb_denoising_loss * latent_outputs["trans_score_scaling"]
+    bb_denoising_loss = _nodewise_to_graphwise(
+        bb_denoising_loss[residx],
+        residx_num_nodes,
+        residx_mask
+    )
+
+    residx_x_mask = torch.ones_like(x_mask).bool()
+    residx_x_mask[residx] = False
+    # we wanna unmask the +1 and -1 residues so we can get the relative positionings
+    # in context with the un-noised structure
+    residx_p1 = residx + 1
+    residx_p1 = residx_p1[residx_p1 < len(x_mask)]  # prevent selecting a non-existant residue
+    residx_x_mask[residx_p1] = False
+    residx_m1 = residx - 1
+    residx_m1 = residx_m1[residx_m1 > -1]  # prevent selecting a non-existant residue
+    residx_x_mask[residx_m1] = False
+    # remasked residues
+    residx_x_mask[x_mask] = True
+
+    bb_dihedrals_loss = backbone_dihedrals_loss(
+        denoised_bb,
+        bb,
+        data_lens,
+        residx_x_mask)
+
+    bb_conn_lens, bb_conn_angles = backbone_connection_loss(
+        denoised_bb,
+        bb,
+        data_lens,
+        batch.batch,
+        residx_x_mask)
+
+    bb_denoising_loss = bb_denoising_loss + bb_dihedrals_loss + bb_conn_lens + bb_conn_angles
+
+    correct_label_x_mask = x_mask.clone()
+    correct_label_x_mask[~same] = True
+    correct_label_residx_mask = correct_label_x_mask[residx]
+    with torch.no_grad():
+        cl_latent_denoising_loss = so3_embedding_mse(latent, denoised_latent, data_lens, correct_label_x_mask)
+        cl_latent_ref_noise = so3_embedding_mse(latent, noised_latent, data_lens, correct_label_x_mask)
+
+        # cl_x_denoising_loss = _nodewise_to_graphwise(
+        #     (denoised_x - X_ca[residx]).square().mean(dim=-1),
+        #     [30 + 1 for _ in range(len(residx)//31)],
+        #     correct_label_residx_mask
+        # )
+        # cl_x_ref_noise = _nodewise_to_graphwise(
+        #     (noised_x - X_ca[residx]).square().mean(dim=-1),
+        #     [30 + 1 for _ in range(len(residx)//31)],
+        #     correct_label_residx_mask
+        # )
+        cl_denoising_loss = cl_latent_denoising_loss + 0 #cl_x_denoising_loss
+
+
+    ### construct losses
+
+    vae_loss = (
+        autoencoder_loss + 1e-4 * kl_div +
+        seq_loss +  # atom91_rmsd +
+        bond_length_mse + sidechain_dists_mse +
+        bond_angle_loss + chi_loss  #+
+        # intrares_clash_loss + interres_clash_loss + local_atomic_dist_loss
+    )
+    # if 'sidechain_loss_weight' not in latent_outputs:
+    #     latent_outputs['sidechain_loss_weight'] = 1
+    # if 'bb_loss_weight' not in latent_outputs:
+    #     latent_outputs['bb_loss_weight'] = 1
+
+    denoising_loss = latent_outputs["latent_sidechain_score_scaling"] * latent_denoising_loss + bb_denoising_loss # latent_outputs["trans_score_scaling"] * bb_denoising_loss
+    if not warmup:
+        loss = (denoising_loss + vae_loss * ae_loss_weight).mean()
+    else:
+        loss = vae_loss.mean()
+
+    return {
+        "loss": loss,
+        "denoising_loss": denoising_loss,
+        "bb_denoising_loss": bb_denoising_loss,
+        "latent_denoising_loss": latent_denoising_loss,
+        "bb_ref_noise": torch.tensor([0]),#bb_ref_noise,
+        "latent_ref_noise": latent_ref_noise,
+        "bb_dihedrals_loss": bb_dihedrals_loss,
+        "bb_connection_dist_mse": bb_conn_lens,
+        "bb_connection_angle_loss": bb_conn_angles,
+        "seq_loss": seq_loss,
+        "atom91_mse": autoencoder_loss,
+        "atom91_rmsd": atom91_rmsd,
+        "sidechain_dists_mse": sidechain_dists_mse,
+        "bond_length_mse": bond_length_mse,
+        "bond_angle_loss": bond_angle_loss,
+        "chi_loss": chi_loss,
+        "intrares_clash_loss": intrares_clash_loss,
+        "interres_clash_loss": interres_clash_loss,
+        "local_atomic_dist_loss": local_atomic_dist_loss,
+        "cl_denoising_loss": cl_denoising_loss,
+        "cl_atom91_rmsd": cl_atom91_rmsd,
+        "cl_sidechain_dists_mse": cl_sidechain_dists_mse,
+        "cl_bond_length_mse": cl_bond_length_mse,
+        "cl_bond_angle_loss": cl_bond_angle_loss,
+        "cl_chi_loss": cl_chi_loss,
+        "cl_intrares_clash_loss": cl_intrares_clash_loss,
+        "cl_interres_clash_loss": cl_interres_clash_loss,
+        "cl_local_atomic_dist_loss": cl_local_atomic_dist_loss,
+    }
+
+
+### some functions to make creating loss functions easier
+
+
+NOT_LOSS_FNS = ["_get_loss_fn", "construct_loss_fn"]
+
+def _get_loss_fn(fn_name):
+    """ Retrieve a loss function from this file given the function name """
+    try:
+        if fn_name in NOT_LOSS_FNS:  # prevent recursive and unexpected behavior
+            raise NameError
+        return getattr(sys.modules[__name__], fn_name)
+    except NameError as ne:
+        raise ValueError(f"Loss fn {fn_name} not found in {__name__}") from ne
+
+
+def construct_loss_fn(loss_config, latent_loss_config, denoiser_loss_config):
+    """ Construct a combined loss function based on the inputted hparams
+
+    Args
+    ----
+    loss_config : dict
+        A loss function config. It should
+        contain an entry for 'loss_config' in the format {loss_fn_name : scaling_factor}. For example,
+        .. code-block :
+            {
+                'nlcpl': 1,
+                'etab_norm_penalty': 0.01
+            }
+
+    Returns
+    -------
+    _loss_fn
+        The constructed loss function
+    """
+
+    def _loss_fn(data, latent_outputs, decoder_outputs):
+        """ The returned loss function """
+        latent_loss_dict = {}
+        for loss_fn_name, scaling_factor in latent_loss_config.items():
+            if scaling_factor == 0:
+                continue
+            subloss_fn = _get_loss_fn(loss_fn_name)
+            loss = subloss_fn(data, latent_outputs, decoder_outputs)
+            latent_loss_dict[loss_fn_name] = {"loss": loss, "scaling_factor": scaling_factor}
+
+        denoiser_loss_dict = {}
+        for loss_fn_name, scaling_factor in denoiser_loss_config.items():
+            if scaling_factor == 0:
+                continue
+            subloss_fn = _get_loss_fn(loss_fn_name)
+            loss = subloss_fn(data, latent_outputs, decoder_outputs)
+            denoiser_loss_dict[loss_fn_name] = {"loss": loss, "scaling_factor": scaling_factor}
+
+        return loss_dict
+
+    return _loss_fn

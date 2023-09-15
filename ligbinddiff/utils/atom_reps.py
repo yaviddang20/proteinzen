@@ -55,6 +55,13 @@ restype_3to1 = {v: k for k, v in restype_1to3.items()}
 
 backbone_atoms = ['N', 'CA', 'C', 'O']
 
+backbone_frame_atoms = np.array(
+    [
+        [-0.572, 1.337,  0.000],  # N
+        [0.000,  0.000,  0.000],   # CA
+        [1.517, -0.000, -0.000]  # C
+    ]
+)
 # A list of atoms (excluding hydrogen) for each AA sidechain. PDB naming convention.
 sidechain_atoms = {
     'ALA': ['CB'],

@@ -4,7 +4,7 @@ import torch
 
 
 def _normalize(x, dim=-1):
-    return x / torch.linalg.vector_norm(x, dim=dim)
+    return x / torch.linalg.vector_norm(x, dim=dim, keepdim=True)
 
 
 def rigid_from_3_points(x1, x2, x3):
@@ -16,7 +16,7 @@ def rigid_from_3_points(x1, x2, x3):
     v1 = x3 - x2
     v2 = x1 - x2
     e1 = _normalize(v1)
-    u2 = v2 - e1 * (e1 * v2).sum(dim=-1)
+    u2 = v2 - e1 * (e1 * v2).sum(dim=-1)[..., None]
     e2 = _normalize(u2)
     e3 = torch.cross(e1, e2)
     R = torch.stack([e1, e2, e3], dim=-2)

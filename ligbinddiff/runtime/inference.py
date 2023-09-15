@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 # from ligbinddiff.utils.fiber import compact_fiber_to_nl
 from ligbinddiff.utils.atom_reps import num_to_letter, atom91_atom_masks
-from .loss import _mask
+from ._loss import _mask
 from ligbinddiff.data.io.pdb_utils import atom91_to_pdb
 
 

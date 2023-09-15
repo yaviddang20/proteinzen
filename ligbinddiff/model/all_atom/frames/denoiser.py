@@ -6,15 +6,15 @@ import numpy as np
 from torch_cluster import knn_graph
 from torch_geometric.utils import sort_edge_index
 
-from ligbinddiff.model.modules.equiformer_v2.so2_ops import Nodewise_SO3_Convolution
 from ligbinddiff.model.modules.equiformer_v2.so3 import CoefficientMappingModule, SO3_Embedding, SO3_Rotation, SO3_Grid, SO3_LinearV2
 from ligbinddiff.model.modules.equiformer_v2.layer_norm import MultiResEquivariantRMSNormArraySphericalHarmonicsV2 as NormSO3
 from ligbinddiff.model.modules.equiformer_v2.transformer_block import FeedForwardNetwork, MultiResFeedForwardNetwork, TransBlockV2
 from ligbinddiff.model.modules.equiformer_v2.edge_rot_mat import init_edge_rot_mat
-from .autoencoder import ProjectLayer
+from ligbinddiff.model.modules.openfold import rigid_utils as ru
+from ligbinddiff.diffusion.noisers.se3 import _extract_rots_trans, _assemble_rigid
 
 from ligbinddiff.data.datasets.featurize.sidechain import _rbf, _positional_embeddings
-from ligbinddiff.utils.atom_reps import atom91_start_end
+from .autoencoder import ProjectLayer
 
 
 def sample_inv_cubic_edges(batched_X_ca, batched_x_mask, batch, knn_k=30, inv_cube_k=10):
@@ -58,48 +58,38 @@ def sample_inv_cubic_edges(batched_X_ca, batched_x_mask, batch, knn_k=30, inv_cu
     return edge_index[:, edge_select]
 
 
-class LatentDenoisingLayer(nn.Module):
-    """ Denoising layer on sidechain densities """
+def mask_rigids(rigid_unmasked, rigid_masked, mask):
+    rots_unmasked, trans_unmasked = _extract_rots_trans(rigid_unmasked)
+    rots_masked, trans_masked = _extract_rots_trans(rigid_masked)
+
+    rots = mask.long()[:, None, None] * rots_masked + (1 - mask.long())[:, None, None] * rots_unmasked
+    trans = mask.long()[:, None] * trans_masked + (1 - mask.long())[:, None] * trans_unmasked
+    return _assemble_rigid(rots, trans)
+
+
+class FrameUpdate(nn.Module):
     def __init__(self,
                  node_lmax_list,
                  edge_channels_list,
                  mappingReduced_nodes,
                  node_SO3_rotation,
                  node_SO3_grid,
+                 frame_SO3_rotation,
                  num_heads=8,
                  h_channels=32,
-                 bb_channels=1,
-                 k=30,
-                 ):
-        """
-        Args
-        ----
-        """
+                 frame_channels=3,
+                 knn_k=30,
+                 lrange_k=30):
         super().__init__()
-        self.node_lmax_list = node_lmax_list
 
-        self.mappingReduced_nodes = mappingReduced_nodes
+        self.node_lmax_list = node_lmax_list
+        self.h_channels = h_channels
         self.node_SO3_rotation = node_SO3_rotation
-        self.node_SO3_grid = node_SO3_grid
+        self.frame_channels = frame_channels
+        self.frame_SO3_rotation = frame_SO3_rotation
 
         self.lrange_attention = TransBlockV2(
-            sphere_channels=h_channels + bb_channels,
-            attn_hidden_channels=h_channels,
-            num_heads=num_heads,
-            attn_alpha_channels=h_channels // 2,
-            attn_value_channels=h_channels // 4,
-            ffn_hidden_channels=h_channels,
-            output_channels=bb_channels,
-            lmax_list=node_lmax_list,
-            mmax_list=node_lmax_list,
-            SO3_rotation=node_SO3_rotation,
-            SO3_grid=node_SO3_grid,
-            edge_channels_list=edge_channels_list,
-            mappingReduced=mappingReduced_nodes
-        )
-
-        self.local_attention = TransBlockV2(
-            sphere_channels=h_channels + bb_channels,
+            sphere_channels=h_channels + frame_channels,
             attn_hidden_channels=h_channels,
             num_heads=num_heads,
             attn_alpha_channels=h_channels // 2,
@@ -112,6 +102,229 @@ class LatentDenoisingLayer(nn.Module):
             SO3_grid=node_SO3_grid,
             edge_channels_list=edge_channels_list,
             mappingReduced=mappingReduced_nodes
+        )
+        self.frame_update = nn.Linear(h_channels, 6)
+        self.knn_k = knn_k
+        self.lrange_k = lrange_k
+
+    def forward(self,
+                rigids: ru.Rigid,
+                node_features: SO3_Embedding,
+                batch: torch.Tensor,
+                x_mask: torch.Tensor,
+                noising_mask: torch.Tensor):
+        num_nodes = noising_mask.shape[0]
+
+        X_ca = rigids.get_trans()
+        edge_index = sample_inv_cubic_edges(X_ca, x_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k)
+        edge_dist_vec = X_ca[edge_index[0]] - X_ca[edge_index[1]]
+        edge_dist = torch.linalg.vector_norm(edge_dist_vec, dim=-1)
+        # update rotation matrices
+        edge_rot_mat = init_edge_rot_mat(edge_dist_vec)
+        for rot in self.node_SO3_rotation:
+            rot.set_wigner(edge_rot_mat)
+
+        # compute edge features
+        edge_dist_rbf = _rbf(edge_dist, device=edge_dist.device)  # edge_channels_list
+        edge_dist_rel_pos = _positional_embeddings(edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
+        edge_features = torch.cat([edge_dist_rbf, edge_dist_rel_pos], dim=-1)
+
+        # we can treat the rotation matrix as the three basis vectors of the frame
+        rigid_basis_vectors = rigids.get_rots().get_rot_mats()
+        bb_node_fused = SO3_Embedding(
+            num_nodes,
+            self.node_lmax_list,
+            num_channels=self.h_channels + self.frame_channels,
+            device = node_features.device,
+            dtype=node_features.dtype
+        )
+        bb_node_fused.embedding[..., :self.h_channels] = node_features.embedding
+        bb_node_fused.embedding[..., 1:4, -self.frame_channels:] = rigid_basis_vectors.transpose(-1, -2)
+
+        editable = noising_mask.clone()
+        editable[x_mask] = False
+        bb_node_fused.embedding[..., 0:1, -1:] = editable[..., None, None].long() # is node editable or not
+
+        bb_update = self.lrange_attention(
+            bb_node_fused,
+            edge_features,
+            edge_index
+        )
+        bb_invariants = bb_update.get_invariant_features(flat=True)
+        q_vec_update = self.frame_update(bb_invariants)
+
+        # rotate associated node features
+        quat_update = self._pure_vec_to_unit_quat(q_vec_update[..., :3])
+        rot_update = ru.quat_to_rot(quat_update)
+        for rot in self.frame_SO3_rotation:
+            rot.set_wigner(rot_update)
+        node_features_updated = node_features.clone()
+        node_features_updated._rotate(self.frame_SO3_rotation, self.node_lmax_list, self.node_lmax_list)
+
+        # update rigids
+        rots, trans = _extract_rots_trans(rigids)
+        rots_updated = torch.einsum("...ij,...jk->...ik", rot_update, rots)
+        trans_updated = trans + q_vec_update[..., 3:]
+        rigids_updated = _assemble_rigid(rots_updated, trans_updated)
+
+        # apply noising mask
+        # True = noise, False = fixed
+        rigids_updated = mask_rigids(rigids, rigids_updated, noising_mask)
+        node_features_updated.embedding[~noising_mask] = node_features.embedding[~noising_mask]
+
+        return rigids_updated, node_features_updated
+
+    def _pure_vec_to_unit_quat(self, pure_vec):
+        ones = torch.ones(list(pure_vec.shape[:-1]) + [1], device=pure_vec.device)
+        unnormed_quat = torch.cat([ones, pure_vec], dim=-1)
+        norm = torch.linalg.vector_norm(unnormed_quat, dim=-1, keepdims=True)
+        return unnormed_quat / norm
+
+
+class LatentUpdate(nn.Module):
+    def __init__(self,
+                 node_lmax_list,
+                 edge_channels_list,
+                 mappingReduced_nodes,
+                 node_SO3_rotation,
+                 node_SO3_grid,
+                 frame_SO3_rotation,
+                 num_heads=8,
+                 h_channels=32,
+                 frame_channels=3,
+                 k=30):
+        super().__init__()
+
+        self.node_lmax_list = node_lmax_list
+        self.h_channels = h_channels
+        self.node_SO3_rotation = node_SO3_rotation
+        self.frame_channels = frame_channels
+        self.frame_SO3_rotation = frame_SO3_rotation
+
+        self.local_attention = TransBlockV2(
+            sphere_channels=h_channels + frame_channels,
+            attn_hidden_channels=h_channels,
+            num_heads=num_heads,
+            attn_alpha_channels=h_channels // 2,
+            attn_value_channels=h_channels // 4,
+            ffn_hidden_channels=h_channels,
+            output_channels=h_channels,
+            lmax_list=node_lmax_list,
+            mmax_list=node_lmax_list,
+            SO3_rotation=node_SO3_rotation,
+            SO3_grid=node_SO3_grid,
+            edge_channels_list=edge_channels_list,
+            mappingReduced=mappingReduced_nodes
+        )
+        self.k = k
+
+    def forward(self,
+                rigids: ru.Rigid,
+                node_features: SO3_Embedding,
+                batch: torch.Tensor,
+                x_mask: torch.Tensor,
+                noising_mask: torch.Tensor):
+        num_nodes = noising_mask.shape[0]
+
+        # compute local knn graph
+        X_ca = rigids.get_trans()
+        edge_index = knn_graph(X_ca, self.k, batch)
+        # update rotation matrices
+        edge_dist_vec = X_ca[edge_index[0]] - X_ca[edge_index[1]]
+        edge_dist = torch.linalg.vector_norm(edge_dist_vec, dim=-1)
+        # hacky way to filter for bad edges
+        # TODO: use x_mask
+        edge_select = edge_dist.isfinite() & (edge_dist > 1e-6)  # mostly arbitrary cutoff
+        edge_index = edge_index[:, edge_select]
+        edge_dist_vec = edge_dist_vec[edge_select]
+        edge_dist = edge_dist[edge_select]
+
+        edge_rot_mat = init_edge_rot_mat(edge_dist_vec)
+        for rot in self.node_SO3_rotation:
+            rot.set_wigner(edge_rot_mat)
+
+        edge_dist_rbf = _rbf(edge_dist, device=edge_dist.device)  # edge_channels_list
+        edge_dist_rel_pos = _positional_embeddings(edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
+        edge_features = torch.cat([edge_dist_rbf, edge_dist_rel_pos], dim=-1)
+
+        # update latent sidechains
+        # we can treat the rotation matrix as the three basis vectors of the frame
+        rigid_basis_vectors = rigids.get_rots().get_rot_mats()
+        bb_node_fused = SO3_Embedding(
+            num_nodes,
+            self.node_lmax_list,
+            num_channels=self.h_channels + self.frame_channels,
+            device = node_features.device,
+            dtype=node_features.dtype
+        )
+        bb_node_fused.embedding[..., :self.h_channels] = node_features.embedding
+        bb_node_fused.embedding[..., 1:4, -self.frame_channels:] = rigid_basis_vectors.transpose(-1, -2)
+
+        editable = noising_mask.clone()
+        editable[x_mask] = False
+        bb_node_fused.embedding[..., 0:1, -1:] = editable[..., None, None].long() # is node editable or not
+
+        update_node_features = self.local_attention(
+            bb_node_fused,
+            edge_features,
+            edge_index
+        )
+        new_node_features = node_features.clone()
+        new_node_features.embedding[noising_mask] = update_node_features.embedding[noising_mask]
+        return new_node_features
+
+
+class LatentDenoisingLayer(nn.Module):
+    """ Denoising layer on sidechain densities """
+    def __init__(self,
+                 node_lmax_list,
+                 edge_channels_list,
+                 mappingReduced_nodes,
+                 node_SO3_rotation,
+                 node_SO3_grid,
+                 frame_SO3_rotation,
+                 num_heads=8,
+                 h_channels=32,
+                 frame_channels=3,
+                 knn_k=30,
+                 lrange_k=10,
+                 ):
+        """
+        Args
+        ----
+        """
+        super().__init__()
+        self.node_lmax_list = node_lmax_list
+
+        self.mappingReduced_nodes = mappingReduced_nodes
+        self.node_SO3_rotation = node_SO3_rotation
+        self.node_SO3_grid = node_SO3_grid
+
+        self.frame_update = FrameUpdate(
+            node_lmax_list=node_lmax_list,
+            edge_channels_list=edge_channels_list,
+            mappingReduced_nodes=mappingReduced_nodes,
+            node_SO3_rotation=node_SO3_rotation,
+            node_SO3_grid=node_SO3_grid,
+            frame_SO3_rotation=frame_SO3_rotation,
+            num_heads=num_heads,
+            h_channels=h_channels,
+            frame_channels=frame_channels,
+            knn_k=knn_k,
+            lrange_k=lrange_k
+        )
+
+        self.latent_update = LatentUpdate(
+            node_lmax_list=node_lmax_list,
+            edge_channels_list=edge_channels_list,
+            mappingReduced_nodes=mappingReduced_nodes,
+            node_SO3_rotation=node_SO3_rotation,
+            node_SO3_grid=node_SO3_grid,
+            frame_SO3_rotation=frame_SO3_rotation,
+            num_heads=num_heads,
+            h_channels=h_channels,
+            frame_channels=frame_channels,
+            k=knn_k
         )
 
         # if bb_lmax_list != node_lmax_list:
@@ -127,9 +340,8 @@ class LatentDenoisingLayer(nn.Module):
         #         super_SO3_grid=None,
         #     )
 
-        self.k = k
         self.h_channels = h_channels
-        self.bb_channels = bb_channels
+        self.bb_channels = frame_channels
 
     def forward(
             self,
@@ -137,89 +349,27 @@ class LatentDenoisingLayer(nn.Module):
             data,
             intermediates
     ):
-        # compute which nodes are being noised and which aren't
-        num_nodes = node_features.length
-        noised_residx = intermediates['noised_residx']
-        residx_select = torch.arange(num_nodes).to(node_features.device)
-        residx_select = (residx_select[:, None] == noised_residx[None, :]).any(dim=-1)
-        one_hot_residx_select = residx_select.float()
-
-        # compute graph with knn + inv cubic edges
-        X_ca = intermediates['denoised_x']
+        rigids = intermediates['denoised_frames']
+        noising_mask = intermediates['noising_mask']
         x_mask = data['x_mask']
-        edge_index = sample_inv_cubic_edges(X_ca, x_mask, data.batch)
-        edge_dist_vec = X_ca[edge_index[0]] - X_ca[edge_index[1]]
-        edge_dist = torch.linalg.vector_norm(edge_dist_vec, dim=-1)
-        # update rotation matrices
-        edge_rot_mat = init_edge_rot_mat(edge_dist_vec)
-        for rot in self.node_SO3_rotation:
-            rot.set_wigner(edge_rot_mat)
+        batch = data.batch
 
-        # update backbone
-        bb_node_fused = SO3_Embedding(
-            num_nodes,
-            self.node_lmax_list,
-            num_channels = self.h_channels + self.bb_channels,
-            device = node_features.device,
-            dtype=node_features.dtype
+        new_rigids, new_node_features = self.frame_update(
+            rigids,
+            node_features,
+            batch,
+            x_mask,
+            noising_mask,
         )
-        bb_node_fused.embedding[..., :self.h_channels] = node_features.embedding
-        bb_node_fused.embedding[..., 1:4, -self.bb_channels:] = X_ca.unsqueeze(-1)
-        bb_node_fused.embedding[..., 0:1, -self.bb_channels:] = one_hot_residx_select[:, None, None] # is node editable or not
-        edge_dist_rbf = _rbf(edge_dist, device=edge_dist.device)  # edge_channels_list
-        edge_dist_rel_pos = _positional_embeddings(edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
-        edge_features = torch.cat([edge_dist_rbf, edge_dist_rel_pos], dim=-1)
-
-        update_X_ca = self.lrange_attention(
-            bb_node_fused,
-            edge_features,
-            edge_index
+        new_node_features = self.latent_update(
+            rigids,
+            node_features,
+            batch,
+            x_mask,
+            noising_mask,
         )
-        update_X_ca = update_X_ca.embedding[..., 1:4, :].squeeze(-1)
-        new_X_ca = X_ca.clone()
-        new_X_ca[noised_residx] = update_X_ca[noised_residx]
 
-        # compute local knn graph
-        edge_index = knn_graph(new_X_ca, self.k, data.batch)
-        # update rotation matrices
-        edge_dist_vec = new_X_ca[edge_index[0]] - new_X_ca[edge_index[1]]
-        edge_dist = torch.linalg.vector_norm(edge_dist_vec, dim=-1)
-        # hacky way to filter for bad edges
-        # TODO: use x_mask
-        edge_select = edge_dist.isfinite() & (edge_dist > 1e-6)  # mostly arbitrary cutoff
-        edge_index = edge_index[:, edge_select]
-        edge_dist_vec = edge_dist_vec[edge_select]
-        edge_dist = edge_dist[edge_select]
-
-        edge_rot_mat = init_edge_rot_mat(edge_dist_vec)
-        for rot in self.node_SO3_rotation:
-            rot.set_wigner(edge_rot_mat)
-
-        # update latent sidechains
-        bb_node_fused = SO3_Embedding(
-            num_nodes,
-            self.node_lmax_list,
-            num_channels = self.h_channels + self.bb_channels,
-            device = node_features.device,
-            dtype=node_features.dtype
-        )
-        bb_node_fused.embedding[..., :self.h_channels] = node_features.embedding
-        bb_node_fused.embedding[..., 1:4, -self.bb_channels:] = new_X_ca.unsqueeze(-1)
-        bb_node_fused.embedding[..., 0:1, -self.bb_channels:] = one_hot_residx_select[:, None, None] # is node editable or not
-
-        edge_dist_rbf = _rbf(edge_dist, device=edge_dist.device)  # edge_channels_list
-        edge_dist_rel_pos = _positional_embeddings(edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
-        edge_features = torch.cat([edge_dist_rbf, edge_dist_rel_pos], dim=-1)
-
-        update_node_features = self.local_attention(
-            bb_node_fused,
-            edge_features,
-            edge_index
-        )
-        new_node_features = node_features.clone()
-        new_node_features.embedding[noised_residx] = update_node_features.embedding[noised_residx]
-
-        return new_X_ca, new_node_features
+        return new_rigids, new_node_features
 
 
 # adapted from https://github.com/jmclong/random-fourier-features-pytorch/blob/main/rff/layers.py
@@ -270,6 +420,11 @@ class LatentDenoiser(nn.Module):
             h_channels + h_time, h_channels
         )
 
+        self.frame_SO3_rotation = nn.ModuleList()
+        for lmax in node_lmax_list:
+            self.frame_SO3_rotation.append(
+                SO3_Rotation(lmax)
+            )
 
         self.denoiser = nn.ModuleList([
             LatentDenoisingLayer(
@@ -278,11 +433,16 @@ class LatentDenoiser(nn.Module):
                 mappingReduced_nodes=mappingReduced_nodes,
                 node_SO3_rotation=self.node_SO3_rotation_list,
                 node_SO3_grid=self.node_SO3_grid_list,
+                frame_SO3_rotation=self.frame_SO3_rotation,
                 num_heads=num_heads,
                 h_channels=h_channels)
             for _ in range(n_layers)
         ])
 
+    def _translate_rigids(self, rigids, shift):
+        rots = rigids.get_rots()
+        trans = rigids.get_trans()
+        return ru.Rigid(rots, trans + shift)
 
     def forward(self, data, intermediates):
         ## prep features
@@ -313,7 +473,7 @@ class LatentDenoiser(nn.Module):
         for i in range(data.batch.max().item() + 1):
             select = (data.batch == i)
             num_nodes = select.long().sum()
-            subset_x_ca = intermediates['noised_x']
+            subset_x_ca = intermediates['noised_frames'].get_trans()[select]
             subset_mean = subset_x_ca.mean(dim=0)
             center.append(subset_mean[None, :].expand(num_nodes, -1))
         center = torch.cat(center, dim=0)
@@ -321,13 +481,13 @@ class LatentDenoiser(nn.Module):
 
         ## denoising
         f_V = node_features
-        intermediates['denoised_x'] = intermediates['noised_x'] - center
+        intermediates['denoised_frames'] = self._translate_rigids(intermediates['noised_frames'], -center)
 
         for layer in self.denoiser:
             f_ca, f_V = layer(f_V, data, intermediates)
-            intermediates['denoised_x'] = f_ca
+            intermediates['denoised_frames'] = f_ca
 
-        intermediates['denoised_x'] = intermediates['denoised_x'] + center
+        intermediates['denoised_frames'] = self._translate_rigids(intermediates['denoised_frames'], center)
 
         intermediates['denoised_latent_sidechain'] = f_V
         return intermediates

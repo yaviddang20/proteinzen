@@ -34,12 +34,12 @@ class SO3Diffuser(nn.Module):
         self.igso3 = igso3.IGSO3(min_t=self.min_sigma**2, max_t=self.max_sigma**2,
                 L=2000, num_ts=self.num_sigma, num_omegas=num_omega)
 
-        _score_scaling = np.sqrt(np.abs(
-            np.sum(
-                self.igso3._d_logf_d_omega**2 * self.igso3._pdf_angle, axis=-1) / np.sum(
-                    self.igso3._pdf_angle, axis=-1)
+        _score_scaling = torch.sqrt(torch.abs(
+            torch.sum(
+                self.igso3._d_logf_d_omega**2 * self.igso3._pdf_angle, dim=-1) / torch.sum(
+                    self.igso3._pdf_angle, dim=-1)
         )) / np.sqrt(3)
-        self._score_scaling = torch.as_tensor(_score_scaling)
+        self._score_scaling = _score_scaling#torch.as_tensor(_score_scaling)
 
     @property
     def discrete_sigma(self):
@@ -99,7 +99,8 @@ class SO3Diffuser(nn.Module):
 
     def score_scaling(self, t: torch.Tensor):
         """Calculates scaling used for scores during trianing."""
-        return self._score_scaling[self.igso3.t_idx(t)]
+        self_device = self._score_scaling.device
+        return self._score_scaling[self.igso3.t_idx(t).to(self_device)].to(t.device)
 
     def forward_marginal(self, R_0: torch.Tensor, t: torch.Tensor):
         """Samples from the forward diffusion process at time index t.

@@ -125,7 +125,7 @@ class IGSO3:
 
     def t_idx(self, t: torch.Tensor):
         """Calculates the index for discretized t during IGSO(3) initialization."""
-        return torch.bucketize(t, self._discrete_ts) - 1
+        return torch.bucketize(t, self._discrete_ts.to(t.device)) - 1
 
     def argmin_omega_for_d_logf_d_omega(self, t):
         return self._argmin_omega_for_d_logf_d_omega[self.t_idx(t)]
@@ -149,8 +149,9 @@ class IGSO3:
         for _t in unique_t:
             select = (t == _t)
             n_samples = select.long().sum()
+            select = select.numpy(force=True)
             x = np.random.rand(n_samples)
-            angles = np.interp(x, self._cdf[self.t_idx(_t)], self._discrete_omegas)
+            angles = np.interp(x, self._cdf[self.t_idx(torch.tensor(_t))], self._discrete_omegas)
             out[select] = angles
 
         return out
@@ -170,8 +171,8 @@ class IGSO3:
         x = np.random.randn(n_samples, 3)
         x /= np.linalg.norm(x, axis=-1, keepdims=True)
         rot_vecs = x * self.sample_angle(t)[:, None]
-        rot_vecs = torch.tensor(rot_vecs)
-        return so3_utils.exp(so3_utils.hat(rot_vecs))
+        rot_vecs = torch.tensor(rot_vecs).float()
+        return so3_utils.exp(so3_utils.hat(rot_vecs)).to(t.device)
 
     def d_logf_d_omega(self, omega: torch.Tensor, t: torch.Tensor):
         omega = omega.numpy(force=True)
@@ -179,9 +180,9 @@ class IGSO3:
 
         out = np.zeros_like(omega)
         for _t in unique_t:
-            select = (t == _t)
+            select = (t == _t).numpy(force=True)
             subset_omega = omega[select]
-            diff = np.interp(subset_omega, self._discrete_omegas, self._d_logf_d_omega[self.t_idx(_t)])
+            diff = np.interp(subset_omega, self._discrete_omegas, self._d_logf_d_omega[self.t_idx(torch.tensor(_t))])
             out[select] = diff
         return torch.as_tensor(out, device=t.device)
 
@@ -207,4 +208,4 @@ class IGSO3:
         direction = torch.einsum('...jk,...kl->...jl',
                 R, so3_utils.log(R)/(omega[..., None, None] + eps))
 
-        return direction * torch.tensor(d_logf_d_omega[..., None, None], dtype=direction.dtype)
+        return direction * d_logf_d_omega[..., None, None]
