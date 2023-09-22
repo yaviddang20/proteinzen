@@ -143,8 +143,8 @@ class SO3Diffuser(nn.Module):
             [..., 3] rotation vector at next step.
         """
         # Convert to pytorch tensors
-        g_t = self.diffusion_coef(t[:, None])
-        perturb = ( g_t ** 2 ) * dt * score_t + noise_scale * g_t * np.sqrt(dt) * so3_utils.tangent_gaussian(R_t)
+        g_t = self.diffusion_coef(t[:, None, None])
+        perturb = ( g_t ** 2 ) * dt * score_t + noise_scale * g_t * np.sqrt(np.abs(dt)) * so3_utils.tangent_gaussian(R_t)
         if mask is not None: perturb *= mask[..., None, None]
         R_t_1 = so3_utils.expmap(R_t, perturb)
         return R_t_1

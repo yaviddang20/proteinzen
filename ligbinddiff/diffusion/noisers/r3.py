@@ -17,7 +17,7 @@ class FixedBetaSchedule:
         self.max_beta = max_beta
 
     def b_t(self, t):
-        if np.any(t < 0) or np.any(t > 1):
+        if torch.any(t < 0) or torch.any(t > 1):
             raise ValueError(f'Invalid t={t}')
         return self.min_beta + t*(self.max_beta - self.min_beta)
 
@@ -34,7 +34,7 @@ class LearnedBetaSchedule(nn.Module):
         self.max_beta = max_beta
 
     def b_t(self, t):
-        if np.any(t < 0) or np.any(t > 1):
+        if torch.any(t < 0) or torch.any(t > 1):
             raise ValueError(f'Invalid t={t}')
         return self._schedule.beta(t)
 
@@ -149,13 +149,13 @@ class R3Diffuser(nn.Module):
         t = t[:, None]
         g_t = self.diffusion_coef(t)
         f_t = self.drift_coef(x_t, t)
-        z = noise_scale * torch.randn(size=score_t.shape)
-        perturb = (f_t - g_t**2 * score_t) * dt + g_t * np.sqrt(dt) * z
+        z = noise_scale * torch.randn(size=score_t.shape, device=score_t.device)
+        perturb = (f_t - g_t**2 * score_t) * dt + g_t * np.sqrt(np.abs(dt)) * z
 
         if mask is not None:
             perturb *= mask[..., None]
         else:
-            mask = torch.ones(x_t.shape[:-1])
+            mask = torch.ones(x_t.shape[:-1], device=x_t.device)
         x_t_1 = x_t - perturb
         if center:
             com = torch.sum(x_t_1, dim=-2) / torch.sum(mask, dim=-1)[..., None]
@@ -173,5 +173,3 @@ class R3Diffuser(nn.Module):
     def score(self, x_t, x_0, t):
         t = t[:, None]
         return -(x_t - torch.exp(-1/2*self.marginal_b_t(t)) * x_0) / self.conditional_var(t)
-
-RnDiffuser = R3Diffuser  # this should work for any R^n?

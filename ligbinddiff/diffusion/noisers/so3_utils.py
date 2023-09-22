@@ -68,7 +68,7 @@ def log(R): return hat(Log(R))
 
 
 ### New Log map adapted from geomstats
-def rotation_vector_from_matrix(rot_mat):
+def rotation_vector_from_matrix(rot_mat, eps=1e-8):
     r"""Convert rotation matrix (in 3D) to rotation vector (axis-angle).
 
     # Adapted from geomstats
@@ -117,11 +117,14 @@ def rotation_vector_from_matrix(rot_mat):
     rot_vec_not_pi = rot_vec_not_pi * numerator[..., None] / denominator[..., None]
 
     vector_outer = 0.5 * (torch.eye(3, dtype=rot_mat.dtype).to(rot_mat.device) + rot_mat)
-    vector_outer = vector_outer + (torch.maximum(torch.tensor(0.0,
-        dtype=vector_outer.dtype).to(rot_mat.device), vector_outer) - vector_outer)*torch.eye(3,
-                dtype=vector_outer.dtype).to(rot_mat.device)
+    vector_outer = vector_outer + (
+        torch.maximum(
+            torch.tensor(0.0, dtype=vector_outer.dtype).to(rot_mat.device),
+            vector_outer
+        ) - vector_outer
+    ) * torch.eye(3, dtype=vector_outer.dtype).to(rot_mat.device)
     squared_diag_comp = torch.diagonal(vector_outer, dim1=-2, dim2=-1)
-    diag_comp = torch.sqrt(squared_diag_comp)
+    diag_comp = torch.sqrt(squared_diag_comp + eps)
     norm_line = torch.linalg.norm(vector_outer, dim=-1)
     max_line_index = torch.argmax(norm_line, dim=-1)
     selected_line = vector_outer[range(n_rot_mats), max_line_index]
@@ -197,7 +200,7 @@ def expmap(R0, tangent):
 
 # Normal sample in tangent space at R0
 def tangent_gaussian(R0): return torch.einsum('...ij,...jk->...ik', R0,
-        hat(torch.randn(*R0.shape[:-2], 3, dtype=R0.dtype)))
+        hat(torch.randn(*R0.shape[:-2], 3, dtype=R0.dtype, device=R0.device)))
 
 # sample from uniform distribution on SO(3)
 def sample_uniform(N, M=1000):

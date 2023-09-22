@@ -143,7 +143,7 @@ class IGSO3:
 
         Returns: [n_samples] angles of rotation.
         """
-        unique_t = torch.unique(t).tolist()
+        unique_t = set(t.tolist())
 
         out = np.zeros_like(t.numpy(force=True))
         for _t in unique_t:
@@ -176,7 +176,7 @@ class IGSO3:
 
     def d_logf_d_omega(self, omega: torch.Tensor, t: torch.Tensor):
         omega = omega.numpy(force=True)
-        unique_t = torch.unique(t).tolist()
+        unique_t = set(t.tolist())
 
         out = np.zeros_like(omega)
         for _t in unique_t:

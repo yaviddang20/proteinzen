@@ -2,17 +2,16 @@
 
 
 import torch
-from se3_transformer.model.fiber import Fiber
 
 
 def gen_nmax_fiber(n_max):
-    return Fiber({
+    return {
         l: n_max - l + 1
         for l in range(n_max+1)
-    })
+    }
 
 
-def gen_compact_nmax_fiber(n_max):
+def gen_compact_nmax_fiber_struct(n_max):
     fiber_dict = {l: 0 for l in range(n_max+1)}
     n_levels = {l: [] for l in range(n_max+1)}
     for l in fiber_dict.keys():
@@ -21,14 +20,14 @@ def gen_compact_nmax_fiber(n_max):
             if (n-l) % 2 == 0:
                 fiber_dict[l] = fiber_dict[l] + 1
                 n_levels[l].append(n)
-    return Fiber(fiber_dict)
+    return fiber_dict
 
 
-def gen_full_n_channel_fiber(l_max, n_channels):
-    return Fiber({
+def gen_full_n_channel_fiber_struct(l_max, n_channels):
+    return {
         l: n_channels
         for l in range(l_max + 1)
-    })
+    }
 
 
 def nl_to_fiber(Z):
@@ -109,7 +108,7 @@ def rand_fiber_density(num_nodes, n_max, device='cpu'):
 
 
 def rand_compact_fiber_density(num_nodes, n_max, num_channels=1, device='cpu'):
-    fiber = gen_compact_nmax_fiber(n_max)
+    fiber = gen_compact_nmax_fiber_struct(n_max)
     density = {}
     for l, num_vecs in fiber.items():
         m_tot = 2*l+1

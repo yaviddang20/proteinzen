@@ -14,8 +14,11 @@ from ligbinddiff.model.modules.equiformer_v2.so3 import SO3_Embedding
 
 from ligbinddiff.model.seq_des.latent.equiformer_v2.denoiser import LatentDenoiser
 from ligbinddiff.model.seq_des.latent.equiformer_v2.discriminator import Atom91Discriminator
-from ligbinddiff.model.seq_des.latent.equiformer_v2.autoencoder import LatentEncoder, LatentDecoder
+from ligbinddiff.model.seq_des.latent.equiformer_v2.autoencoder import LatentEncoder, LatentEncoder2, LatentDecoder, LatentDecoder2
 from ligbinddiff.model.modules.equiformer_v2.so3 import CoefficientMappingModule, SO3_Embedding, SO3_Rotation, SO3_Grid, SO3_LinearV2
+
+from ligbinddiff.model.seq_des.frames.autoencoder import AtomicSidechainEncoder, SidechainDecoder
+from ligbinddiff.model.seq_des.frames.denoiser import LatentSidechainDenoiser
 
 
 # TODO: brought this in to avoid importing dgl in the utils, do this in a less hacky way
@@ -341,7 +344,7 @@ class LatentDiffuser(Diffuser):
                  h_time=64,
                  scalar_h_dim=128,
                  bb_lmax_list=[1],
-                 bb_channels=6,
+                 bb_channels=7,
                  atom_lmax_list=[1],
                  atom_channels=91,
                  num_heads=8,
@@ -353,6 +356,7 @@ class LatentDiffuser(Diffuser):
         bb_super_lmax_list = [max(l1, l2) for l1, l2 in zip(bb_lmax_list, node_lmax_list)]
         atom_super_SO3_rotation_list = nn.ModuleList()
         bb_super_SO3_rotation_list = nn.ModuleList()
+        atom_SO3_rotation_list = nn.ModuleList()
         node_SO3_rotation_list = nn.ModuleList()
         for lmax in atom_super_lmax_list:
             atom_super_SO3_rotation_list.append(
@@ -362,6 +366,10 @@ class LatentDiffuser(Diffuser):
             bb_super_SO3_rotation_list.append(
                 SO3_Rotation(lmax)
             )
+        for lmax in atom_lmax_list:
+            atom_SO3_rotation_list.append(
+                SO3_Rotation(lmax)
+            )
         for lmax in node_lmax_list:
             node_SO3_rotation_list.append(
                 SO3_Rotation(lmax)
@@ -369,6 +377,7 @@ class LatentDiffuser(Diffuser):
 
         atom_super_SO3_grid_list = nn.ModuleList()
         bb_super_SO3_grid_list = nn.ModuleList()
+        atom_SO3_grid_list = nn.ModuleList()
         node_SO3_grid_list = nn.ModuleList()
         for l in range(max(atom_super_lmax_list) + 1):
             SO3_m_grid = nn.ModuleList()
@@ -384,7 +393,13 @@ class LatentDiffuser(Diffuser):
                     SO3_Grid(l, m)
                 )
             bb_super_SO3_grid_list.append(SO3_m_grid)
-        bb_super_SO3_grid_list = nn.ModuleList()
+        for l in range(max(atom_lmax_list) + 1):
+            SO3_m_grid = nn.ModuleList()
+            for m in range(l + 1):
+                SO3_m_grid.append(
+                    SO3_Grid(l, m)
+                )
+            atom_SO3_grid_list.append(SO3_m_grid)
         for l in range(max(node_lmax_list) + 1):
             SO3_m_grid = nn.ModuleList()
             for m in range(l + 1):
@@ -395,9 +410,10 @@ class LatentDiffuser(Diffuser):
 
         mappingReduced_super_atoms = CoefficientMappingModule(atom_super_lmax_list, atom_super_lmax_list)
         mappingReduced_super_bb = CoefficientMappingModule(bb_super_lmax_list, bb_super_lmax_list)
+        mappingReduced_atoms = CoefficientMappingModule(atom_lmax_list, atom_lmax_list)
         mappingReduced_nodes = CoefficientMappingModule(node_lmax_list, node_lmax_list)
 
-        denoiser = LatentDenoiser(
+        denoiser = LatentSidechainDenoiser(
             node_lmax_list=node_lmax_list,
             edge_channels_list=edge_channels_list,
             mappingReduced_nodes=mappingReduced_nodes,
@@ -419,27 +435,25 @@ class LatentDiffuser(Diffuser):
                          x_0_key='latent',
                          x_0_pred_key='denoised_latent',
                          x_t_key='noised_latent')
-        self.encoder = LatentEncoder(
+        self.encoder = AtomicSidechainEncoder(
             node_lmax_list=node_lmax_list,
             edge_channels_list=edge_channels_list,
             mappingReduced_nodes=mappingReduced_nodes,
-            mappingReduced_super_bb=mappingReduced_super_bb,
+            mappingReduced_atoms=mappingReduced_atoms,
             mappingReduced_super_atoms=mappingReduced_super_atoms,
             node_SO3_rotation=node_SO3_rotation_list,
             node_SO3_grid=node_SO3_grid_list,
-            bb_super_SO3_rotation=bb_super_SO3_rotation_list,
-            bb_super_SO3_grid=bb_super_SO3_grid_list,
+            atom_SO3_rotation=atom_super_SO3_rotation_list,
+            atom_SO3_grid=atom_super_SO3_grid_list,
             atom_super_SO3_rotation=atom_super_SO3_rotation_list,
             atom_super_SO3_grid=atom_super_SO3_grid_list,
-            bb_lmax_list=bb_lmax_list,
-            bb_channels=bb_channels,
             atom_lmax_list=atom_lmax_list,
             atom_channels=atom_channels,
             num_heads=num_heads,
             h_channels=h_channels,
             num_layers=num_layers
         )
-        self.decoder = LatentDecoder(
+        self.decoder = SidechainDecoder(
             node_lmax_list=node_lmax_list,
             edge_channels_list=edge_channels_list,
             mappingReduced_nodes=mappingReduced_nodes,
@@ -464,6 +478,7 @@ class LatentDiffuser(Diffuser):
         self.latent_n_channels = h_channels
         self.mappingReduced_super_atoms = mappingReduced_super_atoms
         self.mappingReduced_super_bb = mappingReduced_super_bb
+        self.mappingReduced_atoms = mappingReduced_super_atoms
         self.mappingReduced_nodes = mappingReduced_nodes
         self._apply_so3 = gen_so3_unop
 

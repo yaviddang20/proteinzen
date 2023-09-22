@@ -2,7 +2,7 @@
 
 Parts adapted from https://github.com/StatPhysBio/protein_holography/blob/main/protein_holography/hologram/hologram.py """
 
-import ligbinddiff.utils.o3 as o3
+from e3nn import o3
 import numpy as np
 import torch
 import scipy.special

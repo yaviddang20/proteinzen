@@ -104,8 +104,8 @@ class SE3Diffuser(torch.nn.Module):
         return diff_mask.long() * x_diff + (1 - diff_mask.long()) * x_fixed
 
     def score(self,
-              rigid_0: ru.Rigid,
               rigid_t: ru.Rigid,
+              rigid_0: ru.Rigid,
               t: torch.Tensor):
         R_0, trans_0 = _extract_rots_trans(rigid_0)
         R_t, trans_t = _extract_rots_trans(rigid_t)
@@ -195,11 +195,16 @@ class SE3Diffuser(torch.nn.Module):
         rot_ref = self._so3_diffuser.sample_ref(n_samples=n_samples)
         trans_ref = self._r3_diffuser.sample_ref(n_samples=n_samples)
 
+
         if diffuse_mask is not None:
+            rot_ref = rot_ref.to(diffuse_mask.device)
+            trans_ref = trans_ref.to(diffuse_mask.device)
+
             rot_ref = self._apply_mask(
                 rot_ref, rot_impute, diffuse_mask[..., None, None])
             trans_ref = self._apply_mask(
                 trans_ref, trans_impute, diffuse_mask[..., None])
         return {
-            'rigits_t': _assemble_rigid(rot_ref, trans_ref)
+            'rigids_t': _assemble_rigid(rot_ref, trans_ref),
+            'noised_frames': _assemble_rigid(rot_ref, trans_ref)
         }

@@ -2,6 +2,8 @@
 
 import torch
 
+from ligbinddiff.utils.atom_reps import backbone_frame_atoms
+
 
 def _normalize(x, dim=-1):
     return x / torch.linalg.vector_norm(x, dim=dim, keepdim=True)
@@ -53,3 +55,14 @@ def update_frame_with_quaternion(frames, quaternion, translation):
     new_R = torch.bmm(R_update, R)
     new_t = t + translation
     return (new_R, new_t)
+
+
+def backbone_frames_to_bb_atoms(bb_frames):
+    num_nodes = bb_frames.shape[0]
+    backbone_ref = torch.as_tensor(backbone_frame_atoms, device=bb_frames.device, dtype=torch.float)
+    backbone_ref = backbone_ref[None, ...].expand(num_nodes, -1, -1)
+    bb_N = bb_frames.apply(backbone_ref[:, 0])
+    bb_CA = bb_frames.apply(backbone_ref[:, 1])
+    bb_C = bb_frames.apply(backbone_ref[:, 2])
+    bb = torch.stack([bb_N, bb_CA, bb_C], dim=-2)
+    return bb

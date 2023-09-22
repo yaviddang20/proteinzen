@@ -5,55 +5,30 @@ import logging
 import os
 from functools import partial
 
-import dgl
 import numpy as np
 import torch
 from lightning import Fabric
 from hydra.utils import get_original_cwd
-from hydra_zen import make_config, make_custom_builds_fn, zen
 from torch import optim
 from torch.utils.data import DataLoader
 from torch.utils.data import SequentialSampler
 
-from se3_transformer.model.fiber import Fiber
 from ligbinddiff.data.datasets.dataset import ProteinGraphDataset
 from ligbinddiff.data.sampler import BatchSampler
 
 from ligbinddiff.data.datasets.cath import CATHDataset
-from ligbinddiff.diffusion.density_diff import LearnableVPDensityDiffuser, LinearDiscreteVPDensityDiffuser
-from ligbinddiff.model.seq_des.density.se3_transformer.se3_transformer import DensityDenoiser
-from ligbinddiff.runtime.training import cath_train_loop
-from ligbinddiff.runtime.inference import cath_inference_loop
+from ligbinddiff.runtime.training import cath_train_loop, inpaint_train_loop
+from ligbinddiff.runtime.inference import cath_inference_loop, inpaint_inference_loop
 
-from ligbinddiff.utils.fiber import gen_compact_nmax_fiber, gen_full_n_channel_fiber
+from ligbinddiff.utils.fiber import gen_compact_nmax_fiber_struct, gen_full_n_channel_fiber_struct
 
 # A logger for this file
 log = logging.getLogger(__name__)
 
-pbuilds = make_custom_builds_fn(zen_partial=True, populate_full_signature=True)
-ExperimentConfig = make_config(
-    job_id=-1,
-    n_max=5,
-    l_max=1,
-    n_h_channels=32,
-    dataset_init=pbuilds(ProteinGraphDataset),
-    denoiser_init=pbuilds(DensityDenoiser),
-    diffuser_init=pbuilds(LinearDiscreteVPDensityDiffuser),
-    optimizer_init=pbuilds(optim.Adam),
-    batch_size=500,
-    num_workers=4,
-    num_epoch=100,
-    num_warmup_epoch=0,
-    comment="",
-    training_curve_path="training_curve.json",
-    checkpoint_prefix="diffuser",
-    resume_path=None
-)
 
 
 def build_model_and_optim(
         fabric,
-        denoiser_init,
         diffuser_init,
         optimizer_init,
         l_max,
@@ -63,17 +38,8 @@ def build_model_and_optim(
         resume_path,
         checkpoint_prefix
     ):
-    # pre-set based on input features set
-    fiber_in = Fiber({
-        0: 6,
-        1: 3
-    })
-    fiber_edge = Fiber({
-        0: 32,
-        1: 1
-    })
-    fiber_node = gen_full_n_channel_fiber(l_max, n_h_channels)
-    fiber_density = gen_compact_nmax_fiber(n_max) * n_input_channels
+    fiber_node = gen_full_n_channel_fiber_struct(l_max, n_h_channels)
+    fiber_density = gen_compact_nmax_fiber_struct(n_max) * n_input_channels
 
     denoiser = denoiser_init(
         fiber_in=fiber_in,
@@ -222,16 +188,63 @@ def main(denoiser_init,
             torch.save(state_dict, f"{checkpoint_prefix}_best.pt")
 
 
-task_function = zen(main)
 
 if __name__ == '__main__':
-    from hydra_zen import ZenStore
+    from hydra_zen import make_config, store, builds, make_custom_builds_fn, just, zen
+    from ligbinddiff.diffusion.diffusers.all_atom import LatentR3InpaintingDiffuser, LatentFrameInpaintingDiffuser
+    from ligbinddiff.diffusion.diffusers.seq_des import LatentDiffuser as LatentSeqDesDiffuser
+    from ligbinddiff.diffusion.noisers.se3 import SE3Diffuser
 
-    store = ZenStore(deferred_hydra_store=False)
-    store(ExperimentConfig, name="diffuser_train")
+    pbuilds = make_custom_builds_fn(zen_partial=True, populate_full_signature=True)
+
+    task_function = zen(main)
+
+    model_store = store(group="diffuser")
+    model_store(LatentSeqDesDiffuser, name="seq_des_latent")
+    model_store(LatentR3InpaintingDiffuser, name="inpaint_r3",
+                node_lmax_list=[1],
+                edge_channels_list=[32, 32, 32],
+    )
+    model_store(LatentFrameInpaintingDiffuser, name="inpaint_frame",
+                node_lmax_list=[1],
+                edge_channels_list=[32, 32, 32],
+    )
+    diffuser_store = store(group="diffuser/scheduler")
+    diffuser_store()
+
+
+    dataset_store = store(group="dataset")
+    dataset_store(CATHDataset, name="cath")
+
+    dataloader_store = store(group="dataloader")
+    dataloader_store(pbuilds(ProteinGraphDataset), name="cath")
+
+    train_loop_store = store(group="train_loop")
+    train_loop_store(just(cath_train_loop), name="cath_seq_des")
+    train_loop_store(just(inpaint_train_loop), name="cath_inpaint")
+
+    val_loop_store = store(group="val_loop")
+    val_loop_store(just(cath_inference_loop), name="cath_seq_des")
+    val_loop_store(just(inpaint_inference_loop), name="cath_inpaint")
+
+    store(
+        main,
+        hydra_defaults=[
+            ## defaults for selecting the model, dataset, and task
+            {"diffuser": "inpaint_r3"},
+            {"dataset": "cath"},
+            {"train_loop": "cath_inpaint"},
+            {"val_loop": "cath_inpaint"},
+            ## defaults for overall training script stuff
+            {
+                "num_workers": 4,
+                "checkpoint_path": ".",
+            }
+        ]
+    )
 
     task_function.hydra_main(
-        config_name="diffuser_train",
+        config_name="main",
         version_base="1.1",
         config_path="."
     )

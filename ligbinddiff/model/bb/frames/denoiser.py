@@ -14,7 +14,6 @@ from ligbinddiff.model.modules.openfold import rigid_utils as ru
 from ligbinddiff.diffusion.noisers.se3 import _extract_rots_trans, _assemble_rigid
 
 from ligbinddiff.data.datasets.featurize.sidechain import _rbf, _positional_embeddings
-from .autoencoder import ProjectLayer
 
 from ligbinddiff.utils.frames import backbone_frames_to_bb_atoms
 
@@ -79,8 +78,6 @@ class FrameUpdate(nn.Module):
                  frame_SO3_rotation,
                  num_heads=8,
                  h_channels=32,
-                 rigid_h_channels=32,
-                 sidechain_h_channels=32,
                  frame_channels=3,
                  knn_k=30,
                  lrange_k=30):
@@ -88,20 +85,18 @@ class FrameUpdate(nn.Module):
 
         self.node_lmax_list = node_lmax_list
         self.h_channels = h_channels
-        self.rigid_h_channels = rigid_h_channels
-        self.sidechain_h_channels = sidechain_h_channels
         self.node_SO3_rotation = node_SO3_rotation
         self.frame_channels = frame_channels
         self.frame_SO3_rotation = frame_SO3_rotation
 
         self.lrange_attention = TransBlockV2(
-            sphere_channels=rigid_h_channels + sidechain_h_channels + frame_channels,
+            sphere_channels=h_channels + frame_channels,
             attn_hidden_channels=h_channels,
             num_heads=num_heads,
             attn_alpha_channels=h_channels // 2,
             attn_value_channels=h_channels // 4,
             ffn_hidden_channels=h_channels,
-            output_channels=rigid_h_channels,
+            output_channels=h_channels,
             lmax_list=node_lmax_list,
             mmax_list=node_lmax_list,
             SO3_rotation=node_SO3_rotation,
@@ -110,23 +105,24 @@ class FrameUpdate(nn.Module):
             mappingReduced=mappingReduced_nodes
         )
         self.frame_rot_update = nn.Sequential(
-            nn.Linear(rigid_h_channels, h_channels * 2),
+            nn.Linear(h_channels, h_channels * 2),
             nn.ReLU(),
-            nn.Linear(h_channels*2, 6),
+            nn.Linear(h_channels*2, h_channels),
+            nn.ReLU(),
+            nn.Linear(h_channels, 6)
+
         )
         self.frame_trans_update = SO3_LinearV2(
-            in_features=rigid_h_channels,
+            in_features=h_channels,
             out_features=1,
             lmax=max(node_lmax_list)
         )
         self.knn_k = knn_k
         self.lrange_k = lrange_k
 
-
     def forward(self,
                 rigids: ru.Rigid,
-                rigid_features: SO3_Embedding,
-                sidechain_features: SO3_Embedding,
+                node_features: SO3_Embedding,
                 batch: torch.Tensor,
                 x_mask: torch.Tensor,
                 noising_mask: torch.Tensor):
@@ -157,13 +153,13 @@ class FrameUpdate(nn.Module):
         bb_node_fused = SO3_Embedding(
             num_nodes,
             self.node_lmax_list,
-            num_channels=self.rigid_h_channels + self.sidechain_h_channels + self.frame_channels,
-            device=rigid_features.device,
-            dtype=rigid_features.dtype
+            num_channels=self.h_channels + self.frame_channels,
+            device = node_features.device,
+            dtype=node_features.dtype
         )
-        bb_node_fused.embedding[..., :self.rigid_h_channels] = rigid_features.embedding
-        bb_node_fused.embedding[..., self.rigid_h_channels:self.rigid_h_channels + self.sidechain_h_channels] = sidechain_features.embedding
+        bb_node_fused.embedding[..., :self.h_channels] = node_features.embedding
         bb_node_fused.embedding[..., 1:4, -self.frame_channels:] = frame_atoms.transpose(-1, -2)
+
         editable = noising_mask.clone()
         editable[x_mask] = False
         bb_node_fused.embedding[..., 0:1, -1:] = editable[..., None, None].long() # is node editable or not
@@ -176,25 +172,30 @@ class FrameUpdate(nn.Module):
         bb_invariants = bb_update.get_invariant_features(flat=True)
         q_vec_update = self.frame_rot_update(bb_invariants)
 
-        # compute rotation and translation
+        # rotate associated node features
         quat_update = self._pure_vec_to_unit_quat(q_vec_update[..., :3])
         rot_update = ru.quat_to_rot(quat_update)
+        # for rot in self.frame_SO3_rotation:
+        #     rot.set_wigner(rot_update)
+        node_features_updated = node_features.clone()
+        # node_features_updated._rotate(self.frame_SO3_rotation, self.node_lmax_list, self.node_lmax_list)
+
         trans_update = self.frame_trans_update(bb_update)
         trans_update = trans_update.embedding[:, 1:4].squeeze(-1)
 
         # update rigids
         rots, trans = _extract_rots_trans(rigids)
         rots_updated = torch.einsum("...ij,...jk->...ik", rots, rot_update)
+        # trans_updated = trans + torch.einsum("...ij,...j->...i", rots, q_vec_update[..., 3:])  # transform translation in local frame to global frame
         trans_updated = trans + trans_update
         rigids_updated = _assemble_rigid(rots_updated, trans_updated)
 
         # apply noising mask
         # True = noise, False = fixed
         rigids_updated = mask_rigids(rigids, rigids_updated, noising_mask)
-        rigid_features_updated = rigid_features.clone()
-        rigid_features_updated.embedding[~noising_mask] = bb_update.embedding[~noising_mask]
+        node_features_updated.embedding[~noising_mask] = bb_update.embedding[~noising_mask]
 
-        return rigids_updated, rigid_features_updated
+        return rigids_updated, bb_update
 
     def _pure_vec_to_unit_quat(self, pure_vec):
         ones = torch.ones(list(pure_vec.shape[:-1]) + [1], device=pure_vec.device)
@@ -213,28 +214,24 @@ class LatentUpdate(nn.Module):
                  frame_SO3_rotation,
                  num_heads=8,
                  h_channels=32,
-                 rigid_h_channels=32,
-                 sidechain_h_channels=32,
                  frame_channels=3,
                  k=30):
         super().__init__()
 
         self.node_lmax_list = node_lmax_list
         self.h_channels = h_channels
-        self.rigid_h_channels = rigid_h_channels
-        self.sidechain_h_channels = sidechain_h_channels
         self.node_SO3_rotation = node_SO3_rotation
         self.frame_channels = frame_channels
         self.frame_SO3_rotation = frame_SO3_rotation
 
         self.local_attention = TransBlockV2(
-            sphere_channels=rigid_h_channels + sidechain_h_channels + frame_channels,
+            sphere_channels=h_channels + frame_channels,
             attn_hidden_channels=h_channels,
             num_heads=num_heads,
             attn_alpha_channels=h_channels // 2,
             attn_value_channels=h_channels // 4,
             ffn_hidden_channels=h_channels,
-            output_channels=sidechain_h_channels,
+            output_channels=h_channels,
             lmax_list=node_lmax_list,
             mmax_list=node_lmax_list,
             SO3_rotation=node_SO3_rotation,
@@ -246,8 +243,7 @@ class LatentUpdate(nn.Module):
 
     def forward(self,
                 rigids: ru.Rigid,
-                rigid_features: SO3_Embedding,
-                sidechain_features: SO3_Embedding,
+                node_features: SO3_Embedding,
                 batch: torch.Tensor,
                 x_mask: torch.Tensor,
                 noising_mask: torch.Tensor):
@@ -280,29 +276,28 @@ class LatentUpdate(nn.Module):
         bb_node_fused = SO3_Embedding(
             num_nodes,
             self.node_lmax_list,
-            num_channels=self.rigid_h_channels + self.sidechain_h_channels + self.frame_channels,
-            device=sidechain_features.device,
-            dtype=sidechain_features.dtype
+            num_channels=self.h_channels + self.frame_channels,
+            device = node_features.device,
+            dtype=node_features.dtype
         )
-        bb_node_fused.embedding[..., :self.rigid_h_channels] = rigid_features.embedding
-        bb_node_fused.embedding[..., self.rigid_h_channels:self.rigid_h_channels + self.sidechain_h_channels] = sidechain_features.embedding
+        bb_node_fused.embedding[..., :self.h_channels] = node_features.embedding
         bb_node_fused.embedding[..., 1:4, -self.frame_channels:] = frame_atoms.transpose(-1, -2)
 
         editable = noising_mask.clone()
         editable[x_mask] = False
         bb_node_fused.embedding[..., 0:1, -1:] = editable[..., None, None].long() # is node editable or not
 
-        update_sidechain_features = self.local_attention(
+        update_node_features = self.local_attention(
             bb_node_fused,
             edge_features,
             edge_index
         )
-        new_sidechain_features = sidechain_features.clone()
-        new_sidechain_features.embedding[noising_mask] = update_sidechain_features.embedding[noising_mask]
-        return new_sidechain_features
+        new_node_features = node_features.clone()
+        new_node_features.embedding[noising_mask] = update_node_features.embedding[noising_mask]
+        return new_node_features
 
 
-class LatentDenoisingLayer(nn.Module):
+class FrameDenoisingLayer(nn.Module):
     """ Denoising layer on sidechain densities """
     def __init__(self,
                  node_lmax_list,
@@ -360,37 +355,31 @@ class LatentDenoisingLayer(nn.Module):
 
     def forward(
             self,
-            rigid_features: SO3_Embedding,
+            frame_features: SO3_Embedding,
             data,
             intermediates
     ):
         rigids = intermediates['denoised_frames']
-        sidechain_features = intermediates['denoised_latent_sidechain']
         noising_mask = intermediates['noising_mask']
         x_mask = data['x_mask']
         batch = data.batch
 
-        new_rigids, new_rigid_features = self.frame_update(
+        new_rigids, rotated_frame_features = self.frame_update(
             rigids,
-            rigid_features,
-            sidechain_features,
+            frame_features,
             batch,
             x_mask,
             noising_mask,
         )
-        new_sidechain_features = self.latent_update(
+        new_frame_features = self.latent_update(
             new_rigids,
-            new_rigid_features,
-            sidechain_features,
+            rotated_frame_features,
             batch,
             x_mask,
             noising_mask,
         )
 
-        intermediates['denoised_frames'] = new_rigids
-        intermediates['denoised_latent_sidechain'] = new_sidechain_features
-
-        return new_rigid_features
+        return new_rigids, new_frame_features
 
 
 # adapted from https://github.com/jmclong/random-fourier-features-pytorch/blob/main/rff/layers.py
@@ -406,7 +395,7 @@ class RBF(nn.Module):
         return torch.cat([torch.cos(tp), torch.sin(tp)], dim=-1)
 
 
-class LatentDenoiser(nn.Module):
+class FrameDenoiser(nn.Module):
     """ Denoising model on sidechain densities """
     def __init__(self,
                  node_lmax_list,
@@ -416,7 +405,6 @@ class LatentDenoiser(nn.Module):
                  node_SO3_grid,
                  num_heads=8,
                  h_channels=32,
-                 rigid_h_channels=32,
                  h_time=64,
                  scalar_h_dim=128,
                  n_layers=4,
@@ -424,7 +412,6 @@ class LatentDenoiser(nn.Module):
         super().__init__()
 
         self.node_lmax_list = node_lmax_list
-        self.rigid_h_channels = rigid_h_channels
         self.h_channels = h_channels
 
         self.mappingReduced_nodes = mappingReduced_nodes
@@ -451,7 +438,7 @@ class LatentDenoiser(nn.Module):
             )
 
         self.denoiser = nn.ModuleList([
-            LatentDenoisingLayer(
+            FrameDenoisingLayer(
                 node_lmax_list=node_lmax_list,
                 edge_channels_list=edge_channels_list,
                 mappingReduced_nodes=mappingReduced_nodes,
@@ -470,32 +457,27 @@ class LatentDenoiser(nn.Module):
 
     def forward(self, data, intermediates):
         ## prep features
-        rigid_features = SO3_Embedding(
-            data.num_nodes,
-            self.node_lmax_list,
-            self.rigid_h_channels,
-            device=data['x'].device,
-            dtype=torch.float
+        node_features = SO3_Embedding(
+           data.num_nodes,
+           self.node_lmax_list,
+           self.h_channels,
+           device=data['x'].device,
+           dtype=torch.float
         )
         ts = intermediates['t']  # (B,)
 
-        ## create time embedding
-        fourier_time = self.time_rbf(ts.unsqueeze(-1))  # (B x h_time,)
-        embedded_time = self.time_mlp(fourier_time)  # (B x h_time)
-        data_splits = data._slice_dict['x']
-        data_lens = data_splits[1:] - data_splits[:-1]
-        embedded_time = torch.cat([
-            embedded_time[i].view(1, -1).expand(l, -1) for i, l in enumerate(data_lens)
-        ])  # n_res x h_time
+        # ## create time embedding
+        # fourier_time = self.time_rbf(ts.unsqueeze(-1))  # (B x h_time,)
+        # embedded_time = self.time_mlp(fourier_time)  # (B x h_time)
 
-        # fuse time embedding into node features
-        rigid_num_l0 = len(self.node_lmax_list)
-        rigid_l0 = rigid_features.get_invariant_features()  # n_res x (node_num_m0 x h_channels)
-        time_expanded = embedded_time.unsqueeze(-2).expand(-1, rigid_num_l0, -1)
-        node_l0 = self.embed_time(
-            torch.cat([rigid_l0, time_expanded], dim=-1)
-        )
-        rigid_features.set_invariant_features(node_l0)
+        # # fuse time embedding into node features
+        # node_num_l0 = len(self.node_lmax_list)
+        # node_l0 = node_features.get_invariant_features()  # n_res x (node_num_m0 x h_channels)
+        # time_expanded = embedded_time.unsqueeze(-2).expand(-1, node_num_l0, -1)
+        # node_l0 = self.embed_time(
+        #     torch.cat([node_l0, time_expanded], dim=-1)
+        # )
+        # node_features.set_invariant_features(node_l0)
 
         # center the training example at the mean of the x_cas
         center = []
@@ -508,12 +490,30 @@ class LatentDenoiser(nn.Module):
         center = torch.cat(center, dim=0)
 
         ## denoising
-        f_V = rigid_features
-        intermediates['denoised_frames'] = self._translate_rigids(intermediates['noised_frames'], -center)
-        intermediates['denoised_latent_sidechain'] = intermediates['noised_latent_sidechain']
+        f_V = node_features
+        true_X_ca = data['x'] - center
+        noising_mask = intermediates['noising_mask']
 
-        for layer in self.denoiser:
-            f_V = layer(f_V, data, intermediates)
+        intermediates['denoised_frames'] = self._translate_rigids(intermediates['noised_frames'], -center)
+
+        ## create time embedding
+        fourier_time = self.time_rbf(ts.unsqueeze(-1))  # (B x h_time,)
+        embedded_time = self.time_mlp(fourier_time)  # (B x h_time)
+        for i, layer in enumerate(self.denoiser):
+            # fuse time embedding into node features
+            node_num_l0 = len(self.node_lmax_list)
+            node_l0 = f_V.get_invariant_features()  # n_res x (node_num_m0 x h_channels)
+            time_expanded = embedded_time.unsqueeze(-2).expand(-1, node_num_l0, -1)
+            node_l0 = self.embed_time(
+                torch.cat([node_l0, time_expanded], dim=-1)
+            )
+            f_V.set_invariant_features(node_l0)
+
+            f_ca, f_V = layer(f_V, data, intermediates)
+            intermediates['denoised_frames'] = f_ca
+            pred_X_ca = f_ca.get_trans()
+            X_ca_diff = torch.linalg.vector_norm(true_X_ca - pred_X_ca, dim=-1)
+            # print(i, X_ca_diff[noising_mask])
 
         intermediates['denoised_frames'] = self._translate_rigids(intermediates['denoised_frames'], center)
         intermediates['denoised_bb'] = backbone_frames_to_bb_atoms(intermediates['denoised_frames'])

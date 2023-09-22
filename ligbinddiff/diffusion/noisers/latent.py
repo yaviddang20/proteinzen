@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch import nn
 from ligbinddiff.diffusion.schedulers import LearnedScheduler
-from ligbinddiff.utils.so3_embedding import so3_add, so3_sub, so3_mult, so3_randn_like, so3_ones_like, gen_so3_unop
+from ligbinddiff.utils.so3_embedding import so3_mult, so3_randn_like, so3_ones_like, gen_so3_unop
 from ligbinddiff.model.modules.equiformer_v2.so3 import SO3_Embedding
 
 
@@ -19,7 +19,7 @@ class FixedBetaSchedule:
         self.max_beta = max_beta
 
     def b_t(self, t):
-        if np.any(t < 0) or np.any(t > 1):
+        if torch.any(t < 0) or torch.any(t > 1):
             raise ValueError(f'Invalid t={t}')
         return self.min_beta + t*(self.max_beta - self.min_beta)
 
@@ -36,7 +36,7 @@ class LearnedBetaSchedule(nn.Module):
         self.max_beta = max_beta
 
     def b_t(self, t):
-        if np.any(t < 0) or np.any(t > 1):
+        if torch.any(t < 0) or torch.any(t > 1):
             raise ValueError(f'Invalid t={t}')
         return self._schedule.beta(t)
 
@@ -49,7 +49,7 @@ class SidechainDiffuser(nn.Module):
 
     def __init__(self,
                  lmax_list=[1],
-                 num_channels=32,
+                 num_channels=8,
                  min_beta=0.1,
                  max_beta=20,
                  schedule='fixed'):
@@ -89,8 +89,18 @@ class SidechainDiffuser(nn.Module):
         """Time-dependent drift coefficient."""
         return so3_mult(-1/2 * self.b_t(t), x)
 
-    def sample_ref(self, n_samples: int=1, device='cpu', dtype=torch.float) -> SO3_Embedding:
-        sample_embedding = torch.randn(size=(n_samples, self.num_coeffs, self.num_channels))
+    def sample_ref(self,
+                   n_samples: int=1,
+                   impute=None,
+                   noising_mask=None,
+                   device='cpu',
+                   dtype=torch.float):
+        sample_embedding = torch.randn(
+            size=(n_samples, self.num_coeffs, self.num_channels),
+            device=device)
+        if impute is not None and noising_mask is not None:
+            sample_embedding[noising_mask] = impute.embedding[noising_mask]
+
         sample = SO3_Embedding(
             n_samples,
             self.lmax_list,
@@ -99,7 +109,9 @@ class SidechainDiffuser(nn.Module):
             dtype=dtype
         )
         sample.set_embedding(sample_embedding)
-        return sample
+        return {
+            "noised_latent_sidechain": sample
+        }
 
     def calc_x_0(self, score_t: SO3_Embedding, x_t: SO3_Embedding, t) -> SO3_Embedding:
         """
@@ -155,7 +167,6 @@ class SidechainDiffuser(nn.Module):
 
     def reverse(
             self,
-            *,
             x_t: SO3_Embedding,
             score_t: SO3_Embedding,
             t: torch.Tensor,
@@ -178,8 +189,8 @@ class SidechainDiffuser(nn.Module):
         t = t[:, None, None]
         g_t = self.diffusion_coef(t)
         f_t = self.drift_coef(x_t, t)
-        z = noise_scale * torch.randn(size=score_t.embedding.shape)
-        perturb = (f_t - g_t**2 * score_t.embedding) * dt + g_t * np.sqrt(dt) * z  # TODO: shouldn't dt be negative? if not shouldn't you subtract noise here?
+        z = noise_scale * torch.randn(size=score_t.embedding.shape, device=score_t.device)
+        perturb = (f_t.embedding - g_t**2 * score_t.embedding) * dt + g_t * np.sqrt(np.abs(dt)) * z  # TODO: shouldn't dt be negative? if not shouldn't you subtract noise here?
 
         if mask is not None:
             perturb *= mask[..., None, None]

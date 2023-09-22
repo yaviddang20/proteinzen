@@ -6,9 +6,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch_cluster
-from torch_geometric.data import Data
+from torch_geometric.data import Data, HeteroData
 
-from ligbinddiff.utils.atom_reps import atom14_to_atom91, atom91_atom_masks, letter_to_num, atom14_sidechain_bonds
+from ligbinddiff.utils.atom_reps import atom14_to_atom91, atom14_residue_bonds, atom14_atomic_row, atom14_atomic_period, restype_3to1, atom_to_atomic_period, atom_to_atomic_row
 # from ligbinddiff.utils.fiber import nl_to_fiber
 
 # TODO: brought this in to avoid importing dgl in the utils, do this in a less hacky way
@@ -287,6 +287,8 @@ def featurize_cross_scale_atomic(protein,
                                  num_rbf=16,
                                  num_positional_embeddings=16,
                                  top_k=30,
+                                 max_period=18,
+                                 max_row=5,
                                  device='cpu'):
     name = protein['name']
     with torch.no_grad():
@@ -334,25 +336,136 @@ def featurize_cross_scale_atomic(protein,
         node_s, node_v, edge_s, edge_v = map(nan_to_num,
                 (node_s, node_v, edge_s, edge_v))
 
+        atom_type_embedding = atom14_atom_type_embedding(seq, atom14_mask, letter_to_num, max_period=max_period, max_row=max_row)
+        atoms_flat, atomic_radius_edge_index, backbone_atoms_select = atom_radius_graph(atom14, atom14_mask)
+        atom14_to_ca_edge_index = atom14_to_ca_graph(atom14, atom14_mask)
 
-        sidechain_bonds = []
-        for b_list in atom14_sidechain_bonds.values():
-            sidechain_bonds.append(b_list)
-        sidechain_bonds = torch.as_tensor(sidechain_bonds, device=device).T
-        sidechain_lens = (~atom14_mask).long().sum(dim=-1)
+        residue_dict = {
+            "x": nan_to_num(X_ca),
+            "x_mask": x_mask,
+            "x_cb": nan_to_num(X_cb),
+            "seq": seq,
+            "bb_s": nan_to_num(node_s),
+            "bb_v": nan_to_num(node_v),
+            "edge_index": edge_index,
+            "edge_s": nan_to_num(edge_s),
+            "edge_v": nan_to_num(edge_v),
+            "atom91_centered": nan_to_num(atom91 - X_ca.unsqueeze(-2)),
+            "atom91_mask": atom91_mask,
+        }
 
+        atomic_dict = {
+            "x": atoms_flat,
+            "atom_embedding": atom_type_embedding,
+            "backbone_atoms_select": backbone_atoms_select,
+            "atomic_radius_edge_index": atomic_radius_edge_index,
+            "atom14_to_ca_edge_index": atom14_to_ca_edge_index,
+        }
 
-        graph = Data(x=nan_to_num(X_ca),
-                     x_mask=x_mask,
-                     x_cb=nan_to_num(X_cb),
-                     seq=seq,
-                     bb_s=nan_to_num(node_s),
-                     bb_v=nan_to_num(node_v),
-                     edge_index=edge_index,
-                     edge_s=nan_to_num(edge_s),
-                     edge_v=nan_to_num(edge_v),
-                     atom91_centered=nan_to_num(atom91 - X_ca.unsqueeze(-2)),
-                     atom91_mask=atom91_mask,
-                     name=name)
+        graph = HeteroData(
+            atomic=atomic_dict,
+            residue=residue_dict,
+            name=name)
 
     return graph
+
+
+def residue_bond_graph(atom14_mask, seq, letter_to_num):
+    assert len(atom14_mask.shape) == 2
+    # compute residue bond graphs
+    num_atoms_per_residue = ~atom14_mask.sum(dim=-1)
+    atom_idx_offset = torch.cat([
+        torch.zeros(1),
+        torch.cumsum(num_atoms_per_residue, dim=0)[:-1]
+    ], dim=0)
+
+    residue_bonds_mask = torch.zeros(
+        len(atom14_residue_bonds.keys()),
+        sum(len(bonds) for bonds in atom14_residue_bonds.values())
+    )
+    offset = 0
+    residue_bonds = []
+    for aa, bonds in atom14_residue_bonds.items():
+        bonds_forward = torch.as_tensor(bonds).T
+        bonds_reverse = torch.flip(bonds_forward, (0,))
+        bonds_idx = torch.cat([bonds_forward, bonds_reverse], dim=0)
+        residue_bonds.append(bonds_idx)
+        aa_idx = letter_to_num[aa]
+        residue_bonds_mask[aa_idx, offset:offset+2*len(bonds)] = bonds_idx
+        offset += 2*len(bonds)
+    residue_bonds = torch.cat(residue_bonds, dim=-1)
+
+    residue_bond_edges = residue_bonds[seq] + atom_idx_offset[:, None]
+    residue_bond_edge_mask = residue_bonds_mask[seq]
+    residue_bond_edge_index = residue_bond_edges[residue_bond_edge_mask]
+
+    return residue_bond_edge_index
+
+
+def atom_radius_graph(atom14, atom14_mask, radius=6):
+    assert len(atom14_mask.shape) == 2
+    residue_atoms = atom14[~atom14_mask]
+    atom_radius_edge_index = torch_cluster.radius_graph(residue_atoms, r=radius)
+
+    backbone_atoms_select = torch.zeros_like(atom14_mask).bool()
+    backbone_atoms_select[:, :4] = True
+    backbone_atoms_select = backbone_atoms_select[~atom14_mask]
+
+    return residue_atoms, atom_radius_edge_index, backbone_atoms_select
+
+
+def atom14_to_ca_graph(atom14, atom14_mask):
+    assert len(atom14_mask.shape) == 2
+    num_res = atom14.shape[0]
+    num_atoms_per_residue = ~atom14_mask.sum(dim=-1)
+    atom_idx_offset = torch.cat([
+        torch.zeros(1),
+        torch.cumsum(num_atoms_per_residue, dim=0)[:-1]
+    ], dim=0)
+
+    residue_dst = torch.arange(14)
+    residue_src = torch.ones(14)  # ca is index 1
+    residue_graph = torch.stack([
+        residue_dst,
+        residue_src
+    ], dim=-1)
+    residue_graph = residue_graph[residue_dst != 1]  # no self edge to ca
+    atom14_to_ca_graph = residue_graph.unsqueeze(0).expand(num_res, -1) + atom_idx_offset
+
+    atom14_mask_no_ca = atom14_mask[:, residue_dst != 1]
+    atom14_to_ca_edge_index = atom14_to_ca_graph[atom14_mask_no_ca]
+    return atom14_to_ca_edge_index
+
+
+def atom14_atom_type_embedding(seq, atom14_mask, letter_to_num, max_period=None, max_row=None):
+    if max_period is None:
+        max_period = max(atom_to_atomic_period.values())
+    if max_row is None:
+        max_row = max(atom_to_atomic_row.values())
+    one_hot_period = torch.eye(max_period+1)
+    one_hot_row = torch.eye(max_row+1)
+
+    num_aa = max(letter_to_num.values()) + 1
+
+    period_store = torch.zeros(
+        num_aa,
+        14
+    )
+    row_store = torch.zeros(
+        num_aa,
+        14
+    )
+    for aa, periods in atom14_atomic_period.items():
+        aa_idx = letter_to_num(restype_3to1[aa])
+        period_store[aa_idx] = torch.as_tensor(periods)
+    for aa, row in atom14_atomic_period.items():
+        aa_idx = letter_to_num(restype_3to1[aa])
+        row_store[aa_idx] = torch.as_tensor(row)
+
+    atom_periods = period_store[seq]
+    atom_rows = row_store[seq]
+    period_embedding = one_hot_period[atom_periods]
+    row_embedding = one_hot_row[atom_rows]
+    atom_type_embedding = torch.cat([period_embedding, row_embedding], dim=-1)  # n_nodes x 14 x n_period+n_row
+
+    return atom_type_embedding[~atom14_mask]  # n_atoms x n_period+n_row

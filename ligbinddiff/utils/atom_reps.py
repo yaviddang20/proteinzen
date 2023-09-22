@@ -55,11 +55,15 @@ restype_3to1 = {v: k for k, v in restype_1to3.items()}
 
 backbone_atoms = ['N', 'CA', 'C', 'O']
 
+# i got this from openfold but i had to change
+# them to match the forward/reverse transform test
+# TODO: why did I have to do this?
+# i suspect it's a reference frame thing
 backbone_frame_atoms = np.array(
     [
-        [-0.572, 1.337,  0.000],  # N
-        [0.000,  0.000,  0.000],   # CA
-        [1.517, -0.000, -0.000]  # C
+        [-1.517, 0.000,  0.000],  # N
+        [0.000,  0.000,  0.000],  # CA
+        [0.572,  1.337,  0.000],  # C
     ]
 )
 # A list of atoms (excluding hydrogen) for each AA sidechain. PDB naming convention.
@@ -477,6 +481,32 @@ restype_name_to_atom14_names = {
     'UNK': ['',  '',   '',  '',  '',   '',    '',    '',    '',    '',    '',    '',    '',    ''],
 }
 
+atom_to_atomic_period = {
+    "C": 14,
+    "N": 15,
+    "O": 16,
+    "S": 16
+}
+atom_to_atomic_row = {
+    "C": 2,
+    "N": 2,
+    "O": 2,
+    "S": 3
+}
+
+atom14_atom_type = {
+    aa: [atom[0] if len(atom) > 0 else "" for atom in atoms]
+    for aa, atoms in restype_name_to_atom14_names.items()
+}
+atom14_atomic_row = {
+    aa: [atom_to_atomic_row[atom] if len(atom) == 1 else 0 for atom in atoms]
+    for aa, atoms in atom14_atom_type.items()
+}
+atom14_atomic_period = {
+    aa: [atom_to_atomic_period[atom] if len(atom) == 1 else 0 for atom in atoms]
+    for aa, atoms in atom14_atom_type.items()
+}
+
 atom14_sidechain_bonds = {}
 for res_3lt, bonds in sidechain_bonds.items():
     bond_idxs = []
@@ -498,20 +528,37 @@ for res_3lt, bonds in sidechain_bonds.items():
 atom14_residue_bonds = {}
 for res_3lt, bonds in residue_bonds.items():
     bond_idxs = []
-    atom_order = sidechain_atoms[res_3lt]
+    atom_order = restype_name_to_atom14_names[res_3lt]
     for (atom1, atom2) in bonds:
-        if atom1 in backbone_atoms:
-            idx1 = backbone_atoms.index(atom1)
-        else:
-            idx1 = atom_order.index(atom1) + 4
-
-        if atom2 in backbone_atoms:
-            idx2 = backbone_atoms.index(atom2)
-        else:
-            idx2 = atom_order.index(atom2) + 4
-
+        idx1 = atom_order.index(atom1)
+        idx2 = atom_order.index(atom2)
         bond_idxs.append((idx1, idx2))
     atom14_residue_bonds[res_3lt] = bond_idxs
+
+
+atom14_sidechain_angles = {}
+for res_3lt, angles in sidechain_bond_angles.items():
+    angle_idxs = []
+    atom_order = restype_name_to_atom14_names[res_3lt]
+    for (atom1, atom2, atom3) in angles:
+        idx1 = atom_order.index(atom1)
+        idx2 = atom_order.index(atom2)
+        idx3 = atom_order.index(atom3)
+        angle_idxs.append((idx1, idx2, idx3))
+    atom14_sidechain_angles[res_3lt] = angle_idxs
+
+
+atom14_residue_angles = {}
+for res_3lt, angles in residue_bond_angles.items():
+    angle_idxs = []
+    atom_order = restype_name_to_atom14_names[res_3lt]
+    for (atom1, atom2, atom3) in angles:
+        idx1 = atom_order.index(atom1)
+        idx2 = atom_order.index(atom2)
+        idx3 = atom_order.index(atom3)
+        angle_idxs.append((idx1, idx2, idx3))
+    atom14_residue_angles[res_3lt] = angle_idxs
+
 
 
 ### Conversion functions
