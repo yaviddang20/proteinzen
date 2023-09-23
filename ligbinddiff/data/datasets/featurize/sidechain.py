@@ -336,18 +336,24 @@ def featurize_cross_scale_atomic(protein,
         node_s, node_v, edge_s, edge_v = map(nan_to_num,
                 (node_s, node_v, edge_s, edge_v))
 
-        atom_type_embedding = atom14_atom_type_embedding(seq, atom14_mask, letter_to_num, max_period=max_period, max_row=max_row)
-        atoms_flat, atomic_radius_edge_index, backbone_atoms_select = atom_radius_graph(atom14, atom14_mask)
-        atom14_to_ca_edge_index = atom14_to_ca_graph(atom14, atom14_mask)
+        atom_type_embedding = atom14_atom_type_embedding(seq, atom14_mask.any(dim=-1), letter_to_num, max_period=max_period, max_row=max_row)
+        atoms_flat, atomic_radius_edge_index, backbone_atoms_select = atom_radius_graph(atom14, atom14_mask.any(dim=-1))
+        atom_to_residue_map, atom14_to_ca_edge_index = atom14_to_ca_graph(atom14, atom14_mask.any(dim=-1))
+
+        atom_to_residue_edge_index = torch.stack([
+            atom_to_residue_map,
+            torch.arange(atom_to_residue_map.numel(), device=atom_to_residue_map.device)
+        ], dim=0)
 
         residue_dict = {
             "x": nan_to_num(X_ca),
             "x_mask": x_mask,
             "x_cb": nan_to_num(X_cb),
             "seq": seq,
+            "bb": nan_to_num(coords),
             "bb_s": nan_to_num(node_s),
             "bb_v": nan_to_num(node_v),
-            "edge_index": edge_index,
+            # "edge_index": edge_index,
             "edge_s": nan_to_num(edge_s),
             "edge_v": nan_to_num(edge_v),
             "atom91_centered": nan_to_num(atom91 - X_ca.unsqueeze(-2)),
@@ -358,14 +364,17 @@ def featurize_cross_scale_atomic(protein,
             "x": atoms_flat,
             "atom_embedding": atom_type_embedding,
             "backbone_atoms_select": backbone_atoms_select,
-            "atomic_radius_edge_index": atomic_radius_edge_index,
-            "atom14_to_ca_edge_index": atom14_to_ca_edge_index,
+            "atom_to_residue_map": atom_to_residue_map
         }
 
         graph = HeteroData(
             atomic=atomic_dict,
             residue=residue_dict,
             name=name)
+        graph["residue", "knn", "residue"].edge_index = edge_index
+        graph["atomic", "radius_interact", "atomic"].edge_index = atomic_radius_edge_index
+        graph["atomic", "parent", "residue"].edge_index = atom_to_residue_edge_index
+        graph["atomic", "to_ca", "atomic"].edge_index = atom14_to_ca_edge_index
 
     return graph
 
@@ -373,7 +382,7 @@ def featurize_cross_scale_atomic(protein,
 def residue_bond_graph(atom14_mask, seq, letter_to_num):
     assert len(atom14_mask.shape) == 2
     # compute residue bond graphs
-    num_atoms_per_residue = ~atom14_mask.sum(dim=-1)
+    num_atoms_per_residue = (~atom14_mask).sum(dim=-1)
     atom_idx_offset = torch.cat([
         torch.zeros(1),
         torch.cumsum(num_atoms_per_residue, dim=0)[:-1]
@@ -411,13 +420,13 @@ def atom_radius_graph(atom14, atom14_mask, radius=6):
     backbone_atoms_select[:, :4] = True
     backbone_atoms_select = backbone_atoms_select[~atom14_mask]
 
-    return residue_atoms, atom_radius_edge_index, backbone_atoms_select
+    return residue_atoms, atom_radius_edge_index.long(), backbone_atoms_select
 
 
 def atom14_to_ca_graph(atom14, atom14_mask):
     assert len(atom14_mask.shape) == 2
     num_res = atom14.shape[0]
-    num_atoms_per_residue = ~atom14_mask.sum(dim=-1)
+    num_atoms_per_residue = (~atom14_mask).sum(dim=-1)
     atom_idx_offset = torch.cat([
         torch.zeros(1),
         torch.cumsum(num_atoms_per_residue, dim=0)[:-1]
@@ -430,14 +439,19 @@ def atom14_to_ca_graph(atom14, atom14_mask):
         residue_src
     ], dim=-1)
     residue_graph = residue_graph[residue_dst != 1]  # no self edge to ca
-    atom14_to_ca_graph = residue_graph.unsqueeze(0).expand(num_res, -1) + atom_idx_offset
+    atom14_to_ca_graph = residue_graph.unsqueeze(0).expand(num_res, -1, -1) + atom_idx_offset[:, None, None]
 
     atom14_mask_no_ca = atom14_mask[:, residue_dst != 1]
-    atom14_to_ca_edge_index = atom14_to_ca_graph[atom14_mask_no_ca]
-    return atom14_to_ca_edge_index
+    atom14_to_ca_edge_index = atom14_to_ca_graph[~atom14_mask_no_ca].transpose(-1, -2)
+
+    atom_to_res_map = torch.arange(num_res)[:, None].expand(-1, 14)
+    atom_to_res_map = atom_to_res_map[~atom14_mask]
+
+    return atom_to_res_map, atom14_to_ca_edge_index.long()
 
 
 def atom14_atom_type_embedding(seq, atom14_mask, letter_to_num, max_period=None, max_row=None):
+    assert len(atom14_mask.shape) == 2
     if max_period is None:
         max_period = max(atom_to_atomic_period.values())
     if max_row is None:
@@ -456,16 +470,16 @@ def atom14_atom_type_embedding(seq, atom14_mask, letter_to_num, max_period=None,
         14
     )
     for aa, periods in atom14_atomic_period.items():
-        aa_idx = letter_to_num(restype_3to1[aa])
+        aa_idx = letter_to_num[restype_3to1[aa]]
         period_store[aa_idx] = torch.as_tensor(periods)
-    for aa, row in atom14_atomic_period.items():
-        aa_idx = letter_to_num(restype_3to1[aa])
+    for aa, row in atom14_atomic_row.items():
+        aa_idx = letter_to_num[restype_3to1[aa]]
         row_store[aa_idx] = torch.as_tensor(row)
 
     atom_periods = period_store[seq]
     atom_rows = row_store[seq]
-    period_embedding = one_hot_period[atom_periods]
-    row_embedding = one_hot_row[atom_rows]
+    period_embedding = one_hot_period[atom_periods.long()]
+    row_embedding = one_hot_row[atom_rows.long()]
     atom_type_embedding = torch.cat([period_embedding, row_embedding], dim=-1)  # n_nodes x 14 x n_period+n_row
 
     return atom_type_embedding[~atom14_mask]  # n_atoms x n_period+n_row

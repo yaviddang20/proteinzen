@@ -497,6 +497,7 @@ atom_to_atomic_row = {
 atom14_atom_type = {
     aa: [atom[0] if len(atom) > 0 else "" for atom in atoms]
     for aa, atoms in restype_name_to_atom14_names.items()
+    if aa != 'UNK'  # ignoring this
 }
 atom14_atomic_row = {
     aa: [atom_to_atomic_row[atom] if len(atom) == 1 else 0 for atom in atoms]

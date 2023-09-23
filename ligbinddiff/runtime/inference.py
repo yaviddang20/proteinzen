@@ -170,27 +170,30 @@ def inpaint_inference_loop(diffuser,
             from torch_geometric.data import Batch
             batch = Batch.from_data_list([batch.to_data_list()[0]])
 
-        latent_outputs, denoiser_outputs = diffuser.sample(batch, steps=num_steps, show_progress=show_progress, select_task=select_task)
+        latent_outputs, decoder_outputs = diffuser.sample(batch, steps=num_steps, show_progress=show_progress, select_task=select_task)
 
         passthrough_outputs = {}
         passthrough_outputs.update(latent_outputs)
-        passthrough_outputs.update(denoiser_outputs)
+        passthrough_outputs.update(decoder_outputs)
 
-        loss_dict = loss_fn(batch, latent_outputs, denoiser_outputs, passthrough_outputs)
+        loss_dict = loss_fn(batch, latent_outputs, decoder_outputs, passthrough_outputs)
         print(batch.name)
         print(loss_dict)
 
-        data_splits = batch._slice_dict['x']
+        data_splits = batch._slice_dict['residue']['x']
         data_lens = (data_splits[1:] - data_splits[:-1]).tolist()
 
-        pred_seq = denoiser_outputs['seq_logits'].argmax(dim=-1).tolist()
+        if 'noising_mask' not in latent_outputs:
+            latent_outputs['noising_mask'] = torch.ones_like(batch['residue']['seq']).bool()
+
+        pred_seq = decoder_outputs['seq_logits'].argmax(dim=-1).tolist()
         pred_seq = "".join([num_to_letter[i] for i in pred_seq])
-        ref_seq = "".join([num_to_letter[i] for i in batch['seq'].tolist()])
-        total_seq_recov = seq_recov(batch['seq'], denoiser_outputs['seq_logits'], num_nodes=data_lens, mask=batch['x_mask'])
-        noised_seq_recov = seq_recov(batch['seq'], denoiser_outputs['seq_logits'], num_nodes=data_lens, mask=batch['x_mask'] | ~latent_outputs['noising_mask'])
-        unnoised_seq_recov = seq_recov(batch['seq'], denoiser_outputs['seq_logits'], num_nodes=data_lens, mask=batch['x_mask'] | latent_outputs['noising_mask'])
+        ref_seq = "".join([num_to_letter[i] for i in batch['residue']['seq'].tolist()])
+        total_seq_recov = seq_recov(batch['residue']['seq'], decoder_outputs['seq_logits'], num_nodes=data_lens, mask=batch['residue']['x_mask'])
+        noised_seq_recov = seq_recov(batch['residue']['seq'], decoder_outputs['seq_logits'], num_nodes=data_lens, mask=batch['residue']['x_mask'] | ~latent_outputs['noising_mask'])
+        unnoised_seq_recov = seq_recov(batch['residue']['seq'], decoder_outputs['seq_logits'], num_nodes=data_lens, mask=batch['residue']['x_mask'] | latent_outputs['noising_mask'])
         noised_pos = "".join(["X" if pos else " " for pos in latent_outputs['noising_mask'].tolist()])
-        masked_pos = "".join(["_" if pos else " " for pos in batch['x_mask'].tolist()])
+        masked_pos = "".join(["_" if pos else " " for pos in batch['residue']['x_mask'].tolist()])
         print()
         print("pred seq:\t", pred_seq)
         print("ref seq: \t", ref_seq)
@@ -206,7 +209,7 @@ def inpaint_inference_loop(diffuser,
 
         if save:
             denoised_x_ca = latent_outputs['denoised_bb'][..., 1, :]
-            atom91_uncentered = denoiser_outputs['decoded_latent'] + denoised_x_ca.unsqueeze(-2)
+            atom91_uncentered = decoder_outputs['decoded_latent'] + denoised_x_ca.unsqueeze(-2)
             atom91_uncentered[..., :4, :] = latent_outputs['denoised_bb']  # set backbone atoms to those from denoiser
             atom91_to_pdb(ref_seq, atom91_uncentered.numpy(force=True), batch.name[0] + "_native_seq")
             atom91_to_pdb(pred_seq, atom91_uncentered.numpy(force=True), batch.name[0] + "_designed_seq")
@@ -267,5 +270,45 @@ def debug_inpaint_inference_loop(diffuser,
             denoised_bb = latent_outputs['denoised_bb']
             denoised_bb = torch.cat([denoised_bb, batch['bb'][:, 3:4]], dim=-2)  # add O
             atom91_to_pdb("".join(["G" for _ in range(batch.num_nodes)]), denoised_bb.numpy(force=True), batch.name[0] + "_bb")
+
+    return {key: np.mean(losses) for key, losses in epoch_dict.items()}
+
+
+def bb_inpaint_inference_loop(diffuser,
+                           dataloader,
+                           num_steps,
+                           loss_fn,
+                           device=None,
+                           save=False,
+                           truncate=None,
+                           use_channel_weights=True,
+                           show_progress=False):
+    epoch_dict = {}
+
+    for idx, batch in (pbar := tqdm.tqdm(enumerate(dataloader))):
+        if truncate and idx > truncate:
+            break
+
+        if device:
+            batch = batch.to(device)
+
+        if save:
+            from torch_geometric.data import Batch
+            batch = Batch.from_data_list([batch.to_data_list()[0]])
+
+        denoiser_outputs = diffuser.sample(batch, steps=num_steps, show_progress=show_progress)
+
+        loss_dict = loss_fn(batch, denoiser_outputs)
+        print(batch.name)
+        print(loss_dict)
+
+        epoch_dict = update_epoch_loss_dict(epoch_dict, loss_dict)
+        pbar_str = gen_pbar_str(loss_dict)
+        pbar.set_description(pbar_str)
+
+        if save:
+            denoised_bb = denoiser_outputs['denoised_bb']
+            denoised_bb = torch.cat([denoised_bb, batch['bb'][:, 3:4]], dim=-2)  # add O
+            atom91_to_pdb("".join(["G" for _ in range(batch['residue'].num_nodes)]), denoised_bb.numpy(force=True), batch.name[0] + "_bb")
 
     return {key: np.mean(losses) for key, losses in epoch_dict.items()}

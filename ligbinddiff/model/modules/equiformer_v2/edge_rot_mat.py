@@ -1,6 +1,14 @@
 import torch
 
 
+def sanitize_edge_index(edge_index, edge_distance_vec):
+    """  Remove edges that are too short """
+    edge_dist = torch.linalg.vector_norm(edge_distance_vec, dim=-1)
+    edge_select = edge_dist > 0.0001  # based on below
+
+    return edge_index[:, edge_select], edge_distance_vec[edge_select], edge_dist[edge_select]
+
+
 def init_edge_rot_mat(edge_distance_vec):
     edge_vec_0 = edge_distance_vec
     edge_vec_0_distance = torch.sqrt(torch.sum(edge_vec_0**2, dim=1))
@@ -13,7 +21,7 @@ def init_edge_rot_mat(edge_distance_vec):
                 torch.min(edge_vec_0_distance)
             )
         )
-        
+
     norm_x = edge_vec_0 / (edge_vec_0_distance.view(-1, 1))
 
     edge_vec_2 = torch.rand_like(edge_vec_0) - 0.5

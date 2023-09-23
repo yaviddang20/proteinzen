@@ -3,6 +3,8 @@
 import torch
 from torch import nn
 import numpy as np
+from torch_cluster import knn_graph
+from ligbinddiff.model.modules.common import EdgeUpdate
 
 from ligbinddiff.model.modules.equiformer_v2.so2_ops import Nodewise_SO3_Convolution
 from ligbinddiff.model.modules.equiformer_v2.so3 import CoefficientMappingModule, SO3_Embedding, SO3_Rotation, SO3_Grid, SO3_LinearV2
@@ -11,32 +13,6 @@ from ligbinddiff.model.modules.equiformer_v2.transformer_block import FeedForwar
 from ligbinddiff.model.modules.equiformer_v2.edge_rot_mat import init_edge_rot_mat
 
 from ligbinddiff.utils.atom_reps import atom91_start_end
-
-
-class EdgeUpdate(nn.Module):
-    def __init__(self,
-                 node_lmax_list,
-                 edge_channels_list,
-                 h_channels=32):
-        super().__init__()
-        h_dim = edge_channels_list[0]
-        num_l0 = len(node_lmax_list)
-        self.ff = nn.Sequential(
-            nn.Linear(h_dim + h_channels * num_l0 * 2, h_dim),
-            nn.ReLU(),
-            nn.Linear(h_dim, h_dim)
-        )
-        self.norm = nn.LayerNorm(h_dim)
-
-    def forward(self, node_features, edge_features, edge_index):
-        node_src = node_features.expand_edge(edge_index[0])
-        node_src_invariant = node_src.get_invariant_features(flat=True)
-        node_dst = node_features.expand_edge(edge_index[1])
-        node_dst_invariant = node_dst.get_invariant_features(flat=True)
-        in_features = torch.cat([node_src_invariant, node_dst_invariant, edge_features], dim=-1)
-        update = self.ff(in_features)
-
-        return edge_features + self.norm(update)
 
 
 class LatentDenoisingLayer(nn.Module):
@@ -87,23 +63,20 @@ class LatentDenoisingLayer(nn.Module):
             self,
             node_features: SO3_Embedding,
             edge_features: torch.Tensor,
-            graph
+            edge_index
     ):
-        # transformer block
-        edge_index = graph.edge_index
         # transformer block
         node_features = self.attention(
             node_features,
             edge_features,
-            edge_index=edge_index
+            edge_index
         )
-        node_features = node_features.distribute_resolutions(len(self.node_lmax_list))
 
         # update edges
         edge_features = self.edge_update(
             node_features,
             edge_features,
-            graph.edge_index
+            edge_index
         )
         return node_features, edge_features
 
@@ -121,7 +94,7 @@ class RBF(nn.Module):
         return torch.cat([torch.cos(tp), torch.sin(tp)], dim=-1)
 
 
-class LatentDenoiser(nn.Module):
+class LatentSidechainDenoiser(nn.Module):
     """ Denoising model on sidechain densities """
     def __init__(self,
                  node_lmax_list,
@@ -134,6 +107,7 @@ class LatentDenoiser(nn.Module):
                  h_time=64,
                  scalar_h_dim=128,
                  n_layers=4,
+                 k=30,
                  device='cpu'):
         super().__init__()
 
@@ -169,26 +143,18 @@ class LatentDenoiser(nn.Module):
             for _ in range(n_layers)
         ])
 
+        self.k = k
 
-    def forward(self, graph):
+
+    def forward(self, data, intermediates):
         ## prep features
-        num_nodes = graph['x'].shape[0]
-        node_features = graph['noised_latent']
-        edge_features = graph['edge_s']
-        ts = graph['t']  # (B, 1, 1)
-
-        # init SO3_rotation and SO3_grid
-        edge_index = graph.edge_index
-        X_ca = graph['x']
-        edge_distance_vec = X_ca[edge_index[1]] - X_ca[edge_index[0]]
-        edge_rot_mat = init_edge_rot_mat(edge_distance_vec)
-        for rot in self.node_SO3_rotation_list:
-            rot.set_wigner(edge_rot_mat)
+        node_features = intermediates['noised_latent_sidechain']
+        ts = intermediates['t']  # (B, 1, 1)
 
         ## create time embedding
         fourier_time = self.time_rbf(ts.unsqueeze(-1))  # (B x h_time,)
         embedded_time = self.time_mlp(fourier_time)  # (B x h_time)
-        data_splits = graph._slice_dict['x']
+        data_splits = data._slice_dict['residue']['x']
         data_lens = data_splits[1:] - data_splits[:-1]
         embedded_time = torch.cat([
             embedded_time[i].view(1, -1).expand(l, -1) for i, l in enumerate(data_lens)
@@ -203,13 +169,23 @@ class LatentDenoiser(nn.Module):
         )
         node_features.set_invariant_features(node_l0)
 
+        # init SO3_rotation and SO3_grid
+        X_ca = data['residue']['x']
+        masked_X_ca = X_ca.clone()
+        masked_X_ca[data['residue']['x_mask']] = torch.inf
+        edge_index = knn_graph(masked_X_ca, self.k, data['residue'].batch)
+        edge_distance_vec = X_ca[edge_index[1]] - X_ca[edge_index[0]]
+        edge_rot_mat = init_edge_rot_mat(edge_distance_vec)
+        for rot in self.node_SO3_rotation_list:
+            rot.set_wigner(edge_rot_mat)
+        edge_features = data['residue']['edge_s']
+
         ## denoising
         f_V = node_features
         f_E = edge_features
 
         for layer in self.denoiser:
-            f_V, f_E = layer(f_V, f_E, graph)
+            f_V, f_E = layer(f_V, f_E, edge_index)
 
-        graph['denoised_latent'] = f_V
-        # graph['latent_edge'] = f_E
-        return graph
+        intermediates['denoised_latent_sidechain'] = f_V
+        return intermediates

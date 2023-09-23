@@ -6,15 +6,13 @@ import torch.distributions as dist
 import numpy as np
 
 from ligbinddiff.utils.so3_embedding import so3_add, so3_mult, so3_randn_like, gen_so3_unop
-from ligbinddiff.model.all_atom.frames.denoiser import LatentDenoiser
-from ligbinddiff.model.bb.frames.denoiser import FrameDenoiser
-from ligbinddiff.model.seq_des.frames.denoiser import LatentSidechainDenoiser
-from ligbinddiff.model.all_atom.frames.autoencoder import LatentEncoder, LatentDecoder
+from ligbinddiff.model.denoiser.bb_sidechain.frames_latent import LatentDenoiser
+from ligbinddiff.model.denoiser.bb.frames import FrameDenoiser
+from ligbinddiff.model.denoiser.sidechain.latent import LatentSidechainDenoiser
+from ligbinddiff.model.autoencoder.atom91 import Atom91Encoder, Atom91Decoder
+from ligbinddiff.model.autoencoder.atomic import AtomicSidechainEncoder
 from ligbinddiff.model.modules.equiformer_v2.so3 import CoefficientMappingModule, SO3_Rotation, SO3_Grid
 from ligbinddiff.model.modules.openfold import rigid_utils as ru
-
-
-from ligbinddiff.model.all_atom.frames.autoencoder import LatentEncoder2, LatentDecoder2
 
 
 class FrameInpaintingDiffuser(nn.Module):
@@ -337,7 +335,7 @@ class LatentFrameInpaintingDiffuser(nn.Module):
             scalar_h_dim=scalar_h_dim,
             n_layers=num_layers,
         )
-        self.encoder = LatentEncoder(
+        self.encoder = Atom91Encoder(
             node_lmax_list=node_lmax_list,
             edge_channels_list=edge_channels_list,
             mappingReduced_nodes=mappingReduced_nodes,
@@ -357,7 +355,7 @@ class LatentFrameInpaintingDiffuser(nn.Module):
             h_channels=h_channels,
             num_layers=num_layers
         )
-        self.decoder = LatentDecoder(
+        self.decoder = Atom91Decoder(
             node_lmax_list=node_lmax_list,
             edge_channels_list=edge_channels_list,
             mappingReduced_nodes=mappingReduced_nodes,
@@ -728,7 +726,7 @@ class LatentInpaintingDiffuser(nn.Module):
             scalar_h_dim=scalar_h_dim,
             n_layers=num_layers,
         )
-        self.encoder = LatentEncoder2(
+        self.encoder = Atom91Encoder(
             node_lmax_list=node_lmax_list,
             edge_channels_list=edge_channels_list,
             mappingReduced_nodes=mappingReduced_nodes,
@@ -748,7 +746,7 @@ class LatentInpaintingDiffuser(nn.Module):
             h_channels=h_channels,
             num_layers=num_layers
         )
-        self.decoder = LatentDecoder2(
+        self.decoder = Atom91Decoder(
             node_lmax_list=node_lmax_list,
             edge_channels_list=edge_channels_list,
             mappingReduced_nodes=mappingReduced_nodes,

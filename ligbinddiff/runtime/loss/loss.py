@@ -226,24 +226,24 @@ def discriminator_loss(model_outputs):
     total_logprobs = logprobs_real_correct + logprobs_fake_correct
     return -_nodewise_to_graphwise(total_logprobs, data_lens, x_mask)
 
-def cath_latent_loss_fn(noised_batch, model_outputs, use_channel_weights=None, warmup=False, ae_loss_weight=1):
-    atom91_centered = noised_batch['atom91_centered']
-    seq = noised_batch['seq']
-    X_ca = noised_batch['x']
-    bb = noised_batch['bb']
+def cath_latent_loss_fn(batch, latent_outputs, decoder_outputs, use_channel_weights=None, warmup=False, ae_loss_weight=1):
+    atom91_centered = batch['residue']['atom91_centered']
+    seq = batch['residue']['seq']
+    X_ca = batch['residue']['x']
+    bb = batch['residue']['bb']
     bb_rel = bb - X_ca.unsqueeze(-2)
-    x_mask = noised_batch['x_mask']
-    atom91_mask = noised_batch['atom91_mask']
+    x_mask = batch['residue']['x_mask']
+    atom91_mask = batch['residue']['atom91_mask']
 
-    latent = model_outputs['latent']
-    latent_mu = model_outputs['latent_mu']
-    latent_logvar = model_outputs['latent_logvar']
+    latent = latent_outputs['latent_sidechain']
+    latent_mu = latent_outputs['latent_mu']
+    latent_logvar = latent_outputs['latent_logvar']
 
-    decoded_atom91 = model_outputs['decoded_latent']
+    decoded_atom91 = decoder_outputs['decoded_latent']
     decoded_atom91[..., :4, :] = bb_rel
-    seq_logits = model_outputs['decoded_seq_logits']
+    seq_logits = decoder_outputs['decoded_seq_logits']
 
-    data_splits = noised_batch._slice_dict['x']
+    data_splits = batch._slice_dict['residue']['x']
     data_lens = (data_splits[1:] - data_splits[:-1]).tolist()
 
     autoencoder_loss = atom91_mse_loss(atom91_centered, decoded_atom91, data_lens, atom91_mask, no_bb=False)
@@ -255,14 +255,14 @@ def cath_latent_loss_fn(noised_batch, model_outputs, use_channel_weights=None, w
     chi_loss = torsion_loss(atom91_centered, decoded_atom91, data_lens, atom91_mask.any(dim=-1))
     kl_div = so3_embedding_kl(latent_mu, latent_logvar, data_lens, x_mask)
 
-    edge_splits = noised_batch._slice_dict['edge_index']
+    edge_splits = batch._slice_dict['residue', 'knn', 'residue']['edge_index']
     num_edges = (edge_splits[1:] - edge_splits[:-1]).tolist()
 
     intrares_clash_loss = intrasidechain_clash_loss(decoded_atom91, data_lens, atom91_mask.any(dim=-1))
     interres_clash_loss = intersidechain_clash_loss(
         decoded_atom91 + X_ca.unsqueeze(-2),
         seq,
-        noised_batch.edge_index,
+        batch['residue', 'knn', 'residue'].edge_index,
         num_edges,
         x_mask
     )
@@ -270,16 +270,11 @@ def cath_latent_loss_fn(noised_batch, model_outputs, use_channel_weights=None, w
         atom91_centered + X_ca.unsqueeze(-2),
         decoded_atom91 + X_ca.unsqueeze(-2),
         seq,
-        noised_batch.edge_index,
+        batch['residue', 'knn', 'residue'].edge_index,
         num_edges,
         x_mask
     )
     # print(kl_div)
-
-    if 'discrim_logits_real' in model_outputs:
-        gen_loss = generator_loss(model_outputs, data_lens, x_mask)
-    else:
-        gen_loss = torch.zeros(1, device=chi_loss.device)
 
     correct_label_atom91_mask = atom91_mask.clone()
     pred_seq = seq_logits.argmax(dim=-1)
@@ -296,7 +291,7 @@ def cath_latent_loss_fn(noised_batch, model_outputs, use_channel_weights=None, w
         cl_interres_clash_loss = intersidechain_clash_loss(
             decoded_atom91 + X_ca.unsqueeze(-2),
             seq,
-            noised_batch.edge_index,
+            batch['residue', 'knn', 'residue'].edge_index,
             num_edges,
             x_mask | (~same)
         )
@@ -304,14 +299,14 @@ def cath_latent_loss_fn(noised_batch, model_outputs, use_channel_weights=None, w
             atom91_centered + X_ca.unsqueeze(-2),
             decoded_atom91 + X_ca.unsqueeze(-2),
             seq,
-            noised_batch.edge_index,
+            batch['residue', 'knn', 'residue'].edge_index,
             num_edges,
             x_mask | (~same)
         )
 
     if not warmup:
-        noised_latent = model_outputs['noised_latent']
-        denoised_latent = model_outputs['denoised_latent']
+        noised_latent = latent_outputs['noised_latent_sidechain']
+        denoised_latent = latent_outputs['denoised_latent_sidechain']
 
         denoising_loss = so3_embedding_mse(latent, denoised_latent, data_lens, x_mask)
         ref_noise = so3_embedding_mse(latent, noised_latent, data_lens, x_mask)
@@ -330,14 +325,13 @@ def cath_latent_loss_fn(noised_batch, model_outputs, use_channel_weights=None, w
         autoencoder_loss + 1e-6 * kl_div +
         seq_loss +  # atom91_rmsd +
         bond_length_mse + sidechain_dists_mse +
-        bond_angle_loss + chi_loss +
-        gen_loss # +
-        # intrares_clash_loss + interres_clash_loss + local_atomic_dist_loss
+        bond_angle_loss + chi_loss
+        # + intrares_clash_loss + interres_clash_loss + local_atomic_dist_loss
     )
     if not warmup:
-        loss = (noised_batch['loss_weight'] * denoising_loss + vae_loss * ae_loss_weight).mean()
+        loss = (latent_outputs['loss_weight'] * denoising_loss + vae_loss * ae_loss_weight).mean()
     else:
-        noised_batch['t'] = torch.zeros(1)
+        latent_outputs['t'] = torch.zeros(1)
         loss = vae_loss.mean()
 
     return {
@@ -350,7 +344,6 @@ def cath_latent_loss_fn(noised_batch, model_outputs, use_channel_weights=None, w
         "sidechain_dists_mse": sidechain_dists_mse,
         "bond_length_mse": bond_length_mse,
         "bond_angle_loss": bond_angle_loss,
-        "gen_loss": gen_loss,
         "chi_loss": chi_loss,
         "intrares_clash_loss": intrares_clash_loss,
         "interres_clash_loss": interres_clash_loss,
@@ -1126,4 +1119,126 @@ def debug_latent_loss_fn(batch,
     # out_dict.update(passthrough_loss_dict)
     # out_dict.update({"pt_" + key: value for key, value in passthrough_denoise_loss_dict.items()})
     # out_dict.update({"pt_" + key: value for key, value in passthrough_decode_loss_dict.items()})
+    return out_dict
+
+def backbone_r3_diffusion_loss(batch,
+                               diffusion_outputs,
+                               time_threshold=0.25):
+    x_mask = batch['residue']['x_mask']
+    noising_mask = diffusion_outputs['noising_select']
+    # if we don't noise anything, just eval on everything as a sanity check
+    if (~noising_mask).all():
+        noising_mask = ~noising_mask
+    total_mask = ~x_mask & noising_mask
+
+    data_splits = batch._slice_dict['residue']['x']
+    data_lens = (data_splits[1:] - data_splits[:-1]).tolist()
+
+    X_ca = batch['residue']['bb'][:, 1]
+    pred_X_ca =  diffusion_outputs['denoised_bb'][:, 1]
+    ref_X_ca = diffusion_outputs['noised_bb'][:, 1]
+    pred_X_ca_dist = torch.linalg.vector_norm(X_ca - pred_X_ca, dim=-1)
+    pred_X_ca_mse = _nodewise_to_graphwise(pred_X_ca_dist[total_mask], data_lens, ~total_mask)
+    ref_X_ca_dist = torch.linalg.vector_norm(X_ca - ref_X_ca, dim=-1)
+    ref_X_ca_mse = _nodewise_to_graphwise(ref_X_ca_dist[total_mask], data_lens, ~total_mask)
+
+    bb = batch['residue']["bb"]
+    denoised_bb = diffusion_outputs['denoised_bb']
+    noised_bb = diffusion_outputs['noised_bb']
+
+    pred_backbone_mse = torch.square(denoised_bb - bb).sum(dim=-1)
+    pred_backbone_mse = pred_backbone_mse[total_mask].view(-1)
+    total_mask_expand = total_mask[:, None].expand(-1, 4)
+    pred_backbone_mse = _elemwise_to_graphwise(pred_backbone_mse, data_lens, ~total_mask_expand)
+
+    ref_backbone_mse = torch.square(noised_bb - bb).sum(dim=-1)
+    ref_backbone_mse = ref_backbone_mse[total_mask].view(-1)
+    total_mask_expand = total_mask[:, None].expand(-1, 4)
+    ref_backbone_mse = _elemwise_to_graphwise(ref_backbone_mse, data_lens, ~total_mask_expand)
+
+    bb_rel = bb - bb[:, 1].unsqueeze(-2)
+    denoised_bb_rel = denoised_bb - denoised_bb[:, 1].unsqueeze(-2)
+    noised_bb_rel = noised_bb - noised_bb[:, 1].unsqueeze(-2)
+
+    pred_bb_rel_mse = torch.square(denoised_bb_rel - bb_rel)[:, (0, 2, 3)].sum(dim=-1)
+    pred_bb_rel_mse = pred_bb_rel_mse[total_mask].view(-1)
+    total_mask_expand = total_mask[:, None].expand(-1, 3)
+    pred_bb_rel_mse = _elemwise_to_graphwise(pred_bb_rel_mse, data_lens, ~total_mask_expand)
+
+    ref_bb_rel_mse = torch.square(noised_bb_rel - bb_rel)[:, (0, 2, 3)].sum(dim=-1)
+    ref_bb_rel_mse = ref_bb_rel_mse[total_mask].view(-1)
+    total_mask_expand = total_mask[:, None].expand(-1, 3)
+    ref_bb_rel_mse = _elemwise_to_graphwise(ref_bb_rel_mse, data_lens, ~total_mask_expand)
+
+    residx = diffusion_outputs['noised_residx']
+    if residx.numel() > 0:
+        residx_x_mask = torch.ones_like(x_mask).bool()
+        residx_x_mask[residx] = False
+        # we wanna unmask the +1 and -1 residues so we can get the relative positionings
+        # in context with the un-noised structure
+        residx_p1 = residx + 1
+        residx_p1 = residx_p1[residx_p1 < len(x_mask)]  # prevent selecting a non-existant residue
+        residx_x_mask[residx_p1] = False
+        residx_m1 = residx - 1
+        residx_m1 = residx_m1[residx_m1 > -1]  # prevent selecting a non-existant residue
+        residx_x_mask[residx_m1] = False
+        # remasked residues
+        residx_x_mask[x_mask] = True
+    else:
+        residx_x_mask = torch.zeros_like(x_mask).bool()
+
+    t = diffusion_outputs['t']
+    apply_chain_loss = t < time_threshold
+    apply_chain_loss = torch.cat([
+        torch.ones(data_len, device=t.device) * apply_chain_loss[i]
+        for i, data_len in enumerate(data_lens)
+    ], dim=0).bool()
+    residx_x_mask = residx_x_mask & apply_chain_loss
+
+    bb_dihedrals_loss = backbone_dihedrals_loss(
+        denoised_bb,
+        bb,
+        data_lens,
+        residx_x_mask)
+
+    bb_conn_lens, bb_conn_angles = chain_constraints_loss(
+        denoised_bb,
+        bb,
+        data_lens,
+        batch['residue'].batch,
+        residx_x_mask)
+
+    return {
+        "pred_x_ca_mse": pred_X_ca_mse,
+        "ref_x_ca_mse": ref_X_ca_mse,
+        "pred_bb_mse": pred_backbone_mse,
+        "ref_bb_mse": ref_backbone_mse,
+        "pred_bb_rel_mse": pred_bb_rel_mse,
+        "ref_bb_rel_mse": ref_bb_rel_mse,
+        "bb_dihedrals_loss": bb_dihedrals_loss,
+        "bb_conn_lens": bb_conn_lens,
+        "bb_conn_angles": bb_conn_angles
+    }
+
+def bb_inpaint_r3_loss_fn(batch,
+                          denoiser_outputs,
+                          absolute_error=False):
+
+    bb_denoising_dict = backbone_r3_diffusion_loss(
+        batch,
+        denoiser_outputs
+    )
+
+    bb_denoising_loss = (
+        bb_denoising_dict["pred_x_ca_mse"] +
+        bb_denoising_dict["pred_bb_rel_mse"] +
+        bb_denoising_dict["bb_dihedrals_loss"] +
+        bb_denoising_dict["bb_conn_lens"] +
+        bb_denoising_dict["bb_conn_angles"]
+    ) * denoiser_outputs["bb_loss_weight"]
+
+    loss = bb_denoising_loss.mean()
+
+    out_dict = {"loss": loss}
+    out_dict.update(bb_denoising_dict)
     return out_dict

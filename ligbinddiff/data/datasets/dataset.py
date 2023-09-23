@@ -4,7 +4,7 @@ import numpy as np
 import torch.utils.data as data
 
 
-from ligbinddiff.utils.atom_reps import atom14_to_atom91, atom91_atom_masks, letter_to_num
+from ligbinddiff.utils.atom_reps import atom91_atom_masks, letter_to_num
 from ligbinddiff.utils.zernike import ZernikeTransform
 
 from .featurize import sidechain
@@ -35,7 +35,7 @@ class ProteinGraphDataset(data.Dataset):
     :param device: if "cuda", will do preprocessing on the GPU
     '''
 
-    FEATURE_MODES = ['sidechain.atomic', 'sidechain.density']
+    FEATURE_MODES = ['sidechain.atomic', 'sidechain.density', 'sidechain.cross_scale']
 
     def __init__(self, data_list,
                  num_positional_embeddings=16,
@@ -94,3 +94,10 @@ class ProteinGraphDataset(data.Dataset):
                                                num_rbf=self.num_rbf,
                                                top_k=self.top_k,
                                                device=self.device)
+        elif self.feature_mode == 'sidechain.cross_scale':
+            return sidechain.featurize_cross_scale_atomic(
+                self.data_list[i],
+                letter_to_num=self.letter_to_num,
+                num_rbf=self.num_rbf,
+                top_k=self.top_k,
+                device=self.device)

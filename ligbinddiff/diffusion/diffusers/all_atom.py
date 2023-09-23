@@ -9,7 +9,7 @@ import numpy as np
 
 from ligbinddiff.utils.so3_embedding import so3_add, so3_sub, so3_mult, so3_randn_like, so3_ones_like, gen_so3_unop
 
-from ligbinddiff.model.all_atom.r3.denoiser import LatentDenoiser
+from ligbinddiff.model.denoiser.bb_sidechain.r3_latent import LatentDenoiser
 from ligbinddiff.model.all_atom.r3.autoencoder import LatentEncoder, LatentDecoder
 from ligbinddiff.model.modules.equiformer_v2.so3 import CoefficientMappingModule, SO3_Embedding, SO3_Rotation, SO3_Grid, SO3_LinearV2
 

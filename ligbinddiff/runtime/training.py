@@ -308,3 +308,79 @@ def debug_inpaint_train_loop(diffuser,
         # exit()
 
     return {key: np.mean(losses) for key, losses in epoch_dict.items()}
+
+
+def bb_inpaint_train_loop(diffuser,
+                       dataloader,
+                       optimizer,
+                       fabric,
+                       loss_fn,
+                       train=True,
+                       warmup=False,
+                       debug=False,
+                       debug_device='cpu',
+                       ):
+    epoch_dict = {}
+
+    for batch in (pbar := tqdm.tqdm(dataloader)):
+
+        try:
+            # print(batch.name)
+            if train:
+                optimizer.zero_grad()
+
+            if debug:
+                batch = batch.to(debug_device)
+            denoiser_outputs = diffuser.forward(batch)
+
+            loss_dict = loss_fn(batch, denoiser_outputs)
+            # print(loss_dict)
+            loss = loss_dict["loss"]
+
+            if train:
+                if debug:
+                    loss.backward()
+                else:
+                    fabric.backward(loss)
+
+                # check if there are any nans in grads
+                # if so, rerun this step under anomaly detection
+                nan_param_grad = False
+                for name, param in diffuser.named_parameters():
+                    if param.grad is not None and not param.grad.isfinite().all():
+                        torch.set_printoptions(threshold=1000000)
+                        print("nan in", name, "grad")
+                        nan_param_grad = True
+
+                if nan_param_grad:
+                    optimizer.zero_grad()
+                    with torch.autograd.detect_anomaly():
+                        latent_data, decoder_outputs = diffuser.forward(batch, warmup=warmup)
+
+                        loss_dict = loss_fn(batch, latent_data, decoder_outputs, warmup=warmup)
+                        loss = loss_dict["loss"]
+                        if debug:
+                            loss.backward()
+                        else:
+                            fabric.backward(loss)
+                else:
+                    optimizer.step()
+
+
+            epoch_dict = update_epoch_loss_dict(epoch_dict, loss_dict)
+            epoch_loss = np.mean(epoch_dict['loss'])
+            pbar_str = f"epoch_loss: {np.mean(epoch_loss):.4f}, "
+            pbar_str += gen_pbar_str(loss_dict)
+            pbar_str += f"t: {format_list(denoiser_outputs['t'].unique(sorted=False), '{:.4f}')}"
+            pbar.set_description(pbar_str)
+
+            if torch.isnan(loss).any():
+                exit()
+        except Exception as e:
+            torch.save(batch, "problematic_inputs.pt")
+            torch.save(denoiser_outputs, "decoder_outputs.pt")
+            raise e
+        # print("Done")
+        # exit()
+
+    return {key: np.mean(losses) for key, losses in epoch_dict.items()}
