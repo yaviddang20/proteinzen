@@ -150,13 +150,13 @@ class R3Diffuser(nn.Module):
         g_t = self.diffusion_coef(t)
         f_t = self.drift_coef(x_t, t)
         z = noise_scale * torch.randn(size=score_t.shape, device=score_t.device)
-        perturb = (f_t - g_t**2 * score_t) * dt + g_t * np.sqrt(np.abs(dt)) * z
+        perturb = (f_t - g_t**2 * score_t) * (-dt) + g_t * np.sqrt(np.abs(dt)) * z
 
         if mask is not None:
             perturb *= mask[..., None]
         else:
             mask = torch.ones(x_t.shape[:-1], device=x_t.device)
-        x_t_1 = x_t - perturb
+        x_t_1 = x_t + perturb
         if center:
             com = torch.sum(x_t_1, dim=-2) / torch.sum(mask, dim=-1)[..., None]
             x_t_1 -= com[..., None, :]

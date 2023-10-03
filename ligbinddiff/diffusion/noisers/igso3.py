@@ -112,7 +112,7 @@ class IGSO3:
         igso3_vals = calculate_igso3(
             num_ts=num_ts, num_omegas=num_omegas,min_t=min_t, max_t=max_t, L=L)
 
-        igso3_vals = {key: torch.as_tensor(val) for key,val in igso3_vals.items()}
+        igso3_vals = {key: torch.as_tensor(val).float() for key,val in igso3_vals.items()}
 
         self._cdf = igso3_vals['cdf']
         self._pdf = igso3_vals['pdf']
@@ -146,9 +146,10 @@ class IGSO3:
         unique_t = set(t.tolist())
 
         out = np.zeros_like(t.numpy(force=True))
-        for _t in unique_t:
+        for i, _t in enumerate(unique_t):
             select = (t == _t)
             n_samples = select.long().sum()
+            # print(i, _t, n_samples)
             select = select.numpy(force=True)
             x = np.random.rand(n_samples)
             angles = np.interp(x, self._cdf[self.t_idx(torch.tensor(_t))], self._discrete_omegas)
@@ -179,7 +180,7 @@ class IGSO3:
         unique_t = set(t.tolist())
 
         out = np.zeros_like(omega)
-        for _t in unique_t:
+        for i, _t in enumerate(unique_t):
             select = (t == _t).numpy(force=True)
             subset_omega = omega[select]
             diff = np.interp(subset_omega, self._discrete_omegas, self._d_logf_d_omega[self.t_idx(torch.tensor(_t))])
@@ -193,16 +194,22 @@ class IGSO3:
 
         Args:
             R: [..., 3, 3] array of rotation matrices in SO(3)
-            t: time for Brownian motion
+            t: [...] array of times for Brownian motion
             eps: for stability when dividing by something small
 
         Returns:
             [..., 3, 3] score vector in the direction of the sampled vector with
             magnitude given by _d_logf_d_omega.
         """
-        device = R.device
         omega = so3_utils.Omega(R)
-        d_logf_d_omega = self.d_logf_d_omega(omega, t)
+        t_idx = self.t_idx(t)
+        omega_idx = torch.bucketize(omega, self._discrete_omegas[:-1])
+        if t_idx.shape == omega_idx.shape:
+            d_logf_d_omega = self._d_logf_d_omega[t_idx, omega_idx]
+        elif len(t_idx.shape) + 1 == len(omega_idx.shape):
+            d_logf_d_omega = self._d_logf_d_omega[t_idx[:, None], omega_idx]
+        else:
+            raise ValueError(f"we have weird shapes of R {R.shape} and t {t.shape}")
 
         # Unit vector in tangent space
         direction = torch.einsum('...jk,...kl->...jl',

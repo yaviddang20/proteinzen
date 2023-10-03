@@ -26,6 +26,7 @@ except ImportError:
 
 from .wigner import wigner_D
 from torch.nn import Linear
+import torch_geometric.utils as pygu
 
 
 class CoefficientMappingModule(torch.nn.Module):
@@ -283,6 +284,15 @@ class SO3_Embedding():
             dtype=self.embedding.dtype,
         )
         new_embedding.index_add_(0, edge_index, self.embedding)
+
+        # # embedding: n_node x n_coeff x n_channel
+        # # edge_index: n_node
+
+        # new_embedding = pygu.scatter(
+        #     src=self.embedding,
+        #     index=edge_index[:, None, None],
+        #     dim=0,
+        #     dim_size=num_nodes)
         self.set_embedding(new_embedding)
 
 

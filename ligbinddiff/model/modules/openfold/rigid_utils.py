@@ -1190,20 +1190,20 @@ class Rigid:
         origin = torch.unbind(origin, dim=-1)
         p_xy_plane = torch.unbind(p_xy_plane, dim=-1)
 
-        e0 = [c1 - c2 for c1, c2 in zip(origin, p_neg_x_axis)]
-        e1 = [c1 - c2 for c1, c2 in zip(p_xy_plane, origin)]
+        e0 = [c1 - c2 for c1, c2 in zip(origin, p_neg_x_axis)]  # v1 = x2 - x1
+        e1 = [c1 - c2 for c1, c2 in zip(p_xy_plane, origin)]  # v2 = x3 - x2
 
         denom = torch.sqrt(sum((c * c for c in e0)) + eps)
-        e0 = [c / denom for c in e0]
-        dot = sum((c1 * c2 for c1, c2 in zip(e0, e1)))
-        e1 = [c2 - c1 * dot for c1, c2 in zip(e0, e1)]
+        e0 = [c / denom for c in e0]  # e1 = norm v1
+        dot = sum((c1 * c2 for c1, c2 in zip(e0, e1)))  # e1 . v2
+        e1 = [c2 - c1 * dot for c1, c2 in zip(e0, e1)]  # u2 = v2 - e1 (e1 . v2)
         denom = torch.sqrt(sum((c * c for c in e1)) + eps)
-        e1 = [c / denom for c in e1]
+        e1 = [c / denom for c in e1]  # e2 = norm u2
         e2 = [
             e0[1] * e1[2] - e0[2] * e1[1],
             e0[2] * e1[0] - e0[0] * e1[2],
             e0[0] * e1[1] - e0[1] * e1[0],
-        ]
+        ]  # e3 = e1 x e2
 
         rots = torch.stack([c for tup in zip(e0, e1, e2) for c in tup], dim=-1)
         rots = rots.reshape(rots.shape[:-1] + (3, 3))

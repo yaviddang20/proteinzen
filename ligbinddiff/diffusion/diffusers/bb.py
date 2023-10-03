@@ -108,10 +108,11 @@ class R3InpaintingDiffuser(nn.Module):
         out_dict = {}
         t = self.time_dist.sample([data.num_graphs])
         t = t.to(data['residue']['x'].device)
+        out_dict['t_per_graph'] = t
+        out_dict['t'] = t
         bb_data_coeff, bb_noise_coeff = self.bb_scheduler.noising_coeffs(t)
         noised_data = self.noise_bb(data, intermediates['noised_residx'], bb_data_coeff, bb_noise_coeff)
         out_dict.update(noised_data)
-        out_dict['t'] = t
         out_dict['bb_loss_weight'] = self.bb_scheduler.weight(t)
         return out_dict
 
@@ -258,6 +259,7 @@ class R3InpaintingDiffuser(nn.Module):
             steps = self.time_T
 
         intermediates['t'] = torch.ones([num_nodes], device=device).float() * (steps - 1)
+        intermediates['t_per_graph'] = torch.ones([data.num_graphs], device=device).float() * (steps - 1)
         delta_t = - self.time_T // steps
         denoiser_output = None
 

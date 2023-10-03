@@ -5,55 +5,95 @@ from torch import nn
 import torch.nn.functional as F
 import numpy as np
 from torch_cluster import knn_graph
-from torch_geometric.utils import sort_edge_index
 
 from ligbinddiff.model.modules.equiformer_v2.so3 import CoefficientMappingModule, SO3_Embedding, SO3_Rotation, SO3_Grid, SO3_LinearV2
 from ligbinddiff.model.modules.equiformer_v2.layer_norm import MultiResEquivariantRMSNormArraySphericalHarmonicsV2 as NormSO3
 from ligbinddiff.model.modules.equiformer_v2.transformer_block import FeedForwardNetwork, MultiResFeedForwardNetwork, TransBlockV2
 from ligbinddiff.model.modules.equiformer_v2.edge_rot_mat import init_edge_rot_mat
+from ligbinddiff.model.modules.common import EdgeUpdate
+from ligbinddiff.model.modules.common import sample_inv_cubic_edges
 
 from ligbinddiff.data.datasets.featurize.sidechain import _rbf, _positional_embeddings
 
 
-def sample_inv_cubic_edges(batched_X_ca, batched_x_mask, batch, knn_k=30, inv_cube_k=10):
-    edge_indicies = []
-    offset = 0
-    for i in range(batch.max().item() + 1):
-        X_ca = batched_X_ca[batch == i]
-        x_mask = batched_x_mask[batch == i]
+class GraphUpdate(nn.Module):
+    def __init__(self,
+                 bb_lmax_list,
+                 edge_channels_list,
+                 mappingReduced_bb,
+                 bb_SO3_rotation,
+                 bb_SO3_grid,
+                 num_heads=8,
+                 h_channels=32,
+                 bb_channels=32,
+                 n_bb_atoms=4,
+                 ):
+        super().__init__()
 
-        X_ca[x_mask] = torch.inf
-        rel_pos_CA = X_ca.unsqueeze(1) - X_ca.unsqueeze(0)  # N x N x 3
-        dist_CA = torch.linalg.vector_norm(rel_pos_CA, dim=-1)  # N x N
-        sorted_dist, sorted_edges = torch.sort(dist_CA, dim=-1)  # N x N
-        knn_edges = sorted_edges[..., :knn_k]
+        self.n_bb_atoms = n_bb_atoms-1
+        self.bb_lmax_list = bb_lmax_list
+        self.h_channels = h_channels
+        self.bb_channels = bb_channels
+        self.bb_SO3_rotation = bb_SO3_rotation
 
-        # remove knn edges
-        remaining_dist = sorted_dist[..., knn_k:]  # N x (N - knn_k)
-        remaining_edges = sorted_edges[..., knn_k:]  # N x (N - knn_k)
+        self.attention = TransBlockV2(
+            sphere_channels=bb_channels + self.n_bb_atoms,
+            attn_hidden_channels=h_channels,
+            num_heads=num_heads,
+            attn_alpha_channels=h_channels // 2,
+            attn_value_channels=h_channels // 4,
+            ffn_hidden_channels=h_channels,
+            output_channels=bb_channels,
+            lmax_list=bb_lmax_list,
+            mmax_list=bb_lmax_list,
+            SO3_rotation=bb_SO3_rotation,
+            SO3_grid=bb_SO3_grid,
+            edge_channels_list=edge_channels_list,
+            mappingReduced=mappingReduced_bb
+        )
 
-        ## inv cube
-        uniform = torch.distributions.Uniform(0,1)
-        dist_noise = uniform.sample(remaining_dist.shape).to(batched_X_ca.device)  # N x (N - knn_k)
+        self.edge_update = EdgeUpdate(
+            node_lmax_list=bb_lmax_list,
+            edge_channels_list=edge_channels_list,
+            h_channels=bb_channels
+        )
 
-        logprobs = -3 * torch.log(remaining_dist)  # N x (N - knn_k)
-        perturbed_logprobs = logprobs - torch.log(-torch.log(dist_noise))  # N x (N - knn_k)
-        _, sampled_edges_relative_idx = torch.topk(perturbed_logprobs, k=inv_cube_k, dim=-1)
-        sampled_edges = torch.gather(remaining_edges, -1, sampled_edges_relative_idx)  # N x inv_cube_k
 
-        edge_sinks = torch.cat([knn_edges, sampled_edges], dim=-1)  # B x N x (knn_k + inv_cube_k)
-        edge_sources = torch.arange(X_ca.shape[0]).repeat_interleave(knn_k + inv_cube_k).to(edge_sinks.device)
-        edge_index = torch.stack([edge_sinks.flatten(), edge_sources], dim=0)
-        edge_indicies.append(sort_edge_index(edge_index, sort_by_row=False) + offset)
-        offset = offset + (batch == i).long().sum()
+    def forward(self,
+                bb_rel: torch.Tensor,
+                bb_features: SO3_Embedding,
+                edge_features: torch.Tensor,
+                edge_index: torch.Tensor,
+                noising_mask: torch.Tensor):
+        # compute which nodes are being noised and which aren't
+        num_nodes = bb_features.length
 
-    edge_index = torch.cat(edge_indicies, dim=-1)
-    edge_dist_vec = batched_X_ca[edge_index[0]] - batched_X_ca[edge_index[1]]
-    edge_dist = torch.linalg.vector_norm(edge_dist_vec, dim=-1)
-    # slightly hacky
-    # TODO: use x_mask instead
-    edge_select = edge_dist.isfinite() & (edge_dist > 0.1)  # mostly arbitrary cutoff
-    return edge_index[:, edge_select]
+        # update backbone
+        node_features = SO3_Embedding(
+            num_nodes,
+            self.bb_lmax_list,
+            num_channels=self.bb_channels + self.n_bb_atoms,
+            device=bb_features.device,
+            dtype=bb_features.dtype
+        )
+        node_features.embedding[..., :self.bb_channels] = bb_features.embedding
+        node_features.embedding[..., 1:4, -self.n_bb_atoms:] = bb_rel.transpose(-1, -2)
+        node_features.embedding[..., 0:1, -1:] = noising_mask[:, None, None].float() # is node editable or not
+
+        new_bb_features = self.attention(
+            node_features,
+            edge_features,
+            edge_index
+        )
+
+        # update edges
+        new_edge_features = self.edge_update(
+            new_bb_features,
+            edge_features,
+            edge_index
+        )
+
+        return new_bb_features, new_edge_features
 
 
 class BackboneUpdate(nn.Module):
@@ -67,8 +107,8 @@ class BackboneUpdate(nn.Module):
                  h_channels=32,
                  bb_channels=32,
                  n_bb_atoms=4,
-                 knn_k=30,
-                 lrange_k=30):
+                 knn_k=20,
+                 lrange_k=40):
         super().__init__()
 
         self.n_bb_atoms = n_bb_atoms-1
@@ -78,6 +118,22 @@ class BackboneUpdate(nn.Module):
         self.bb_SO3_rotation = bb_SO3_rotation
 
         self.lrange_attention = TransBlockV2(
+            sphere_channels=bb_channels + self.n_bb_atoms,
+            attn_hidden_channels=h_channels,
+            num_heads=num_heads,
+            attn_alpha_channels=h_channels // 2,
+            attn_value_channels=h_channels // 4,
+            ffn_hidden_channels=h_channels,
+            output_channels=bb_channels,
+            lmax_list=bb_lmax_list,
+            mmax_list=bb_lmax_list,
+            SO3_rotation=bb_SO3_rotation,
+            SO3_grid=bb_SO3_grid,
+            edge_channels_list=edge_channels_list,
+            mappingReduced=mappingReduced_bb
+        )
+
+        self.local_attention = TransBlockV2(
             sphere_channels=bb_channels + self.n_bb_atoms,
             attn_hidden_channels=h_channels,
             num_heads=num_heads,
@@ -124,15 +180,26 @@ class BackboneUpdate(nn.Module):
         num_nodes = bb_features.length
 
         # compute graph with knn + inv cubic edges
-        edge_index = sample_inv_cubic_edges(X_ca, x_mask, batch)
+        lrange_edge_index = sample_inv_cubic_edges(X_ca, x_mask, batch, self.knn_k, self.lrange_k)
+        masked_X_ca = X_ca.clone()
+        masked_X_ca[x_mask] = torch.inf
+        knn_edge_index = knn_graph(masked_X_ca, self.knn_k, batch)
+        edge_index = torch.cat([knn_edge_index, lrange_edge_index], dim=-1)
         edge_dist_vec = X_ca[edge_index[0]] - X_ca[edge_index[1]]
         edge_dist = torch.linalg.vector_norm(edge_dist_vec, dim=-1)
-        # update rotation matrices
-        edge_rot_mat = init_edge_rot_mat(edge_dist_vec)
-        for rot in self.bb_SO3_rotation:
-            rot.set_wigner(edge_rot_mat)
 
-        # update backbone
+        # gen edge features
+        edge_dist_rbf = _rbf(edge_dist, device=edge_dist.device)  # edge_channels_list
+        edge_dist_rel_pos = _positional_embeddings(edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
+        edge_features = torch.cat([edge_dist_rbf, edge_dist_rel_pos], dim=-1)
+        edge_rot_mat = init_edge_rot_mat(edge_dist_vec)
+
+        # update rotation matrices
+        knn_edge_rot_mat = edge_rot_mat[:knn_edge_index.shape[1]]
+        for rot in self.bb_SO3_rotation:
+            rot.set_wigner(knn_edge_rot_mat)
+
+        # update using local information
         node_features = SO3_Embedding(
             num_nodes,
             self.bb_lmax_list,
@@ -144,10 +211,27 @@ class BackboneUpdate(nn.Module):
         node_features.embedding[..., 1:4, -self.n_bb_atoms:] = bb_rel.transpose(-1, -2)
         node_features.embedding[..., 0:1, -1:] = noising_mask[:, None, None].float() # is node editable or not
 
-        # gen edge features
-        edge_dist_rbf = _rbf(edge_dist, device=edge_dist.device)  # edge_channels_list
-        edge_dist_rel_pos = _positional_embeddings(edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
-        edge_features = torch.cat([edge_dist_rbf, edge_dist_rel_pos], dim=-1)
+        knn_edge_features = edge_features[:knn_edge_index.shape[1]]
+        updated_bb_features = self.local_attention(
+            node_features,
+            knn_edge_features,
+            knn_edge_index
+        )
+
+        # update rotation matrices
+        for rot in self.bb_SO3_rotation:
+            rot.set_wigner(edge_rot_mat)
+        # update using lrange information
+        node_features = SO3_Embedding(
+            num_nodes,
+            self.bb_lmax_list,
+            num_channels=self.bb_channels + self.n_bb_atoms,
+            device=bb_features.device,
+            dtype=bb_features.dtype
+        )
+        node_features.embedding[..., :self.bb_channels] = bb_features.embedding
+        node_features.embedding[..., 1:4, -self.n_bb_atoms:] = bb_rel.transpose(-1, -2)
+        node_features.embedding[..., 0:1, -1:] = noising_mask[:, None, None].float() # is node editable or not
 
         updated_bb_features = self.lrange_attention(
             node_features,
@@ -169,6 +253,60 @@ class BackboneUpdate(nn.Module):
         new_bb_rel[noising_mask] = bb_rel[noising_mask] + update_bb.embedding[:, 1:4].transpose(-1, -2)[noising_mask]
 
         return new_X_ca, new_bb_rel, updated_bb_features.clone()
+
+class BackboneUpdateFromGraph(nn.Module):
+    def __init__(self,
+                 bb_lmax_list,
+                 edge_channels_list,
+                 mappingReduced_bb,
+                 bb_SO3_rotation,
+                 bb_SO3_grid,
+                 num_heads=8,
+                 h_channels=32,
+                 bb_channels=32,
+                 n_bb_atoms=4,
+                 knn_k=30,
+                 lrange_k=10):
+        super().__init__()
+
+        self.n_bb_atoms = n_bb_atoms-1
+        self.bb_lmax_list = bb_lmax_list
+        self.h_channels = h_channels
+        self.bb_channels = bb_channels
+        self.bb_SO3_rotation = bb_SO3_rotation
+
+        self.update_x_ca = SO3_LinearV2(
+            in_features=bb_channels,
+            out_features=1,
+            lmax=max(bb_lmax_list)
+        )
+
+        self.update_bb = SO3_LinearV2(
+            in_features=bb_channels,
+            out_features=self.n_bb_atoms,
+            lmax=max(bb_lmax_list)
+        )
+
+        self.knn_k = knn_k
+        self.lrange_k = lrange_k
+
+
+    def forward(self,
+                X_ca: torch.Tensor,
+                bb_rel: torch.Tensor,
+                bb_features: SO3_Embedding,
+                noising_mask: torch.Tensor):
+        update_X_ca = self.update_x_ca(bb_features)
+        update_bb = self.update_bb(bb_features)
+
+        subset_update_X_ca = update_X_ca.embedding[:, 1:4].squeeze(-1)[noising_mask]
+
+        new_X_ca = X_ca.clone()
+        new_X_ca[noising_mask] = X_ca[noising_mask] + subset_update_X_ca
+        new_bb_rel = bb_rel.clone()
+        new_bb_rel[noising_mask] = bb_rel[noising_mask] + update_bb.embedding[:, 1:4].transpose(-1, -2)[noising_mask]
+
+        return new_X_ca, new_bb_rel
 
 
 # adapted from https://github.com/jmclong/random-fourier-features-pytorch/blob/main/rff/layers.py
@@ -198,6 +336,8 @@ class BackboneR3Denoiser(nn.Module):
                  h_time=64,
                  scalar_h_dim=128,
                  n_layers=4,
+                 knn_k=20,
+                 lrange_k=40,
                  device='cpu'):
         super().__init__()
 
@@ -217,12 +357,27 @@ class BackboneR3Denoiser(nn.Module):
             nn.ReLU()
         )
 
-        self.embed_time = nn.Linear(
-            bb_channels + h_time, bb_channels
+        def time_mlp():
+            return nn.Sequential(
+            nn.Linear(bb_channels+h_time, scalar_h_dim),
+            nn.ReLU(),
+            nn.Linear(scalar_h_dim, bb_channels),
+            nn.ReLU(),
+            nn.LayerNorm(bb_channels)
         )
 
-        self.denoiser = nn.ModuleList([
-            BackboneUpdate(
+        self.embed_time = time_mlp()
+
+        # self.embed_time_encoder = nn.ModuleList([
+        #     time_mlp() for _ in range(n_layers)
+        # ])
+
+        # self.embed_time_denoiser = nn.ModuleList([
+        #     time_mlp() for _ in range(n_layers)
+        # ])
+
+        self.spatial_encoder = nn.ModuleList([
+            GraphUpdate(
                 bb_lmax_list=bb_lmax_list,
                 edge_channels_list=edge_channels_list,
                 mappingReduced_bb=mappingReduced_bb,
@@ -233,6 +388,31 @@ class BackboneR3Denoiser(nn.Module):
                 h_channels=h_channels)
             for _ in range(n_layers)
         ])
+        self.seq_local_encoder = nn.ModuleList([
+            GraphUpdate(
+                bb_lmax_list=bb_lmax_list,
+                edge_channels_list=edge_channels_list,
+                mappingReduced_bb=mappingReduced_bb,
+                bb_SO3_rotation=bb_SO3_rotation,
+                bb_SO3_grid=bb_SO3_grid,
+                num_heads=num_heads,
+                bb_channels=bb_channels,
+                h_channels=h_channels)
+            for _ in range(n_layers)
+        ])
+
+        self.denoiser = BackboneUpdateFromGraph(
+                bb_lmax_list=bb_lmax_list,
+                edge_channels_list=edge_channels_list,
+                mappingReduced_bb=mappingReduced_bb,
+                bb_SO3_rotation=bb_SO3_rotation,
+                bb_SO3_grid=bb_SO3_grid,
+                num_heads=num_heads,
+                bb_channels=bb_channels,
+                h_channels=h_channels)
+
+        self.knn_k = knn_k
+        self.lrange_k = lrange_k
 
 
     def forward(self, data, intermediates):
@@ -249,7 +429,37 @@ class BackboneR3Denoiser(nn.Module):
             device=noised_X_ca.device,
             dtype=torch.float
         )
+        # add residue positional index
+        residx = torch.arange(data['residue'].num_nodes, device=bb_features.device)
+        bb_features.embedding[:, 0] = _positional_embeddings(residx, num_embeddings=self.bb_channels, device=bb_features.device)
         ts = intermediates['t']  # (B,)
+
+        # compute graph with knn + inv cubic edges
+        batch = data['residue'].batch
+        masked_X_ca = noised_X_ca.clone()
+        masked_X_ca[x_mask] = torch.inf
+        edge_index = sample_inv_cubic_edges(masked_X_ca, x_mask, batch, self.knn_k, self.lrange_k)
+        edge_dist_vec = noised_X_ca[edge_index[0]] - noised_X_ca[edge_index[1]]
+        edge_dist = torch.linalg.vector_norm(edge_dist_vec, dim=-1)
+
+        # gen edge features
+        edge_dist_rbf = _rbf(edge_dist, device=edge_dist.device)  # edge_channels_list
+        edge_dist_rel_pos = _positional_embeddings(edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
+        edge_features = torch.cat([edge_dist_rbf, edge_dist_rel_pos], dim=-1)
+        edge_rot_mat = init_edge_rot_mat(edge_dist_vec)
+        # for rot in self.bb_SO3_rotation_list:
+        #     rot.set_wigner(edge_rot_mat)
+
+        seq_local_edge_index = data['residue', 'seq_local', 'residue'].edge_index
+        seq_local_edge_dist_vec = noised_X_ca[seq_local_edge_index[0]] - noised_X_ca[seq_local_edge_index[1]]
+        seq_local_edge_dist = torch.linalg.vector_norm(seq_local_edge_dist_vec, dim=-1)
+
+        # gen edge features
+        seq_local_edge_dist_rbf = _rbf(seq_local_edge_dist, device=edge_dist.device)  # edge_channels_list
+        seq_local_edge_dist_rel_pos = _positional_embeddings(seq_local_edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
+        seq_local_edge_features = torch.cat([seq_local_edge_dist_rbf, seq_local_edge_dist_rel_pos], dim=-1)
+
+        seq_local_edge_rot_mat = init_edge_rot_mat(seq_local_edge_dist_vec)
 
         ## create time embedding
         fourier_time = self.time_rbf(ts.unsqueeze(-1))  # (B x h_time,)
@@ -259,7 +469,14 @@ class BackboneR3Denoiser(nn.Module):
         embedded_time = torch.cat([
             embedded_time[i].view(1, -1).expand(l, -1) for i, l in enumerate(data_lens)
         ])  # n_res x h_time
-
+        # fuse time embedding into node features
+        bb_num_l0 = len(self.bb_lmax_list)
+        bb_l0 = bb_features.get_invariant_features()  # n_res x (node_num_m0 x h_channels)
+        time_expanded = embedded_time.unsqueeze(-2).expand(-1, bb_num_l0, -1)
+        bb_update_l0 = self.embed_time(
+            torch.cat([bb_l0, time_expanded], dim=-1)
+        )
+        bb_features.set_invariant_features(bb_l0 + bb_update_l0)
 
         # center the training example at the mean of the x_cas
         center = []
@@ -272,28 +489,32 @@ class BackboneR3Denoiser(nn.Module):
             center.append(subset_mean[None, :].expand(num_nodes, -1))
         center = torch.cat(center, dim=0)
 
-
         ## denoising
         X_ca = noised_X_ca - center
         bb_rel = noised_bb_rel
 
-        for layer in self.denoiser:
-            # fuse time embedding into node features
-            bb_num_l0 = len(self.bb_lmax_list)
-            bb_l0 = bb_features.get_invariant_features()  # n_res x (node_num_m0 x h_channels)
-            time_expanded = embedded_time.unsqueeze(-2).expand(-1, bb_num_l0, -1)
-            bb_l0 = self.embed_time(
-                torch.cat([bb_l0, time_expanded], dim=-1)
-            )
-            bb_features.set_invariant_features(bb_l0)
-
-            X_ca, bb_rel, bb_features = layer(
-                X_ca,
+        for spatial_layer, seq_local_layer in zip(self.spatial_encoder, self.seq_local_encoder):
+            for rot in self.bb_SO3_rotation_list:
+                rot.set_wigner(edge_rot_mat)
+            bb_features, edge_features = spatial_layer(
                 bb_rel,
                 bb_features,
-                data['residue'].batch,
-                x_mask,
-                noising_mask)
+                edge_features,
+                edge_index,
+                noising_mask
+            )
+
+            for rot in self.bb_SO3_rotation_list:
+                rot.set_wigner(seq_local_edge_rot_mat)
+            bb_features, seq_local_edge_features = seq_local_layer(
+                bb_rel,
+                bb_features,
+                seq_local_edge_features,
+                seq_local_edge_index,
+                noising_mask
+            )
+
+        X_ca, bb_rel = self.denoiser(X_ca, bb_rel, bb_features, noising_mask)
 
         denoised_bb_vecs = torch.empty_like(noised_bb_vecs)
         denoised_bb_vecs[:, 1] = X_ca + center

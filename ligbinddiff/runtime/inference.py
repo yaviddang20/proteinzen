@@ -241,7 +241,7 @@ def debug_inpaint_inference_loop(diffuser,
                            device=None,
                            save=False,
                            truncate=None,
-                           use_channel_weights=True,
+                           noise_scale=1.0,
                            show_progress=False):
     epoch_dict = {}
 
@@ -256,7 +256,7 @@ def debug_inpaint_inference_loop(diffuser,
             from torch_geometric.data import Batch
             batch = Batch.from_data_list([batch.to_data_list()[0]])
 
-        latent_outputs, denoiser_outputs = diffuser.sample(batch, steps=num_steps, show_progress=show_progress)
+        latent_outputs, denoiser_outputs = diffuser.sample(batch, steps=num_steps, show_progress=show_progress, noise_scale=noise_scale)
 
         loss_dict = loss_fn(batch, latent_outputs, denoiser_outputs)
         print(batch.name)

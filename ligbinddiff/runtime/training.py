@@ -240,6 +240,8 @@ def debug_inpaint_train_loop(diffuser,
                        warmup=False,
                        debug=False,
                        debug_device='cpu',
+                       step_count=None,
+                       checkpoint_steps=None
                        ):
     epoch_dict = {}
 
@@ -294,8 +296,13 @@ def debug_inpaint_train_loop(diffuser,
             epoch_loss = np.mean(epoch_dict['loss'])
             pbar_str = f"epoch_loss: {np.mean(epoch_loss):.4f}, "
             pbar_str += gen_pbar_str(loss_dict)
-            pbar_str += f"t: {format_list(latent_data['t'].unique(sorted=False), '{:.4f}')}"
+            pbar_str += f", t: {format_list(latent_data['t_per_graph'], '{:.4f}')}"
             pbar.set_description(pbar_str)
+            print(pbar_str)
+            if step_count is not None:
+                step_count += 1
+                if checkpoint_steps is not None and step_count % checkpoint_steps == 0:
+                    torch.save(diffuser.state_dict(), f"checkpoint_step_{step_count}.pt")
 
             if torch.isnan(loss).any():
                 exit()
@@ -307,7 +314,7 @@ def debug_inpaint_train_loop(diffuser,
         # print("Done")
         # exit()
 
-    return {key: np.mean(losses) for key, losses in epoch_dict.items()}
+    return {key: np.mean(losses) for key, losses in epoch_dict.items()}, step_count
 
 
 def bb_inpaint_train_loop(diffuser,
@@ -371,7 +378,7 @@ def bb_inpaint_train_loop(diffuser,
             epoch_loss = np.mean(epoch_dict['loss'])
             pbar_str = f"epoch_loss: {np.mean(epoch_loss):.4f}, "
             pbar_str += gen_pbar_str(loss_dict)
-            pbar_str += f"t: {format_list(denoiser_outputs['t'].unique(sorted=False), '{:.4f}')}"
+            pbar_str += f"t: {format_list(denoiser_outputs['t_per_graph'], '{:.4f}')}"
             pbar.set_description(pbar_str)
 
             if torch.isnan(loss).any():

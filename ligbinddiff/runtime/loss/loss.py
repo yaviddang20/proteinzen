@@ -725,15 +725,16 @@ def backbone_frame_diffusion_loss(batch,
 
     bb_frames = batch['frames']
     noised_bb_frames = latent_outputs['noised_frames']
-    denoised_bb_frames = latent_outputs['denoised_frames']
+    # denoised_bb_frames = latent_outputs['denoised_frames']
+    denoised_bb_frames = decoder_outputs['denoised_frames']
 
     X_ca = batch['bb'][:, 1]
     pred_frame_X_ca = denoised_bb_frames.get_trans()
-    pred_X_ca_dist = torch.linalg.vector_norm(X_ca - pred_frame_X_ca, dim=-1)
-    pred_X_ca_mse = _nodewise_to_graphwise(pred_X_ca_dist[total_mask], data_lens, ~total_mask)
     ref_frame_X_ca = noised_bb_frames.get_trans()
-    ref_X_ca_dist = torch.linalg.vector_norm(X_ca - ref_frame_X_ca, dim=-1)
-    ref_X_ca_mse = _nodewise_to_graphwise(ref_X_ca_dist[total_mask], data_lens, ~total_mask)
+    pred_X_ca_se = torch.square(X_ca - pred_frame_X_ca).sum(dim=-1)
+    pred_X_ca_mse = _nodewise_to_graphwise(pred_X_ca_se[total_mask], data_lens, ~total_mask)
+    ref_X_ca_se = torch.square(X_ca - ref_frame_X_ca).sum(dim=-1)
+    ref_X_ca_mse = _nodewise_to_graphwise(ref_X_ca_se[total_mask], data_lens, ~total_mask)
 
     bb = batch['bb'][:, :3]  # we're moving O to the sidechain
     denoised_bb = latent_outputs['denoised_bb']
@@ -763,11 +764,13 @@ def backbone_frame_diffusion_loss(batch,
     trans_score_scaling = latent_outputs['trans_score_scaling']
 
     # Translation score loss
+    # print(ref_trans_score.shape, pred_trans_score.shape)
     trans_score_se = (ref_trans_score - pred_trans_score)**2 * total_mask[..., None]
     trans_score_loss = (trans_score_se / trans_score_scaling[:, None]**2).sum(dim=-1)
     trans_score_loss = _nodewise_to_graphwise(trans_score_loss[total_mask], data_lens, ~total_mask)
 
     # Rotation score loss
+    # print(ref_rot_score.shape, pred_rot_score.shape)
     rot_se = (ref_rot_score - pred_rot_score)**2 * total_mask[..., None, None]
     rot_score_loss = (rot_se / rot_score_scaling[:, None, None]**2).sum(dim=(-1, -2))
     rot_score_loss = _nodewise_to_graphwise(rot_score_loss[total_mask], data_lens, ~total_mask)
@@ -1028,22 +1031,25 @@ def debug_inpaint_frame_latent_loss_fn(batch,
                                  decoder_outputs,
                                  warmup=False,
                                  ae_loss_weight=1,
-                                 absolute_error=False):
-    bb_frame_diffusion_loss_dict = backbone_frame_diffusion_loss(batch,
-                                                                 latent_outputs,
-                                                                 decoder_outputs)
+                                 absolute_error=False,
+                                 time_threshold=0.25):
+    bb_frame_diffusion_loss_dict = frame_diffusion_loss(batch,
+                                                        latent_outputs,
+                                                        decoder_outputs)
     bb_denoising_loss = (
-        # bb_frame_diffusion_loss_dict["rot_score_loss"] +
-        # bb_frame_diffusion_loss_dict["trans_score_loss"] +
         bb_frame_diffusion_loss_dict["pred_x_ca_mse"] +
+        bb_frame_diffusion_loss_dict["rot_score_loss"]
+    )
+    bb_denoising_finegrain_loss = (
         bb_frame_diffusion_loss_dict["pred_bb_mse"] +
-        bb_frame_diffusion_loss_dict["bb_fape"] +
         bb_frame_diffusion_loss_dict["bb_dihedrals_loss"] +
         bb_frame_diffusion_loss_dict["bb_conn_lens"] +
         bb_frame_diffusion_loss_dict["bb_conn_angles"]
-    )
+    ) * (latent_outputs['t_per_graph'] < time_threshold)
 
+    # loss = (bb_denoising_loss + bb_denoising_finegrain_loss).mean()
     loss = bb_denoising_loss.mean()
+    # loss = bb_frame_diffusion_loss_dict["pred_x_ca_mse"].mean()
 
     out_dict = {"loss": loss}
     out_dict.update(bb_frame_diffusion_loss_dict)
@@ -1137,10 +1143,10 @@ def backbone_r3_diffusion_loss(batch,
     X_ca = batch['residue']['bb'][:, 1]
     pred_X_ca =  diffusion_outputs['denoised_bb'][:, 1]
     ref_X_ca = diffusion_outputs['noised_bb'][:, 1]
-    pred_X_ca_dist = torch.linalg.vector_norm(X_ca - pred_X_ca, dim=-1)
-    pred_X_ca_mse = _nodewise_to_graphwise(pred_X_ca_dist[total_mask], data_lens, ~total_mask)
-    ref_X_ca_dist = torch.linalg.vector_norm(X_ca - ref_X_ca, dim=-1)
-    ref_X_ca_mse = _nodewise_to_graphwise(ref_X_ca_dist[total_mask], data_lens, ~total_mask)
+    pred_X_ca_se = torch.square(X_ca - pred_X_ca).sum(dim=-1)
+    pred_X_ca_mse = _nodewise_to_graphwise(pred_X_ca_se[total_mask], data_lens, ~total_mask)
+    ref_X_ca_se = torch.square(X_ca - ref_X_ca).sum(dim=-1)
+    ref_X_ca_mse = _nodewise_to_graphwise(ref_X_ca_se[total_mask], data_lens, ~total_mask)
 
     bb = batch['residue']["bb"]
     denoised_bb = diffusion_outputs['denoised_bb']
@@ -1222,7 +1228,8 @@ def backbone_r3_diffusion_loss(batch,
 
 def bb_inpaint_r3_loss_fn(batch,
                           denoiser_outputs,
-                          absolute_error=False):
+                          absolute_error=False,
+                          time_threshold=0.25):
 
     bb_denoising_dict = backbone_r3_diffusion_loss(
         batch,
@@ -1231,14 +1238,128 @@ def bb_inpaint_r3_loss_fn(batch,
 
     bb_denoising_loss = (
         bb_denoising_dict["pred_x_ca_mse"] +
-        bb_denoising_dict["pred_bb_rel_mse"] +
+        (bb_denoising_dict["pred_bb_rel_mse"] if not absolute_error else bb_denoising_dict["pred_bb_mse"]) #  * denoiser_outputs["bb_loss_weight"]
+    )
+    bb_denoising_finegrain_loss = (
+        bb_denoising_dict["pred_bb_mse"] +
         bb_denoising_dict["bb_dihedrals_loss"] +
         bb_denoising_dict["bb_conn_lens"] +
         bb_denoising_dict["bb_conn_angles"]
-    ) * denoiser_outputs["bb_loss_weight"]
+    ) * (denoiser_outputs['t_per_graph'] < time_threshold) # * denoiser_outputs["bb_loss_weight"]
 
-    loss = bb_denoising_loss.mean()
+    loss = (bb_denoising_loss + bb_denoising_finegrain_loss).mean()
 
     out_dict = {"loss": loss}
     out_dict.update(bb_denoising_dict)
     return out_dict
+
+
+def frame_diffusion_loss(batch,
+                         noised_data,
+                         denoiser_outputs,
+                         time_threshold=0.25):
+    x_mask = batch['x_mask']
+    noising_mask = noised_data['noising_mask']
+    # if we don't noise anything, just eval on everything as a sanity check
+    if (~noising_mask).all():
+        noising_mask = ~noising_mask
+    total_mask = ~x_mask & noising_mask
+
+    data_splits = batch._slice_dict['x']
+    data_lens = (data_splits[1:] - data_splits[:-1]).tolist()
+
+    bb_frames = batch['frames']
+    noised_bb_frames = noised_data['noised_frames']
+    # denoised_bb_frames = latent_outputs['denoised_frames']
+    denoised_bb_frames = denoiser_outputs['denoised_frames']
+
+    X_ca = batch['bb'][:, 1]
+    pred_frame_X_ca = denoised_bb_frames.get_trans()
+    ref_frame_X_ca = noised_bb_frames.get_trans()
+    pred_X_ca_se = torch.square(X_ca - pred_frame_X_ca).sum(dim=-1)
+    pred_X_ca_mse = _nodewise_to_graphwise(pred_X_ca_se[total_mask], data_lens, ~total_mask)
+    ref_X_ca_se = torch.square(X_ca - ref_frame_X_ca).sum(dim=-1)
+    ref_X_ca_mse = _nodewise_to_graphwise(ref_X_ca_se[total_mask], data_lens, ~total_mask)
+
+    bb = batch['bb'][:, :3]  # we're moving O to the sidechain
+    denoised_bb = denoiser_outputs['denoised_bb']
+    backbone_mse = torch.square(denoised_bb - bb).sum(dim=-1)
+    backbone_mse = backbone_mse[total_mask].view(-1)
+    total_mask_expand = total_mask[:, None].expand(-1, 3)
+    backbone_mse = _elemwise_to_graphwise(backbone_mse, data_lens, ~total_mask_expand)
+
+    bb_fape = compute_fape(
+        denoised_bb_frames,
+        bb_frames,
+        (~x_mask).long(),
+        denoised_bb,
+        bb,
+        (~x_mask).long()[:, None].expand(-1, 3),#noising_mask.long()[:, None].expand(-1, 3),
+        l1_clamp_distance=10
+    )
+    fape_mask = torch.isclose(bb_fape, torch.zeros_like(bb_fape))
+    fape_mask[x_mask] = True
+    bb_fape = _nodewise_to_graphwise(bb_fape[~fape_mask], data_lens, fape_mask)
+
+    pred_rot_score, pred_trans_score = denoiser_outputs['pred_bb_score']
+    ref_rot_score = noised_data['rot_score']
+    ref_trans_score = noised_data['trans_score']
+
+    rot_score_scaling = noised_data['rot_score_scaling']
+    trans_score_scaling = noised_data['trans_score_scaling']
+
+    # Translation score loss
+    trans_score_se = (ref_trans_score - pred_trans_score)**2 * total_mask[..., None]
+    trans_score_loss = (trans_score_se / trans_score_scaling[:, None]**2).sum(dim=-1)
+    trans_score_loss = _nodewise_to_graphwise(trans_score_loss[total_mask], data_lens, ~total_mask)
+
+    # Rotation score loss
+    rot_se = (ref_rot_score - pred_rot_score)**2 * total_mask[..., None, None]
+    rot_score_loss = (rot_se / rot_score_scaling[:, None, None]**2).sum(dim=(-1, -2))
+    rot_score_loss = _nodewise_to_graphwise(rot_score_loss[total_mask], data_lens, ~total_mask)
+
+    residx = noised_data['noised_residx']
+    if residx.numel() > 0:
+        residx_x_mask = torch.ones_like(x_mask).bool()
+        residx_x_mask[residx] = False
+        # we wanna unmask the +1 and -1 residues so we can get the relative positionings
+        # in context with the un-noised structure
+        residx_p1 = residx + 1
+        residx_p1 = residx_p1[residx_p1 < len(x_mask)]  # prevent selecting a non-existant residue
+        residx_x_mask[residx_p1] = False
+        residx_m1 = residx - 1
+        residx_m1 = residx_m1[residx_m1 > -1]  # prevent selecting a non-existant residue
+        residx_x_mask[residx_m1] = False
+        # remasked residues
+        residx_x_mask[x_mask] = True
+    else:
+        residx_x_mask = torch.zeros_like(x_mask).bool()
+
+    t = noised_data['t']
+    apply_chain_loss = t < time_threshold
+    residx_x_mask = residx_x_mask & apply_chain_loss
+
+    bb_dihedrals_loss = backbone_dihedrals_loss(
+        denoised_bb,
+        bb,
+        data_lens,
+        residx_x_mask)
+
+    bb_conn_lens, bb_conn_angles = chain_constraints_loss(
+        denoised_bb,
+        bb,
+        data_lens,
+        batch.batch,
+        residx_x_mask)
+
+    return {
+        "rot_score_loss": rot_score_loss,
+        "trans_score_loss": trans_score_loss,
+        "pred_x_ca_mse": pred_X_ca_mse,
+        "pred_bb_mse": backbone_mse,
+        "ref_x_ca_mse": ref_X_ca_mse,
+        "bb_fape": bb_fape,
+        "bb_dihedrals_loss": bb_dihedrals_loss,
+        "bb_conn_lens": bb_conn_lens,
+        "bb_conn_angles": bb_conn_angles
+    }

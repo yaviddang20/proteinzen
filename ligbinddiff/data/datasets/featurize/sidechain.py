@@ -236,9 +236,14 @@ def featurize_atomic(protein,
                                 device=device, dtype=torch.long)
         # backbone coords
         coords = atom14[:, :4]
-        X_cb = _ideal_virtual_Cb(coords)
 
         x_mask = torch.isfinite(coords.sum(dim=(1,2)))
+        center = coords[:, 1][x_mask].mean(dim=0)
+        coords = coords - center.unsqueeze(-2)
+        atom14 = atom14 - center.unsqueeze(-2)
+        atom91 = atom91 - center.unsqueeze(-2)
+
+        X_cb = _ideal_virtual_Cb(coords)
         x_mask = ~x_mask
         coords[x_mask] = np.inf
         atom14_mask[x_mask] = True
@@ -289,6 +294,7 @@ def featurize_cross_scale_atomic(protein,
                                  top_k=30,
                                  max_period=18,
                                  max_row=5,
+                                 seq_local_half_size=5,
                                  device='cpu'):
     name = protein['name']
     with torch.no_grad():
@@ -336,6 +342,8 @@ def featurize_cross_scale_atomic(protein,
         node_s, node_v, edge_s, edge_v = map(nan_to_num,
                 (node_s, node_v, edge_s, edge_v))
 
+        seq_local_edge_index = sequence_local_graph(x_mask.numel(), x_mask, half_local_size=seq_local_half_size)
+
         atom_type_embedding = atom14_atom_type_embedding(seq, atom14_mask.any(dim=-1), letter_to_num, max_period=max_period, max_row=max_row)
         atoms_flat, atomic_radius_edge_index, backbone_atoms_select = atom_radius_graph(atom14, atom14_mask.any(dim=-1))
         atom_to_residue_map, atom14_to_ca_edge_index = atom14_to_ca_graph(atom14, atom14_mask.any(dim=-1))
@@ -372,6 +380,7 @@ def featurize_cross_scale_atomic(protein,
             residue=residue_dict,
             name=name)
         graph["residue", "knn", "residue"].edge_index = edge_index
+        graph["residue", "seq_local", "residue"].edge_index = seq_local_edge_index
         graph["atomic", "radius_interact", "atomic"].edge_index = atomic_radius_edge_index
         graph["atomic", "parent", "residue"].edge_index = atom_to_residue_edge_index
         graph["atomic", "to_ca", "atomic"].edge_index = atom14_to_ca_edge_index
@@ -483,3 +492,48 @@ def atom14_atom_type_embedding(seq, atom14_mask, letter_to_num, max_period=None,
     atom_type_embedding = torch.cat([period_embedding, row_embedding], dim=-1)  # n_nodes x 14 x n_period+n_row
 
     return atom_type_embedding[~atom14_mask]  # n_atoms x n_period+n_row
+
+
+def sequence_local_graph(num_nodes, x_mask, half_local_size=10):
+    device = x_mask.device
+    local_index = torch.cat([
+        -(torch.arange(half_local_size) + 1),
+        (torch.arange(half_local_size) + 1)
+    ], dim=-1).to(device)
+    offset = torch.arange(num_nodes)[..., None].to(device)
+    global_edge_index = local_index[None].expand(num_nodes, -1) + offset
+
+    head = torch.empty(half_local_size, half_local_size*2)
+    for i in range(half_local_size):
+        chunk = torch.cat([
+            torch.arange(0, i),
+            torch.arange(i+1, half_local_size*2+1)
+        ], dim=-1)
+        head[i] = chunk
+
+    tail = torch.empty(half_local_size, half_local_size*2)
+    for i in range(half_local_size):
+        i = i+1
+        start = num_nodes - half_local_size * 2
+        current = num_nodes - i
+        chunk = torch.cat([
+            torch.arange(start-1, current),
+            torch.arange(current+1, num_nodes)
+        ], dim=-1)
+        tail[-i] = chunk
+
+    global_edge_index[:half_local_size] = head.to(device)
+    global_edge_index[-half_local_size:] = tail.to(device)
+
+    node_src = offset.expand(-1, half_local_size*2)
+    edge_index = torch.stack(
+        [global_edge_index, node_src], dim=0
+    )
+    edge_index = edge_index.reshape(2, -1)
+
+    masked_nodes = offset[x_mask].view(1, 1, -1)
+    edge_mask = (edge_index[..., None] == masked_nodes).any(dim=-1).any(dim=0)
+
+    edge_index = edge_index[:, ~edge_mask]
+    # edge_index = edge_index[:, edge_index[0] != edge_index[1]]
+    return edge_index
