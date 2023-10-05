@@ -4,6 +4,10 @@ import os, time, gzip, urllib, json
 import mmtf
 from collections import defaultdict
 
+import mdtraj as md
+from Bio.PDB import PDBIO
+from Bio.PDB.mmtf import MMTFParser
+
 def download_cached(url, target_location):
     """ Download with caching """
     target_dir = os.path.dirname(target_location)
@@ -27,6 +31,33 @@ def mmtf_fetch(pdb, cache_dir='cath/mmtf/'):
     mmtf_file = download_cached(url, mmtf_file)
     mmtf_record = mmtf.parse_gzip(mmtf_file)
     return mmtf_record
+
+
+def compute_dssp(mmtf_path, chain):
+    pdb_path = None
+    try:
+        # Workaround for MDtraj not supporting mmcif in their latest release.
+        # MDtraj source does support mmcif https://github.com/mdtraj/mdtraj/issues/652
+        # We temporarily save the mmcif as a pdb and delete it after running mdtraj.
+        p = MMTFParser()
+        struc = p.get_structure(mmtf_path)
+        io = PDBIO()
+        io.set_structure(struc)
+        pdb_path = mmtf_path.replace('.mmtf', '.pdb')
+        io.save(pdb_path)
+
+        # MDtraj
+        traj = md.load(pdb_path)
+        # SS calculation
+        pdb_ss = md.compute_dssp(traj, simplified=True)
+        os.remove(pdb_path)
+    except Exception as e:
+        raise ValueError(f'Mdtraj failed with error {e}')
+    finally:
+        if pdb_path is not None and os.path.exists(pdb_path):
+            os.remove(pdb_path)
+
+    return pdb_ss
 
 
 def mmtf_parse(pdb_id, chain, target_atoms = ['N', 'CA', 'C', 'O'], cache_dir='mmtf/'):

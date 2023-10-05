@@ -274,6 +274,30 @@ def debug_inpaint_inference_loop(diffuser,
     return {key: np.mean(losses) for key, losses in epoch_dict.items()}
 
 
+def debug_inpaint_inference_loop2(diffuser,
+                           sample_sizes,
+                           num_steps,
+                           loss_fn,
+                           device=None,
+                           save=False,
+                           truncate=None,
+                           noise_scale=1.0,
+                           show_progress=False):
+    epoch_dict = {}
+
+    for idx, batch in (pbar := tqdm.tqdm(enumerate(sample_sizes))):
+        if truncate and idx > truncate:
+            break
+
+        latent_outputs, denoiser_outputs = diffuser.sample(batch, steps=num_steps, show_progress=show_progress, noise_scale=noise_scale, device=device)
+
+        if save:
+            denoised_bb = latent_outputs['denoised_bb']
+            denoised_bb = torch.cat([denoised_bb, torch.zeros(batch, 1, 3)], dim=-2)  # add O
+            atom91_to_pdb("".join(["G" for _ in range(batch)]), denoised_bb.numpy(force=True), f"len_{batch}_bb")
+
+    return {key: np.mean(losses) for key, losses in epoch_dict.items()}
+
 def bb_inpaint_inference_loop(diffuser,
                            dataloader,
                            num_steps,

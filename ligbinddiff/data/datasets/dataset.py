@@ -44,7 +44,8 @@ class ProteinGraphDataset(data.Dataset):
                  density_nmax=5,
                  density_rmax=8,
                  channel_atoms=False,
-                 bb_density=True):
+                 bb_density=True,
+                 diffuser=None):
 
         super(ProteinGraphDataset, self).__init__()
         assert feature_mode in self.__class__.FEATURE_MODES, f"feature_mode must be in {self.__class__.FEATURE_MODES}"
@@ -75,6 +76,8 @@ class ProteinGraphDataset(data.Dataset):
             else:
                 self.channel_values = None
                 self.num_channels = 1
+        elif 'atomic' in self.feature_mode:
+            self.diffuser = diffuser
 
     def __len__(self): return len(self.data_list)
 
@@ -84,6 +87,7 @@ class ProteinGraphDataset(data.Dataset):
                                               letter_to_num=self.letter_to_num,
                                               num_rbf=self.num_rbf,
                                               top_k=self.top_k,
+                                              diffuser=self.diffuser,
                                               device=self.device)
         elif self.feature_mode == 'sidechain.density':
             return sidechain.featurize_density(self.data_list[i],

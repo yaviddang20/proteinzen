@@ -7,7 +7,7 @@ import tqdm
 
 import numpy as np
 
-from ligbinddiff.utils.atom_reps import atom37_atom_label, atom37_to_atom14
+from ligbinddiff.utils.atom_reps import atom37_atom_label, atom37_to_atom14, alphabet
 
 
 def process_entry(line):
@@ -34,13 +34,42 @@ def process_entry(line):
     if name in ['1din.A', '2j6v.A']:  # weird coord business (122 == 235 coord-wise?)
         return None
 
+    if name in [
+        '2qqh.A',
+        '2yhx.A',
+        '3jxv.A',
+        '6n0w.A',
+        '7f0s.A',
+        '2gnx.A',
+        '6n0w.A',
+        '7f0s.A',
+        '3jxv.A',
+        '2qqh.A',
+        '2yhx.A',
+        '6hkq.A',
+        '1pfp.A',
+        '6hn3.A',
+        '6un2.A',
+    ]:  # these have Xs and i am too lazy to deal with that rn
+        return None
+
+
     coords = entry['coords']
 
     atom37 = list(zip(
         *[coords[atom] for atom in atom37_atom_label]
     ))
+
+    seq = [c for c in entry['seq']]
+    for c in seq:
+        if c not in alphabet:
+            print(name)
+            return None
     atom14, atom14_mask = atom37_to_atom14(entry['seq'], np.array(atom37))
     entry['coords'] = atom14
+    if np.isnan(atom14[:, :4]).all():
+        print(name)
+        return None
     entry['coords_mask'] = atom14_mask
     return entry
 

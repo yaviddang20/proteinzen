@@ -17,6 +17,8 @@ from ligbinddiff.utils.atom_reps import atom91_atom_masks
 from .frames import all_atom_fape_loss
 from .openfold import compute_fape
 
+from ligbinddiff.model.modules.openfold import rigid_utils as ru
+
 
 def seq_cce_loss(ref_seq,
                  seq_logits,
@@ -1041,14 +1043,13 @@ def debug_inpaint_frame_latent_loss_fn(batch,
         bb_frame_diffusion_loss_dict["rot_score_loss"]
     )
     bb_denoising_finegrain_loss = (
-        bb_frame_diffusion_loss_dict["pred_bb_mse"] +
-        bb_frame_diffusion_loss_dict["bb_dihedrals_loss"] +
-        bb_frame_diffusion_loss_dict["bb_conn_lens"] +
-        bb_frame_diffusion_loss_dict["bb_conn_angles"]
-    ) * (latent_outputs['t_per_graph'] < time_threshold)
+        bb_frame_diffusion_loss_dict["pred_bb_mse"] #+
+        # bb_frame_diffusion_loss_dict["bb_dihedrals_loss"] +
+        # bb_frame_diffusion_loss_dict["bb_conn_lens"] +
+        # bb_frame_diffusion_loss_dict["bb_conn_angles"]
+    ) * (latent_outputs['t'] < time_threshold)
 
-    # loss = (bb_denoising_loss + bb_denoising_finegrain_loss).mean()
-    loss = bb_denoising_loss.mean()
+    loss = (bb_denoising_loss + bb_denoising_finegrain_loss).mean()
     # loss = bb_frame_diffusion_loss_dict["pred_x_ca_mse"].mean()
 
     out_dict = {"loss": loss}
@@ -1259,6 +1260,7 @@ def frame_diffusion_loss(batch,
                          denoiser_outputs,
                          time_threshold=0.25):
     x_mask = batch['x_mask']
+    device = x_mask.device
     noising_mask = noised_data['noising_mask']
     # if we don't noise anything, just eval on everything as a sanity check
     if (~noising_mask).all():
@@ -1268,10 +1270,19 @@ def frame_diffusion_loss(batch,
     data_splits = batch._slice_dict['x']
     data_lens = (data_splits[1:] - data_splits[:-1]).tolist()
 
-    bb_frames = batch['frames']
-    noised_bb_frames = noised_data['noised_frames']
+    bb_frames = ru.Rigid.from_tensor_7(batch['rigids_0'])
+    if isinstance(noised_data['rigids_t'], torch.Tensor):
+        noised_bb_frames = ru.Rigid.from_tensor_7(noised_data['rigids_t'].to(device))
+    else:
+        noised_bb_frames = noised_data['rigids_t']
+        dtype = noised_bb_frames._trans.dtype
+        noised_bb_frames = ru.Rigid(
+            rots=noised_bb_frames._rots.to(device=device, dtype=dtype),
+            trans=noised_bb_frames._trans.to(device)
+        )
+
     # denoised_bb_frames = latent_outputs['denoised_frames']
-    denoised_bb_frames = denoiser_outputs['denoised_frames']
+    denoised_bb_frames = denoiser_outputs['final_rigids']
 
     X_ca = batch['bb'][:, 1]
     pred_frame_X_ca = denoised_bb_frames.get_trans()
@@ -1308,14 +1319,27 @@ def frame_diffusion_loss(batch,
     rot_score_scaling = noised_data['rot_score_scaling']
     trans_score_scaling = noised_data['trans_score_scaling']
 
+    # batch_size = noised_data['t'].shape[0]
+    # num_nodes = batch.num_nodes // batch_size
+
+    trans_score_scaling_nodewise = torch.cat([
+        trans_score_scaling[i] * torch.ones(l, device=x_mask.device) for i, l in enumerate(data_lens)
+    ], dim=0)
+    rot_score_scaling_nodewise = torch.cat([
+        rot_score_scaling[i] * torch.ones(l, device=x_mask.device) for i, l in enumerate(data_lens)
+    ], dim=0)
+
+
     # Translation score loss
     trans_score_se = (ref_trans_score - pred_trans_score)**2 * total_mask[..., None]
-    trans_score_loss = (trans_score_se / trans_score_scaling[:, None]**2).sum(dim=-1)
+    trans_score_loss = (trans_score_se / trans_score_scaling_nodewise[:, None]**2).sum(dim=-1)
+    # trans_score_loss = trans_score_loss / (~x_mask.view(batch_size, num_nodes)).sum(dim=-1)
     trans_score_loss = _nodewise_to_graphwise(trans_score_loss[total_mask], data_lens, ~total_mask)
 
     # Rotation score loss
-    rot_se = (ref_rot_score - pred_rot_score)**2 * total_mask[..., None, None]
-    rot_score_loss = (rot_se / rot_score_scaling[:, None, None]**2).sum(dim=(-1, -2))
+    rot_se = (ref_rot_score - pred_rot_score)**2 * total_mask[..., None]
+    rot_score_loss = (rot_se / rot_score_scaling_nodewise[:, None]**2).sum(dim=-1)
+    # rot_score_loss = rot_score_loss / (~x_mask.view(batch_size, num_nodes)).sum(dim=-1)
     rot_score_loss = _nodewise_to_graphwise(rot_score_loss[total_mask], data_lens, ~total_mask)
 
     residx = noised_data['noised_residx']
@@ -1336,8 +1360,12 @@ def frame_diffusion_loss(batch,
         residx_x_mask = torch.zeros_like(x_mask).bool()
 
     t = noised_data['t']
-    apply_chain_loss = t < time_threshold
-    residx_x_mask = residx_x_mask & apply_chain_loss
+    t_expand = torch.cat([
+        t[i] * torch.ones(l, device=t.device) for i, l in enumerate(data_lens)
+    ], dim=0)
+    apply_chain_loss = t_expand < time_threshold
+    # residx_x_mask = (residx_x_mask.view(batch_size, num_nodes) & apply_chain_loss[:, None]).view(-1)
+    apply_chain_loss = residx_x_mask & apply_chain_loss
 
     bb_dihedrals_loss = backbone_dihedrals_loss(
         denoised_bb,

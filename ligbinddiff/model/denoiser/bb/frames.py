@@ -594,11 +594,11 @@ class FrameDenoisingLayer2(nn.Module):
         )
         node_features = self.ln_s1(node_features + node_s_update * (~x_mask)[..., None])
         if node_vectors is None:
-            # node_vectors = self.ln_v1(node_v_update * (~x_mask)[..., None, None])
-            node_vectors = node_v_update
+            node_vectors = self.ln_v1(node_v_update * (~x_mask)[..., None, None])
+            # node_vectors = node_v_update
         else:
-            # node_vectors = self.ln_v1(node_vectors + node_v_update * (~x_mask)[..., None, None])
-            node_vectors = node_v_update
+            node_vectors = self.ln_v1(node_vectors + node_v_update * (~x_mask)[..., None, None])
+            # node_vectors = node_v_update
 
         node_s_update, node_v_update = self.attn_spatial(
             node_features,
@@ -608,21 +608,21 @@ class FrameDenoisingLayer2(nn.Module):
             node_vectors
         )
         node_features = self.ln_s2(node_features + node_s_update * (~x_mask)[..., None])
-        # node_vectors = self.ln_v2(node_vectors + node_v_update * (~x_mask)[..., None, None])
+        node_vectors = self.ln_v2(node_vectors + node_v_update * (~x_mask)[..., None, None])
 
         node_s_update, node_v_update = self.local_update(
             node_features,
             node_vectors,
             rigids
         )
-        # node_features = self.ln_s3(node_features + node_s_update * (~x_mask)[..., None])
-        node_features = node_s_update
-        # node_vectors = self.ln_v3(node_vectors + node_v_update * (~x_mask)[..., None, None])
-        node_vectors = node_v_update
+        node_features = self.ln_s3(node_features + node_s_update * (~x_mask)[..., None])
+        # node_features = node_s_update
+        node_vectors = self.ln_v3(node_vectors + node_v_update * (~x_mask)[..., None, None])
+        # node_vectors = node_v_update
 
-        # node_features, node_vectors = self.node_transition(node_features, node_vectors)
-        # node_features = node_features  * (~x_mask)[..., None]
-        # node_vectors = node_vectors  * (~x_mask)[..., None, None]
+        node_features, node_vectors = self.node_transition(node_features, node_vectors)
+        node_features = node_features  * (~x_mask)[..., None]
+        node_vectors = node_vectors  * (~x_mask)[..., None, None]
         rigids_update = self.bb_update(
             node_features * noising_mask[..., None],
             node_vectors * noising_mask[..., None, None])
@@ -709,7 +709,7 @@ class FrameDenoiser2(nn.Module):
             center.append(subset_mean[None, :].expand(num_nodes, -1))
         center = torch.cat(center, dim=0)
         rigids = self._translate_rigids(intermediates['noised_frames'], -center)
-        rigids = scale_rigids(rigids, 10)
+        rigids = scale_rigids(rigids, 0.1)
 
         # generate sequence edges
         residx = []
@@ -777,7 +777,7 @@ class FrameDenoiser2(nn.Module):
                 node_vectors=node_vectors
             )
 
-        rigids = scale_rigids(rigids, 0.1)
+        rigids = scale_rigids(rigids, 10)
         intermediates['denoised_frames'] = self._translate_rigids(rigids, center)
         intermediates['denoised_bb'] = backbone_frames_to_bb_atoms(intermediates['denoised_frames'])
         intermediates['node_features'] = node_features
@@ -786,5 +786,167 @@ class FrameDenoiser2(nn.Module):
 
 def scale_rigids(rigids, scale):
     trans = rigids.get_trans()
-    scaled_trans = trans / scale
+    scaled_trans = trans * scale
     return ru.Rigid(rots=rigids.get_rots(), trans=scaled_trans)
+
+
+class FrameDenoiser2p5(nn.Module):
+    """ Denoising model on sidechain densities """
+    def __init__(self,
+                 c_s,
+                 c_v,
+                 c_z,
+                 c_hidden,
+                 num_heads,
+                 num_qk_pts,
+                 num_v_pts,
+                 h_time=64,
+                 scalar_h_dim=128,
+                 n_layers=4,
+                 device='cpu',
+                 knn_k=20,
+                 lrange_k=30):
+        super().__init__()
+
+        self.c_s = c_s
+        self.c_v = c_v
+        self.c_z = c_z
+
+        self.h_time = h_time
+        self.time_rbf = RBF(n_basis=h_time//2)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(h_time, scalar_h_dim),
+            nn.ReLU(),
+            nn.Linear(scalar_h_dim, h_time),
+            nn.ReLU()
+        )
+
+        self.embed_node = nn.Linear(
+            c_s + h_time + 1, c_s
+        )
+
+        self.denoiser = nn.ModuleList([
+            FrameDenoisingLayer2(
+                 c_s,
+                 c_v,
+                 c_z,
+                 c_hidden,
+                 num_heads,
+                 num_qk_pts,
+                 num_v_pts,
+                 gen_vectors=(i == 0)
+            )
+            for i in range(n_layers)
+        ])
+        self.knn_k = knn_k
+        self.lrange_k = lrange_k
+
+    def _translate_rigids(self, rigids, shift):
+        rots = rigids.get_rots()
+        trans = rigids.get_trans()
+        return ru.Rigid(rots, trans + shift)
+
+    def forward(self, data):
+        ## prep features
+        ts = data['t']  # (B,)
+        expanded_ts = []
+
+        for i, t in enumerate(ts.view(-1).tolist()):
+            select = (data.batch == i)
+            num_nodes = select.long().sum()
+            expanded_ts.append(t * torch.ones(num_nodes, device=select.device))
+        ts = torch.cat(expanded_ts, dim=0)
+
+        x_mask = data['x_mask']
+        rigids_t = ru.Rigid.from_tensor_7(data['rigids_t'])
+        batch = data.batch
+        device = ts.device
+        num_nodes = ts.shape[0]
+
+        # center the training example at the mean of the x_cas
+        center = []
+        for i in range(data.batch.max().item() + 1):
+            select = (data.batch == i)
+            num_nodes = select.long().sum()
+            subset_x_ca = rigids_t.get_trans()[select]
+            subset_mean = subset_x_ca.mean(dim=0)
+            center.append(subset_mean[None, :].expand(num_nodes, -1))
+        center = torch.cat(center, dim=0)
+        rigids = self._translate_rigids(rigids_t, -center)
+        rigids = scale_rigids(rigids, 0.1)
+
+        # generate sequence edges
+        residx = []
+        seq_local_edge_index = []
+        offset = 0
+        for i in range(data.batch.max().item() + 1):
+            select = (data.batch == i)
+            local_residx = torch.arange(select.sum().item(), device=device) + offset
+            residx.append(local_residx)
+            seq_local_edge_index.append(
+                sequence_local_graph(select.sum().item(), data['x_mask'][select]) + offset
+            )
+            offset += select.sum().item()
+        seq_local_edge_index = torch.cat(seq_local_edge_index, dim=-1)
+
+        # generate spatial edges
+        X_ca = rigids.get_trans()
+        masked_X_ca = X_ca.clone()
+        masked_X_ca[x_mask] = torch.inf
+        edge_index = sample_inv_cubic_edges(masked_X_ca, x_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k)
+
+        # compute edge features
+        edge_dist_vec = X_ca[edge_index[0]] - X_ca[edge_index[1]]
+        edge_dist = torch.linalg.vector_norm(edge_dist_vec, dim=-1)
+        edge_dist_rbf = _rbf(edge_dist, device=edge_dist.device, D_count=self.c_z//2)  # edge_channels_list
+        edge_dist_rel_pos = _positional_embeddings(edge_index, num_embeddings=self.c_z//2, device=edge_dist.device)  # edge_channels_list
+        edge_features = torch.cat([edge_dist_rbf, edge_dist_rel_pos], dim=-1)
+
+        seq_edge_dist_vec = X_ca[seq_local_edge_index[0]] - X_ca[seq_local_edge_index[1]]
+        seq_edge_dist = torch.linalg.vector_norm(seq_edge_dist_vec, dim=-1)
+        seq_edge_dist_rbf = _rbf(seq_edge_dist, device=seq_edge_dist.device, D_count=self.c_z//2)  # edge_channels_list
+        seq_edge_dist_rel_pos = _positional_embeddings(seq_local_edge_index, num_embeddings=self.c_z//2, device=seq_edge_dist.device)  # edge_channels_list
+        seq_edge_features = torch.cat([seq_edge_dist_rbf, seq_edge_dist_rel_pos], dim=-1)
+
+        ## create time embedding
+        fourier_time = self.time_rbf(ts.unsqueeze(-1))  # (N_node x h_time,)
+        embedded_time = self.time_mlp(fourier_time)  # (N_node x h_time)
+
+        # generate node features
+        residx = torch.cat(residx, dim=-1)
+        res_pos = _positional_embeddings(
+            torch.stack([residx, torch.zeros_like(residx)]),  # yea this is hacky
+            num_embeddings=self.c_s, device=device)
+        # print(res_pos.shape, embedded_time.shape, data['noising_mask'].shape)
+        node_features = self.embed_node(
+            torch.cat([
+                res_pos,
+                embedded_time,
+                data['noising_mask'].float()[..., None]
+            ], dim=-1)
+        )
+
+        ## denoising
+        node_vectors = None
+
+        for i, layer in enumerate(self.denoiser):
+            node_features, rigids, edge_features, seq_edge_features, node_vectors = layer(
+                node_features,
+                rigids,
+                edge_features,
+                edge_index,
+                seq_edge_features,
+                seq_local_edge_index,
+                data,
+                data,
+                node_vectors=node_vectors
+            )
+
+        rigids = scale_rigids(rigids, 10)
+        ret = {}
+        ret['denoised_frames'] = self._translate_rigids(rigids, center)
+        ret['final_rigids'] = self._translate_rigids(rigids, center)
+        ret['denoised_bb'] = backbone_frames_to_bb_atoms(ret['denoised_frames'])
+        ret['node_features'] = node_features
+
+        return ret

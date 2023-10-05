@@ -1,6 +1,7 @@
 """ Featurize only the sidechains """
 import math
 from functools import partial
+import tree
 
 import numpy as np
 import torch
@@ -9,7 +10,7 @@ import torch_cluster
 from torch_geometric.data import Data, HeteroData
 
 from ligbinddiff.utils.atom_reps import atom14_to_atom91, atom14_residue_bonds, atom14_atomic_row, atom14_atomic_period, restype_3to1, atom_to_atomic_period, atom_to_atomic_row
-# from ligbinddiff.utils.fiber import nl_to_fiber
+from ligbinddiff.model.modules.openfold import rigid_utils as ru
 
 # TODO: brought this in to avoid importing dgl in the utils, do this in a less hacky way
 def nl_to_fiber(Z):
@@ -218,6 +219,8 @@ def featurize_atomic(protein,
                      num_rbf=16,
                      num_positional_embeddings=16,
                      top_k=30,
+                     diffuser=None,
+                     center_data=True,
                      device='cpu'):
     name = protein['name']
     with torch.no_grad():
@@ -238,10 +241,11 @@ def featurize_atomic(protein,
         coords = atom14[:, :4]
 
         x_mask = torch.isfinite(coords.sum(dim=(1,2)))
-        center = coords[:, 1][x_mask].mean(dim=0)
-        coords = coords - center.unsqueeze(-2)
-        atom14 = atom14 - center.unsqueeze(-2)
-        atom91 = atom91 - center.unsqueeze(-2)
+        if center_data:
+            center = coords[:, 1][x_mask].mean(dim=0)
+            coords = coords - center.unsqueeze(-2)
+            atom14 = atom14 - center.unsqueeze(-2)
+            atom91 = atom91 - center.unsqueeze(-2)
 
         X_cb = _ideal_virtual_Cb(coords)
         x_mask = ~x_mask
@@ -270,7 +274,6 @@ def featurize_atomic(protein,
         node_s, node_v, edge_s, edge_v = map(nan_to_num,
                 (node_s, node_v, edge_s, edge_v))
 
-
         graph = Data(x=nan_to_num(X_ca),
                      x_mask=x_mask,
                      x_cb=nan_to_num(X_cb),
@@ -284,6 +287,29 @@ def featurize_atomic(protein,
                      atom91_centered=nan_to_num(atom91 - X_ca.unsqueeze(-2)),
                      atom91_mask=atom91_mask,
                      name=name)
+
+        if diffuser is not None:
+            rng = np.random.default_rng(None)
+
+            X_n = nan_to_num(coords[:, 0])
+            X_ca = nan_to_num(coords[:, 1])
+            X_c = nan_to_num(coords[:, 2])
+            rigids_0 = ru.Rigid.from_3_points(X_n, X_ca, X_c)
+
+            t = rng.uniform(0.01, 1.0)
+            diff_feats_t = diffuser.forward_marginal(
+                rigids_0=rigids_0,
+                t=t,
+                diffuse_mask=None
+            )
+            diff_feats_t['rigids_0'] = rigids_0.to_tensor_7()
+            diff_feats_t['t'] = t
+            diff_feats_t['fixed_mask'] = torch.zeros_like(x_mask)
+            diff_feats_t['noising_mask'] = torch.ones_like(x_mask)
+            diff_feats_t['noised_residx'] = torch.arange(len(x_mask))
+            diff_feats_t = tree.map_structure(
+                lambda x: x if torch.is_tensor(x) else torch.tensor(x), diff_feats_t)
+            graph.update(diff_feats_t)
 
     return graph
 

@@ -260,6 +260,12 @@ def debug_inpaint_train_loop(diffuser,
             loss = loss_dict["loss"]
 
             if train:
+                # TODO: get rid of this
+                if torch.isnan(loss).any():
+                    print("loss is nan")
+                    print(batch.name)
+                    continue
+
                 if debug:
                     loss.backward()
                 else:
@@ -296,16 +302,13 @@ def debug_inpaint_train_loop(diffuser,
             epoch_loss = np.mean(epoch_dict['loss'])
             pbar_str = f"epoch_loss: {np.mean(epoch_loss):.4f}, "
             pbar_str += gen_pbar_str(loss_dict)
-            pbar_str += f", t: {format_list(latent_data['t_per_graph'], '{:.4f}')}"
+            pbar_str += f", t: {format_list(latent_data['t'], '{:.4f}')}"
             pbar.set_description(pbar_str)
-            print(pbar_str)
             if step_count is not None:
                 step_count += 1
                 if checkpoint_steps is not None and step_count % checkpoint_steps == 0:
                     torch.save(diffuser.state_dict(), f"checkpoint_step_{step_count}.pt")
 
-            if torch.isnan(loss).any():
-                exit()
         except Exception as e:
             torch.save(batch, "problematic_inputs.pt")
             torch.save(latent_data, "latent_outputs.pt")
