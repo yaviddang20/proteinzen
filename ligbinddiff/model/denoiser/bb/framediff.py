@@ -6,15 +6,15 @@ import math
 from scipy.stats import truncnorm
 import torch.nn as nn
 from typing import Optional, Callable, List, Sequence
-from ligbinddiff.model.modules.openfold.rigid_utils import Rigid, Rotation
-from ligbinddiff.utils.frames import backbone_frames_to_bb_atoms
 
 import functools as fn
 
-from ligbinddiff.data.datasets.featurize.sidechain import _rbf, _positional_embeddings, sequence_local_graph
-from ligbinddiff.model.modules.common import sample_inv_cubic_edges
+from ligbinddiff.data.datasets.featurize.common import _node_positional_embeddings
 from ligbinddiff.model.modules.frames import KnnIpaScore
-from ligbinddiff.model.denoiser.bb.frames import RBF
+from ligbinddiff.model.modules.common import RBF
+from ligbinddiff.model.utils.graph import get_data_lens, batchwise_to_nodewise, gen_spatial_graph_features, sample_inv_cubic_edges, sequence_local_graph
+from ligbinddiff.utils.openfold.rigid_utils import Rigid, batchwise_center
+from ligbinddiff.utils.framediff.all_atom import compute_backbone
 
 
 def permute_final_dims(tensor: torch.Tensor, inds: List[int]):
@@ -795,87 +795,8 @@ class IpaScore(nn.Module):
         }
         return model_out
 
+
 class IpaScoreWrapper(nn.Module):
-    def __init__(self,
-                 diffuser,
-                 c_s=256,
-                 c_z=128,
-                 c_skip=64,
-                 c_hidden=256,
-                 num_heads=8,
-                 num_qk_points=8,
-                 num_v_points=12,
-                 num_blocks=4,
-                 ):
-        super().__init__()
-
-        self.ipa_score = IpaScore(
-            diffuser,
-            c_s=c_s,
-            c_z=c_z,
-            c_skip=c_skip,
-            c_hidden=c_hidden,
-            num_heads=num_heads,
-            num_qk_points=num_qk_points,
-            num_v_points=num_v_points,
-            num_blocks=num_blocks
-        )
-        self.embedder = Embedder(c_s=c_s, c_z=c_z)
-
-    def forward(self, data, intermediates):
-        device = data['x'].device
-
-        # node_embed = intermediates['node_embed']
-        # edge_embed = intermediates['edge_embed']
-
-        data_list = data.to_data_list()
-        seq_idx = [torch.arange(data_list[0].num_nodes, device=device) for _ in data_list]
-        seq_idx = torch.stack(seq_idx)
-        t = intermediates['t_per_graph']
-        fixed_mask = ~intermediates['noising_mask'].view(t.shape[0], -1)
-
-        node_embed, edge_embed = self.embedder(seq_idx=seq_idx, t=t, fixed_mask=fixed_mask)
-
-        node_mask = ~data['x_mask'].view(t.shape[0], -1)
-
-        # center the training example at the mean of the x_cas
-        center = []
-        for i in range(data.batch.max().item() + 1):
-            select = (data.batch == i)
-            num_nodes = select.long().sum()
-            subset_x_ca = intermediates['noised_frames'].get_trans()[select]
-            subset_mean = subset_x_ca.mean(dim=0)
-            center.append(subset_mean[None, :].expand(num_nodes, -1))
-        center = torch.cat(center, dim=0)
-
-        rigids_t = _translate_rigids(intermediates['noised_frames'], -center)
-        # rigids = scale_rigids(rigids, 10)
-        rigids_t = reshape_rigids(rigids_t, [t.shape[0], -1])
-
-        input_feats = {
-            'fixed_mask': fixed_mask,
-            'res_mask': node_mask,
-            'rigids_t': rigids_t.to_tensor_7(),
-            't': t
-        }
-
-        score_dict = self.ipa_score(node_embed, edge_embed, input_feats)
-        rigids = reshape_rigids(score_dict['final_rigids'], [-1])
-        # rigids = scale_rigids(rigids, 0.1)
-        rigids = _translate_rigids(rigids, center)
-
-        ret = {}
-        ret['denoised_frames'] = rigids
-        ret['final_rigids'] = rigids
-        ret['denoised_bb'] = backbone_frames_to_bb_atoms(rigids)
-        ret['node_features'] = score_dict['node_embed']
-        ret['rot_score'] = score_dict['rot_score']
-        ret['trans_score'] = score_dict['trans_score']
-        ret['psi'] = score_dict['psi']
-
-        return ret
-
-class IpaScoreWrapper2(nn.Module):
     def __init__(self,
                  diffuser,
                  c_s=256,
@@ -905,32 +826,22 @@ class IpaScoreWrapper2(nn.Module):
     def forward(self, data):
         device = data['x'].device
 
-        # node_embed = intermediates['node_embed']
-        # edge_embed = intermediates['edge_embed']
-
         data_list = data.to_data_list()
         seq_idx = [torch.arange(data_list[0].num_nodes, device=device) for _ in data_list]
         seq_idx = torch.stack(seq_idx)
         t = data['t']
-        fixed_mask = data['fixed_mask'].view(t.shape[0], -1)
+        batch_size = t.shape[0]
+        fixed_mask = data['fixed_mask'].view(batch_size, -1)
 
         node_embed, edge_embed = self.embedder(seq_idx=seq_idx, t=t, fixed_mask=fixed_mask)
 
-        node_mask = ~data['x_mask'].view(t.shape[0], -1)
+        node_mask = ~data['x_mask'].view(batch_size, -1)
 
         # center the training example at the mean of the x_cas
-        center = []
-        for i in range(data.batch.max().item() + 1):
-            select = (data.batch == i)
-            num_nodes = select.long().sum()
-            subset_x_ca = data['rigids_t'][:, 4:][select]
-            subset_mean = subset_x_ca.mean(dim=0)
-            center.append(subset_mean[None, :].expand(num_nodes, -1))
-        center = torch.cat(center, dim=0)
-
         rigids_t = Rigid.from_tensor_7(data['rigids_t'])
-        rigids_t = _translate_rigids(rigids_t, -center)
-        rigids_t = reshape_rigids(rigids_t, [t.shape[0], -1])
+        center = batchwise_center(rigids_t, data.batch)
+        rigids_t = rigids_t.translate(-center)
+        rigids_t = rigids_t.view([t.shape[0], -1])
 
         input_feats = {
             'fixed_mask': fixed_mask,
@@ -940,44 +851,23 @@ class IpaScoreWrapper2(nn.Module):
         }
 
         score_dict = self.ipa_score(node_embed, edge_embed, input_feats)
-        rigids = reshape_rigids(score_dict['final_rigids'], [-1])
-        # rigids = scale_rigids(rigids, 0.1)
-        rigids = _translate_rigids(rigids, center)
+        rigids = score_dict['final_rigids'].view(-1)
+        rigids = rigids.translate(center)
+
+        psi = score_dict['psi'].view(-1, 2)
 
         ret = {}
         ret['denoised_frames'] = rigids
         ret['final_rigids'] = rigids
-        ret['denoised_bb'] = backbone_frames_to_bb_atoms(rigids)
+        denoised_bb_items = compute_backbone(rigids.unsqueeze(0), psi.unsqueeze(0))
+        denoised_bb = denoised_bb_items[-1].squeeze(0)[:, :5]
+        ret['denoised_bb'] = denoised_bb
         ret['node_features'] = score_dict['node_embed']
         # intermediates['rot_score'] = score_dict['rot_score']
         # intermediates['trans_score'] = score_dict['trans_score']
-        ret['psi'] = score_dict['psi']
+        ret['psi'] = psi
 
         return ret
-
-
-def reshape_rigids(rigids, shape):
-    rots, trans = rigids.get_rots(), rigids.get_trans()
-    reshape_trans = trans.view(shape + [3])
-    if rots._quats is None:
-        rot_mats = rots.get_rot_mats()
-        reshape_rots = Rotation(rot_mats=rot_mats.view(shape + [3, 3]))
-    else:
-        quats = rots.get_quats()
-        reshape_rots = Rotation(quats=quats.view(shape + [4]))
-    reshape_rigids = Rigid(reshape_rots, reshape_trans)
-    return reshape_rigids
-
-
-def scale_rigids(rigids, scale):
-    trans = rigids.get_trans()
-    scaled_trans = trans / scale
-    return Rigid(rots=rigids.get_rots(), trans=scaled_trans)
-
-def _translate_rigids(rigids, shift):
-    rots = rigids.get_rots()
-    trans = rigids.get_trans()
-    return Rigid(rots, trans + shift)
 
 
 class KnnIpaScoreWrapper(nn.Module):
@@ -1032,15 +922,9 @@ class KnnIpaScoreWrapper(nn.Module):
 
     def forward(self, data):
         ## prep features
+        data_lens = get_data_lens(data, 'x')
         ts = data['t']  # (B,)
-        expanded_ts = []
-
-        for i, t in enumerate(ts.view(-1).tolist()):
-            select = (data.batch == i)
-            num_nodes = select.long().sum()
-            expanded_ts.append(t * torch.ones(num_nodes, device=select.device))
-        ts = torch.cat(expanded_ts, dim=0)
-
+        ts = batchwise_to_nodewise(ts, data_lens)
         x_mask = data['x_mask']
         rigids_t = Rigid.from_tensor_7(data['rigids_t'])
         batch = data.batch
@@ -1048,25 +932,15 @@ class KnnIpaScoreWrapper(nn.Module):
         num_nodes = ts.shape[0]
 
         # center the training example at the mean of the x_cas
-        center = []
-        for i in range(data.batch.max().item() + 1):
-            select = (data.batch == i)
-            num_nodes = select.long().sum()
-            subset_x_ca = rigids_t.get_trans()[select]
-            subset_mean = subset_x_ca.mean(dim=0)
-            center.append(subset_mean[None, :].expand(num_nodes, -1))
-        center = torch.cat(center, dim=0)
-        rigids_t = _translate_rigids(rigids_t, -center)
-        rigids_t = scale_rigids(rigids_t, 0.1)
+        center = batchwise_center(rigids_t, data.batch)
+        rigids_t = rigids_t.translate(-center)
 
         # generate sequence edges
-        residx = []
         seq_local_edge_index = []
         offset = 0
         for i in range(data.batch.max().item() + 1):
             select = (data.batch == i)
             local_residx = torch.arange(select.sum().item(), device=device) + offset
-            residx.append(local_residx)
             seq_local_edge_index.append(
                 sequence_local_graph(select.sum().item(), data['x_mask'][select]) + offset
             )
@@ -1080,26 +954,17 @@ class KnnIpaScoreWrapper(nn.Module):
         edge_index = sample_inv_cubic_edges(masked_X_ca, x_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k)
 
         # compute edge features
-        edge_dist_vec = X_ca[edge_index[0]] - X_ca[edge_index[1]]
-        edge_dist = torch.linalg.vector_norm(edge_dist_vec, dim=-1)
-        edge_dist_rbf = _rbf(edge_dist, device=edge_dist.device, D_count=self.c_z//2)  # edge_channels_list
-        edge_dist_rel_pos = _positional_embeddings(edge_index, num_embeddings=self.c_z//2, device=edge_dist.device)  # edge_channels_list
-        edge_features = torch.cat([edge_dist_rbf, edge_dist_rel_pos], dim=-1)
-
-        seq_edge_dist_vec = X_ca[seq_local_edge_index[0]] - X_ca[seq_local_edge_index[1]]
-        seq_edge_dist = torch.linalg.vector_norm(seq_edge_dist_vec, dim=-1)
-        seq_edge_dist_rbf = _rbf(seq_edge_dist, device=seq_edge_dist.device, D_count=self.c_z//2)  # edge_channels_list
-        seq_edge_dist_rel_pos = _positional_embeddings(seq_local_edge_index, num_embeddings=self.c_z//2, device=seq_edge_dist.device)  # edge_channels_list
-        seq_edge_features = torch.cat([seq_edge_dist_rbf, seq_edge_dist_rel_pos], dim=-1)
+        edge_features = gen_spatial_graph_features(X_ca, edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=self.c_z//2)
+        seq_edge_features = gen_spatial_graph_features(X_ca, seq_local_edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=self.c_z//2)
 
         ## create time embedding
         fourier_time = self.time_rbf(ts.unsqueeze(-1))  # (N_node x h_time,)
         embedded_time = self.time_mlp(fourier_time)  # (N_node x h_time)
 
         # generate node features
-        residx = torch.cat(residx, dim=-1)
-        res_pos = _positional_embeddings(
-            torch.stack([residx, torch.zeros_like(residx)]),  # yea this is hacky
+        residx = torch.arange(num_nodes, device=device)
+        res_pos = _node_positional_embeddings(
+            residx,
             num_embeddings=self.c_s, device=device)
         # print(res_pos.shape, embedded_time.shape, data['noising_mask'].shape)
         node_features = self.embed_node(
@@ -1111,10 +976,8 @@ class KnnIpaScoreWrapper(nn.Module):
         )
 
         ## denoising
-        node_vectors = None
         fixed_mask = data['fixed_mask']
         node_mask = ~data['x_mask']
-
 
         input_feats = {
             'fixed_mask': fixed_mask,
@@ -1130,16 +993,12 @@ class KnnIpaScoreWrapper(nn.Module):
             edge_index,
             seq_local_edge_index,
             input_feats)
-        rigids = scale_rigids(score_dict['final_rigids'], 10)
-        rigids = _translate_rigids(rigids, center)
+        rigids = score_dict['final_rigids'].scale_translation(10)
+        rigids = rigids.translate(center)
 
         ret = {}
         ret['denoised_frames'] = rigids
         ret['final_rigids'] = rigids
         ret['denoised_bb'] = backbone_frames_to_bb_atoms(rigids)
-        # ret['node_features'] = score_dict['node_embed']
-        # intermediates['rot_score'] = score_dict['rot_score']
-        # intermediates['trans_score'] = score_dict['trans_score']
-        # ret['psi'] = score_dict['psi']
 
         return ret

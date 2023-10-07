@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 from typing import Dict, Optional, Tuple
 
-from ligbinddiff.model.modules.openfold.rigid_utils import Rotation, Rigid
+from ligbinddiff.utils.openfold.rigid_utils import Rotation, Rigid
 
 
 def compute_fape(

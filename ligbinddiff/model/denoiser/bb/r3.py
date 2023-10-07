@@ -5,15 +5,16 @@ from torch import nn
 import torch.nn.functional as F
 import numpy as np
 from torch_cluster import knn_graph
+from ligbinddiff.data.datasets.featurize.common import _rbf
 
 from ligbinddiff.model.modules.equiformer_v2.so3 import CoefficientMappingModule, SO3_Embedding, SO3_Rotation, SO3_Grid, SO3_LinearV2
 from ligbinddiff.model.modules.equiformer_v2.layer_norm import MultiResEquivariantRMSNormArraySphericalHarmonicsV2 as NormSO3
 from ligbinddiff.model.modules.equiformer_v2.transformer_block import FeedForwardNetwork, MultiResFeedForwardNetwork, TransBlockV2
 from ligbinddiff.model.modules.equiformer_v2.edge_rot_mat import init_edge_rot_mat
 from ligbinddiff.model.modules.common import EdgeUpdate
-from ligbinddiff.model.modules.common import sample_inv_cubic_edges
+from ligbinddiff.model.utils.graph import sample_inv_cubic_edges
 
-from ligbinddiff.data.datasets.featurize.sidechain import _rbf, _positional_embeddings
+from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddings
 
 
 class GraphUpdate(nn.Module):
@@ -190,7 +191,7 @@ class BackboneUpdate(nn.Module):
 
         # gen edge features
         edge_dist_rbf = _rbf(edge_dist, device=edge_dist.device)  # edge_channels_list
-        edge_dist_rel_pos = _positional_embeddings(edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
+        edge_dist_rel_pos = _edge_positional_embeddings(edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
         edge_features = torch.cat([edge_dist_rbf, edge_dist_rel_pos], dim=-1)
         edge_rot_mat = init_edge_rot_mat(edge_dist_vec)
 
@@ -431,7 +432,7 @@ class BackboneR3Denoiser(nn.Module):
         )
         # add residue positional index
         residx = torch.arange(data['residue'].num_nodes, device=bb_features.device)
-        bb_features.embedding[:, 0] = _positional_embeddings(residx, num_embeddings=self.bb_channels, device=bb_features.device)
+        bb_features.embedding[:, 0] = _edge_positional_embeddings(residx, num_embeddings=self.bb_channels, device=bb_features.device)
         ts = intermediates['t']  # (B,)
 
         # compute graph with knn + inv cubic edges
@@ -444,7 +445,7 @@ class BackboneR3Denoiser(nn.Module):
 
         # gen edge features
         edge_dist_rbf = _rbf(edge_dist, device=edge_dist.device)  # edge_channels_list
-        edge_dist_rel_pos = _positional_embeddings(edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
+        edge_dist_rel_pos = _edge_positional_embeddings(edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
         edge_features = torch.cat([edge_dist_rbf, edge_dist_rel_pos], dim=-1)
         edge_rot_mat = init_edge_rot_mat(edge_dist_vec)
         # for rot in self.bb_SO3_rotation_list:
@@ -456,7 +457,7 @@ class BackboneR3Denoiser(nn.Module):
 
         # gen edge features
         seq_local_edge_dist_rbf = _rbf(seq_local_edge_dist, device=edge_dist.device)  # edge_channels_list
-        seq_local_edge_dist_rel_pos = _positional_embeddings(seq_local_edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
+        seq_local_edge_dist_rel_pos = _edge_positional_embeddings(seq_local_edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
         seq_local_edge_features = torch.cat([seq_local_edge_dist_rbf, seq_local_edge_dist_rel_pos], dim=-1)
 
         seq_local_edge_rot_mat = init_edge_rot_mat(seq_local_edge_dist_vec)

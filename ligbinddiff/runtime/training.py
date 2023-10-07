@@ -256,7 +256,7 @@ def debug_inpaint_train_loop(diffuser,
                 batch = batch.to(debug_device)
             latent_data, decoder_outputs = diffuser.forward(batch)
 
-            loss_dict = loss_fn(batch, latent_data, decoder_outputs, warmup=warmup)
+            loss_dict = loss_fn(batch, latent_data, decoder_outputs)
             loss = loss_dict["loss"]
 
             if train:

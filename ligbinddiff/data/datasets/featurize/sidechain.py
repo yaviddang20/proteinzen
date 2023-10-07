@@ -8,9 +8,11 @@ import torch
 import torch.nn.functional as F
 import torch_cluster
 from torch_geometric.data import Data, HeteroData
+from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddings, _rbf
+from ligbinddiff.model.utils.graph import sequence_local_graph
 
 from ligbinddiff.utils.atom_reps import atom14_to_atom91, atom14_residue_bonds, atom14_atomic_row, atom14_atomic_period, restype_3to1, atom_to_atomic_period, atom_to_atomic_row
-from ligbinddiff.model.modules.openfold import rigid_utils as ru
+from ligbinddiff.utils.openfold import rigid_utils as ru
 
 # TODO: brought this in to avoid importing dgl in the utils, do this in a less hacky way
 def nl_to_fiber(Z):
@@ -37,22 +39,6 @@ def _normalize(tensor, dim=-1, eps=1e-8):
         torch.div(tensor, torch.norm(tensor+eps, dim=dim, keepdim=True)))
 
 
-def _rbf(D, D_min=0., D_max=20., D_count=16, device='cpu'):
-    '''
-    From https://github.com/jingraham/neurips19-graph-protein-design
-
-    Returns an RBF embedding of `torch.Tensor` `D` along a new axis=-1.
-    That is, if `D` has shape [...dims], then the returned tensor will have
-    shape [...dims, D_count].
-    '''
-    D_mu = torch.linspace(D_min, D_max, D_count, device=device)
-    D_mu = D_mu.view([1, -1])
-    D_sigma = (D_max - D_min) / D_count
-    D_expand = torch.unsqueeze(D, -1)
-
-    RBF = torch.exp(-((D_expand - D_mu) / D_sigma) ** 2)
-    return RBF
-
 def _dihedrals(X, eps=1e-7):
     # From https://github.com/jingraham/neurips19-graph-protein-design
 
@@ -78,21 +64,6 @@ def _dihedrals(X, eps=1e-7):
     # Lift angle representations to the circle
     D_features = torch.cat([torch.cos(D), torch.sin(D)], 1)
     return D_features
-
-
-def _positional_embeddings(edge_index,
-                           num_embeddings,
-                           device='cpu'):
-    # From https://github.com/jingraham/neurips19-graph-protein-design
-    d = edge_index[0] - edge_index[1]
-
-    frequency = torch.exp(
-        torch.arange(0, num_embeddings, 2, dtype=torch.float32, device=device)
-        * -(np.log(10000.0) / num_embeddings)
-    )
-    angles = d.unsqueeze(-1) * frequency
-    E = torch.cat((torch.cos(angles), torch.sin(angles)), -1)
-    return E
 
 
 def _orientations(X):
@@ -160,7 +131,7 @@ def featurize_density(protein,
         X_ca = coords[:, 1]
         edge_index = torch_cluster.knn_graph(X_ca, k=top_k)
 
-        pos_embeddings = _positional_embeddings(edge_index, num_positional_embeddings)
+        pos_embeddings = _edge_positional_embeddings(edge_index, num_positional_embeddings)
         E_vectors = X_ca[edge_index[0]] - X_ca[edge_index[1]]
         rbf = _rbf(E_vectors.norm(dim=-1), D_count=num_rbf, device=device)
 
@@ -256,7 +227,7 @@ def featurize_atomic(protein,
         X_ca = coords[:, 1]
         edge_index = torch_cluster.knn_graph(X_ca, k=top_k)
 
-        pos_embeddings = _positional_embeddings(edge_index, num_positional_embeddings)
+        pos_embeddings = _edge_positional_embeddings(edge_index, num_positional_embeddings)
         E_vectors = X_ca[edge_index[0]] - X_ca[edge_index[1]]
         rbf = _rbf(E_vectors.norm(dim=-1), D_count=num_rbf, device=device)
 
@@ -350,7 +321,7 @@ def featurize_cross_scale_atomic(protein,
         X_ca = coords[:, 1]
         edge_index = torch_cluster.knn_graph(X_ca, k=top_k)
 
-        pos_embeddings = _positional_embeddings(edge_index, num_positional_embeddings)
+        pos_embeddings = _edge_positional_embeddings(edge_index, num_positional_embeddings)
         E_vectors = X_ca[edge_index[0]] - X_ca[edge_index[1]]
         rbf = _rbf(E_vectors.norm(dim=-1), D_count=num_rbf, device=device)
 
@@ -518,48 +489,3 @@ def atom14_atom_type_embedding(seq, atom14_mask, letter_to_num, max_period=None,
     atom_type_embedding = torch.cat([period_embedding, row_embedding], dim=-1)  # n_nodes x 14 x n_period+n_row
 
     return atom_type_embedding[~atom14_mask]  # n_atoms x n_period+n_row
-
-
-def sequence_local_graph(num_nodes, x_mask, half_local_size=10):
-    device = x_mask.device
-    local_index = torch.cat([
-        -(torch.arange(half_local_size) + 1),
-        (torch.arange(half_local_size) + 1)
-    ], dim=-1).to(device)
-    offset = torch.arange(num_nodes)[..., None].to(device)
-    global_edge_index = local_index[None].expand(num_nodes, -1) + offset
-
-    head = torch.empty(half_local_size, half_local_size*2)
-    for i in range(half_local_size):
-        chunk = torch.cat([
-            torch.arange(0, i),
-            torch.arange(i+1, half_local_size*2+1)
-        ], dim=-1)
-        head[i] = chunk
-
-    tail = torch.empty(half_local_size, half_local_size*2)
-    for i in range(half_local_size):
-        i = i+1
-        start = num_nodes - half_local_size * 2
-        current = num_nodes - i
-        chunk = torch.cat([
-            torch.arange(start-1, current),
-            torch.arange(current+1, num_nodes)
-        ], dim=-1)
-        tail[-i] = chunk
-
-    global_edge_index[:half_local_size] = head.to(device)
-    global_edge_index[-half_local_size:] = tail.to(device)
-
-    node_src = offset.expand(-1, half_local_size*2)
-    edge_index = torch.stack(
-        [global_edge_index, node_src], dim=0
-    )
-    edge_index = edge_index.reshape(2, -1)
-
-    masked_nodes = offset[x_mask].view(1, 1, -1)
-    edge_mask = (edge_index[..., None] == masked_nodes).any(dim=-1).any(dim=0)
-
-    edge_index = edge_index[:, ~edge_mask]
-    # edge_index = edge_index[:, edge_index[0] != edge_index[1]]
-    return edge_index

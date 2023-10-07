@@ -7,7 +7,7 @@ import collections
 from omegaconf import OmegaConf
 import dataclasses
 from . import so3_utils
-from ligbinddiff.model.modules.openfold import rigid_utils
+from ligbinddiff.utils.openfold import rigid_utils
 from scipy.spatial.transform import Rotation
 from Bio import PDB
 from Bio.PDB.Chain import Chain

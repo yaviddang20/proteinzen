@@ -1,8 +1,11 @@
+import numpy as np
+import torch
+
+from torch_geometric.nn import radius_graph
+from torch_geometric.utils import sort_edge_index
+
 from ligbinddiff.data.datasets.featurize.sidechain import _dihedrals
 from ligbinddiff.runtime.loss.utils import _elemwise_to_graphwise, _nodewise_to_graphwise, vec_norm
-
-
-import torch
 
 from ligbinddiff.utils.atom_reps import alphabet, atom91_residue_angles, atom91_residue_bonds, atom91_sidechain_angles, atom91_sidechain_bonds, atom91_start_end, chi_atom_idxs, chi_pi_periodic, nonbonded_sidechain_atom_pairs, restype_1to3
 
@@ -435,3 +438,42 @@ def chain_constraints_loss(pred_bb, ref_bb, num_nodes, batch_mask, x_mask, eps=1
     conn_mask_expand = conn_mask[:, None].expand(-1, 2)
     angle_loss = _elemwise_to_graphwise(angle_diff.flatten(), num_conn, conn_mask_expand)
     return lens_loss, angle_loss
+
+
+def framediff_local_atomic_context_loss(
+    pred_bb,
+    ref_bb,
+    batch,
+    x_mask,
+    r=6,
+    eps=1e-6,
+    max_num_neighbors=32
+):
+    # chop off CB
+    flat_ref_bb = ref_bb[~x_mask, :4].view(-1, 3)
+    flat_pred_bb = pred_bb[~x_mask, :4].view(-1, 3)
+    batch_expand = batch[~x_mask].repeat_interleave(4, dim=0)
+    edge_index = radius_graph(flat_ref_bb, r, batch_expand, max_num_neighbors=max_num_neighbors)
+    edge_index = sort_edge_index(edge_index, sort_by_row=False)
+
+    pred_dist_vec = flat_pred_bb[edge_index[0]] - flat_pred_bb[edge_index[1]]
+    pred_dists = torch.linalg.vector_norm(pred_dist_vec + eps, dim=-1)
+
+    ref_dist_vec = flat_ref_bb[edge_index[0]] - flat_ref_bb[edge_index[1]]
+    ref_dists = torch.linalg.vector_norm(ref_dist_vec + eps, dim=-1)
+
+    dist_se = torch.square(pred_dists - ref_dists)
+
+    data_lens = [0]
+    for i in range(batch.max().item() + 1):
+        select = (batch == i)
+        sub_x_mask = ~x_mask[select]
+        data_lens.append(sub_x_mask.long().sum() * 4)  # 4 bb atoms per residue
+
+    partitions = torch.cumsum(torch.as_tensor(data_lens, device=batch.device), dim=0)
+    edge_index_batch_id = torch.bucketize(edge_index[1], partitions, right=True) - 1
+    edge_data_lens = [(edge_index_batch_id == i).sum().item() for i in range(batch.max().item() + 1)]
+
+    dist_se_split = torch.split(dist_se, edge_data_lens)
+    dist_mse = torch.stack([sub_se.mean() for sub_se in dist_se_split], dim=0)
+    return dist_mse

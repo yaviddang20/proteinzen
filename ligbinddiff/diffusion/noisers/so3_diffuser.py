@@ -242,6 +242,23 @@ class SO3Diffuser:
         x = np.random.rand(n_samples)
         return np.interp(x, self._cdf[self.t_to_idx(t)], self.discrete_omega)
 
+    def torch_sample_igso3(
+            self,
+            t: torch.Tensor):
+        """Uses the inverse cdf to sample an angle of rotation from IGSO(3).
+
+        Args:
+            t: continuous time in [0, 1].
+            n_samples: number of samples to draw.
+
+        Returns:
+            [n_samples] angles of rotation.
+        """
+        if not np.isscalar(t):
+            raise ValueError(f'{t} must be a scalar.')
+        x = torch.randn_like(t)
+        return np.interp(x, self._cdf[self.t_to_idx(t)], self.discrete_omega)
+
     def sample(
             self,
             t: float,
@@ -257,6 +274,22 @@ class SO3Diffuser:
         """
         x = np.random.randn(n_samples, 3)
         x /= np.linalg.norm(x, axis=-1, keepdims=True)
+        return x * self.sample_igso3(t, n_samples=n_samples)[:, None]
+
+    def torch_sample(
+            self,
+            t: torch.Tensor):
+        """Generates rotation vector(s) from IGSO(3).
+
+        Args:
+            t: continuous time in [0, 1].
+            n_sample: number of samples to generate.
+
+        Returns:
+            [n_samples, 3] axis-angle rotation vectors sampled from IGSO(3).
+        """
+        x = torch.randn(t.numel(), 3)
+        x /= torch.linalg.vector_norm(x, dim=-1, keepdims=True)
         return x * self.sample_igso3(t, n_samples=n_samples)[:, None]
 
     def sample_ref(self, n_samples: float=1):
@@ -369,6 +402,25 @@ class SO3Diffuser:
         n_samples = np.cumprod(rot_0.shape[:-1])[-1]
         sampled_rots = self.sample(t, n_samples=n_samples)
         rot_score = self.score(sampled_rots, t).reshape(rot_0.shape)
+
+        # Right multiply.
+        rot_t = du.compose_rotvec(rot_0, sampled_rots).reshape(rot_0.shape)
+        return rot_t, rot_score
+
+    def torch_forward_marginal(self, rot_0: torch.Tensor, t: torch.Tensor):
+        """Samples from the forward diffusion process at time index t.
+
+        Args:
+            rot_0: [..., 3] initial rotations.
+            t: [...] continuous time in [0, 1].
+
+        Returns:
+            rot_t: [..., 3] noised rotation vectors.
+            rot_score: [..., 3] score of rot_t as a rotation vector.
+        """
+        n_samples = np.cumprod(rot_0.shape[:-1])[-1]
+        sampled_rots = self.sample(t, n_samples=n_samples)
+        rot_score = self.torch_score(sampled_rots, t).reshape(rot_0.shape)
 
         # Right multiply.
         rot_t = du.compose_rotvec(rot_0, sampled_rots).reshape(rot_0.shape)

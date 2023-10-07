@@ -4,6 +4,7 @@ import torch
 from torch import nn
 import numpy as np
 from torch_cluster import knn, knn_graph
+from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddings, _rbf
 from ligbinddiff.model.modules.common import ProjectLayer
 
 from ligbinddiff.model.modules.equiformer_v2.so3 import CoefficientMappingModule, SO3_Embedding, SO3_Rotation, SO3_Grid
@@ -12,7 +13,7 @@ from ligbinddiff.model.modules.equiformer_v2.transformer_block import FeedForwar
 from ligbinddiff.model.modules.equiformer_v2.edge_rot_mat import init_edge_rot_mat
 from ligbinddiff.utils.so3_embedding import type_l_to_so3
 from ligbinddiff.utils.frames import backbone_frames_to_bb_atoms
-from ligbinddiff.data.datasets.featurize.sidechain import _rbf, _positional_embeddings, _orientations, _ideal_virtual_Cb, _dihedrals
+from ligbinddiff.data.datasets.featurize.sidechain import _orientations, _ideal_virtual_Cb, _dihedrals
 
 from ligbinddiff.model.modules.common import EdgeUpdate
 
@@ -166,7 +167,7 @@ class Atom91Encoder(nn.Module):
         edge_rot_mat = init_edge_rot_mat(edge_distance_vec)
         edge_dist = torch.linalg.vector_norm(edge_distance_vec, dim=-1)
         edge_dist_rbf = _rbf(edge_dist, device=edge_dist.device)  # edge_channels_list
-        edge_dist_rel_pos = _positional_embeddings(edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
+        edge_dist_rel_pos = _edge_positional_embeddings(edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
         edge_features = torch.cat([edge_dist_rbf, edge_dist_rel_pos], dim=-1)
 
         # atom_features = graph['noised_atom91']
@@ -358,7 +359,7 @@ class Atom91Decoder(nn.Module):
         edge_rot_mat = init_edge_rot_mat(edge_distance_vec)
         edge_dist = torch.linalg.vector_norm(edge_distance_vec, dim=-1)
         edge_dist_rbf = _rbf(edge_dist, device=edge_dist.device)  # edge_channels_list
-        edge_dist_rel_pos = _positional_embeddings(edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
+        edge_dist_rel_pos = _edge_positional_embeddings(edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
         edge_features = torch.cat([edge_dist_rbf, edge_dist_rel_pos], dim=-1)
 
         node_features = intermediates['latent_sidechain']

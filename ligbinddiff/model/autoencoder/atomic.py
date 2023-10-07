@@ -1,4 +1,5 @@
-from ligbinddiff.data.datasets.featurize.sidechain import _rbf, _positional_embeddings
+from ligbinddiff.data.datasets.featurize.common import _rbf
+from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddings
 from ligbinddiff.model.modules.common import ProjectLayer, EdgeUpdate
 from ligbinddiff.model.modules.equiformer_v2.edge_rot_mat import sanitize_edge_index, init_edge_rot_mat
 from ligbinddiff.model.modules.equiformer_v2.so3 import SO3_Embedding, SO3_LinearV2
@@ -245,7 +246,7 @@ class AtomicSidechainEncoder(nn.Module):
         for rot in self.atom_super_SO3_rotation:
             rot.set_wigner(edge_rot_mat)
         edge_dist_rbf = _rbf(edge_dist, device=edge_dist.device, D_count=16)  # edge_channels_list
-        edge_dist_rel_pos = _positional_embeddings(res_edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
+        edge_dist_rel_pos = _edge_positional_embeddings(res_edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
         edge_features = torch.cat([edge_dist_rbf, edge_dist_rel_pos], dim=-1)
 
         res_features = self.project_to_node(res_features, edge_features, res_edge_index)

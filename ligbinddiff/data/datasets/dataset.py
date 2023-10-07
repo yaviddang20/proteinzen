@@ -7,7 +7,7 @@ import torch.utils.data as data
 from ligbinddiff.utils.atom_reps import atom91_atom_masks, letter_to_num
 from ligbinddiff.utils.zernike import ZernikeTransform
 
-from .featurize import sidechain
+from ligbinddiff.data.datasets.featurize.sidechain import featurize_atomic, featurize_density, featurize_cross_scale_atomic
 
 
 class ProteinGraphDataset(data.Dataset):
@@ -83,14 +83,14 @@ class ProteinGraphDataset(data.Dataset):
 
     def __getitem__(self, i):
         if self.feature_mode == 'sidechain.atomic':
-            return sidechain.featurize_atomic(self.data_list[i],
+            return featurize_atomic(self.data_list[i],
                                               letter_to_num=self.letter_to_num,
                                               num_rbf=self.num_rbf,
                                               top_k=self.top_k,
                                               diffuser=self.diffuser,
                                               device=self.device)
         elif self.feature_mode == 'sidechain.density':
-            return sidechain.featurize_density(self.data_list[i],
+            return featurize_density(self.data_list[i],
                                                zernike_transform=self.zernike_transform,
                                                channel_atoms=self.channel_atoms,
                                                channel_values=self.channel_values,
@@ -99,7 +99,7 @@ class ProteinGraphDataset(data.Dataset):
                                                top_k=self.top_k,
                                                device=self.device)
         elif self.feature_mode == 'sidechain.cross_scale':
-            return sidechain.featurize_cross_scale_atomic(
+            return featurize_cross_scale_atomic(
                 self.data_list[i],
                 letter_to_num=self.letter_to_num,
                 num_rbf=self.num_rbf,

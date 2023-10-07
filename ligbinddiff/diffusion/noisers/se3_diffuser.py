@@ -2,9 +2,10 @@
 import dataclasses
 import numpy as np
 from . import so3_diffuser
+from . import so3_utils
 from . import r3_diffuser
 from scipy.spatial.transform import Rotation
-from ligbinddiff.model.modules.openfold import rigid_utils as ru
+from ligbinddiff.utils.openfold import rigid_utils as ru
 from . import utils as du
 import torch
 import logging
@@ -18,6 +19,12 @@ def _extract_trans_rots(rigid: ru.Rigid):
     tran = rigid.get_trans().cpu().numpy()
     return tran, rot
 
+def _torch_extract_trans_rots(rigid: ru.Rigid):
+    rot = rigid.get_rots().get_rot_mats()
+    rot = so3_utils.Log(rot)
+    tran = rigid.get_trans()
+    return tran, rot
+
 def _assemble_rigid(rotvec, trans):
     rotvec_shape = rotvec.shape
     num_rotvecs = np.cumprod(rotvec_shape[:-1])[-1]
@@ -28,6 +35,13 @@ def _assemble_rigid(rotvec, trans):
             rots=ru.Rotation(
                 rot_mats=torch.Tensor(rotmat)),
             trans=torch.tensor(trans))
+
+def _torch_assemble_rigid(rotvec, trans):
+    rotmat = so3_utils.Exp(rotvec)
+    return ru.Rigid(
+        rots=ru.Rotation(rot_mats=rotmat),
+        trans=trans
+    )
 
 
 @dataclasses.dataclass
@@ -77,6 +91,75 @@ class SE3Diffuser:
                 rot_0,
                 np.zeros_like(rot_0),
                 np.ones_like(t)
+            )
+        else:
+            rot_t, rot_score = self._so3_diffuser.forward_marginal(
+                rot_0, t)
+            rot_score_scaling = self._so3_diffuser.score_scaling(t)
+
+        if not self._diffuse_trans:
+            trans_t, trans_score, trans_score_scaling = (
+                trans_0,
+                np.zeros_like(trans_0),
+                np.ones_like(t)
+            )
+        else:
+            trans_t, trans_score = self._r3_diffuser.forward_marginal(
+                trans_0, t)
+            trans_score_scaling = self._r3_diffuser.score_scaling(t)
+
+        if diffuse_mask is not None:
+            # diffuse_mask = torch.tensor(diffuse_mask).to(rot_t.device)
+            rot_t = self._apply_mask(
+                rot_t, rot_0, diffuse_mask[..., None])
+            trans_t = self._apply_mask(
+                trans_t, trans_0, diffuse_mask[..., None])
+
+            trans_score = self._apply_mask(
+                trans_score,
+                np.zeros_like(trans_score),
+                diffuse_mask[..., None])
+            rot_score = self._apply_mask(
+                rot_score,
+                np.zeros_like(rot_score),
+                diffuse_mask[..., None])
+        rigids_t = _assemble_rigid(rot_t, trans_t)
+        if as_tensor_7:
+            rigids_t = rigids_t.to_tensor_7()
+        return {
+            'rigids_t': rigids_t,
+            'trans_score': trans_score,
+            'rot_score': rot_score,
+            'trans_score_scaling': trans_score_scaling,
+            'rot_score_scaling': rot_score_scaling,
+        }
+
+    def torch_forward_marginal(
+            self,
+            rigids_0: ru.Rigid,
+            t: torch.Tensor,
+            diffuse_mask: torch.Tensor = None,
+            as_tensor_7: bool=True,
+        ):
+        """
+        Args:
+            rigids_0: [..., N] openfold Rigid objects
+            t: continuous time in [0, 1].
+
+        Returns:
+            rigids_t: [..., N] noised rigid. [..., N, 7] if as_tensor_7 is true.
+            trans_score: [..., N, 3] translation score
+            rot_score: [..., N, 3] rotation score
+            trans_score_norm: [...] translation score norm
+            rot_score_norm: [...] rotation score norm
+        """
+        trans_0, rot_0 = _torch_extract_trans_rots(rigids_0)
+
+        if not self._diffuse_rot:
+            rot_t, rot_score, rot_score_scaling = (
+                rot_0,
+                torch.zeros_like(rot_0),
+                torch.ones_like(t)
             )
         else:
             rot_t, rot_score = self._so3_diffuser.forward_marginal(

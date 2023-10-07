@@ -1,11 +1,10 @@
 import torch
 import numpy as np
 
-from ligbinddiff.model.modules.openfold import rigid_utils as ru
-from ligbinddiff.diffusion.noisers.se3 import _extract_rots_trans, _assemble_rigid
+from ligbinddiff.utils.openfold import rigid_utils as ru
 from ligbinddiff.utils.atom_reps import atom14_sidechain_angles, atom14_residue_angles
 
-from .utils import _elemwise_to_graphwise
+from .utils import _elemwise_to_graphwise, _nodewise_to_graphwise
 from .atomic import _atom91_to_atom14
 from .openfold import compute_fape
 
@@ -81,3 +80,36 @@ def all_atom_fape_loss(pred_atom91,
     all_atom_fape = torch.cat(all_atom_fape, dim=0)
     return all_atom_fape
     return _elemwise_to_graphwise(all_atom_fape, data_lens, frame_mask)
+
+def angle_axis_rot_loss(
+        pred_rot_score,
+        ref_rot_score,
+        score_scaling,
+        t,
+        data_lens,
+        x_mask,
+        angle_loss_weight=0.5,
+        angle_loss_t_threshold=0.2):
+    gt_rot_score = ref_rot_score[~x_mask]
+    pred_rot_score = pred_rot_score[~x_mask]
+    score_scaling = score_scaling[~x_mask]
+
+    gt_rot_angle = torch.norm(gt_rot_score, dim=-1, keepdim=True)
+    gt_rot_axis = gt_rot_score / (gt_rot_angle + 1e-6)
+
+    pred_rot_angle = torch.norm(pred_rot_score, dim=-1, keepdim=True)
+    pred_rot_axis = pred_rot_score / (pred_rot_angle + 1e-6)
+
+    # Separate loss on the axis
+    axis_loss = torch.square(gt_rot_axis - pred_rot_axis).sum(dim=-1)
+
+    # Separate loss on the angle
+    angle_loss = (gt_rot_angle - pred_rot_angle)**2
+    angle_loss = torch.sum(
+        angle_loss / score_scaling[:, None]**2,
+        dim=-1
+    )
+    angle_loss *= angle_loss_weight
+    angle_loss *= t[~x_mask] > angle_loss_t_threshold
+    rot_loss = angle_loss + axis_loss
+    return _nodewise_to_graphwise(rot_loss, data_lens, x_mask)

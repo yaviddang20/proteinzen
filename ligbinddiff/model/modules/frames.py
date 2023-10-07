@@ -7,7 +7,7 @@ from typing import Optional, Callable, List, Sequence, Tuple
 
 import torch_geometric.utils as pygu
 
-from .openfold.rigid_utils import Rigid
+from ...utils.openfold.rigid_utils import Rigid
 from .equiformer_v2.so3 import SO3_Grid, SO3_LinearV2
 from .equiformer_v2.activation import SeparableS2Activation
 from .equiformer_v2.layer_norm import EquivariantRMSNormArraySphericalHarmonicsV2 as NormSO3

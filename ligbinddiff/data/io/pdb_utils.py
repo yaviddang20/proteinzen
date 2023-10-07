@@ -52,15 +52,12 @@ def atom91_to_chain(seq, atom91, chain_id, x_bb=None):
         atom91[..., :4, :] = x_bb
     atom_idx = 0
     chain = Chain.Chain(chain_id)
-    # pp = Polypeptide.Polypeptide()
     for seq_idx, aa in enumerate(seq):
         coords = atom91[seq_idx]
         if np.isnan(coords).all():
             continue
         res, atom_idx = build_residue(aa, coords, seq_idx, atom_idx)
         chain.add(res)
-        # pp.append(res)
-    # chain.add(pp)
     return chain
 
 def chains_to_struct(chains, model_id=0, struct_id=0):

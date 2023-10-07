@@ -1,6 +1,6 @@
 """ Utils for frames
 
-Sourced from https://github.com/aqlaboratory/openfold/blob/2134cc09b3994b6280e6e3c569dd7d761e4da7a0/openfold/utils/rigid_utils.py
+Adapted from https://github.com/aqlaboratory/openfold/blob/2134cc09b3994b6280e6e3c569dd7d761e4da7a0/openfold/utils/rigid_utils.py
 
 """
 # Copyright 2021 AlQuraishi Laboratory
@@ -814,6 +814,22 @@ class Rotation:
         else:
             raise ValueError("Both rotations are None")
 
+    def view(self, *shape: Sequence) -> Rotation:
+        if len(shape) == 1 and isinstance(shape[0], (list, tuple)):
+                shape = shape[0]
+
+        if(self._rot_mats is not None):
+            return Rotation(rot_mats=self._rot_mats.view(list(shape) + [3, 3]), quats=None)
+        elif(self._quats is not None):
+            return Rotation(
+                rot_mats=None,
+                quats=self._quats.view(list(shape) + [4]),
+                normalize_quats=False,
+            )
+        else:
+            raise ValueError("Both rotations are None")
+
+
 
 class Rigid:
     """
@@ -1293,6 +1309,9 @@ class Rigid:
         fn = lambda t: t * trans_scale_factor
         return self.apply_trans_fn(fn)
 
+    def translate(self, trans_vecs: torch.Tensor) -> Rigid:
+        return self.apply_trans_fn(lambda x: x + trans_vecs)
+
     def stop_rot_gradient(self) -> Rigid:
         """
             Detaches the underlying rotation object
@@ -1384,3 +1403,39 @@ class Rigid:
                 A version of the transformation on GPU
         """
         return Rigid(self._rots.cuda(), self._trans.cuda())
+
+    def to(self, device) -> Rigid:
+        """
+            Moves the transformation object to GPU memory
+
+            Returns:
+                A version of the transformation on GPU
+        """
+        return Rigid(self._rots.to(device, dtype=self._rots.dtype), self._trans.to(device))
+
+    def view(self, *shape) -> Rigid:
+        """
+            Moves the transformation object to GPU memory
+
+            Returns:
+                A version of the transformation on GPU
+        """
+        if len(shape) == 1 and isinstance(shape[0], (list, tuple)):
+            shape = list(shape[0])
+        shape_type = type(shape)
+        return Rigid(
+            self._rots.view(*shape),
+            self._trans.view(shape + shape_type([3]))
+        )
+
+
+def batchwise_center(rigids: Rigid, batch: torch.Tensor):
+    center = []
+    for i in range(batch.max().item() + 1):
+        select = (batch == i)
+        num_nodes = select.long().sum()
+        subset_x_ca = rigids.get_trans()[select]
+        subset_mean = subset_x_ca.mean(dim=0)
+        center.append(subset_mean[None, :].expand(num_nodes, -1))
+    center = torch.cat(center, dim=0)
+    return center

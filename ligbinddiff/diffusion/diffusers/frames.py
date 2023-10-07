@@ -5,1524 +5,13 @@ import tqdm
 import torch.distributions as dist
 import numpy as np
 
-from ligbinddiff.utils.so3_embedding import so3_add, so3_mult, so3_randn_like, gen_so3_unop
-from ligbinddiff.model.denoiser.bb_sidechain.frames_latent import LatentDenoiser
-from ligbinddiff.model.denoiser.bb.frames import FrameDenoiser, FrameDenoiser2, FrameDenoiser2p5
-from ligbinddiff.model.denoiser.bb.framediff import IpaScoreWrapper, IpaScoreWrapper2, reshape_rigids, KnnIpaScoreWrapper
-from ligbinddiff.model.denoiser.sidechain.latent import LatentSidechainDenoiser
-from ligbinddiff.model.autoencoder.atom91 import Atom91Encoder, Atom91Decoder
-from ligbinddiff.model.autoencoder.atomic import AtomicSidechainEncoder
-from ligbinddiff.model.modules.equiformer_v2.so3 import CoefficientMappingModule, SO3_Rotation, SO3_Grid
-from ligbinddiff.model.modules.openfold import rigid_utils as ru
+from ligbinddiff.model.denoiser.bb.framediff import IpaScoreWrapper
+from ligbinddiff.utils.openfold import rigid_utils as ru
 
 from torch_geometric.data import Batch, Data
 
 
-class FrameInpaintingDiffuser(nn.Module):
-    def __init__(self,
-                 se3_noiser,
-                 node_lmax_list=[1],
-                 h_channels=32,
-                 edge_channels_list=[32, 32, 32],
-                 h_time=64,
-                 scalar_h_dim=128,
-                 num_heads=8,
-                 num_layers=4,
-                 k=30,
-                 bb_x_0_key='frames',
-                 bb_x_0_pred_key='denoised_frames',
-                 bb_x_t_key='noised_frames'):
-        super().__init__()
-        self.bb_x_0_key = bb_x_0_key
-        self.bb_x_0_pred_key = bb_x_0_pred_key
-        self.bb_x_t_key = bb_x_t_key
-
-        # build these expensive coeff stores
-        node_SO3_rotation_list = nn.ModuleList()
-        for lmax in node_lmax_list:
-            node_SO3_rotation_list.append(
-                SO3_Rotation(lmax)
-            )
-
-        node_SO3_grid_list = nn.ModuleList()
-        for l in range(max(node_lmax_list) + 1):
-            SO3_m_grid = nn.ModuleList()
-            for m in range(max(node_lmax_list) + 1):
-                SO3_m_grid.append(
-                    SO3_Grid(l, m)
-                )
-            node_SO3_grid_list.append(SO3_m_grid)
-
-        mappingReduced_nodes = CoefficientMappingModule(node_lmax_list, node_lmax_list)
-
-        self.denoiser = FrameDenoiser(
-            node_lmax_list=node_lmax_list,
-            edge_channels_list=edge_channels_list,
-            mappingReduced_nodes=mappingReduced_nodes,
-            node_SO3_rotation=node_SO3_rotation_list,
-            node_SO3_grid=node_SO3_grid_list,
-            num_heads=num_heads,
-            h_channels=h_channels,
-            h_time=h_time,
-            scalar_h_dim=scalar_h_dim,
-            n_layers=num_layers,
-        )
-        self.time_dist = dist.Uniform(0, 1)
-        self.time_T = 1
-        self.se3_noiser = se3_noiser
-        self.k = k
-
-    def build_bb_frames(self, data):
-        backbone_coords = data['bb']
-        N, CA, C = backbone_coords[..., 0, :], backbone_coords[..., 1, :], backbone_coords[..., 2, :]
-        frames = ru.Rigid.from_3_points(N, CA, C)
-        return frames
-
-    def forward_noising(self, data):
-        device = data['x'].device
-        out_dict = {}
-
-        # sample a t per graph, then expand to per node
-        # t_per_graph = torch.ones((data.num_graphs)) * 0.5
-        t_per_graph = self.time_dist.sample((data.num_graphs,))
-        t_per_graph = t_per_graph.to(device)
-        num_nodes = data.num_nodes
-        t_per_node = torch.empty(num_nodes, device=device)
-        for i, batch_num in enumerate(range(data.batch.max().item() + 1)):
-            select = (data.batch == batch_num)
-            t_per_node[select] = t_per_graph[i]
-        t = t_per_node
-        out_dict['t'] = t
-        out_dict['t_per_graph'] = t_per_graph
-
-        sampled_residx, noising_mask = self.sample_noise_residx(data)
-        out_dict['noised_residx'] = sampled_residx
-        out_dict['noising_mask'] = noising_mask
-        noised_bb_data = self.noise_bb(data, noising_mask, t)
-        out_dict.update(noised_bb_data)
-        return out_dict
-
-    def sample_noise_residx(self, data):
-        device = data['x'].device
-        num_graphs = data.num_graphs
-        # we noise by selecting a random residue, then noising its knn neighborhood
-        edge_splits = data._slice_dict['edge_index']
-        num_edges = (edge_splits[1:] - edge_splits[:-1]).tolist()
-        edge_index_split = data.edge_index.split(num_edges, dim=-1)
-
-        sampled_src_residx = []
-        for edge_index in edge_index_split:
-            # we sample an edge, then look at its source node
-            # we can do this since we have the same number of edges per node
-            # this also avoids the problem of sampling a masked node, since it won't have an edge to it
-            srcs = edge_index[1]
-            select_idx = torch.randint(low=0, high=srcs.shape[0], size=(1,), device=device)
-            sampled_src_residx.append(srcs[select_idx])
-        sampled_src_residx = torch.cat(sampled_src_residx, dim=0)
-
-        # select the relevant edges
-        edge_selector = data.edge_index[1][:, None] == sampled_src_residx[None, :]   # n_edge x n_graph
-        edge_selector = edge_selector.any(dim=-1)
-        # gather the dst of all src nodes
-        sampled_dst_residx = data.edge_index[0][edge_selector]  # by construction these must be unique, n_edge
-        # do a little reshaping so that the order is [(src, {dsts}), ...]
-        sampled_dst_residx = sampled_dst_residx.view(num_graphs, self.k)
-        sampled_residx = torch.cat([sampled_src_residx[:, None], sampled_dst_residx], dim=-1).long()
-        sampled_residx = sampled_residx.flatten()
-
-        num_nodes = data.num_nodes
-        residxs = torch.arange(num_nodes, device=device)
-        noising_mask = (residxs[:, None] == sampled_residx[None, :]).any(dim=-1)
-
-        return sampled_residx, noising_mask
-
-    def noise_bb(self, data, noising_mask, t):
-        bb_x_0 = data[self.bb_x_0_key]
-        noised_bb = self.se3_noiser.forward_marginal(bb_x_0, t, noising_mask)
-        return noised_bb
-
-    def reverse_noising(self, data, intermediates):
-        denoiser_output = self.denoiser(data, intermediates)
-        pred_bb_score = self.bb_score_fn(denoiser_output)
-        denoiser_output["pred_bb_score"] = pred_bb_score
-        return denoiser_output
-
-    def bb_score_fn(self, denoiser_output):
-        bb_x_t = denoiser_output[self.bb_x_t_key]
-        bb_x_0_pred = denoiser_output[self.bb_x_0_pred_key]
-        t = denoiser_output['t']
-        bb_score = self.se3_noiser.score(bb_x_t, bb_x_0_pred, t)
-        return bb_score
-
-    def forward(self, data, warmup=False, deterministic=False):
-        if self.bb_x_0_key not in data:
-            data[self.bb_x_0_key] = self.build_bb_frames(data)
-
-        noised_data = self.forward_noising(data)
-        denoised_outputs = self.reverse_noising(data, noised_data)
-
-        return noised_data, denoised_outputs
-
-    def sample_prior(self, data):
-        sampled_residx, noising_mask = self.sample_noise_residx(data)
-        num_nodes = data.num_nodes
-        bb_x_0 = data[self.bb_x_0_key]
-        bb_prior = self.se3_noiser.sample_ref(num_nodes, bb_x_0, noising_mask)
-        out_dict = {
-            'noised_residx': sampled_residx,
-            'noising_mask': noising_mask
-        }
-        out_dict.update(bb_prior)
-        return out_dict
-
-    def reverse_step(self, data, intermediates, delta_t, noise_scale=1.0):
-        # assert delta_t < 0
-        t = intermediates['t']
-        noising_mask = intermediates['noising_mask']
-        bb_x_t = intermediates[self.bb_x_t_key]
-
-        denoiser_output = self.denoiser(data, intermediates)
-        rot_score, trans_score = self.bb_score_fn(denoiser_output)
-
-        bb_x_tm1 = self.se3_noiser.reverse(
-            rigids_t=bb_x_t,
-            rot_score=rot_score,
-            trans_score=trans_score,
-            t=t,
-            delta_t=delta_t,
-            diffuse_mask=noising_mask,
-            noise_scale=noise_scale)
-        tm1 = t - np.abs(delta_t) #+ delta_t
-
-        return bb_x_tm1, tm1, denoiser_output
-
-    def sample(self,
-               data,
-               steps=100,
-               show_progress=False,
-               device=None,
-               noise_scale=1.0):
-        if device is None:
-            device = data['x'].device
-
-        if self.bb_x_0_key not in data:
-            data[self.bb_x_0_key] = self.build_bb_frames(data)
-
-        # num_batch = len(data._slice_dict['x'])
-        # num_nodes = num_batch * self.k
-        num_nodes = data.num_nodes
-        prior = self.sample_prior(data)
-        intermediates = prior
-
-        delta_t = self.time_T / steps  # should this be negative?
-        intermediates['t'] = torch.ones([num_nodes], device=device).float() - np.abs(delta_t)
-        intermediates['t_per_graph'] = torch.ones([data.num_graphs], device=device).float() - np.abs(delta_t)
-        bb_x_t = intermediates[self.bb_x_t_key]
-        denoiser_output = None
-
-        with torch.no_grad():
-            if show_progress:
-                pbar = tqdm.tqdm(total=steps)
-
-            while (intermediates['t'] > np.abs(delta_t)).all():
-                bb_x_tm1, tm1, denoiser_output = self.reverse_step(data, intermediates, delta_t, noise_scale=noise_scale)
-                intermediates['t'] = tm1
-                intermediates[self.bb_x_t_key] = bb_x_tm1
-
-                if show_progress:
-                    pbar.update(1)
-
-            if show_progress:
-                pbar.close()
-
-        diffusion_outputs = intermediates
-        diffusion_outputs[self.bb_x_0_key] = diffusion_outputs[self.bb_x_t_key]
-        diffusion_outputs[self.bb_x_t_key] = bb_x_t
-        # add a bunch of keys so the loss fn is happy
-        pred_bb_score = self.bb_score_fn(denoiser_output)
-        diffusion_outputs["pred_bb_score"] = pred_bb_score
-        diffusion_outputs["rot_score"] = torch.zeros_like(pred_bb_score[0])
-        diffusion_outputs["trans_score"] = torch.zeros_like(pred_bb_score[1])
-        diffusion_outputs["rot_score_scaling"] = torch.ones(pred_bb_score[0].shape[:-2], device=pred_bb_score[0].device)
-        diffusion_outputs["trans_score_scaling"] = torch.ones(pred_bb_score[1].shape[:-1], device=pred_bb_score[1].device)
-
-        return diffusion_outputs, {}
-
-
-class LatentFrameInpaintingDiffuser(nn.Module):
-    def __init__(self,
-                 se3_noiser,
-                 sidechain_noiser,
-                 node_lmax_list=[1],
-                 h_channels=32,
-                 edge_channels_list=[32, 32, 32],
-                 h_time=64,
-                 scalar_h_dim=128,
-                 bb_lmax_list=[1],
-                 bb_channels=6,
-                 atom_lmax_list=[1],
-                 atom_channels=91,
-                 num_heads=8,
-                 num_layers=4,
-                 k=30,
-                 sidechain_x_0_key='latent_sidechain',
-                 sidechain_x_0_pred_key='denoised_latent_sidechain',
-                 sidechain_x_t_key='noised_latent_sidechain',
-                 bb_x_0_key='frames',
-                 bb_x_0_pred_key='denoised_frames',
-                 bb_x_t_key='noised_frames'):
-        super().__init__()
-        self.sidechain_x_0_key = sidechain_x_0_key
-        self.sidechain_x_0_pred_key = sidechain_x_0_pred_key
-        self.sidechain_x_t_key = sidechain_x_t_key
-
-        self.bb_x_0_key = bb_x_0_key
-        self.bb_x_0_pred_key = bb_x_0_pred_key
-        self.bb_x_t_key = bb_x_t_key
-
-        # build these expensive coeff stores
-        atom_super_lmax_list = [max(l1, l2) for l1, l2 in zip(atom_lmax_list, node_lmax_list)]
-        bb_super_lmax_list = [max(l1, l2) for l1, l2 in zip(bb_lmax_list, node_lmax_list)]
-        atom_super_SO3_rotation_list = nn.ModuleList()
-        bb_super_SO3_rotation_list = nn.ModuleList()
-        node_SO3_rotation_list = nn.ModuleList()
-        for lmax in atom_super_lmax_list:
-            atom_super_SO3_rotation_list.append(
-                SO3_Rotation(lmax)
-            )
-        for lmax in bb_super_lmax_list:
-            bb_super_SO3_rotation_list.append(
-                SO3_Rotation(lmax)
-            )
-        for lmax in node_lmax_list:
-            node_SO3_rotation_list.append(
-                SO3_Rotation(lmax)
-            )
-
-        atom_super_SO3_grid_list = nn.ModuleList()
-        bb_super_SO3_grid_list = nn.ModuleList()
-        node_SO3_grid_list = nn.ModuleList()
-        for l in range(max(atom_super_lmax_list) + 1):
-            SO3_m_grid = nn.ModuleList()
-            for m in range(max(atom_lmax_list) + 1):
-                SO3_m_grid.append(
-                    SO3_Grid(l, m)
-                )
-            atom_super_SO3_grid_list.append(SO3_m_grid)
-        for l in range(max(bb_super_lmax_list) + 1):
-            SO3_m_grid = nn.ModuleList()
-            for m in range(max(node_lmax_list) + 1):
-                SO3_m_grid.append(
-                    SO3_Grid(l, m)
-                )
-            bb_super_SO3_grid_list.append(SO3_m_grid)
-        bb_super_SO3_grid_list = nn.ModuleList()
-        for l in range(max(node_lmax_list) + 1):
-            SO3_m_grid = nn.ModuleList()
-            for m in range(max(atom_lmax_list) + 1):
-                SO3_m_grid.append(
-                    SO3_Grid(l, m)
-                )
-            node_SO3_grid_list.append(SO3_m_grid)
-
-        mappingReduced_super_atoms = CoefficientMappingModule(atom_super_lmax_list, atom_super_lmax_list)
-        mappingReduced_super_bb = CoefficientMappingModule(bb_super_lmax_list, bb_super_lmax_list)
-        mappingReduced_nodes = CoefficientMappingModule(node_lmax_list, node_lmax_list)
-
-        self.denoiser = LatentDenoiser(
-            node_lmax_list=node_lmax_list,
-            edge_channels_list=edge_channels_list,
-            mappingReduced_nodes=mappingReduced_nodes,
-            node_SO3_rotation=node_SO3_rotation_list,
-            node_SO3_grid=node_SO3_grid_list,
-            num_heads=num_heads,
-            h_channels=h_channels,
-            h_time=h_time,
-            scalar_h_dim=scalar_h_dim,
-            n_layers=num_layers,
-        )
-        self.encoder = Atom91Encoder(
-            node_lmax_list=node_lmax_list,
-            edge_channels_list=edge_channels_list,
-            mappingReduced_nodes=mappingReduced_nodes,
-            mappingReduced_super_bb=mappingReduced_super_bb,
-            mappingReduced_super_atoms=mappingReduced_super_atoms,
-            node_SO3_rotation=node_SO3_rotation_list,
-            node_SO3_grid=node_SO3_grid_list,
-            bb_super_SO3_rotation=bb_super_SO3_rotation_list,
-            bb_super_SO3_grid=bb_super_SO3_grid_list,
-            atom_super_SO3_rotation=atom_super_SO3_rotation_list,
-            atom_super_SO3_grid=atom_super_SO3_grid_list,
-            bb_lmax_list=bb_lmax_list,
-            bb_channels=bb_channels,
-            atom_lmax_list=atom_lmax_list,
-            atom_channels=atom_channels,
-            num_heads=num_heads,
-            h_channels=h_channels,
-            num_layers=num_layers
-        )
-        self.decoder = Atom91Decoder(
-            node_lmax_list=node_lmax_list,
-            edge_channels_list=edge_channels_list,
-            mappingReduced_nodes=mappingReduced_nodes,
-            mappingReduced_super_atoms=mappingReduced_super_atoms,
-            mappingReduced_super_bb=mappingReduced_super_bb,
-            node_SO3_rotation=node_SO3_rotation_list,
-            node_SO3_grid=node_SO3_grid_list,
-            bb_super_SO3_rotation=bb_super_SO3_rotation_list,
-            bb_super_SO3_grid=bb_super_SO3_grid_list,
-            atom_super_SO3_rotation=atom_super_SO3_rotation_list,
-            atom_super_SO3_grid=atom_super_SO3_grid_list,
-            bb_lmax_list=bb_lmax_list,
-            bb_channels=bb_channels,
-            atom_lmax_list=atom_lmax_list,
-            atom_channels=atom_channels,
-            num_heads=num_heads,
-            h_channels=h_channels,
-            num_layers=num_layers
-        )
-        self.time_dist = dist.Uniform(0, 1)
-        self.time_T = 1
-        self.se3_noiser = se3_noiser
-        self.sidechain_noiser = sidechain_noiser
-        self.k = k
-
-    def build_bb_frames(self, data):
-        backbone_coords = data['bb']
-        N, CA, C = backbone_coords[..., 0, :], backbone_coords[..., 1, :], backbone_coords[..., 2, :]
-        frames = ru.Rigid.from_3_points(N, CA, C)
-        return frames
-
-    def forward_noising(self, data, intermediates):
-        device = data['x'].device
-        out_dict = {}
-
-        # sample a t per graph, then expand to per node
-        t_per_graph = self.time_dist.sample((data.num_graphs,))
-        t_per_graph = t_per_graph.to(device)
-        num_nodes = data.num_nodes
-        t_per_node = torch.empty(num_nodes, device=device)
-        for i, batch_num in enumerate(range(data.batch.max().item() + 1)):
-            select = (data.batch == batch_num)
-            t_per_node[select] = t_per_graph[i]
-        t = t_per_node
-        out_dict['t'] = t
-        out_dict['t_per_graph'] = t_per_graph
-
-        sampled_residx, noising_mask = self.sample_noise_residx(data)
-        out_dict['noised_residx'] = sampled_residx
-        out_dict['noising_mask'] = noising_mask
-        noised_bb_data = self.noise_bb(data, noising_mask, t)
-        noised_sidechain_data = self.noise_sidechain(intermediates, noising_mask, t)
-        out_dict.update(noised_bb_data)
-        out_dict.update(noised_sidechain_data)
-        return out_dict
-
-    def sample_noise_residx(self, data):
-        device = data['x'].device
-        num_graphs = data.num_graphs
-        # we noise by selecting a random residue, then noising its knn neighborhood
-        edge_splits = data._slice_dict['edge_index']
-        num_edges = (edge_splits[1:] - edge_splits[:-1]).tolist()
-        edge_index_split = data.edge_index.split(num_edges, dim=-1)
-
-        sampled_src_residx = []
-        for edge_index in edge_index_split:
-            # we sample an edge, then look at its source node
-            # we can do this since we have the same number of edges per node
-            # this also avoids the problem of sampling a masked node, since it won't have an edge to it
-            srcs = edge_index[1]
-            select_idx = torch.randint(low=0, high=srcs.shape[0], size=(1,), device=device)
-            sampled_src_residx.append(srcs[select_idx])
-        sampled_src_residx = torch.cat(sampled_src_residx, dim=0)
-
-        # select the relevant edges
-        edge_selector = data.edge_index[1][:, None] == sampled_src_residx[None, :]   # n_edge x n_graph
-        edge_selector = edge_selector.any(dim=-1)
-        # gather the dst of all src nodes
-        sampled_dst_residx = data.edge_index[0][edge_selector]  # by construction these must be unique, n_edge
-        # do a little reshaping so that the order is [(src, {dsts}), ...]
-        sampled_dst_residx = sampled_dst_residx.view(num_graphs, self.k)
-        sampled_residx = torch.cat([sampled_src_residx[:, None], sampled_dst_residx], dim=-1).long()
-        sampled_residx = sampled_residx.flatten()
-
-        num_nodes = data.num_nodes
-        residxs = torch.arange(num_nodes, device=device)
-        noising_mask = (residxs[:, None] == sampled_residx[None, :]).any(dim=-1)
-
-        if (torch.rand(1) < 0.5).all():
-            return sampled_residx, noising_mask
-        else:
-            return torch.tensor([], device=device), torch.zeros_like(noising_mask).bool()
-
-    def noise_bb(self, data, noising_mask, t):
-        bb_x_0 = data[self.bb_x_0_key]
-        noised_bb = self.se3_noiser.forward_marginal(bb_x_0, t, noising_mask)
-        return noised_bb
-
-    def noise_sidechain(self, intermediates, noising_mask, t):
-        sidechain_x_0 = intermediates[self.sidechain_x_0_key]
-        noised_sidechain = self.sidechain_noiser.forward_marginal(sidechain_x_0, t, noising_mask)
-        return noised_sidechain
-
-    def reverse_noising(self, data, intermediates):
-        denoiser_output = self.denoiser(data, intermediates)
-        pred_bb_score = self.bb_score_fn(denoiser_output)
-        pred_sidechain_score = self.sidechain_score_fn(denoiser_output)
-        denoiser_output["pred_bb_score"] = pred_bb_score
-        denoiser_output["pred_sidechain_score"] = pred_sidechain_score
-        return denoiser_output
-
-    def bb_score_fn(self, denoiser_output):
-        bb_x_t = denoiser_output[self.bb_x_t_key]
-        bb_x_0_pred = denoiser_output[self.bb_x_0_pred_key]
-        t = denoiser_output['t']
-        bb_score = self.se3_noiser.score(bb_x_t, bb_x_0_pred, t)
-        return bb_score
-
-    def sidechain_score_fn(self, denoiser_output):
-        sidechain_x_t = denoiser_output[self.sidechain_x_t_key]
-        sidechain_x_0_pred = denoiser_output[self.sidechain_x_0_pred_key]
-        t = denoiser_output['t']
-        sidechain_score = self.sidechain_noiser.score(sidechain_x_t, sidechain_x_0_pred, t)
-        return sidechain_score
-
-    def forward(self, data, warmup=False, deterministic=False):
-        if self.bb_x_0_key not in data:
-            data[self.bb_x_0_key] = self.build_bb_frames(data)
-        latent_data = self.encoder(data)
-
-        if deterministic:
-            latent_data[self.sidechain_x_0_key] = latent_data['latent_mu']
-        else:
-            latent_sigma = gen_so3_unop(torch.exp)(
-                so3_mult(
-                    latent_data['latent_logvar'],
-                    0.5
-                ),
-            )
-            latent_data[self.sidechain_x_0_key] = so3_add(
-                latent_data['latent_mu'],
-                so3_mult(
-                    latent_sigma,
-                    so3_randn_like(latent_sigma)
-                )
-            )
-        noised_latent = self.forward_noising(data, latent_data)
-        latent_data.update(noised_latent)
-        latent_outputs = self.reverse_noising(data, latent_data)
-        latent_data.update(latent_outputs)
-        decoded_outputs = self.decoder(data, latent_data)
-        passthrough_outputs = self.decoder(data, latent_data, denoiser_output=latent_data)
-        passthrough_outputs.update(latent_data)
-
-        return latent_data, decoded_outputs, passthrough_outputs
-
-    def sample_prior(self, data, intermediates):
-        sampled_residx, noising_mask = self.sample_noise_residx(data)
-        num_nodes = data.num_nodes
-        bb_x_0 = data[self.bb_x_0_key]
-        bb_prior = self.se3_noiser.sample_ref(num_nodes, bb_x_0, noising_mask)
-        sidechain_x_0 = intermediates[self.sidechain_x_0_key]
-        sidechain_prior = self.sidechain_noiser.sample_ref(
-            num_nodes,
-            sidechain_x_0,
-            noising_mask,
-            device=sidechain_x_0.device)
-        out_dict = {
-            'noised_residx': sampled_residx,
-            'noising_mask': noising_mask
-        }
-        out_dict.update(bb_prior)
-        out_dict.update(sidechain_prior)
-        return out_dict
-
-    def reverse_step(self, data, intermediates, delta_t, noise_scale=1.0):
-        # assert delta_t < 0
-        t = intermediates['t']
-        noising_mask = intermediates['noising_mask']
-        bb_x_t = intermediates[self.bb_x_t_key]
-        sidechain_x_t = intermediates[self.sidechain_x_t_key]
-
-        denoiser_output = self.denoiser(data, intermediates)
-        rot_score, trans_score = self.bb_score_fn(denoiser_output)
-        sidechain_score = self.sidechain_score_fn(denoiser_output)
-
-        bb_x_tm1 = self.se3_noiser.reverse(
-            bb_x_t,
-            rot_score,
-            trans_score,
-            t,
-            delta_t,
-            noising_mask,
-            noise_scale=noise_scale)
-        sidechain_x_tm1 = self.sidechain_noiser.reverse(
-            sidechain_x_t,
-            sidechain_score,
-            t,
-            delta_t,
-            noising_mask,
-            noise_scale=noise_scale)
-        tm1 = t - delta_t #+ delta_t
-
-        return bb_x_tm1, sidechain_x_tm1, tm1, denoiser_output
-
-
-    def sample(self,
-               data,
-               steps=100,
-               show_progress=False,
-               device=None):
-        if device is None:
-            device = data['x'].device
-
-        if self.bb_x_0_key not in data:
-            data[self.bb_x_0_key] = self.build_bb_frames(data)
-
-        # num_batch = len(data._slice_dict['x'])
-        # num_nodes = num_batch * self.k
-        num_nodes = data.num_nodes
-        latent_outputs = self.encoder(data)
-        latent_outputs[self.sidechain_x_0_key] = latent_outputs['latent_mu']
-        prior = self.sample_prior(data, latent_outputs)
-        intermediates = prior
-
-        delta_t = self.time_T / steps  # should this be negative?
-        intermediates['t'] = torch.ones([num_nodes], device=device).float() - delta_t
-        intermediates['t_per_graph'] = torch.ones([data.num_graphs], device=device).float() - delta_t
-        bb_x_t = intermediates[self.bb_x_t_key]
-        sidechain_x_t = intermediates[self.sidechain_x_t_key].clone()
-        denoiser_output = None
-
-        with torch.no_grad():
-            if show_progress:
-                pbar = tqdm.tqdm(total=steps)
-
-            while (intermediates['t'] > delta_t).all():
-                bb_x_tm1, sidechain_x_tm1, tm1, denoiser_output = self.reverse_step(data, intermediates, delta_t)
-                intermediates['t'] = tm1
-                intermediates[self.bb_x_t_key] = bb_x_tm1
-                intermediates[self.sidechain_x_t_key] = sidechain_x_tm1
-
-                if show_progress:
-                    pbar.update(1)
-
-            if show_progress:
-                pbar.close()
-
-        diffusion_outputs = intermediates
-        bb_x_0_pred = diffusion_outputs[self.bb_x_t_key]
-        sidechain_x_0_pred = diffusion_outputs[self.sidechain_x_t_key]
-        # swap around keys so we can apply the decoder
-        diffusion_outputs[self.bb_x_0_key] = bb_x_0_pred
-        diffusion_outputs[self.sidechain_x_0_key] = sidechain_x_0_pred
-        diffusion_outputs[self.bb_x_t_key] = bb_x_t
-        diffusion_outputs[self.sidechain_x_t_key] = sidechain_x_t
-        decoded_outputs = self.decoder(data, diffusion_outputs)
-        decoded_outputs['seq_logits'] = decoded_outputs['decoded_seq_logits']
-        # we do this to recover the "ground truth" encoding
-        diffusion_outputs.update(latent_outputs)
-        diffusion_outputs[self.sidechain_x_0_key] = latent_outputs['latent_mu']
-        diffusion_outputs[self.sidechain_x_0_pred_key] = sidechain_x_0_pred
-        diffusion_outputs[self.sidechain_x_t_key] = sidechain_x_t
-
-        # add a bunch of keys so the loss fn is happy
-        pred_bb_score = self.bb_score_fn(denoiser_output)
-        pred_sidechain_score = self.sidechain_score_fn(denoiser_output)
-        diffusion_outputs["pred_bb_score"] = pred_bb_score
-        diffusion_outputs["pred_sidechain_score"] = pred_sidechain_score
-        diffusion_outputs["rot_score"] = pred_bb_score[0]
-        diffusion_outputs["trans_score"] = pred_bb_score[1]
-        diffusion_outputs["latent_sidechain_score"] = pred_sidechain_score
-        diffusion_outputs["rot_score_scaling"] = torch.ones(pred_bb_score[0].shape[:-2], device=pred_bb_score[0].device)
-        diffusion_outputs["trans_score_scaling"] = torch.ones(pred_bb_score[1].shape[:-1], device=pred_bb_score[1].device)
-        diffusion_outputs["latent_sidechain_score_scaling"] = torch.ones(pred_sidechain_score.embedding.shape[:-2], device=pred_sidechain_score.device)
-
-        return diffusion_outputs, decoded_outputs
-
-class LatentInpaintingDiffuser(nn.Module):
-    def __init__(self,
-                 se3_noiser,
-                 sidechain_noiser,
-                 node_lmax_list=[1],
-                 h_channels=32,
-                 edge_channels_list=[32, 32, 32],
-                 h_time=64,
-                 scalar_h_dim=128,
-                 bb_lmax_list=[1],
-                 bb_channels=26,
-                 atom_lmax_list=[1],
-                 atom_channels=91,
-                 num_heads=8,
-                 num_layers=4,
-                 k=30,
-                 sidechain_x_0_key='latent_sidechain',
-                 sidechain_x_0_pred_key='denoised_latent_sidechain',
-                 sidechain_x_t_key='noised_latent_sidechain',
-                 bb_x_0_key='frames',
-                 bb_x_0_pred_key='denoised_frames',
-                 bb_x_t_key='noised_frames'):
-        super().__init__()
-        self.sidechain_x_0_key = sidechain_x_0_key
-        self.sidechain_x_0_pred_key = sidechain_x_0_pred_key
-        self.sidechain_x_t_key = sidechain_x_t_key
-
-        self.bb_x_0_key = bb_x_0_key
-        self.bb_x_0_pred_key = bb_x_0_pred_key
-        self.bb_x_t_key = bb_x_t_key
-
-        # build these expensive coeff stores
-        atom_super_lmax_list = [max(l1, l2) for l1, l2 in zip(atom_lmax_list, node_lmax_list)]
-        bb_super_lmax_list = [max(l1, l2) for l1, l2 in zip(bb_lmax_list, node_lmax_list)]
-        atom_super_SO3_rotation_list = nn.ModuleList()
-        bb_super_SO3_rotation_list = nn.ModuleList()
-        node_SO3_rotation_list = nn.ModuleList()
-        for lmax in atom_super_lmax_list:
-            atom_super_SO3_rotation_list.append(
-                SO3_Rotation(lmax)
-            )
-        for lmax in bb_super_lmax_list:
-            bb_super_SO3_rotation_list.append(
-                SO3_Rotation(lmax)
-            )
-        for lmax in node_lmax_list:
-            node_SO3_rotation_list.append(
-                SO3_Rotation(lmax)
-            )
-
-        atom_super_SO3_grid_list = nn.ModuleList()
-        bb_super_SO3_grid_list = nn.ModuleList()
-        node_SO3_grid_list = nn.ModuleList()
-        for l in range(max(atom_super_lmax_list) + 1):
-            SO3_m_grid = nn.ModuleList()
-            for m in range(max(atom_lmax_list) + 1):
-                SO3_m_grid.append(
-                    SO3_Grid(l, m)
-                )
-            atom_super_SO3_grid_list.append(SO3_m_grid)
-        for l in range(max(bb_super_lmax_list) + 1):
-            SO3_m_grid = nn.ModuleList()
-            for m in range(max(node_lmax_list) + 1):
-                SO3_m_grid.append(
-                    SO3_Grid(l, m)
-                )
-            bb_super_SO3_grid_list.append(SO3_m_grid)
-        bb_super_SO3_grid_list = nn.ModuleList()
-        for l in range(max(node_lmax_list) + 1):
-            SO3_m_grid = nn.ModuleList()
-            for m in range(max(atom_lmax_list) + 1):
-                SO3_m_grid.append(
-                    SO3_Grid(l, m)
-                )
-            node_SO3_grid_list.append(SO3_m_grid)
-
-        mappingReduced_super_atoms = CoefficientMappingModule(atom_super_lmax_list, atom_super_lmax_list)
-        mappingReduced_super_bb = CoefficientMappingModule(bb_super_lmax_list, bb_super_lmax_list)
-        mappingReduced_nodes = CoefficientMappingModule(node_lmax_list, node_lmax_list)
-
-        self.denoiser = LatentSidechainDenoiser(
-            node_lmax_list=node_lmax_list,
-            edge_channels_list=edge_channels_list,
-            mappingReduced_nodes=mappingReduced_nodes,
-            node_SO3_rotation=node_SO3_rotation_list,
-            node_SO3_grid=node_SO3_grid_list,
-            num_heads=num_heads,
-            h_channels=h_channels,
-            h_time=h_time,
-            scalar_h_dim=scalar_h_dim,
-            n_layers=num_layers,
-        )
-        self.encoder = Atom91Encoder(
-            node_lmax_list=node_lmax_list,
-            edge_channels_list=edge_channels_list,
-            mappingReduced_nodes=mappingReduced_nodes,
-            mappingReduced_super_bb=mappingReduced_super_bb,
-            mappingReduced_super_atoms=mappingReduced_super_atoms,
-            node_SO3_rotation=node_SO3_rotation_list,
-            node_SO3_grid=node_SO3_grid_list,
-            bb_super_SO3_rotation=bb_super_SO3_rotation_list,
-            bb_super_SO3_grid=bb_super_SO3_grid_list,
-            atom_super_SO3_rotation=atom_super_SO3_rotation_list,
-            atom_super_SO3_grid=atom_super_SO3_grid_list,
-            bb_lmax_list=bb_lmax_list,
-            bb_channels=bb_channels,
-            atom_lmax_list=atom_lmax_list,
-            atom_channels=atom_channels,
-            num_heads=num_heads,
-            h_channels=h_channels,
-            num_layers=num_layers
-        )
-        self.decoder = Atom91Decoder(
-            node_lmax_list=node_lmax_list,
-            edge_channels_list=edge_channels_list,
-            mappingReduced_nodes=mappingReduced_nodes,
-            mappingReduced_super_atoms=mappingReduced_super_atoms,
-            mappingReduced_super_bb=mappingReduced_super_bb,
-            node_SO3_rotation=node_SO3_rotation_list,
-            node_SO3_grid=node_SO3_grid_list,
-            bb_super_SO3_rotation=bb_super_SO3_rotation_list,
-            bb_super_SO3_grid=bb_super_SO3_grid_list,
-            atom_super_SO3_rotation=atom_super_SO3_rotation_list,
-            atom_super_SO3_grid=atom_super_SO3_grid_list,
-            bb_lmax_list=bb_lmax_list,
-            bb_channels=bb_channels,
-            atom_lmax_list=atom_lmax_list,
-            atom_channels=atom_channels,
-            num_heads=num_heads,
-            h_channels=h_channels,
-            num_layers=num_layers
-        )
-        self.time_dist = dist.Uniform(0, 1)
-        self.time_T = 1
-        self.se3_noiser = se3_noiser
-        self.sidechain_noiser = sidechain_noiser
-        self.k = k
-
-    def build_bb_frames(self, data):
-        backbone_coords = data['bb']
-        N, CA, C = backbone_coords[..., 0, :], backbone_coords[..., 1, :], backbone_coords[..., 2, :]
-        frames = ru.Rigid.from_3_points(N, CA, C)
-        return frames
-
-    def forward_noising(self, data, intermediates):
-        device = data['x'].device
-        out_dict = {}
-
-        # sample a t per graph, then expand to per node
-        t_per_graph = self.time_dist.sample((data.num_graphs,))
-        t_per_graph = t_per_graph.to(device)
-        num_nodes = data.num_nodes
-        t_per_node = torch.empty(num_nodes, device=device)
-        for i, batch_num in enumerate(range(data.batch.max().item() + 1)):
-            select = (data.batch == batch_num)
-            t_per_node[select] = t_per_graph[i]
-        t = t_per_node
-        out_dict['t'] = t
-        out_dict['t_per_graph'] = t_per_graph
-
-        noising_mask = intermediates['noising_mask']
-        noised_sidechain_data = self.noise_sidechain(intermediates, noising_mask, t)
-        out_dict.update(noised_sidechain_data)
-        return out_dict
-
-    def sample_noise_residx(self, data, select_task=None):
-        device = data['x'].device
-        num_graphs = data.num_graphs
-        # we noise by selecting a random residue, then noising its knn neighborhood
-        edge_splits = data._slice_dict['edge_index']
-        num_edges = (edge_splits[1:] - edge_splits[:-1]).tolist()
-        edge_index_split = data.edge_index.split(num_edges, dim=-1)
-
-        sampled_src_residx = []
-        for edge_index in edge_index_split:
-            # we sample an edge, then look at its source node
-            # we can do this since we have the same number of edges per node
-            # this also avoids the problem of sampling a masked node, since it won't have an edge to it
-            srcs = edge_index[1]
-            select_idx = torch.randint(low=0, high=srcs.shape[0], size=(1,), device=device)
-            sampled_src_residx.append(srcs[select_idx])
-        sampled_src_residx = torch.cat(sampled_src_residx, dim=0)
-
-        # select the relevant edges
-        edge_selector = data.edge_index[1][:, None] == sampled_src_residx[None, :]   # n_edge x n_graph
-        edge_selector = edge_selector.any(dim=-1)
-        # gather the dst of all src nodes
-        sampled_dst_residx = data.edge_index[0][edge_selector]  # by construction these must be unique, n_edge
-        # do a little reshaping so that the order is [(src, {dsts}), ...]
-        sampled_dst_residx = sampled_dst_residx.view(num_graphs, self.k)
-        sampled_residx = torch.cat([sampled_src_residx[:, None], sampled_dst_residx], dim=-1).long()
-        sampled_residx = sampled_residx.flatten()
-
-        num_nodes = data.num_nodes
-        residxs = torch.arange(num_nodes, device=device)
-        noising_mask = (residxs[:, None] == sampled_residx[None, :]).any(dim=-1)
-
-        if select_task is not None:
-            select = select_task
-        else:
-            select = torch.rand(1).item()
-        if select < 0.3:
-            return sampled_residx, noising_mask
-        elif select > 0.9:
-            return torch.tensor([], device=device), torch.zeros_like(noising_mask).bool()
-        else:
-            return torch.arange(data.num_nodes, device=device), torch.ones_like(noising_mask).bool()
-
-    def noise_sidechain(self, intermediates, noising_mask, t):
-        sidechain_x_0 = intermediates[self.sidechain_x_0_key]
-        noised_sidechain = self.sidechain_noiser.forward_marginal(sidechain_x_0, t, noising_mask)
-        return noised_sidechain
-
-    def reverse_noising(self, data, intermediates):
-        denoiser_output = self.denoiser(data, intermediates)
-        pred_sidechain_score = self.sidechain_score_fn(denoiser_output)
-        denoiser_output["pred_sidechain_score"] = pred_sidechain_score
-        return denoiser_output
-
-    def sidechain_score_fn(self, denoiser_output):
-        sidechain_x_t = denoiser_output[self.sidechain_x_t_key]
-        sidechain_x_0_pred = denoiser_output[self.sidechain_x_0_pred_key]
-        t = denoiser_output['t']
-        sidechain_score = self.sidechain_noiser.score(sidechain_x_t, sidechain_x_0_pred, t)
-        return sidechain_score
-
-    def forward(self, data, warmup=False, deterministic=False):
-        sampled_residx, noising_mask = self.sample_noise_residx(data)
-
-        if self.bb_x_0_key not in data:
-            data[self.bb_x_0_key] = self.build_bb_frames(data)
-        latent_data = self.encoder(data, noising_mask=noising_mask)
-        latent_data['noised_residx'] = sampled_residx
-        latent_data['noising_mask'] = noising_mask
-
-        if deterministic:
-            latent_data[self.sidechain_x_0_key] = latent_data['latent_mu']
-        else:
-            latent_sigma = gen_so3_unop(torch.exp)(
-                so3_mult(
-                    latent_data['latent_logvar'],
-                    0.5
-                ),
-            )
-            latent_data[self.sidechain_x_0_key] = so3_add(
-                latent_data['latent_mu'],
-                so3_mult(
-                    latent_sigma,
-                    so3_randn_like(latent_sigma)
-                )
-            )
-        noised_latent = self.forward_noising(data, latent_data)
-        latent_data.update(noised_latent)
-        latent_outputs = self.reverse_noising(data, latent_data)
-        latent_data.update(latent_outputs)
-        decoded_outputs = self.decoder(data, latent_data)
-        passthrough_outputs = self.decoder(data, latent_data, denoiser_output=latent_data)
-        passthrough_outputs.update(latent_data)
-
-        return latent_data, decoded_outputs, passthrough_outputs
-
-    def sample_prior(self, data, intermediates):
-        noising_mask = intermediates['noising_mask']
-        num_nodes = data.num_nodes
-        sidechain_x_0 = intermediates[self.sidechain_x_0_key]
-        sidechain_prior = self.sidechain_noiser.sample_ref(
-            num_nodes,
-            sidechain_x_0,
-            noising_mask,
-            device=sidechain_x_0.device)
-        return sidechain_prior
-
-    def reverse_step(self, data, intermediates, delta_t, noise_scale=1.0):
-        # assert delta_t < 0
-        t = intermediates['t']
-        noising_mask = intermediates['noising_mask']
-        sidechain_x_t = intermediates[self.sidechain_x_t_key]
-
-        denoiser_output = self.denoiser(data, intermediates)
-        sidechain_score = self.sidechain_score_fn(denoiser_output)
-
-        sidechain_x_tm1 = self.sidechain_noiser.reverse(
-            sidechain_x_t,
-            sidechain_score,
-            t,
-            delta_t,
-            noising_mask,
-            noise_scale=noise_scale)
-        tm1 = t - delta_t #+ delta_t
-
-        return sidechain_x_tm1, tm1, denoiser_output
-
-
-    def sample(self,
-               data,
-               steps=100,
-               show_progress=False,
-               select_task=None,
-               device=None):
-        if device is None:
-            device = data['x'].device
-
-        if self.bb_x_0_key not in data:
-            data[self.bb_x_0_key] = self.build_bb_frames(data)
-
-        # num_batch = len(data._slice_dict['x'])
-        # num_nodes = num_batch * self.k
-        num_nodes = data.num_nodes
-        sampled_residx, noising_mask = self.sample_noise_residx(data, select_task=select_task)
-        latent_outputs = self.encoder(data, noising_mask=noising_mask)
-        latent_outputs[self.sidechain_x_0_key] = latent_outputs['latent_mu']
-        latent_outputs['noised_residx'] = sampled_residx
-        latent_outputs['noising_mask'] = noising_mask
-        prior = self.sample_prior(data, latent_outputs)
-        intermediates = prior
-        intermediates['noised_residx'] = sampled_residx
-        intermediates['noising_mask'] = noising_mask
-
-        delta_t = self.time_T / steps  # should this be negative?
-        intermediates['t'] = torch.ones([num_nodes], device=device).float() - delta_t
-        intermediates['t_per_graph'] = torch.ones([data.num_graphs], device=device).float() - delta_t
-        sidechain_x_t = intermediates[self.sidechain_x_t_key].clone()
-        denoiser_output = None
-
-        with torch.no_grad():
-            if show_progress:
-                pbar = tqdm.tqdm(total=steps)
-
-            while (intermediates['t'] > delta_t).all():
-                sidechain_x_tm1, tm1, denoiser_output = self.reverse_step(data, intermediates, delta_t)
-                intermediates['t'] = tm1
-                intermediates[self.sidechain_x_t_key] = sidechain_x_tm1
-
-                if show_progress:
-                    pbar.update(1)
-
-            if show_progress:
-                pbar.close()
-
-        diffusion_outputs = intermediates
-        sidechain_x_0_pred = diffusion_outputs[self.sidechain_x_t_key]
-        # swap around keys so we can apply the decoder
-        diffusion_outputs[self.sidechain_x_0_key] = sidechain_x_0_pred
-        diffusion_outputs[self.sidechain_x_t_key] = sidechain_x_t
-        decoded_outputs = self.decoder(data, diffusion_outputs)
-        decoded_outputs['seq_logits'] = decoded_outputs['decoded_seq_logits']
-        # we do this to recover the "ground truth" encoding
-        diffusion_outputs.update(latent_outputs)
-        diffusion_outputs[self.sidechain_x_0_key] = latent_outputs['latent_mu']
-        diffusion_outputs[self.sidechain_x_0_pred_key] = sidechain_x_0_pred
-        diffusion_outputs[self.sidechain_x_t_key] = sidechain_x_t
-
-        # add a bunch of keys so the loss fn is happy
-        pred_sidechain_score = self.sidechain_score_fn(denoiser_output)
-        diffusion_outputs["pred_sidechain_score"] = pred_sidechain_score
-        diffusion_outputs["latent_sidechain_score"] = pred_sidechain_score
-        diffusion_outputs["latent_sidechain_score_scaling"] = torch.ones(pred_sidechain_score.embedding.shape[:-2], device=pred_sidechain_score.device)
-
-        return diffusion_outputs, decoded_outputs
-
-
-class FrameInpaintingDiffuser2(nn.Module):
-    def __init__(self,
-                 se3_noiser,
-                 c_s=128,
-                 c_v=16,
-                 c_z=64,
-                 c_hidden=128,
-                 num_qk_pts=8,
-                 num_v_pts=12,
-                 h_time=64,
-                 scalar_h_dim=128,
-                 num_heads=8,
-                 num_layers=4,
-                 noising_k=30,
-                 knn_k=20,
-                 lrange_k=30,
-                 bb_x_0_key='frames',
-                 bb_x_0_pred_key='denoised_frames',
-                 bb_x_t_key='noised_frames'):
-        super().__init__()
-        self.bb_x_0_key = bb_x_0_key
-        self.bb_x_0_pred_key = bb_x_0_pred_key
-        self.bb_x_t_key = bb_x_t_key
-
-        self.denoiser = FrameDenoiser2(
-            c_s=c_s,
-            c_v=c_v,
-            c_z=c_z,
-            c_hidden=c_hidden,
-            num_heads=num_heads,
-            num_qk_pts=num_qk_pts,
-            num_v_pts=num_v_pts,
-            h_time=h_time,
-            scalar_h_dim=scalar_h_dim,
-            n_layers=num_layers,
-            knn_k=knn_k,
-            lrange_k=lrange_k
-        )
-        self.time_dist = dist.Uniform(0, 1)
-        self.time_T = 1
-        self.se3_noiser = se3_noiser
-        self.noising_k = noising_k
-
-    def build_bb_frames(self, data):
-        backbone_coords = data['bb']
-        N, CA, C = backbone_coords[..., 0, :], backbone_coords[..., 1, :], backbone_coords[..., 2, :]
-        frames = ru.Rigid.from_3_points(N, CA, C)
-        return frames
-
-    def forward_noising(self, data):
-        device = data['x'].device
-        out_dict = {}
-
-        # sample a t per graph, then expand to per node
-        # t_per_graph = torch.ones((data.num_graphs)) * 0.5
-        t_per_graph = self.time_dist.sample((data.num_graphs,))
-        t_per_graph = t_per_graph.to(device)
-        num_nodes = data.num_nodes
-        t_per_node = torch.empty(num_nodes, device=device)
-        for i, batch_num in enumerate(range(data.batch.max().item() + 1)):
-            select = (data.batch == batch_num)
-            t_per_node[select] = t_per_graph[i]
-        t = t_per_node
-        out_dict['t'] = t
-        out_dict['t_per_graph'] = t_per_graph
-
-        sampled_residx, noising_mask = self.sample_noise_residx(data)
-        out_dict['noised_residx'] = sampled_residx
-        out_dict['noising_mask'] = noising_mask
-        noised_bb_data = self.noise_bb(data, noising_mask, t)
-        out_dict.update(noised_bb_data)
-        return out_dict
-
-    def sample_noise_residx(self, data):
-        device = data['x'].device
-        num_graphs = data.num_graphs
-        # we noise by selecting a random residue, then noising its knn neighborhood
-        edge_splits = data._slice_dict['edge_index']
-        num_edges = (edge_splits[1:] - edge_splits[:-1]).tolist()
-        edge_index_split = data.edge_index.split(num_edges, dim=-1)
-
-        sampled_src_residx = []
-        for edge_index in edge_index_split:
-            # we sample an edge, then look at its source node
-            # we can do this since we have the same number of edges per node
-            # this also avoids the problem of sampling a masked node, since it won't have an edge to it
-            srcs = edge_index[1]
-            select_idx = torch.randint(low=0, high=srcs.shape[0], size=(1,), device=device)
-            sampled_src_residx.append(srcs[select_idx])
-        sampled_src_residx = torch.cat(sampled_src_residx, dim=0)
-
-        # select the relevant edges
-        edge_selector = data.edge_index[1][:, None] == sampled_src_residx[None, :]   # n_edge x n_graph
-        edge_selector = edge_selector.any(dim=-1)
-        # gather the dst of all src nodes
-        sampled_dst_residx = data.edge_index[0][edge_selector]  # by construction these must be unique, n_edge
-        # do a little reshaping so that the order is [(src, {dsts}), ...]
-        sampled_dst_residx = sampled_dst_residx.view(num_graphs, self.noising_k)
-        sampled_residx = torch.cat([sampled_src_residx[:, None], sampled_dst_residx], dim=-1).long()
-        sampled_residx = sampled_residx.flatten()
-
-        num_nodes = data.num_nodes
-        residxs = torch.arange(num_nodes, device=device)
-        noising_mask = (residxs[:, None] == sampled_residx[None, :]).any(dim=-1)
-
-        sampled_residx = torch.arange(num_nodes, device=sampled_residx.device)
-        sampled_residx = sampled_residx[~data.x_mask]
-        noising_mask = torch.ones_like(noising_mask).bool()
-        noising_mask = noising_mask & ~data.x_mask
-
-        return sampled_residx, noising_mask
-
-    def noise_bb(self, data, noising_mask, t):
-        bb_x_0 = data[self.bb_x_0_key]
-        noised_bb = self.se3_noiser.forward_marginal(bb_x_0, t, noising_mask)
-        return noised_bb
-
-
-    def reverse_noising(self, data, intermediates):
-        denoiser_output = self.denoiser(data, intermediates)
-        noising_mask = intermediates['noising_mask']
-        x_mask = data['x_mask']
-        mask = x_mask | ~noising_mask
-        pred_bb_score = self.bb_score_fn(denoiser_output, mask)
-        denoiser_output["pred_bb_score"] = pred_bb_score
-        return denoiser_output
-
-    def bb_score_fn(self, denoiser_output, mask):
-        bb_x_t = denoiser_output[self.bb_x_t_key]
-        bb_x_0_pred = denoiser_output[self.bb_x_0_pred_key]
-        t = denoiser_output['t']
-        rot_score, trans_score = self.se3_noiser.score(bb_x_t, bb_x_0_pred, t)
-        rot_score = rot_score * ~mask[..., None, None]
-        trans_score = trans_score * ~mask[..., None]
-        return (rot_score, trans_score)
-
-    def forward(self, data, warmup=False, deterministic=False):
-        if self.bb_x_0_key not in data:
-            data[self.bb_x_0_key] = self.build_bb_frames(data)
-
-        noised_data = self.forward_noising(data)
-        denoised_outputs = self.reverse_noising(data, noised_data)
-
-        return noised_data, denoised_outputs
-
-    def sample_prior(self, data):
-        sampled_residx, noising_mask = self.sample_noise_residx(data)
-        num_nodes = data.num_nodes
-        bb_x_0 = data[self.bb_x_0_key]
-        bb_prior = self.se3_noiser.sample_ref(num_nodes, bb_x_0, noising_mask)
-        out_dict = {
-            'noised_residx': sampled_residx,
-            'noising_mask': noising_mask
-        }
-        out_dict.update(bb_prior)
-        return out_dict
-
-    def reverse_step(self, data, intermediates, delta_t, noise_scale=1.0):
-        # assert delta_t < 0
-        t = intermediates['t']
-        noising_mask = intermediates['noising_mask']
-        x_mask = data['x_mask']
-        mask = x_mask | ~noising_mask
-        bb_x_t = intermediates[self.bb_x_t_key]
-
-        denoiser_output = self.denoiser(data, intermediates)
-        rot_score, trans_score = self.bb_score_fn(denoiser_output, mask)
-
-        bb_x_tm1 = self.se3_noiser.reverse(
-            bb_x_t,
-            rot_score,
-            trans_score,
-            t,
-            delta_t,
-            noising_mask,
-            noise_scale=noise_scale)
-        tm1 = t - np.abs(delta_t) #+ delta_t
-
-        return bb_x_tm1, tm1, denoiser_output
-
-    def sample(self,
-               data,
-               steps=100,
-               show_progress=False,
-               device=None,
-               noise_scale=1.0):
-        if device is None:
-            device = data['x'].device
-
-        if self.bb_x_0_key not in data:
-            data[self.bb_x_0_key] = self.build_bb_frames(data)
-
-        # num_batch = len(data._slice_dict['x'])
-        # num_nodes = num_batch * self.k
-        num_nodes = data.num_nodes
-        prior = self.sample_prior(data)
-        intermediates = prior
-
-        delta_t = self.time_T / steps  # should this be negative?
-        intermediates['t'] = torch.ones([num_nodes], device=device).float() - np.abs(delta_t)
-        intermediates['t_per_graph'] = torch.ones([data.num_graphs], device=device).float() - np.abs(delta_t)
-        bb_x_t = intermediates[self.bb_x_t_key]
-        denoiser_output = None
-
-        with torch.no_grad():
-            if show_progress:
-                pbar = tqdm.tqdm(total=steps)
-
-            while (intermediates['t'] > np.abs(delta_t)).all():
-                bb_x_tm1, tm1, denoiser_output = self.reverse_step(data, intermediates, delta_t, noise_scale=noise_scale)
-                intermediates['t'] = tm1
-                intermediates[self.bb_x_t_key] = bb_x_tm1
-
-                if show_progress:
-                    pbar.update(1)
-
-            if show_progress:
-                pbar.close()
-
-        diffusion_outputs = intermediates
-        diffusion_outputs[self.bb_x_0_key] = diffusion_outputs[self.bb_x_t_key]
-        diffusion_outputs[self.bb_x_t_key] = bb_x_t
-        # add a bunch of keys so the loss fn is happy
-        noising_mask = intermediates['noising_mask']
-        x_mask = data['x_mask']
-        mask = x_mask | ~noising_mask
-        pred_bb_score = self.bb_score_fn(denoiser_output, mask)
-        diffusion_outputs["pred_bb_score"] = pred_bb_score
-        diffusion_outputs["rot_score"] = torch.zeros_like(pred_bb_score[0])
-        diffusion_outputs["trans_score"] = torch.zeros_like(pred_bb_score[1])
-        diffusion_outputs["rot_score_scaling"] = torch.ones(pred_bb_score[0].shape[:-2], device=pred_bb_score[0].device)
-        diffusion_outputs["trans_score_scaling"] = torch.ones(pred_bb_score[1].shape[:-1], device=pred_bb_score[1].device)
-
-        return diffusion_outputs, {}
-
-class FrameInpaintingDiffuser3(nn.Module):
-    def __init__(self,
-                 se3_noiser,
-                 c_s=128,
-                 c_v=16,
-                 c_z=64,
-                 c_hidden=128,
-                 num_qk_pts=8,
-                 num_v_pts=12,
-                 h_time=64,
-                 scalar_h_dim=128,
-                 num_heads=8,
-                 num_layers=4,
-                 noising_k=30,
-                 knn_k=20,
-                 lrange_k=30,
-                 bb_x_0_key='frames',
-                 bb_x_0_pred_key='denoised_frames',
-                 bb_x_t_key='noised_frames',
-                 batch_size=2000):
-        super().__init__()
-        self.bb_x_0_key = bb_x_0_key
-        self.bb_x_0_pred_key = bb_x_0_pred_key
-        self.bb_x_t_key = bb_x_t_key
-
-        self.denoiser = IpaScoreWrapper(
-            se3_noiser,
-            c_s=c_s,
-            c_z=c_z,
-            c_hidden=c_hidden,
-            num_heads=num_heads,
-            num_qk_points=num_qk_pts,
-            num_v_points=num_v_pts,
-        )
-        self.time_dist = dist.Uniform(0, 1)
-        self.time_T = 1
-        self.se3_noiser = se3_noiser
-        self.noising_k = noising_k
-        self.batch_size = batch_size
-
-    def build_bb_frames(self, data):
-        backbone_coords = data['bb']
-        N, CA, C = backbone_coords[..., 0, :], backbone_coords[..., 1, :], backbone_coords[..., 2, :]
-        frames = ru.Rigid.from_3_points(N, CA, C)
-        return frames
-
-    def forward_noising(self, data):
-        device = data['x'].device
-        out_dict = {}
-
-        # sample a t per graph, then expand to per node
-        # t_per_graph = torch.ones((data.num_graphs)) * 0.5
-        t_per_graph = self.time_dist.sample((data.num_graphs,))
-        t_per_graph = t_per_graph.to(device)
-        num_nodes = data.num_nodes
-        t_per_node = torch.empty(num_nodes, device=device)
-        for i, batch_num in enumerate(range(data.batch.max().item() + 1)):
-            select = (data.batch == batch_num)
-            t_per_node[select] = t_per_graph[i]
-        t = t_per_node
-        out_dict['t'] = t
-        out_dict['t_per_graph'] = t_per_graph
-
-        sampled_residx, noising_mask = self.sample_noise_residx(data)
-        out_dict['noised_residx'] = sampled_residx
-        out_dict['noising_mask'] = noising_mask
-        noised_bb_data = self.noise_bb(data, noising_mask.float(), t)#t_per_graph)
-        out_dict.update(noised_bb_data)
-        return data, out_dict
-
-    def sample_noise_residx(self, data):
-        device = data['x'].device
-        num_graphs = data.num_graphs
-        # we noise by selecting a random residue, then noising its knn neighborhood
-        edge_splits = data._slice_dict['edge_index']
-        num_edges = (edge_splits[1:] - edge_splits[:-1]).tolist()
-        edge_index_split = data.edge_index.split(num_edges, dim=-1)
-
-        sampled_src_residx = []
-        for edge_index in edge_index_split:
-            # we sample an edge, then look at its source node
-            # we can do this since we have the same number of edges per node
-            # this also avoids the problem of sampling a masked node, since it won't have an edge to it
-            srcs = edge_index[1]
-            select_idx = torch.randint(low=0, high=srcs.shape[0], size=(1,), device=device)
-            sampled_src_residx.append(srcs[select_idx])
-        sampled_src_residx = torch.cat(sampled_src_residx, dim=0)
-
-        # select the relevant edges
-        edge_selector = data.edge_index[1][:, None] == sampled_src_residx[None, :]   # n_edge x n_graph
-        edge_selector = edge_selector.any(dim=-1)
-        # gather the dst of all src nodes
-        sampled_dst_residx = data.edge_index[0][edge_selector]  # by construction these must be unique, n_edge
-        # do a little reshaping so that the order is [(src, {dsts}), ...]
-        sampled_dst_residx = sampled_dst_residx.view(num_graphs, self.noising_k)
-        sampled_residx = torch.cat([sampled_src_residx[:, None], sampled_dst_residx], dim=-1).long()
-        sampled_residx = sampled_residx.flatten()
-
-        num_nodes = data.num_nodes
-        residxs = torch.arange(num_nodes, device=device)
-        noising_mask = (residxs[:, None] == sampled_residx[None, :]).any(dim=-1)
-
-        sampled_residx = torch.arange(num_nodes, device=sampled_residx.device)
-        sampled_residx = sampled_residx[~data.x_mask]
-        noising_mask = torch.ones_like(noising_mask).bool()
-        noising_mask = noising_mask & ~data.x_mask
-
-        return sampled_residx, noising_mask
-
-    def noise_bb(self, data, noising_mask, t):#t_per_graph):
-        bb_x_0 = data[self.bb_x_0_key]
-        # batch_size = data.num_graphs
-        # single_data_len = noising_mask.numel() // batch_size
-
-        # # funky batch ops
-        # noised_bb = []
-        # for i, t in enumerate(t_per_graph):
-        #     select = (data.batch == i)
-        #     noised_bb.append(
-        #         self.se3_noiser.forward_marginal(
-        #             bb_x_0[select],
-        #             t.item(),
-        #             noising_mask[select]
-        #         )
-        #     )
-
-        # ret_dict = {}
-        # for sub_dict in noised_bb:
-        #     for k, v in sub_dict.items():
-        #         v = torch.as_tensor(v)
-        #         if len(v.shape) == 0:
-        #             v = v[None].expand(single_data_len)
-        #         if k not in ret_dict:
-        #             ret_dict[k] = [v]
-        #         else:
-        #             ret_dict[k].append(v)
-
-        # ret_dict = {k: torch.cat(v, dim=0).to(noising_mask.device) for k,v in ret_dict.items()}
-        # ret_dict['noised_frames'] = ru.Rigid.from_tensor_7(ret_dict['rigids_t'])
-        # return ret_dict
-
-        noised_bb = self.se3_noiser.forward_marginal(bb_x_0, t, noising_mask)
-        return noised_bb
-
-    def reverse_noising(self, data, intermediates):
-        denoiser_output = self.denoiser(data, intermediates)
-        noising_mask = intermediates['noising_mask']
-        x_mask = data['x_mask']
-        mask = x_mask | ~noising_mask
-        denoiser_output['batch_size'] = data.num_graphs
-        pred_bb_score = self.bb_score_fn(intermediates, denoiser_output, mask)
-        denoiser_output["pred_bb_score"] = pred_bb_score
-        return denoiser_output
-
-    def bb_score_fn(self, intermediates, denoiser_output, mask):
-        bb_x_t = intermediates[self.bb_x_t_key]
-        bb_x_0_pred = denoiser_output[self.bb_x_0_pred_key]
-        t_per_graph = intermediates['t_per_graph']
-        t = intermediates['t']
-        # we have to do more batch garbage
-        batch_size = denoiser_output['batch_size']
-        # rots_x_t = reshape_rots(bb_x_t.get_rots(), [batch_size, -1])
-        # rots_x_0_pred = reshape_rots(bb_x_0_pred.get_rots(), [batch_size, -1])
-        # rot_score = self.se3_noiser.calc_rot_score(rots_x_t, rots_x_0_pred, t_per_graph)
-        rots_x_t = bb_x_t.get_rots().get_rot_mats()
-        rots_x_0_pred = bb_x_0_pred.get_rots().get_rot_mats()
-        rot_score = self.se3_noiser.calc_rot_score(rots_x_t, rots_x_0_pred, t)
-        # print(rots_x_t.shape, rots_x_0_pred.shape, rot_score.shape)
-        # rot_score = rot_score.view(mask.shape[0], -1)
-
-        t = intermediates['t']
-        trans_x_t = bb_x_t.get_trans()
-        trans_x_0_pred = bb_x_0_pred.get_trans()
-        trans_score = self.se3_noiser.calc_trans_score(trans_x_t, trans_x_0_pred, t)#[:, None])
-        trans_score = trans_score.view(mask.shape[0], -1)
-
-        rot_score = rot_score * ~mask[..., None, None]
-        trans_score = trans_score * ~mask[..., None]
-        return (rot_score, trans_score)
-
-    def forward(self, data, warmup=False, deterministic=False):
-        data[self.bb_x_0_key] = self.build_bb_frames(data)
-
-        data_flat, noised_data = self.forward_noising(data)
-        denoised_outputs = self.reverse_noising(data_flat, noised_data)
-
-        return noised_data, denoised_outputs
-
-    def sample_prior(self, data):
-        sampled_residx, noising_mask = self.sample_noise_residx(data)
-        num_nodes = data.num_nodes
-        bb_x_0 = data[self.bb_x_0_key]
-        bb_prior = self.se3_noiser.sample_ref(num_nodes, bb_x_0, noising_mask)
-        out_dict = {
-            'noised_residx': sampled_residx,
-            'noising_mask': noising_mask
-        }
-        out_dict.update(bb_prior)
-        return out_dict
-
-    def reverse_step(self, data, intermediates, delta_t, noise_scale=1.0):
-        # assert delta_t < 0
-        t = intermediates['t']
-        noising_mask = intermediates['noising_mask']
-        x_mask = data['x_mask']
-        mask = x_mask | ~noising_mask
-        bb_x_t = intermediates[self.bb_x_t_key]
-
-        denoiser_output = self.denoiser(data, intermediates)
-        rot_score, trans_score = self.bb_score_fn(denoiser_output, mask)
-
-        bb_x_tm1 = self.se3_noiser.reverse(
-            bb_x_t,
-            rot_score,
-            trans_score,
-            t,
-            delta_t,
-            noising_mask,
-            noise_scale=noise_scale)
-        tm1 = t - np.abs(delta_t) #+ delta_t
-
-        return bb_x_tm1, tm1, denoiser_output
-
-    def sample(self,
-               data,
-               steps=100,
-               show_progress=False,
-               device=None,
-               noise_scale=1.0):
-        if device is None:
-            device = data['x'].device
-
-        if self.bb_x_0_key not in data:
-            data[self.bb_x_0_key] = self.build_bb_frames(data)
-
-        # num_batch = len(data._slice_dict['x'])
-        # num_nodes = num_batch * self.k
-        num_nodes = data.num_nodes
-        prior = self.sample_prior(data)
-        intermediates = prior
-
-        delta_t = self.time_T / steps  # should this be negative?
-        intermediates['t'] = torch.ones([num_nodes], device=device).float() - np.abs(delta_t)
-        intermediates['t_per_graph'] = torch.ones([data.num_graphs], device=device).float() - np.abs(delta_t)
-        bb_x_t = intermediates[self.bb_x_t_key]
-        denoiser_output = None
-
-        with torch.no_grad():
-            if show_progress:
-                pbar = tqdm.tqdm(total=steps)
-
-            while (intermediates['t'] > np.abs(delta_t)).all():
-                bb_x_tm1, tm1, denoiser_output = self.reverse_step(data, intermediates, delta_t, noise_scale=noise_scale)
-                intermediates['t'] = tm1
-                intermediates[self.bb_x_t_key] = bb_x_tm1
-
-                if show_progress:
-                    pbar.update(1)
-
-            if show_progress:
-                pbar.close()
-
-        diffusion_outputs = intermediates
-        diffusion_outputs[self.bb_x_0_key] = diffusion_outputs[self.bb_x_t_key]
-        diffusion_outputs[self.bb_x_t_key] = bb_x_t
-        # add a bunch of keys so the loss fn is happy
-        noising_mask = intermediates['noising_mask']
-        x_mask = data['x_mask']
-        mask = x_mask | ~noising_mask
-        pred_bb_score = self.bb_score_fn(denoiser_output, mask)
-        diffusion_outputs["pred_bb_score"] = pred_bb_score
-        diffusion_outputs["rot_score"] = torch.zeros_like(pred_bb_score[0])
-        diffusion_outputs["trans_score"] = torch.zeros_like(pred_bb_score[1])
-        diffusion_outputs["rot_score_scaling"] = torch.ones(pred_bb_score[0].shape[:-2], device=pred_bb_score[0].device)
-        diffusion_outputs["trans_score_scaling"] = torch.ones(pred_bb_score[1].shape[:-1], device=pred_bb_score[1].device)
-
-        return diffusion_outputs, {}
-
-def reshape_rots(rots, shape):
-    if rots._quats is None:
-        rot_mats = rots.get_rot_mats()
-        return ru.Rotation(rot_mats=rot_mats.view(shape + [3, 3]))
-    else:
-        rot_quats = rots.get_quats()
-        return ru.Rotation(quats=rot_quats.view(shape + [4]))
-
-class FrameDiffuser(nn.Module):
+class FrameDiff(nn.Module):
     def __init__(self,
                  se3_noiser,
                  c_s=128,
@@ -1541,7 +30,7 @@ class FrameDiffuser(nn.Module):
         self.bb_x_0_pred_key = bb_x_0_pred_key
         self.bb_x_t_key = bb_x_t_key
 
-        self.denoiser = IpaScoreWrapper2(
+        self.denoiser = IpaScoreWrapper(
             se3_noiser,
             c_s=c_s,
             c_z=c_z,
@@ -1569,8 +58,8 @@ class FrameDiffuser(nn.Module):
         t = data['t']
         bb_x_0_pred = denoiser_output[self.bb_x_0_pred_key]
         num_nodes = bb_x_t.shape[0]
-        bb_x_t = reshape_rigids(bb_x_t, [data.num_graphs, -1])
-        bb_x_0_pred = reshape_rigids(bb_x_0_pred, [data.num_graphs, -1])
+        bb_x_t = bb_x_t.view([data.num_graphs, -1])
+        bb_x_0_pred = bb_x_0_pred.view([data.num_graphs, -1])
         rots_x_t = bb_x_t.get_rots()
         rots_x_0_pred = bb_x_0_pred.get_rots()
         rot_score = self.se3_noiser.calc_rot_score(
@@ -1594,36 +83,7 @@ class FrameDiffuser(nn.Module):
         trans_score = trans_score * ~mask[..., None]
         return (rot_score, trans_score)
 
-    def bb_score_fn2(self, bb_x_t, t, denoiser_output, mask):
-        bb_x_0_pred = denoiser_output[self.bb_x_0_pred_key]
-        num_nodes = bb_x_t.shape[0]
-        bb_x_t = reshape_rigids(bb_x_t, [1, -1])
-        bb_x_0_pred = reshape_rigids(bb_x_0_pred, [1, -1])
-        rots_x_t = bb_x_t.get_rots()
-        rots_x_0_pred = bb_x_0_pred.get_rots()
-        rot_score = self.se3_noiser.calc_rot_score(
-            rots_x_t,
-            rots_x_0_pred,
-            t
-        )
-        rot_score = rot_score.view(num_nodes, -1)
-
-        trans_x_t = bb_x_t.get_trans()
-        trans_x_0_pred = bb_x_0_pred.get_trans()
-        trans_score = self.se3_noiser.calc_trans_score(
-            trans_x_t,
-            trans_x_0_pred,
-            t[:, None, None],
-            use_torch=True
-        )
-        trans_score = trans_score.view(num_nodes, -1)
-
-        rot_score = rot_score * ~mask[..., None]
-        trans_score = trans_score * ~mask[..., None]
-        return (rot_score, trans_score)
-
-
-    def forward(self, data, warmup=False, deterministic=False):
+    def forward(self, data):
         denoised_outputs = self.reverse_noising(data)
         return data, denoised_outputs
 
@@ -1646,12 +106,14 @@ class FrameDiffuser(nn.Module):
         mask = x_mask | ~noising_mask
         bb_x_t = intermediates[self.bb_x_t_key]
 
-        data = Data(x=bb_x_t.get_trans(),
-                    x_mask=x_mask,
-                    noising_mask=noising_mask,
-                    fixed_mask=~noising_mask,
-                    rigids_t=bb_x_t.to_tensor_7(),
-                    t=t)
+        data = Data(
+            x=bb_x_t.get_trans(),
+            x_mask=x_mask,
+            noising_mask=noising_mask,
+            fixed_mask=~noising_mask,
+            rigids_t=bb_x_t.to_tensor_7(),
+            t=t
+        )
         data = Batch.from_data_list([data])
         data = data.to(t.device)
 
@@ -1659,7 +121,8 @@ class FrameDiffuser(nn.Module):
         rot_score, trans_score = self.bb_score_fn(
             data,
             denoiser_output,
-            mask)
+            mask
+        )
 
         bb_x_tm1 = self.se3_noiser.reverse(
             bb_x_t,
@@ -1668,7 +131,8 @@ class FrameDiffuser(nn.Module):
             t.item(),
             delta_t,
             noising_mask.numpy(force=True),
-            noise_scale=noise_scale)
+            noise_scale=noise_scale
+        )
         tm1 = t - np.abs(delta_t) #+ delta_t
 
         return bb_x_tm1, tm1, denoiser_output
@@ -1683,8 +147,8 @@ class FrameDiffuser(nn.Module):
         prior = self.sample_prior(num_nodes, device=device)
         intermediates = prior
 
-        delta_t = self.time_T / steps  # should this be negative?
-        intermediates['t'] = torch.ones(1, device=device) #torch.ones([num_nodes], device=device).float() - np.abs(delta_t)
+        delta_t = self.time_T / steps
+        intermediates['t'] = torch.ones(1, device=device)
         bb_x_t = intermediates[self.bb_x_t_key]
         denoiser_output = None
 
@@ -1708,25 +172,15 @@ class FrameDiffuser(nn.Module):
         diffusion_outputs[self.bb_x_0_key] = diffusion_outputs[self.bb_x_t_key]
         diffusion_outputs[self.bb_x_t_key] = bb_x_t
         # add a bunch of keys so the loss fn is happy
-        noising_mask = intermediates['noising_mask']
-        # x_mask = data['x_mask']
-        # mask = x_mask | ~noising_mask
-        # pred_bb_score = self.bb_score_fn(data, denoiser_output, mask)
-        # diffusion_outputs["pred_bb_score"] = pred_bb_score
-        # diffusion_outputs["rot_score"] = torch.zeros_like(pred_bb_score[0])
-        # diffusion_outputs["trans_score"] = torch.zeros_like(pred_bb_score[1])
-        # diffusion_outputs["rot_score_scaling"] = torch.ones(1, device=pred_bb_score[0].device)
-        # diffusion_outputs["trans_score_scaling"] = torch.ones(1, device=pred_bb_score[1].device)
-
         diffusion_outputs.update(denoiser_output)
 
         return diffusion_outputs, diffusion_outputs
 
-class FrameDiffuser2(nn.Module):
+
+class SelfNoisingFrameDiff(nn.Module):
     def __init__(self,
                  se3_noiser,
                  c_s=128,
-                 c_v=32,
                  c_z=64,
                  c_hidden=128,
                  num_qk_pts=8,
@@ -1742,192 +196,7 @@ class FrameDiffuser2(nn.Module):
         self.bb_x_0_pred_key = bb_x_0_pred_key
         self.bb_x_t_key = bb_x_t_key
 
-        self.denoiser = FrameDenoiser2p5(
-            c_s=c_s,
-            c_v=c_v,
-            c_z=c_z,
-            c_hidden=c_hidden,
-            num_heads=num_heads,
-            num_qk_pts=num_qk_pts,
-            num_v_pts=num_v_pts,
-            n_layers=num_layers
-        )
-        self.time_dist = dist.Uniform(0, 1)
-        self.time_T = 1
-        self.se3_noiser = se3_noiser
-
-    def reverse_noising(self, data):
-        denoiser_output = self.denoiser(data)
-        x_mask = data['x_mask']
-        noising_mask = ~data['fixed_mask'].bool()
-        mask = x_mask | ~noising_mask
-        pred_bb_score = self.bb_score_fn(data, denoiser_output, mask)
-        denoiser_output["pred_bb_score"] = pred_bb_score
-        return denoiser_output
-
-    def bb_score_fn(self, data, denoiser_output, mask):
-        bb_x_t = ru.Rigid.from_tensor_7(data[self.bb_x_t_key])
-        bb_x_0_pred = denoiser_output[self.bb_x_0_pred_key]
-        num_nodes = bb_x_t.shape[0]
-        t = data['t']
-        # bb_x_t = reshape_rigids(bb_x_t, [t.shape[0], -1])
-        # bb_x_0_pred = reshape_rigids(bb_x_0_pred, [t.shape[0], -1])
-        rots_x_t = bb_x_t.get_rots()
-        rots_x_0_pred = bb_x_0_pred.get_rots()
-        rot_score = self.se3_noiser.calc_rot_score2(
-            rots_x_t,
-            rots_x_0_pred,
-            t,
-            data.batch
-        )
-        rot_score = rot_score.view(num_nodes, -1)
-
-        data_splits = data._slice_dict['x']
-        data_lens = (data_splits[1:] - data_splits[:-1]).tolist()
-        t_expand = torch.cat([
-            t[i] * torch.ones(l, device=mask.device) for i, l in enumerate(data_lens)
-        ], dim=0)
-
-        trans_x_t = bb_x_t.get_trans()
-        trans_x_0_pred = bb_x_0_pred.get_trans()
-        trans_score = self.se3_noiser.calc_trans_score(
-            trans_x_t,
-            trans_x_0_pred,
-            t_expand[:, None],
-            use_torch=True
-        )
-        trans_score = trans_score.view(num_nodes, -1)
-
-        rot_score = rot_score * ~mask[..., None]
-        trans_score = trans_score * ~mask[..., None]
-        return (rot_score, trans_score)
-
-    def forward(self, data, warmup=False, deterministic=False):
-        denoised_outputs = self.reverse_noising(data)
-        return data, denoised_outputs
-
-    def sample_prior(self, data):
-        num_nodes = data.num_nodes
-        sampled_residx = torch.arange(num_nodes).to(data['x_mask'].device)
-        noising_mask = torch.ones_like(data['x_mask']).bool()
-        num_nodes = data.num_nodes
-        bb_x_0 = ru.Rigid.from_tensor_7(data[self.bb_x_0_key])
-        bb_prior = self.se3_noiser.sample_ref(n_samples=num_nodes, impute=bb_x_0)
-        out_dict = {
-            'noised_residx': sampled_residx,
-            'noising_mask': noising_mask
-        }
-        out_dict.update(bb_prior)
-        return out_dict
-
-    def reverse_step(self, data, intermediates, delta_t, noise_scale=1.0):
-        # assert delta_t < 0
-        t = intermediates['t']
-        noising_mask = intermediates['noising_mask']
-        x_mask = data['x_mask']
-        mask = x_mask | ~noising_mask
-        bb_x_t = intermediates[self.bb_x_t_key]
-
-        denoiser_output = self.denoiser(data)
-        rot_score, trans_score = self.bb_score_fn(data, denoiser_output, mask)
-
-        bb_x_tm1 = self.se3_noiser.reverse(
-            bb_x_t,
-            rot_score.numpy(force=True),
-            trans_score.numpy(force=True),
-            t,
-            delta_t,
-            noising_mask.numpy(force=True),
-            noise_scale=noise_scale)
-        tm1 = t - np.abs(delta_t) #+ delta_t
-
-        return bb_x_tm1, tm1, denoiser_output
-
-    def sample(self,
-               data,
-               steps=100,
-               show_progress=False,
-               device=None,
-               noise_scale=1.0):
-        if device is None:
-            device = data['x'].device
-
-        num_nodes = data.num_nodes
-        prior = self.sample_prior(data)
-        intermediates = prior
-
-        delta_t = self.time_T / steps  # should this be negative?
-        intermediates['t'] = 1 #torch.ones([num_nodes], device=device).float() - np.abs(delta_t)
-        intermediates['t_per_graph'] = torch.ones([data.num_graphs], device=device).float() # - np.abs(delta_t)
-        bb_x_t = intermediates[self.bb_x_t_key]
-        denoiser_output = None
-
-        with torch.no_grad():
-            if show_progress:
-                pbar = tqdm.tqdm(total=steps)
-
-            while (intermediates['t'] > np.abs(delta_t)).all():
-                data[self.bb_x_t_key] = intermediates[self.bb_x_t_key]
-                data['t'] = intermediates['t']
-                bb_x_tm1, tm1, denoiser_output = self.reverse_step(data, intermediates, delta_t, noise_scale=noise_scale)
-                intermediates['t'] = tm1
-                intermediates[self.bb_x_t_key] = bb_x_tm1
-
-                if show_progress:
-                    pbar.update(1)
-
-            if show_progress:
-                pbar.close()
-
-        intermediates['t'] = torch.as_tensor(intermediates['t_per_graph']).view(-1)
-        diffusion_outputs = intermediates
-        diffusion_outputs[self.bb_x_0_key] = diffusion_outputs[self.bb_x_t_key]
-        diffusion_outputs[self.bb_x_t_key] = bb_x_t
-        # add a bunch of keys so the loss fn is happy
-        noising_mask = intermediates['noising_mask']
-        x_mask = data['x_mask']
-        mask = x_mask | ~noising_mask
-        pred_bb_score = self.bb_score_fn(data, denoiser_output, mask)
-        diffusion_outputs["pred_bb_score"] = pred_bb_score
-        diffusion_outputs["rot_score"] = torch.zeros_like(pred_bb_score[0])
-        diffusion_outputs["trans_score"] = torch.zeros_like(pred_bb_score[1])
-        diffusion_outputs["rot_score_scaling"] = torch.ones(data.num_graphs, device=pred_bb_score[0].device)
-        diffusion_outputs["trans_score_scaling"] = torch.ones(data.num_graphs, device=pred_bb_score[1].device)
-
-        diffusion_outputs.update(denoiser_output)
-
-        ret = {}
-        for k, v in diffusion_outputs.items():
-            if torch.is_tensor(v):
-                ret[k] = v.to(device)
-            else:
-                ret[k] = v
-
-        diffusion_outputs = ret
-
-        return diffusion_outputs, diffusion_outputs
-
-class FrameDiffuser3(nn.Module):
-    def __init__(self,
-                 se3_noiser,
-                 c_s=128,
-                 c_v=32,
-                 c_z=64,
-                 c_hidden=128,
-                 num_qk_pts=8,
-                 num_v_pts=12,
-                 num_heads=8,
-                 num_layers=4,
-                 bb_x_0_key='rigids_0',
-                 bb_x_0_pred_key='final_rigids',
-                 bb_x_t_key='rigids_t',
-                 ):
-        super().__init__()
-        self.bb_x_0_key = bb_x_0_key
-        self.bb_x_0_pred_key = bb_x_0_pred_key
-        self.bb_x_t_key = bb_x_t_key
-
-        self.denoiser = KnnIpaScoreWrapper(
+        self.denoiser = IpaScoreWrapper(
             se3_noiser,
             c_s=c_s,
             c_z=c_z,
@@ -1941,6 +210,10 @@ class FrameDiffuser3(nn.Module):
         self.time_T = 1
         self.se3_noiser = se3_noiser
 
+    def forward_noising(self, data):
+        pass
+
+
     def reverse_noising(self, data):
         denoiser_output = self.denoiser(data)
         x_mask = data['x_mask']
@@ -1952,33 +225,26 @@ class FrameDiffuser3(nn.Module):
 
     def bb_score_fn(self, data, denoiser_output, mask):
         bb_x_t = ru.Rigid.from_tensor_7(data[self.bb_x_t_key])
+        t = data['t']
         bb_x_0_pred = denoiser_output[self.bb_x_0_pred_key]
         num_nodes = bb_x_t.shape[0]
-        t = data['t']
-        # bb_x_t = reshape_rigids(bb_x_t, [t.shape[0], -1])
-        # bb_x_0_pred = reshape_rigids(bb_x_0_pred, [t.shape[0], -1])
+        bb_x_t = bb_x_t.view([data.num_graphs, -1])
+        bb_x_0_pred = bb_x_0_pred.view([data.num_graphs, -1])
         rots_x_t = bb_x_t.get_rots()
         rots_x_0_pred = bb_x_0_pred.get_rots()
-        rot_score = self.se3_noiser.calc_rot_score2(
+        rot_score = self.se3_noiser.calc_rot_score(
             rots_x_t,
             rots_x_0_pred,
-            t,
-            data.batch
+            t
         )
         rot_score = rot_score.view(num_nodes, -1)
-
-        data_splits = data._slice_dict['x']
-        data_lens = (data_splits[1:] - data_splits[:-1]).tolist()
-        t_expand = torch.cat([
-            t[i] * torch.ones(l, device=mask.device) for i, l in enumerate(data_lens)
-        ], dim=0)
 
         trans_x_t = bb_x_t.get_trans()
         trans_x_0_pred = bb_x_0_pred.get_trans()
         trans_score = self.se3_noiser.calc_trans_score(
             trans_x_t,
             trans_x_0_pred,
-            t_expand[:, None],
+            t[:, None, None],
             use_torch=True
         )
         trans_score = trans_score.view(num_nodes, -1)
@@ -1987,15 +253,13 @@ class FrameDiffuser3(nn.Module):
         trans_score = trans_score * ~mask[..., None]
         return (rot_score, trans_score)
 
-    def forward(self, data, warmup=False, deterministic=False):
+    def forward(self, data):
         denoised_outputs = self.reverse_noising(data)
         return data, denoised_outputs
 
-    def sample_prior(self, data):
-        num_nodes = data.num_nodes
-        sampled_residx = torch.arange(num_nodes).to(data['x_mask'].device)
-        noising_mask = torch.ones_like(data['x_mask']).bool()
-        num_nodes = data.num_nodes
+    def sample_prior(self, num_nodes, device):
+        sampled_residx = torch.arange(num_nodes, device=device)
+        noising_mask = torch.ones(num_nodes, device=device).bool()
         bb_prior = self.se3_noiser.sample_ref(n_samples=num_nodes)
         out_dict = {
             'noised_residx': sampled_residx,
@@ -2004,45 +268,57 @@ class FrameDiffuser3(nn.Module):
         out_dict.update(bb_prior)
         return out_dict
 
-    def reverse_step(self, data, intermediates, delta_t, noise_scale=1.0):
+    def reverse_step(self, intermediates, delta_t, noise_scale=1.0):
         # assert delta_t < 0
         t = intermediates['t']
         noising_mask = intermediates['noising_mask']
-        x_mask = data['x_mask']
+        x_mask = torch.zeros_like(noising_mask).bool()
         mask = x_mask | ~noising_mask
         bb_x_t = intermediates[self.bb_x_t_key]
 
+        data = Data(
+            x=bb_x_t.get_trans(),
+            x_mask=x_mask,
+            noising_mask=noising_mask,
+            fixed_mask=~noising_mask,
+            rigids_t=bb_x_t.to_tensor_7(),
+            t=t
+        )
+        data = Batch.from_data_list([data])
+        data = data.to(t.device)
+
         denoiser_output = self.denoiser(data)
-        rot_score, trans_score = self.bb_score_fn(data, denoiser_output, mask)
+        rot_score, trans_score = self.bb_score_fn(
+            data,
+            denoiser_output,
+            mask
+        )
 
         bb_x_tm1 = self.se3_noiser.reverse(
             bb_x_t,
             rot_score.numpy(force=True),
             trans_score.numpy(force=True),
-            t,
+            t.item(),
             delta_t,
             noising_mask.numpy(force=True),
-            noise_scale=noise_scale)
+            noise_scale=noise_scale
+        )
         tm1 = t - np.abs(delta_t) #+ delta_t
 
         return bb_x_tm1, tm1, denoiser_output
 
     def sample(self,
-               data,
+               num_nodes=None,
                steps=100,
                show_progress=False,
                device=None,
                noise_scale=1.0):
-        if device is None:
-            device = data['x'].device
 
-        num_nodes = data.num_nodes
-        prior = self.sample_prior(data)
+        prior = self.sample_prior(num_nodes, device=device)
         intermediates = prior
 
-        delta_t = self.time_T / steps  # should this be negative?
-        intermediates['t'] = 1 #torch.ones([num_nodes], device=device).float() - np.abs(delta_t)
-        intermediates['t_per_graph'] = torch.ones([data.num_graphs], device=device).float() # - np.abs(delta_t)
+        delta_t = self.time_T / steps
+        intermediates['t'] = torch.ones(1, device=device)
         bb_x_t = intermediates[self.bb_x_t_key]
         denoiser_output = None
 
@@ -2051,9 +327,7 @@ class FrameDiffuser3(nn.Module):
                 pbar = tqdm.tqdm(total=steps)
 
             while (intermediates['t'] > np.abs(delta_t)).all():
-                data[self.bb_x_t_key] = intermediates[self.bb_x_t_key]
-                data['t'] = intermediates['t']
-                bb_x_tm1, tm1, denoiser_output = self.reverse_step(data, intermediates, delta_t, noise_scale=noise_scale)
+                bb_x_tm1, tm1, denoiser_output = self.reverse_step(intermediates, delta_t, noise_scale=noise_scale)
                 intermediates['t'] = tm1
                 intermediates[self.bb_x_t_key] = bb_x_tm1
 
@@ -2063,30 +337,11 @@ class FrameDiffuser3(nn.Module):
             if show_progress:
                 pbar.close()
 
-        intermediates['t'] = torch.as_tensor(intermediates['t_per_graph']).view(-1)
+        intermediates['t'] = torch.as_tensor(intermediates['t']).view(1, 1)
         diffusion_outputs = intermediates
         diffusion_outputs[self.bb_x_0_key] = diffusion_outputs[self.bb_x_t_key]
         diffusion_outputs[self.bb_x_t_key] = bb_x_t
         # add a bunch of keys so the loss fn is happy
-        noising_mask = intermediates['noising_mask']
-        x_mask = data['x_mask']
-        mask = x_mask | ~noising_mask
-        pred_bb_score = self.bb_score_fn(data, denoiser_output, mask)
-        diffusion_outputs["pred_bb_score"] = pred_bb_score
-        diffusion_outputs["rot_score"] = torch.zeros_like(pred_bb_score[0])
-        diffusion_outputs["trans_score"] = torch.zeros_like(pred_bb_score[1])
-        diffusion_outputs["rot_score_scaling"] = torch.ones(data.num_graphs, device=pred_bb_score[0].device)
-        diffusion_outputs["trans_score_scaling"] = torch.ones(data.num_graphs, device=pred_bb_score[1].device)
-
         diffusion_outputs.update(denoiser_output)
-
-        ret = {}
-        for k, v in diffusion_outputs.items():
-            if torch.is_tensor(v):
-                ret[k] = v.to(device)
-            else:
-                ret[k] = v
-
-        diffusion_outputs = ret
 
         return diffusion_outputs, diffusion_outputs

@@ -293,8 +293,8 @@ def debug_inpaint_inference_loop2(diffuser,
 
         if save:
             denoised_bb = latent_outputs['denoised_bb']
-            denoised_bb = torch.cat([denoised_bb, torch.zeros(batch, 1, 3)], dim=-2)  # add O
-            atom91_to_pdb("".join(["G" for _ in range(batch)]), denoised_bb.numpy(force=True), f"len_{batch}_bb")
+            # denoised_bb = torch.cat([denoised_bb, torch.zeros(batch, 1, 3)], dim=-2)  # add O
+            atom91_to_pdb("".join(["A" for _ in range(batch)]), denoised_bb.numpy(force=True), f"len_{batch}_bb")
 
     return {key: np.mean(losses) for key, losses in epoch_dict.items()}
 
