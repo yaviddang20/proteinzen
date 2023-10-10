@@ -6,6 +6,7 @@ import torch.distributions as dist
 import numpy as np
 
 from ligbinddiff.model.denoiser.bb.framediff import IpaScoreWrapper
+from ligbinddiff.model.denoiser.bb.frames import PSAEBFrameDenoiser
 from ligbinddiff.utils.openfold import rigid_utils as ru
 
 from torch_geometric.data import Batch, Data
@@ -177,10 +178,11 @@ class FrameDiff(nn.Module):
         return diffusion_outputs, diffusion_outputs
 
 
-class SelfNoisingFrameDiff(nn.Module):
+class PSAEBFrameDiff(nn.Module):
     def __init__(self,
                  se3_noiser,
                  c_s=128,
+                 c_v=16,
                  c_z=64,
                  c_hidden=128,
                  num_qk_pts=8,
@@ -196,23 +198,19 @@ class SelfNoisingFrameDiff(nn.Module):
         self.bb_x_0_pred_key = bb_x_0_pred_key
         self.bb_x_t_key = bb_x_t_key
 
-        self.denoiser = IpaScoreWrapper(
-            se3_noiser,
+        self.denoiser = PSAEBFrameDenoiser(
             c_s=c_s,
+            c_v=c_v,
             c_z=c_z,
             c_hidden=c_hidden,
             num_heads=num_heads,
-            num_qk_points=num_qk_pts,
-            num_v_points=num_v_pts,
-            num_blocks=num_layers
+            num_qk_pts=num_qk_pts,
+            num_v_pts=num_v_pts,
+            n_layers=num_layers
         )
         self.time_dist = dist.Uniform(0, 1)
         self.time_T = 1
         self.se3_noiser = se3_noiser
-
-    def forward_noising(self, data):
-        pass
-
 
     def reverse_noising(self, data):
         denoiser_output = self.denoiser(data)

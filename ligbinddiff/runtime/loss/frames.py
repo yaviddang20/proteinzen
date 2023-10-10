@@ -5,7 +5,7 @@ from ligbinddiff.utils.openfold import rigid_utils as ru
 from ligbinddiff.utils.atom_reps import atom14_sidechain_angles, atom14_residue_angles
 
 from .utils import _elemwise_to_graphwise, _nodewise_to_graphwise
-from .atomic import _atom91_to_atom14
+from .atomic.common import atom91_to_atom14
 from .openfold import compute_fape
 
 def all_atom_fape_loss(pred_atom91,
@@ -21,8 +21,8 @@ def all_atom_fape_loss(pred_atom91,
         angle_atom_idx_select += atom_list
     angle_atom_idx_select = torch.as_tensor(angle_atom_idx_select, device=ref_atom91.device).long() # n_frame x 3
 
-    pred_atom14, _ = _atom91_to_atom14(pred_atom91, seq)
-    ref_atom14, atom14_mask = _atom91_to_atom14(ref_atom91, seq)
+    pred_atom14, _ = atom91_to_atom14(pred_atom91, seq)
+    ref_atom14, atom14_mask = atom91_to_atom14(ref_atom91, seq)
     atom14_mask = atom14_mask.any(dim=-1)
 
     frame_mask = atom14_mask[:, angle_atom_idx_select].any(dim=-1)  # n_res x n_frame

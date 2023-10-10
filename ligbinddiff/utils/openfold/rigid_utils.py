@@ -1206,7 +1206,9 @@ class Rigid:
         origin = torch.unbind(origin, dim=-1)
         p_xy_plane = torch.unbind(p_xy_plane, dim=-1)
 
-        e0 = [c1 - c2 for c1, c2 in zip(origin, p_neg_x_axis)]  # v1 = x2 - x1
+        # e0 = [c1 - c2 for c1, c2 in zip(origin, p_neg_x_axis)]  # v1 = x2 - x1
+        # TODO: i dont know why i have to do this...
+        e0 = [c2 - c1 for c1, c2 in zip(origin, p_neg_x_axis)]  # v1 = x2 - x1
         e1 = [c1 - c2 for c1, c2 in zip(p_xy_plane, origin)]  # v2 = x3 - x2
 
         denom = torch.sqrt(sum((c * c for c in e0)) + eps)

@@ -255,6 +255,8 @@ def featurize_atomic(protein,
                      edge_index=edge_index,
                      edge_s=nan_to_num(edge_s),
                      edge_v=nan_to_num(edge_v),
+                     atom14=nan_to_num(atom14),
+                     atom14_mask=atom14_mask,
                      atom91_centered=nan_to_num(atom91 - X_ca.unsqueeze(-2)),
                      atom91_mask=atom91_mask,
                      name=name)
@@ -265,7 +267,8 @@ def featurize_atomic(protein,
             X_n = nan_to_num(coords[:, 0])
             X_ca = nan_to_num(coords[:, 1])
             X_c = nan_to_num(coords[:, 2])
-            rigids_0 = ru.Rigid.from_3_points(X_n, X_ca, X_c)
+            # TODO: i don't know why this is this order...
+            rigids_0 = ru.Rigid.from_3_points(X_c, X_ca, X_n)
 
             t = rng.uniform(0.01, 1.0)
             diff_feats_t = diffuser.forward_marginal(

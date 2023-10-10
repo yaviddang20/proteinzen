@@ -133,7 +133,7 @@ def cath_train_loop(diffuser,
                 f"gen loss {format_list(gen_loss.tolist(), '{:.4f}')}, discrim loss {format_list(discrim_loss.tolist(), '{:.4f}')}"))
 
             if torch.isnan(loss).any():
-                exit()
+                raise ValueError("loss is nan")
         except Exception as e:
             torch.save(batch, "problematic_inputs.pt")
             torch.save(outputs, "outputs.pt")
@@ -260,11 +260,11 @@ def debug_inpaint_train_loop(diffuser,
             loss = loss_dict["loss"]
 
             if train:
-                # TODO: get rid of this
-                if torch.isnan(loss).any():
-                    print("loss is nan")
-                    print(batch.name)
-                    continue
+                # # TODO: get rid of this
+                # if torch.isnan(loss).any():
+                #     print("loss is nan")
+                #     print(batch.name)
+                #     continue
 
                 if debug:
                     loss.backward()
@@ -304,12 +304,16 @@ def debug_inpaint_train_loop(diffuser,
             pbar_str += gen_pbar_str(loss_dict)
             pbar_str += f", t: {format_list(latent_data['t'], '{:.4f}')}"
             pbar.set_description(pbar_str)
+            print(pbar_str)
             if step_count is not None:
                 step_count += 1
                 if checkpoint_steps is not None and step_count % checkpoint_steps == 0:
                     torch.save(diffuser.state_dict(), f"checkpoint_step_{step_count}.pt")
 
+            if torch.isnan(loss).any():
+                raise ValueError("loss is nan")
         except Exception as e:
+            print(batch.name)
             torch.save(batch, "problematic_inputs.pt")
             torch.save(latent_data, "latent_outputs.pt")
             torch.save(decoder_outputs, "decoder_outputs.pt")

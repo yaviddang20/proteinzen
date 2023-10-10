@@ -5,6 +5,7 @@ from torch import nn
 from ligbinddiff.model.modules.common import RBF
 
 from ligbinddiff.utils.openfold import rigid_utils as ru
+from ligbinddiff.utils.framediff.all_atom import compute_backbone
 
 from ligbinddiff.data.datasets.featurize.common import _node_positional_embeddings
 
@@ -12,6 +13,8 @@ from ligbinddiff.utils.frames import backbone_frames_to_bb_atoms
 from ligbinddiff.model.modules.frames import PointSetAttentionWithEdgeBias, EdgeTransition, NodeTransition, BackboneUpdateVectorBias, VectorLayerNorm, LocalFrameUpdate
 
 from ligbinddiff.model.utils.graph import sample_inv_cubic_edges, sequence_local_graph, gen_spatial_graph_features, batchwise_to_nodewise, get_data_lens
+
+from .framediff import TorsionAngles
 
 
 class PSAEBFrameDenoisingLayer(nn.Module):
@@ -201,6 +204,8 @@ class PSAEBFrameDenoiser(nn.Module):
         self.knn_k = knn_k
         self.lrange_k = lrange_k
 
+        self.torsion_angles = TorsionAngles(c_s, 1)
+
     def forward(self, data):
         ## prep features
         data_lens = get_data_lens(data, key='x')
@@ -223,7 +228,6 @@ class PSAEBFrameDenoiser(nn.Module):
         for i in range(data.batch.max().item() + 1):
             select = (data.batch == i)
             num_nodes = select.sum().item()
-            local_residx = torch.arange(num_nodes, device=device) + offset
             seq_local_edge_index.append(
                 sequence_local_graph(num_nodes, data['x_mask'][select]) + offset
             )
@@ -275,12 +279,16 @@ class PSAEBFrameDenoiser(nn.Module):
                 node_vectors=node_vectors
             )
 
+        psi = self.torsion_angles(node_features)
+
         rigids = rigids.scale_translation(10)
         rigids = rigids.translate(center)
         ret = {}
         ret['denoised_frames'] = rigids
         ret['final_rigids'] = rigids
-        ret['denoised_bb'] = backbone_frames_to_bb_atoms(ret['denoised_frames'])
+        denoised_bb_items = compute_backbone(rigids.unsqueeze(0), psi.unsqueeze(0))
+        denoised_bb = denoised_bb_items[-1].squeeze(0)[:, :5]
+        ret['denoised_bb'] = denoised_bb
         ret['node_features'] = node_features
 
         return ret

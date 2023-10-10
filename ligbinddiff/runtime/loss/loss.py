@@ -2,14 +2,17 @@
 import torch
 import torch.nn.functional as F
 
-from ligbinddiff.runtime.loss.atomic import (angle_loss, atom91_mse_loss,
+from ligbinddiff.runtime.loss.atomic.intraresidue import (angle_loss, atom91_mse_loss,
                                              atom91_rmsd_loss,
-                                             atomic_neighborhood_dist_loss, chain_constraints_loss,
-                                             backbone_dihedrals_loss, bond_length_loss, distance_loss,
-                                             intersidechain_clash_loss,
+                                             bond_length_loss, distance_loss,
                                              intrasidechain_clash_loss,
                                              torsion_loss,
-                                             framediff_local_atomic_context_loss)
+                                             )
+from ligbinddiff.runtime.loss.atomic.interresidue import (chain_constraints_loss,
+                                             backbone_dihedrals_loss,
+                                             intersidechain_clash_loss)
+from ligbinddiff.runtime.loss.atomic.atomic import atomic_neighborhood_dist_loss, framediff_local_atomic_context_loss
+from ligbinddiff.runtime.loss.atomic.hbond import bb_hbond_loss
 from ligbinddiff.runtime.loss.density import zernike_coeff_loss
 from ligbinddiff.runtime.loss.latent import so3_embedding_kl, so3_embedding_mse
 from ligbinddiff.runtime.loss.utils import (_nodewise_to_graphwise, _elemwise_to_graphwise)
@@ -1265,13 +1268,12 @@ def frame_diffusion_loss(batch,
     ref_X_ca_se = torch.square(X_ca - ref_frame_X_ca).sum(dim=-1)
     ref_X_ca_mse = _nodewise_to_graphwise(ref_X_ca_se[total_mask], data_lens, ~total_mask)
 
-    # chop off CB
-    bb = batch['bb'][:, :4]
-    denoised_bb = denoiser_outputs['denoised_bb'][:, :4]
+    bb = batch['atom14'][:, :5]
+    bb_mask = batch['atom14_mask'][:, :5].any(dim=-1)
+    denoised_bb = denoiser_outputs['denoised_bb']
     backbone_mse = torch.square(denoised_bb - bb).sum(dim=-1)
-    backbone_mse = backbone_mse[total_mask].view(-1)
-    total_mask_expand = total_mask[:, None].expand(-1, 4)
-    backbone_mse = _elemwise_to_graphwise(backbone_mse, data_lens, ~total_mask_expand)
+    backbone_mse = backbone_mse[~bb_mask]
+    backbone_mse = _elemwise_to_graphwise(backbone_mse, data_lens, bb_mask)
 
     pred_rot_score, pred_trans_score = denoiser_outputs['pred_bb_score']
     ref_rot_score = noised_data['rot_score']
@@ -1306,6 +1308,19 @@ def frame_diffusion_loss(batch,
         x_mask
     )
 
+    bb_dihedrals_loss = backbone_dihedrals_loss(
+        denoised_bb[:, :3],
+        bb[:, :3],
+        data_lens,
+        ~noising_mask)
+
+    bb_conn_lens, bb_conn_angles = chain_constraints_loss(
+        denoised_bb[:, :3],
+        bb[:, :3],
+        data_lens,
+        batch.batch,
+        ~noising_mask)
+
     return {
         "rot_score_loss": rot_score_loss,
         "trans_score_loss": trans_score_loss,
@@ -1313,8 +1328,27 @@ def frame_diffusion_loss(batch,
         "pred_bb_mse": backbone_mse,
         "ref_x_ca_mse": ref_X_ca_mse,
         "dist_mat_loss": dist_mat_loss,
+        "bb_dihedrals_loss": bb_dihedrals_loss,
+        "bb_conn_mse": bb_conn_lens,
+        "bb_angles_loss": bb_conn_angles
     }
 
+def bb_hbond_params_loss(batch,
+                         bb_outputs):
+    bb = batch['atom14'][:, :4]
+    bb_mask = batch['x_mask']
+    denoised_bb = bb_outputs['denoised_bb'][:, :4]
+
+    data_splits = batch._slice_dict['x']
+    data_lens = (data_splits[1:] - data_splits[:-1]).tolist()
+
+    mse_delta_HA, mse_Theta, mse_Psi, mse_X = bb_hbond_loss(denoised_bb, bb, batch.batch, data_lens, bb_mask)
+    return {
+        "mse_delta_HA": mse_delta_HA,
+        "mse_Theta": mse_Theta,
+        "mse_Psi": mse_Psi,
+        "mse_X": mse_X
+    }
 
 def debug_inpaint_frame_latent_loss_fn(batch,
                                  latent_outputs,
@@ -1323,17 +1357,26 @@ def debug_inpaint_frame_latent_loss_fn(batch,
     bb_frame_diffusion_loss_dict = frame_diffusion_loss(batch,
                                                         latent_outputs,
                                                         decoder_outputs)
+    hbond_loss_dict = bb_hbond_params_loss(batch, decoder_outputs)
     bb_denoising_loss = (
-        bb_frame_diffusion_loss_dict["pred_x_ca_mse"] +
+        bb_frame_diffusion_loss_dict["pred_x_ca_mse"] / 100 +
         bb_frame_diffusion_loss_dict["rot_score_loss"]
     )
     bb_denoising_finegrain_loss = (
         bb_frame_diffusion_loss_dict["pred_bb_mse"]
-        + bb_frame_diffusion_loss_dict["dist_mat_loss"]
+        # + bb_frame_diffusion_loss_dict["dist_mat_loss"]
+        + bb_frame_diffusion_loss_dict["bb_dihedrals_loss"]
+        + bb_frame_diffusion_loss_dict["bb_conn_mse"]
+        + bb_frame_diffusion_loss_dict["bb_angles_loss"]
+        + hbond_loss_dict["mse_delta_HA"]
+        + hbond_loss_dict["mse_Theta"]
+        + hbond_loss_dict["mse_Psi"]
+        + hbond_loss_dict["mse_X"]
     ) * (latent_outputs['t'] < time_threshold)
 
-    loss = (bb_denoising_loss + bb_denoising_finegrain_loss).mean()
+    loss = (bb_denoising_loss + 0.25 * bb_denoising_finegrain_loss).mean()
 
     out_dict = {"loss": loss}
     out_dict.update(bb_frame_diffusion_loss_dict)
+    out_dict.update(hbond_loss_dict)
     return out_dict
