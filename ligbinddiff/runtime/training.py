@@ -241,7 +241,8 @@ def debug_inpaint_train_loop(diffuser,
                        debug=False,
                        debug_device='cpu',
                        step_count=None,
-                       checkpoint_steps=None
+                       checkpoint_steps=None,
+                       early_checkpoint=100,
                        ):
     epoch_dict = {}
 
@@ -304,10 +305,12 @@ def debug_inpaint_train_loop(diffuser,
             pbar_str += gen_pbar_str(loss_dict)
             pbar_str += f", t: {format_list(latent_data['t'], '{:.4f}')}"
             pbar.set_description(pbar_str)
-            print(pbar_str)
+            # print(pbar_str)
             if step_count is not None:
                 step_count += 1
                 if checkpoint_steps is not None and step_count % checkpoint_steps == 0:
+                    torch.save(diffuser.state_dict(), f"checkpoint_step_{step_count}.pt")
+                if step_count == early_checkpoint:
                     torch.save(diffuser.state_dict(), f"checkpoint_step_{step_count}.pt")
 
             if torch.isnan(loss).any():

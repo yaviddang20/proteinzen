@@ -8,10 +8,11 @@ import torch.nn as nn
 from typing import Optional, Callable, List, Sequence
 
 import functools as fn
+from torch_geometric.utils import sort_edge_index
 
-from ligbinddiff.data.datasets.featurize.common import _node_positional_embeddings
-from ligbinddiff.model.modules.frames import KnnIpaScore
+from ligbinddiff.data.datasets.featurize.common import _node_positional_embeddings, _edge_positional_embeddings, _rbf
 from ligbinddiff.model.modules.common import RBF
+from ligbinddiff.model.modules.frames import Linear, flatten_final_dims, ipa_point_weights_init_, permute_final_dims
 from ligbinddiff.model.utils.graph import get_data_lens, batchwise_to_nodewise, gen_spatial_graph_features, sample_inv_cubic_edges, sequence_local_graph
 from ligbinddiff.utils.openfold.rigid_utils import Rigid, batchwise_center
 from ligbinddiff.utils.framediff.all_atom import compute_backbone
@@ -870,6 +871,472 @@ class IpaScoreWrapper(nn.Module):
         return ret
 
 
+class KnnInvariantPointAttention(nn.Module):
+    """
+    Implements Algorithm 22.
+    """
+    def __init__(
+        self,
+        c_s,
+        c_z,
+        c_hidden,
+        no_heads,
+        no_qk_points,
+        no_v_points,
+        inf: float = 1e5,
+        eps: float = 1e-8,
+    ):
+        """
+        Args:
+            c_s:
+                Single representation channel dimension
+            c_z:
+                Pair representation channel dimension
+            c_hidden:
+                Hidden channel dimension
+            no_heads:
+                Number of attention heads
+            no_qk_points:
+                Number of query/key points to generate
+            no_v_points:
+                Number of value points to generate
+        """
+        super().__init__()
+        self.c_s = c_s
+        self.c_z = c_z
+        self.c_hidden = c_hidden
+        self.no_heads = no_heads
+        self.no_qk_points = no_qk_points
+        self.no_v_points = no_v_points
+        self.inf = inf
+        self.eps = eps
+
+        # These linear layers differ from their specifications in the
+        # supplement. There, they lack bias and use Glorot initialization.
+        # Here as in the official source, they have bias and use the default
+        # Lecun initialization.
+        hc = self.c_hidden * self.no_heads
+        self.linear_q = Linear(self.c_s, hc)
+        self.linear_kv = Linear(self.c_s, 2 * hc)
+
+        hpq = self.no_heads * self.no_qk_points * 3
+        self.linear_q_points = Linear(self.c_s, hpq)
+
+        hpkv = self.no_heads * (self.no_qk_points + self.no_v_points) * 3
+        self.linear_kv_points = Linear(self.c_s, hpkv)
+
+        self.linear_b = Linear(self.c_z, self.no_heads)
+        self.down_z = Linear(self.c_z, self.c_z // 4)
+
+        self.head_weights = nn.Parameter(torch.zeros((self.no_heads)))
+        ipa_point_weights_init_(self.head_weights)
+
+        concat_out_dim =  (
+            self.c_z // 4 + self.c_hidden + self.no_v_points * 4
+        )
+        self.linear_out = Linear(self.no_heads * concat_out_dim, self.c_s, init="final")
+
+        self.softmax = nn.Softmax(dim=-1)
+        self.softplus = nn.Softplus()
+        # TODO: Remove after published checkpoint is updated without these weights.
+        self.linear_rbf = Linear(20, 1)
+
+    def forward(
+        self,
+        s: torch.Tensor,
+        z: Optional[torch.Tensor],
+        edge_index: torch.Tensor,
+        r: Rigid,
+        mask: torch.Tensor,
+        _offload_inference: bool = False,
+        _z_reference_list: Optional[Sequence[torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            s:
+                [*, N_res, C_s] single representation
+            z:
+                [*, N_res, k, C_z] pair representation
+            edge_index:
+                [*, N_res, k] edge index
+            r:
+                [*, N_res] transformation object
+            mask:
+                [*, N_res] mask
+        Returns:
+            [*, N_res, C_s] single representation update
+        """
+        if _offload_inference:
+            z = _z_reference_list
+        else:
+            z = [z]
+
+        #######################################
+        # Generate scalar and point activations
+        #######################################
+        # [*, N_res, H * C_hidden]
+        q = self.linear_q(s)
+        kv = self.linear_kv(s)
+
+        # [*, N_res, H, C_hidden]
+        q = q.view(q.shape[:-1] + (self.no_heads, -1))
+
+        # [*, N_res, H, 2 * C_hidden]
+        kv = kv.view(kv.shape[:-1] + (self.no_heads, -1))
+
+        # [*, N_res, k, H, C_hidden]
+        edge_index_expand = edge_index[..., None, None].expand(
+            -1, -1, -1, kv.shape[-2], kv.shape[-1])
+        kv_expand = kv.unsqueeze(-3).expand(-1, -1, edge_index.shape[-1], -1, -1)
+        kv_gather = torch.gather(kv_expand, 1, edge_index_expand)
+        # kv_gather = gather(kv, edge_index)
+        # print(kv_gather.shape)
+        k_gather, v_gather = torch.split(kv_gather, self.c_hidden, dim=-1)
+
+        # [*, N_res, H * P_q * 3]
+        q_pts = self.linear_q_points(s)
+
+        # This is kind of clunky, but it's how the original does it
+        # [*, N_res, H * P_q, 3]
+        q_pts = torch.split(q_pts, q_pts.shape[-1] // 3, dim=-1)
+        q_pts = torch.stack(q_pts, dim=-1)
+        q_pts = r[..., None].apply(q_pts)
+
+        # [*, N_res, H, P_q, 3]
+        q_pts = q_pts.view(
+            q_pts.shape[:-2] + (self.no_heads, self.no_qk_points, 3)
+        )
+
+        # [*, N_res, H * (P_q + P_v) * 3]
+        kv_pts = self.linear_kv_points(s)
+
+        # [*, N_res, H * (P_q + P_v), 3]
+        kv_pts = torch.split(kv_pts, kv_pts.shape[-1] // 3, dim=-1)
+        kv_pts = torch.stack(kv_pts, dim=-1)
+        kv_pts = r[..., None].apply(kv_pts)
+
+        # [*, N_res, H, (P_q + P_v), 3]
+        kv_pts = kv_pts.view(kv_pts.shape[:-2] + (self.no_heads, -1, 3))
+
+        # [*, N_res, k, H, P_q/P_v, 3]
+        edge_index_expand = edge_index[..., None, None, None].expand(
+            -1, -1, -1, kv_pts.shape[-3], kv_pts.shape[-2], kv_pts.shape[-1])
+        kv_pts_expand = kv_pts.unsqueeze(-4).expand(-1, -1, edge_index.shape[-1], -1, -1, -1)
+        kv_pts_gather = torch.gather(kv_pts_expand, 1, edge_index_expand)
+        k_pts_gather, v_pts_gather = torch.split(
+            kv_pts_gather, [self.no_qk_points, self.no_v_points], dim=-2
+        )
+
+        ##########################
+        # Compute attention scores
+        ##########################
+        # [*, N_res, k, H]
+        b = self.linear_b(z[0])
+
+        if(_offload_inference):
+            z[0] = z[0].cpu()
+
+        # [*, H, N_res, k]
+        # q: [*, N_res, H, C_hidden]
+        # k_gather: [*, N_res, k, H, C_hidden]
+        a = torch.matmul(
+            permute_final_dims(q, (1, 0, 2))[..., None, :],  # [*, H, N_res, 1, C_hidden]
+            permute_final_dims(k_gather, (2, 0, 3, 1)),  # [*, H, N_res, C_hidden, k]
+        ).squeeze(-2)
+        # torch.einsum("...nhc,...nkhc->...hnk", q, k_gather)
+        a *= math.sqrt(1.0 / (3 * self.c_hidden))
+        a += (math.sqrt(1.0 / 3) * permute_final_dims(b, (2, 0, 1)))
+
+        # [*, N_res, k, H, P_q, 3]
+        # q_pts: [*, N_res, H, P_q, 3]
+        # k_pts_gather: [*, N_res, k, H, P_q, 3]
+        pt_displacement = q_pts.unsqueeze(-4) - k_pts_gather
+        pt_att = pt_displacement ** 2
+
+        # [*, N_res, k, H, P_q]
+        pt_att = sum(torch.unbind(pt_att, dim=-1))
+        head_weights = self.softplus(self.head_weights).view(
+            *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
+        )
+        head_weights = head_weights * math.sqrt(
+            1.0 / (3 * (self.no_qk_points * 9.0 / 2))
+        )
+        pt_att = pt_att * head_weights
+
+        # [*, N_res, k, H]
+        pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
+        # [*, N_res, k]
+        edge_mask = torch.gather(
+            mask[..., None].expand(-1, -1, edge_index.shape[-1]),
+            1,
+            edge_index)
+        edge_mask = self.inf * (edge_mask - 1)
+
+        # [*, H, N_res, k]
+        pt_att = permute_final_dims(pt_att, (2, 0, 1))
+
+        a = a + pt_att
+        a = a + edge_mask.unsqueeze(-3)
+        a = self.softmax(a)
+
+        ################
+        # Compute output
+        ################
+        # [*, N_res, H, C_hidden]
+        # a: [*, H, N_res, k], originally [*, H, N_res, N_res]
+        # v: [*, N_res, H, C_hidden]
+        # v_gather: [*, N_res, k, H, C_hidden]
+        o = torch.matmul(
+            a.transpose(-2, -3)[..., None, :], # [*, N_res, H, 1, k]
+            v_gather.transpose(-2, -3).to(dtype=a.dtype)  # [*, N_res, H, k, C_hidden]
+        ).squeeze(-2)
+        # torch.einsum("...hnk,...nkhc->...nhc", a, v_gather)
+
+        # [*, N_res, H * C_hidden]
+        o = flatten_final_dims(o, 2)
+
+        # [*, H, 3, N_res, P_v]
+        # a: [*, H, N_res, k], originally [*, H, N_res, N_res]
+        # v_pts [*, N_res, H, P_v, 3]
+        # v_pts_gather: [*, N_res, k, H, P_v, 3]
+        o_pt = torch.matmul(
+            a[..., None, :, None, :],  # a: [*, H, 1, N_res, 1, k]
+            permute_final_dims(v_pts_gather, (2, 4, 0, 1, 3))  # [*, H, 3, N_res, k, P_v]
+        ).squeeze(-2)
+        # torch.einsum("...hnk,...nkhvc->...hcnv", a, v_pts_gather)
+
+        # [*, N_res, H, P_v, 3]
+        o_pt = permute_final_dims(o_pt, (2, 0, 3, 1))
+        o_pt = r[..., None, None].invert_apply(o_pt)
+
+        # [*, N_res, H * P_v]
+        o_pt_dists = torch.sqrt(torch.sum(o_pt ** 2, dim=-1) + self.eps)
+        o_pt_norm_feats = flatten_final_dims(
+            o_pt_dists, 2)
+
+        # [*, N_res, H * P_v, 3]
+        o_pt = o_pt.reshape(*o_pt.shape[:-3], -1, 3)
+
+        if(_offload_inference):
+            z[0] = z[0].to(o_pt.device)
+
+        # [*, N_res, H, C_z // 4]
+        pair_z = self.down_z(z[0]).to(dtype=a.dtype)
+        o_pair = torch.matmul(a.transpose(-2, -3), pair_z)
+
+        # [*, N_res, H * C_z // 4]
+        o_pair = flatten_final_dims(o_pair, 2)
+
+        o_feats = [o, *torch.unbind(o_pt, dim=-1), o_pt_norm_feats, o_pair]
+
+        # [*, N_res, C_s]
+        s = self.linear_out(
+            torch.cat(
+                o_feats, dim=-1
+            ).to(dtype=z[0].dtype)
+        )
+
+        return s
+
+class KnnEdgeTransition(nn.Module):
+    def __init__(
+            self,
+            *,
+            node_embed_size,
+            edge_embed_in,
+            edge_embed_out,
+            num_layers=2,
+            node_dilation=2
+        ):
+        super().__init__()
+
+        bias_embed_size = node_embed_size // node_dilation
+        self.initial_embed = Linear(
+            node_embed_size, bias_embed_size, init="relu")
+        hidden_size = bias_embed_size * 2 + edge_embed_in
+        trunk_layers = []
+        for _ in range(num_layers):
+            trunk_layers.append(Linear(hidden_size, hidden_size, init="relu"))
+            trunk_layers.append(nn.ReLU())
+        self.trunk = nn.Sequential(*trunk_layers)
+        self.final_layer = Linear(hidden_size, edge_embed_out, init="final")
+        self.layer_norm = nn.LayerNorm(edge_embed_out)
+
+    def forward(self, node_embed, edge_embed, edge_index):
+        node_embed = self.initial_embed(node_embed)
+        batch_size, num_res, _ = node_embed.shape
+
+        node_dst = torch.gather(
+            node_embed[..., None, :].expand(-1, -1, edge_index.shape[-1], -1),
+            1,
+            edge_index[..., None].expand(-1, -1, -1, node_embed.shape[-1])
+        )
+        node_src = node_embed[..., None, :].expand(-1, -1, edge_index.shape[-1], -1)
+
+        edge_bias = torch.cat([
+            node_dst,
+            node_src
+        ], dim=-1)
+
+        edge_embed = torch.cat([edge_embed, edge_bias], dim=-1)
+        edge_embed = self.final_layer(self.trunk(edge_embed) + edge_embed)
+        edge_embed = self.layer_norm(edge_embed)
+        return edge_embed
+
+
+class KnnIpaScore(nn.Module):
+    def __init__(self,
+                 diffuser,
+                 c_s=256,
+                 c_z=128,
+                 c_hidden=256,
+                 c_skip=64,
+                 num_heads=8,
+                 num_qk_pts=8,
+                 num_v_pts=12,
+                 num_blocks=4,
+                 coordinate_scaling=0.1,
+                 knn_k=30, local_k=10):
+        super().__init__()
+        self.diffuser = diffuser
+        self.num_blocks = num_blocks
+
+        self.scale_pos = lambda x: x * coordinate_scaling
+        self.scale_rigids = lambda x: x.apply_trans_fn(self.scale_pos)
+
+        self.unscale_pos = lambda x: x / coordinate_scaling
+        self.unscale_rigids = lambda x: x.apply_trans_fn(self.unscale_pos)
+        self.trunk = nn.ModuleDict()
+
+        for b in range(self.num_blocks):
+            self.trunk[f'spatial_ipa_{b}'] = KnnInvariantPointAttention(
+                c_s,
+                c_z,
+                c_hidden,
+                num_heads,
+                num_qk_pts,
+                num_v_pts,
+            )
+            self.trunk[f'spatial_ipa_ln_{b}'] = nn.LayerNorm(c_s)
+            self.trunk[f'spatial_skip_embed_{b}'] = Linear(
+                c_s,
+                c_skip,
+                init="final"
+            )
+            tfmr_in = c_s + c_skip
+            self.trunk[f'post_spatial_{b}'] = Linear(
+                tfmr_in, c_s, init="final")
+            self.trunk[f'seq_ipa_{b}'] = KnnInvariantPointAttention(
+                c_s,
+                c_z,
+                c_hidden,
+                num_heads,
+                num_qk_pts,
+                num_v_pts,
+            )
+            self.trunk[f'seq_ipa_ln_{b}'] = nn.LayerNorm(c_s)
+            self.trunk[f'seq_skip_embed_{b}'] = Linear(
+                c_s,
+                c_skip,
+                init="final"
+            )
+            self.trunk[f'post_seq_{b}'] = Linear(
+                tfmr_in, c_s, init="final")
+            self.trunk[f'node_transition_{b}'] = StructureModuleTransition(
+                c=c_s)
+            self.trunk[f'bb_update_{b}'] = BackboneUpdate(c_s)
+
+            if b < self.num_blocks-1:
+                # No edge update on the last block.
+                edge_in = c_z
+                self.trunk[f'spatial_edge_transition_{b}'] = KnnEdgeTransition(
+                    node_embed_size=c_s,
+                    edge_embed_in=edge_in,
+                    edge_embed_out=c_z,
+                )
+                self.trunk[f'seq_edge_transition_{b}'] = KnnEdgeTransition(
+                    node_embed_size=c_s,
+                    edge_embed_in=edge_in,
+                    edge_embed_out=c_z,
+                )
+
+        self.torsion_pred = TorsionAngles(c_s, 1)
+        self.local_k = local_k
+
+    def forward(self,
+                init_node_embed,
+                spatial_edge_embed,
+                seq_edge_embed,
+                spatial_edge_index,
+                seq_edge_index,
+                input_feats):
+        node_mask = input_feats['res_mask'].type(torch.float32)
+        diffuse_mask = (1 - input_feats['fixed_mask'].type(torch.float32)) * node_mask
+        init_frames = input_feats['rigids_t'].type(torch.float32)
+
+        curr_rigids = Rigid.from_tensor_7(torch.clone(init_frames))
+        init_rigids = Rigid.from_tensor_7(init_frames)
+
+        # Main trunk
+        curr_rigids = self.scale_rigids(curr_rigids)
+        init_node_embed = init_node_embed * node_mask[..., None]
+        node_embed = init_node_embed * node_mask[..., None]
+        for b in range(self.num_blocks):
+            spatial_ipa_embed = self.trunk[f'spatial_ipa_{b}'](
+                s=node_embed,
+                z=spatial_edge_embed,
+                edge_index=spatial_edge_index,
+                r=curr_rigids,
+                mask=node_mask)
+            spatial_ipa_embed *= node_mask[..., None]
+            node_embed = self.trunk[f'spatial_ipa_ln_{b}'](node_embed + spatial_ipa_embed)
+
+            seq_ipa_embed = self.trunk[f'seq_ipa_{b}'](
+                node_embed,
+                seq_edge_embed,
+                seq_edge_index,
+                curr_rigids,
+                node_mask)
+            seq_ipa_embed *= node_mask[..., None]
+            node_embed = self.trunk[f'seq_ipa_ln_{b}'](node_embed + seq_ipa_embed)
+
+            node_embed = self.trunk[f'node_transition_{b}'](node_embed)
+            node_embed = node_embed * node_mask[..., None]
+            rigid_update = self.trunk[f'bb_update_{b}'](
+                node_embed * diffuse_mask[..., None])
+            curr_rigids = curr_rigids.compose_q_update_vec(
+                rigid_update * diffuse_mask[..., None])
+
+            if b < self.num_blocks-1:
+                spatial_edge_embed = self.trunk[f'spatial_edge_transition_{b}'](
+                    node_embed, spatial_edge_embed, spatial_edge_index)
+                seq_edge_embed = self.trunk[f'seq_edge_transition_{b}'](
+                    node_embed, seq_edge_embed, seq_edge_index)
+        # rot_score = self.diffuser.calc_rot_score(
+        #     init_rigids.get_rots(),
+        #     curr_rigids.get_rots(),
+        #     input_feats['t']
+        # )
+        # rot_score = rot_score * node_mask[..., None]
+
+        curr_rigids = self.unscale_rigids(curr_rigids)
+        # trans_score = self.diffuser.calc_trans_score(
+        #     init_rigids.get_trans(),
+        #     curr_rigids.get_trans(),
+        #     input_feats['t'][:, None, None],
+        #     use_torch=True,
+        # )
+        # trans_score = trans_score * node_mask[..., None]
+        _, psi_pred = self.torsion_pred(node_embed)
+        model_out = {
+            'psi': psi_pred,
+            # 'rot_score': rot_score,
+            # 'trans_score': trans_score,
+            'final_rigids': curr_rigids,
+        }
+        return model_out
+
+
 class KnnIpaScoreWrapper(nn.Module):
     def __init__(self,
                  diffuser,
@@ -922,14 +1389,14 @@ class KnnIpaScoreWrapper(nn.Module):
 
     def forward(self, data):
         ## prep features
-        data_lens = get_data_lens(data, 'x')
-        ts = data['t']  # (B,)
-        ts = batchwise_to_nodewise(ts, data_lens)
+        t = data['t']  # (B,)
+        batch_size = t.shape[0]
         x_mask = data['x_mask']
         rigids_t = Rigid.from_tensor_7(data['rigids_t'])
         batch = data.batch
-        device = ts.device
-        num_nodes = ts.shape[0]
+        device = t.device
+        num_nodes = data.to_data_list()[0].num_nodes
+
 
         # center the training example at the mean of the x_cas
         center = batchwise_center(rigids_t, data.batch)
@@ -940,51 +1407,73 @@ class KnnIpaScoreWrapper(nn.Module):
         offset = 0
         for i in range(data.batch.max().item() + 1):
             select = (data.batch == i)
-            local_residx = torch.arange(select.sum().item(), device=device) + offset
             seq_local_edge_index.append(
-                sequence_local_graph(select.sum().item(), data['x_mask'][select]) + offset
+                self.sequence_local_graph(select.sum().item())
             )
             offset += select.sum().item()
-        seq_local_edge_index = torch.cat(seq_local_edge_index, dim=-1)
+        seq_local_edge_index = torch.stack(seq_local_edge_index, dim=0).to(device)
 
         # generate spatial edges
         X_ca = rigids_t.get_trans()
         masked_X_ca = X_ca.clone()
         masked_X_ca[x_mask] = torch.inf
-        edge_index = sample_inv_cubic_edges(masked_X_ca, x_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k)
+        edge_index = self.sample_inv_cubic_edges(masked_X_ca, x_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k)
 
         # compute edge features
-        edge_features = gen_spatial_graph_features(X_ca, edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=self.c_z//2)
-        seq_edge_features = gen_spatial_graph_features(X_ca, seq_local_edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=self.c_z//2)
+        residx = torch.arange(num_nodes, device=device)
+        X_ca = X_ca.view(batch_size, num_nodes, -1)
+        X_dst = torch.gather(
+            X_ca[..., None, :].expand(-1, -1, edge_index.shape[-1], -1),
+            1,
+            edge_index[..., None].expand(-1, -1, -1, X_ca.shape[-1])
+        )
+        edge_dist_vec = X_dst - X_ca.unsqueeze(-2)
+        edge_dist = torch.linalg.vector_norm(edge_dist_vec, dim=-1)
+        edge_dist_rbf = _rbf(edge_dist, device=edge_dist.device, D_count=self.c_z//2)  # edge_channels_list
+        edge_dist_rel_pos = _node_positional_embeddings(edge_index - residx[None, :, None], num_embeddings=self.c_z//2, device=edge_dist.device)  # edge_channels_list
+        edge_features = torch.cat([edge_dist_rbf, edge_dist_rel_pos], dim=-1)
+
+        X_dst = torch.gather(
+            X_ca[..., None, :].expand(-1, -1, seq_local_edge_index.shape[-1], -1),
+            1,
+            seq_local_edge_index[..., None].expand(-1, -1, -1, X_ca.shape[-1])
+        )
+        seq_edge_dist_vec = X_dst - X_ca.unsqueeze(-2)
+        seq_edge_dist = torch.linalg.vector_norm(seq_edge_dist_vec, dim=-1)
+        seq_edge_dist_rbf = _rbf(seq_edge_dist, device=seq_edge_dist.device, D_count=self.c_z//2)  # edge_channels_list
+        seq_edge_dist_rel_pos = _node_positional_embeddings(seq_local_edge_index - residx[None, :, None], num_embeddings=self.c_z//2, device=edge_dist.device)  # edge_channels_list
+        seq_edge_features = torch.cat([seq_edge_dist_rbf, seq_edge_dist_rel_pos], dim=-1)
 
         ## create time embedding
-        fourier_time = self.time_rbf(ts.unsqueeze(-1))  # (N_node x h_time,)
+        fourier_time = self.time_rbf(t.unsqueeze(-1))  # (N_node x h_time,)
         embedded_time = self.time_mlp(fourier_time)  # (N_node x h_time)
 
+        ## denoising
+        fixed_mask = data['fixed_mask'].view(batch_size, -1)
+        node_mask = ~data['x_mask'].view(batch_size, -1)
+        rigids_t = rigids_t.view([batch_size, -1])
+
         # generate node features
-        residx = torch.arange(num_nodes, device=device)
         res_pos = _node_positional_embeddings(
             residx,
             num_embeddings=self.c_s, device=device)
-        # print(res_pos.shape, embedded_time.shape, data['noising_mask'].shape)
         node_features = self.embed_node(
             torch.cat([
-                res_pos,
-                embedded_time,
-                data['noising_mask'].float()[..., None]
+                res_pos[None].expand(batch_size, -1, -1),
+                embedded_time[:, None].expand(-1, num_nodes, -1),
+                data['noising_mask'].float().view(batch_size, -1)[..., None]
             ], dim=-1)
         )
 
-        ## denoising
-        fixed_mask = data['fixed_mask']
-        node_mask = ~data['x_mask']
 
         input_feats = {
             'fixed_mask': fixed_mask,
             'res_mask': node_mask,
             'rigids_t': rigids_t.to_tensor_7(),
-            't': ts
+            't': t
         }
+
+        # print(node_features.shape, edge_features.shape, seq_edge_features.shape, edge_index.shape, seq_local_edge_index.shape, rigids_t.shape)
 
         score_dict = self.ipa_score(
             node_features,
@@ -993,12 +1482,96 @@ class KnnIpaScoreWrapper(nn.Module):
             edge_index,
             seq_local_edge_index,
             input_feats)
-        rigids = score_dict['final_rigids'].scale_translation(10)
+        rigids = score_dict['final_rigids'].view(-1)
         rigids = rigids.translate(center)
+
+        psi = score_dict['psi'].view(-1, 2)
 
         ret = {}
         ret['denoised_frames'] = rigids
         ret['final_rigids'] = rigids
-        ret['denoised_bb'] = backbone_frames_to_bb_atoms(rigids)
+        denoised_bb_items = compute_backbone(rigids.unsqueeze(0), psi.unsqueeze(0))
+        denoised_bb = denoised_bb_items[-1].squeeze(0)[:, :5]
+        ret['denoised_bb'] = denoised_bb
+        # intermediates['rot_score'] = score_dict['rot_score']
+        # intermediates['trans_score'] = score_dict['trans_score']
+        ret['psi'] = psi
 
         return ret
+
+    def sequence_local_graph(self, num_nodes, half_local_size=5):
+        local_index = torch.cat([
+            -(torch.arange(half_local_size) + 1),
+            (torch.arange(half_local_size) + 1)
+        ], dim=-1)
+        offset = torch.arange(num_nodes)[..., None]
+        global_edge_index = local_index[None].expand(num_nodes, -1) + offset
+
+        head = torch.empty(half_local_size, half_local_size*2)
+        for i in range(half_local_size):
+            chunk = torch.cat([
+                torch.arange(0, i),
+                torch.arange(i+1, half_local_size*2+1)
+            ], dim=-1)
+            head[i] = chunk
+
+        tail = torch.empty(half_local_size, half_local_size*2)
+        for i in range(half_local_size):
+            i = i+1
+            start = num_nodes - half_local_size * 2
+            current = num_nodes - i
+            chunk = torch.cat([
+                torch.arange(start-1, current),
+                torch.arange(current+1, num_nodes)
+            ], dim=-1)
+            tail[-i] = chunk
+
+        global_edge_index[:half_local_size] = head
+        global_edge_index[-half_local_size:] = tail
+        return global_edge_index
+
+
+    def sample_inv_cubic_edges(self, batched_X_ca, batched_x_mask, batch, knn_k=30, inv_cube_k=10):
+        edge_indicies = []
+        offset = 0
+        for i in range(batch.max().item() + 1):
+            X_ca = batched_X_ca[batch == i]
+            x_mask = batched_x_mask[batch == i]
+
+            X_ca[x_mask] = torch.inf
+            rel_pos_CA = X_ca.unsqueeze(1) - X_ca.unsqueeze(0)  # N x N x 3
+            dist_CA = torch.linalg.vector_norm(rel_pos_CA, dim=-1)  # N x N
+            sorted_dist, sorted_edges = torch.sort(dist_CA, dim=-1)  # N x N
+            knn_edges = sorted_edges[..., 1:knn_k+1]  # first edge will always be self
+
+            # remove knn edges
+            remaining_dist = sorted_dist[..., knn_k+1:]  # N x (N - knn_k - 1)
+            remaining_edges = sorted_edges[..., knn_k+1:]  # N x (N - knn_k - 1)
+
+            ## inv cube
+            uniform = torch.distributions.Uniform(0,1)
+            dist_noise = uniform.sample(remaining_dist.shape).to(batched_X_ca.device)  # N x (N - knn_k - 1)
+
+            logprobs = -3 * torch.log(remaining_dist)  # N x (N - knn_k)
+            perturbed_logprobs = logprobs - torch.log(-torch.log(dist_noise))  # N x (N - knn_k - 1)
+
+            good_edges = torch.isfinite(perturbed_logprobs)
+            perturbed_logprobs[~good_edges] = -torch.inf
+
+            # if we don't have inv_cube_k nodes to sample, sample the max we can
+            num_bad_edges = (~good_edges).sum(dim=-1)
+            max_num_bad_edges = int(num_bad_edges.max())
+            if inv_cube_k > perturbed_logprobs.shape[-1] - max_num_bad_edges:
+                inv_cube_k = perturbed_logprobs.shape[-1] - max_num_bad_edges
+
+            _, sampled_edges_relative_idx = torch.topk(perturbed_logprobs, k=inv_cube_k, dim=-1)
+            sampled_edges = torch.gather(remaining_edges, -1, sampled_edges_relative_idx)  # N x inv_cube_k
+
+            edge_sinks = torch.cat([knn_edges, sampled_edges], dim=-1)  # B x N x (knn_k + inv_cube_k)
+            edge_indicies.append(edge_sinks)
+            offset = offset + (batch == i).long().sum()
+
+        edge_index = torch.stack(edge_indicies, dim=0)
+        edge_mask = batched_x_mask[edge_index].any(dim=-1)
+        # edge_mask[:, batched_x_mask] = True
+        return edge_index#, edge_mask

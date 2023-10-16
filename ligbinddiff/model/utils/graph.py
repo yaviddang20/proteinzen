@@ -6,7 +6,7 @@ from ligbinddiff.data.datasets.featurize.common import _rbf
 from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddings
 
 
-def sample_inv_cubic_edges(batched_X_ca, batched_x_mask, batch, knn_k=30, inv_cube_k=10):
+def sample_inv_cubic_edges(batched_X_ca, batched_x_mask, batch, knn_k=30, inv_cube_k=10, self_edge=False):
     edge_indicies = []
     offset = 0
     for i in range(batch.max().item() + 1):
@@ -17,11 +17,14 @@ def sample_inv_cubic_edges(batched_X_ca, batched_x_mask, batch, knn_k=30, inv_cu
         rel_pos_CA = X_ca.unsqueeze(1) - X_ca.unsqueeze(0)  # N x N x 3
         dist_CA = torch.linalg.vector_norm(rel_pos_CA, dim=-1)  # N x N
         sorted_dist, sorted_edges = torch.sort(dist_CA, dim=-1)  # N x N
-        knn_edges = sorted_edges[..., 1:knn_k+1]  # first edge will always be self
+        # knn_edges = sorted_edges[..., 1:knn_k+1]  # first edge will always be self
+        knn_edges = sorted_edges[..., 0:knn_k]  # first edge will always be self
 
         # remove knn edges
-        remaining_dist = sorted_dist[..., knn_k+1:]  # N x (N - knn_k - 1)
-        remaining_edges = sorted_edges[..., knn_k+1:]  # N x (N - knn_k - 1)
+        # remaining_dist = sorted_dist[..., knn_k+1:]  # N x (N - knn_k - 1)
+        # remaining_edges = sorted_edges[..., knn_k+1:]  # N x (N - knn_k - 1)
+        remaining_dist = sorted_dist[..., knn_k:]  # N x (N - knn_k - 1)
+        remaining_edges = sorted_edges[..., knn_k:]  # N x (N - knn_k - 1)
 
         ## inv cube
         uniform = torch.distributions.Uniform(0,1)

@@ -229,7 +229,10 @@ class PointSetAttentionWithEdgeBias(nn.Module):
         self.head_weights = nn.Parameter(torch.zeros((no_heads)))
         ipa_point_weights_init_(self.head_weights)
 
-        self.linear_out_s_s = Linear(self.no_heads * self.c_hidden, self.c_s, init="final")
+        self.linear_out_s_s = Linear(
+            self.no_heads * self.c_hidden + self.no_heads * (self.c_z // 4),
+            self.c_s,
+            init="final")
         self.linear_out_s_v = Linear(self.no_heads * self.no_v_points, self.c_v, init="final", bias=False)
 
         self.softplus = nn.Softplus()
@@ -282,6 +285,7 @@ class PointSetAttentionWithEdgeBias(nn.Module):
         # [N_res, H, C_hidden]
         k, v = torch.split(kv, self.c_hidden, dim=-1)
 
+        t = r.get_trans()
         if self.gen_vectors:
             # [N_res, H * P_q * 3]
             q_pts = self.linear_q_points(s_s)
@@ -313,13 +317,13 @@ class PointSetAttentionWithEdgeBias(nn.Module):
                 kv_pts, [self.no_qk_points, self.no_v_points], dim=-2
             )
 
-            t_q = q_pts
-            t_k = k_pts
+            # [N_res, H, P_q/P_v, 3]
+            t_q = q_pts + t[..., None, None, :]/self.D_points
+            t_k = k_pts + t[..., None, None, :]/self.D_points
             t_v = v_pts
 
         else:
             assert s_v is not None
-            t = r.get_trans()
             # [N_res, 3, H * P_q]
             t_q = self.linear_t_q(s_v.transpose(-1, -2)) + t[..., None]/self.D_points
             # [N_res, H, P_q, 3]
@@ -332,6 +336,7 @@ class PointSetAttentionWithEdgeBias(nn.Module):
 
             # [N_res, H, P_q or P_v, 3]
             t_k, t_v = t_kv.split([self.no_qk_points, self.no_v_points], dim=-2)
+            t_k = t_k + t[..., None, None, :]/self.D_points
 
 
         ##########################
@@ -380,8 +385,8 @@ class PointSetAttentionWithEdgeBias(nn.Module):
         # [N_res, H, C_hidden]
         o = pygu.scatter(
             a[..., None] *  # [N_edge, H]
-            v[edge_index[1]],  # [N_edge, H, C_hidden]
-            edge_index[0],
+            v[edge_index[0]],  # [N_edge, H, C_hidden]
+            edge_index[1],
             dim=0,
             dim_size=n_nodes
         )
@@ -392,16 +397,31 @@ class PointSetAttentionWithEdgeBias(nn.Module):
         # [N_res, H, P_v, 3]
         o_pt = pygu.scatter(
             a[..., None, None]  # [N_edge, H, 1, 1]
-            * t_v[edge_index[1]],  # [N_edge, H, P_v, 3]
-            edge_index[0],
+            * t_v[edge_index[0]],  # [N_edge, H, P_v, 3]
+            edge_index[1],
             dim=0,
             dim_size=n_nodes
         )
         # [N_res, H * P_v, 3]
         o_pt = o_pt.flatten(start_dim=-3, end_dim=-2)
 
+        # [N_res, H, C_z // 4]
+        pair_z = self.down_z(z)
+        o_pair = pygu.scatter(
+            a[..., None] *  # [N_edge, H, 1]
+            pair_z[..., None, :],  # [N_edge, 1, C_z // 4]
+            edge_index[1],
+            dim=0,
+            dim_size=n_nodes
+        )
+        # [N_res, H * C_z // 4]
+        o_pair = o_pair.flatten(-2, -1)
+
+        # [N_res, H * C_hidden + H * C_z // 4]
+        o_feats = torch.cat([o, o_pair], dim=-1)
+
         # [N_res, C_s]
-        out_s_s = self.linear_out_s_s(o)
+        out_s_s = self.linear_out_s_s(o_feats)
         # [N_res, C_v, 3]
         out_s_v = self.linear_out_s_v(o_pt.transpose(-1, -2)).transpose(-1, -2)
 
@@ -841,12 +861,12 @@ class GraphInvariantPointAttention(nn.Module):
         ################
         # Compute output
         ################
-        v_dst = v[edge_index[1]]
+        v_dst = v[edge_index[0]]
         # [N_res, H, C_hidden]
         o = pygu.scatter(
             a[..., None] *  # [N_edge, H]
             v_dst,  # [N_edge, H, C_hidden]
-            edge_index[0],
+            edge_index[1],
             dim=0,
             dim_size=n_nodes
         )
@@ -854,11 +874,11 @@ class GraphInvariantPointAttention(nn.Module):
         o = flatten_final_dims(o, 2)
 
         # [N_res, H, P_v, 3]
-        v_pts_dst = v_pts[edge_index[1]]
+        v_pts_dst = v_pts[edge_index[0]]
         o_pt = pygu.scatter(
             a[..., None, None]  # [N_edge, H, 1, 1]
             * v_pts_dst,  # [N_edge, H, P_v, 3]
-            edge_index[0],
+            edge_index[1],
             dim=0,
             dim_size=n_nodes
         )
@@ -880,7 +900,7 @@ class GraphInvariantPointAttention(nn.Module):
         o_pair = pygu.scatter(
             a[..., None]  # [N_edge, H, 1]
             * pair_z[..., None, :],  # [N_edge, 1, C_z // 4]
-            edge_index[0],
+            edge_index[1],
             dim=0,
             dim_size=n_nodes
         )
@@ -923,154 +943,37 @@ class StructureModuleTransition(nn.Module):
 
         return s
 
-class KnnIpaScore(nn.Module):
-    def __init__(self,
-                 diffuser,
-                 c_s=256,
-                 c_z=128,
-                 c_hidden=256,
-                 c_skip=64,
-                 num_heads=8,
-                 num_qk_pts=8,
-                 num_v_pts=12,
-                 num_blocks=4,
-                 coordinate_scaling=0.1,
-                 knn_k=30, local_k=10):
-        super().__init__()
-        self.diffuser = diffuser
-        self.num_blocks = num_blocks
+class TorsionAngles(nn.Module):
+    def __init__(self, c, num_torsions, eps=1e-8):
+        super(TorsionAngles, self).__init__()
 
-        self.scale_pos = lambda x: x * coordinate_scaling
-        self.scale_rigids = lambda x: x.apply_trans_fn(self.scale_pos)
+        self.c = c
+        self.eps = eps
+        self.num_torsions = num_torsions
 
-        self.unscale_pos = lambda x: x / coordinate_scaling
-        self.unscale_rigids = lambda x: x.apply_trans_fn(self.unscale_pos)
-        self.trunk = nn.ModuleDict()
+        self.linear_1 = Linear(self.c, self.c, init="relu")
+        self.linear_2 = Linear(self.c, self.c, init="relu")
+        # TODO: Remove after published checkpoint is updated without these weights.
+        self.linear_3 = Linear(self.c, self.c, init="final")
+        self.linear_final = Linear(
+            self.c, self.num_torsions * 2, init="final")
 
-        for b in range(self.num_blocks):
-            self.trunk[f'spatial_ipa_{b}'] = GraphInvariantPointAttention(
-                c_s,
-                c_z,
-                c_hidden,
-                num_heads,
-                num_qk_pts,
-                num_v_pts,
+        self.relu = nn.ReLU()
+
+    def forward(self, s):
+        s_initial = s
+        s = self.linear_1(s)
+        s = self.relu(s)
+        s = self.linear_2(s)
+
+        s = s + s_initial
+        unnormalized_s = self.linear_final(s)
+        norm_denom = torch.sqrt(
+            torch.clamp(
+                torch.sum(unnormalized_s ** 2, dim=-1, keepdim=True),
+                min=self.eps,
             )
-            self.trunk[f'spatial_ipa_ln_{b}'] = nn.LayerNorm(c_s)
-            self.trunk[f'spatial_skip_embed_{b}'] = Linear(
-                c_s,
-                c_skip,
-                init="final"
-            )
-            tfmr_in = c_s + c_skip
-            self.trunk[f'post_spatial_{b}'] = Linear(
-                tfmr_in, c_s, init="final")
-            self.trunk[f'seq_ipa_{b}'] = GraphInvariantPointAttention(
-                c_s,
-                c_z,
-                c_hidden,
-                num_heads,
-                num_qk_pts,
-                num_v_pts,
-            )
-            self.trunk[f'seq_ipa_ln_{b}'] = nn.LayerNorm(c_s)
-            self.trunk[f'seq_skip_embed_{b}'] = Linear(
-                c_s,
-                c_skip,
-                init="final"
-            )
-            self.trunk[f'post_seq_{b}'] = Linear(
-                tfmr_in, c_s, init="final")
-            self.trunk[f'node_transition_{b}'] = StructureModuleTransition(
-                c=c_s)
-            self.trunk[f'bb_update_{b}'] = BackboneUpdate(c_s)
+        )
+        normalized_s = unnormalized_s / norm_denom
 
-            if b < self.num_blocks-1:
-                # No edge update on the last block.
-                edge_in = c_z
-                self.trunk[f'spatial_edge_transition_{b}'] = EdgeTransition(
-                    node_embed_size=c_s,
-                    edge_embed_in=edge_in,
-                    edge_embed_out=c_z,
-                )
-                self.trunk[f'seq_edge_transition_{b}'] = EdgeTransition(
-                    node_embed_size=c_s,
-                    edge_embed_in=edge_in,
-                    edge_embed_out=c_z,
-                )
-
-        # self.torsion_pred = TorsionAngles(ipa_conf.c_s, 1)
-        self.local_k = local_k
-
-    def forward(self,
-                init_node_embed,
-                spatial_edge_embed,
-                seq_edge_embed,
-                spatial_edge_index,
-                seq_edge_index,
-                input_feats):
-        node_mask = input_feats['res_mask'].type(torch.float32)
-        diffuse_mask = (1 - input_feats['fixed_mask'].type(torch.float32)) * node_mask
-        init_frames = input_feats['rigids_t'].type(torch.float32)
-
-        curr_rigids = Rigid.from_tensor_7(torch.clone(init_frames))
-        init_rigids = Rigid.from_tensor_7(init_frames)
-
-        # Main trunk
-        curr_rigids = self.scale_rigids(curr_rigids)
-        init_node_embed = init_node_embed * node_mask[..., None]
-        node_embed = init_node_embed * node_mask[..., None]
-        for b in range(self.num_blocks):
-            spatial_ipa_embed = self.trunk[f'spatial_ipa_{b}'](
-                s=node_embed,
-                z=spatial_edge_embed,
-                edge_index=spatial_edge_index,
-                r=curr_rigids,
-                mask=node_mask)
-            spatial_ipa_embed *= node_mask[..., None]
-            node_embed = self.trunk[f'spatial_ipa_ln_{b}'](node_embed + spatial_ipa_embed)
-
-            seq_ipa_embed = self.trunk[f'seq_ipa_{b}'](
-                node_embed,
-                seq_edge_embed,
-                seq_edge_index,
-                curr_rigids,
-                node_mask)
-            seq_ipa_embed *= node_mask[..., None]
-            node_embed = self.trunk[f'seq_ipa_ln_{b}'](node_embed + seq_ipa_embed)
-
-            node_embed = self.trunk[f'node_transition_{b}'](node_embed)
-            node_embed = node_embed * node_mask[..., None]
-            rigid_update = self.trunk[f'bb_update_{b}'](
-                node_embed * diffuse_mask[..., None])
-            curr_rigids = curr_rigids.compose_q_update_vec(
-                rigid_update * diffuse_mask[..., None])
-
-            if b < self.num_blocks-1:
-                spatial_edge_embed = self.trunk[f'spatial_edge_transition_{b}'](
-                    node_embed, spatial_edge_embed, spatial_edge_index)
-                seq_edge_embed = self.trunk[f'seq_edge_transition_{b}'](
-                    node_embed, seq_edge_embed, seq_edge_index)
-        # rot_score = self.diffuser.calc_rot_score(
-        #     init_rigids.get_rots(),
-        #     curr_rigids.get_rots(),
-        #     input_feats['t']
-        # )
-        # rot_score = rot_score * node_mask[..., None]
-
-        curr_rigids = self.unscale_rigids(curr_rigids)
-        # trans_score = self.diffuser.calc_trans_score(
-        #     init_rigids.get_trans(),
-        #     curr_rigids.get_trans(),
-        #     input_feats['t'][:, None, None],
-        #     use_torch=True,
-        # )
-        # trans_score = trans_score * node_mask[..., None]
-        # _, psi_pred = self.torsion_pred(node_embed)
-        model_out = {
-            # 'psi': psi_pred,
-            # 'rot_score': rot_score,
-            # 'trans_score': trans_score,
-            'final_rigids': curr_rigids,
-        }
-        return model_out
+        return unnormalized_s, normalized_s
