@@ -113,6 +113,9 @@ ENV/
 data/cath/mmtf
 data/cath/*.json
 data/cath/*.jsonl
+data/framediff/mmtf
+data/framediff/*.json
+data/framediff/*.jsonl
 scripts/submit_scripts/autogen_scripts
 outputs/
 _debug/
