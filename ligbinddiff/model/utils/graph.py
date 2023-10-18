@@ -17,14 +17,14 @@ def sample_inv_cubic_edges(batched_X_ca, batched_x_mask, batch, knn_k=30, inv_cu
         rel_pos_CA = X_ca.unsqueeze(1) - X_ca.unsqueeze(0)  # N x N x 3
         dist_CA = torch.linalg.vector_norm(rel_pos_CA, dim=-1)  # N x N
         sorted_dist, sorted_edges = torch.sort(dist_CA, dim=-1)  # N x N
-        # knn_edges = sorted_edges[..., 1:knn_k+1]  # first edge will always be self
-        knn_edges = sorted_edges[..., 0:knn_k]  # first edge will always be self
+        knn_edges = sorted_edges[..., 1:knn_k+1]  # first edge will always be self
+        # knn_edges = sorted_edges[..., 0:knn_k]  # first edge will always be self
 
         # remove knn edges
-        # remaining_dist = sorted_dist[..., knn_k+1:]  # N x (N - knn_k - 1)
-        # remaining_edges = sorted_edges[..., knn_k+1:]  # N x (N - knn_k - 1)
-        remaining_dist = sorted_dist[..., knn_k:]  # N x (N - knn_k - 1)
-        remaining_edges = sorted_edges[..., knn_k:]  # N x (N - knn_k - 1)
+        remaining_dist = sorted_dist[..., knn_k+1:]  # N x (N - knn_k - 1)
+        remaining_edges = sorted_edges[..., knn_k+1:]  # N x (N - knn_k - 1)
+        # remaining_dist = sorted_dist[..., knn_k:]  # N x (N - knn_k - 1)
+        # remaining_edges = sorted_edges[..., knn_k:]  # N x (N - knn_k - 1)
 
         ## inv cube
         uniform = torch.distributions.Uniform(0,1)
@@ -49,7 +49,8 @@ def sample_inv_cubic_edges(batched_X_ca, batched_x_mask, batch, knn_k=30, inv_cu
         edge_sources = torch.arange(X_ca.shape[0]).repeat_interleave(knn_k + inv_cube_k).to(edge_sinks.device)
         edge_index = torch.stack([edge_sinks.flatten(), edge_sources], dim=0)
         # sorting not strictly necessarily but it help if we ever hack things to dense knn graphs
-        edge_indicies.append(sort_edge_index(edge_index, sort_by_row=False) + offset)
+        # edge_indicies.append(sort_edge_index(edge_index, sort_by_row=False) + offset)
+        edge_indicies.append(edge_index + offset)
         offset = offset + (batch == i).long().sum()
 
     edge_index = torch.cat(edge_indicies, dim=-1)
@@ -103,7 +104,7 @@ def sparse_to_dense_graph(node_features, edge_features, edge_index, batch_size, 
     return dense_node_features, dense_edge_features, dense_edge_index
 
 
-def sequence_local_graph(num_nodes, x_mask, half_local_size=10):
+def sequence_local_graph(num_nodes, x_mask, half_local_size=5):
     device = x_mask.device
     local_index = torch.cat([
         -(torch.arange(half_local_size) + 1),
@@ -140,8 +141,7 @@ def sequence_local_graph(num_nodes, x_mask, half_local_size=10):
     )
     edge_index = edge_index.reshape(2, -1)
 
-    masked_nodes = offset[x_mask].view(1, 1, -1)
-    edge_mask = (edge_index[..., None] == masked_nodes).any(dim=-1).any(dim=0)
+    edge_mask = x_mask[edge_index[0]] | x_mask[edge_index[1]]
 
     edge_index = edge_index[:, ~edge_mask]
     # edge_index = edge_index[:, edge_index[0] != edge_index[1]]

@@ -1218,14 +1218,14 @@ class KnnIpaScore(nn.Module):
                 num_v_pts,
             )
             self.trunk[f'spatial_ipa_ln_{b}'] = nn.LayerNorm(c_s)
-            self.trunk[f'spatial_skip_embed_{b}'] = Linear(
-                c_s,
-                c_skip,
-                init="final"
-            )
-            tfmr_in = c_s + c_skip
-            self.trunk[f'post_spatial_{b}'] = Linear(
-                tfmr_in, c_s, init="final")
+            # self.trunk[f'spatial_skip_embed_{b}'] = Linear(
+            #     c_s,
+            #     c_skip,
+            #     init="final"
+            # )
+            # tfmr_in = c_s + c_skip
+            # self.trunk[f'post_spatial_{b}'] = Linear(
+            #     tfmr_in, c_s, init="final")
             self.trunk[f'seq_ipa_{b}'] = KnnInvariantPointAttention(
                 c_s,
                 c_z,
@@ -1235,13 +1235,13 @@ class KnnIpaScore(nn.Module):
                 num_v_pts,
             )
             self.trunk[f'seq_ipa_ln_{b}'] = nn.LayerNorm(c_s)
-            self.trunk[f'seq_skip_embed_{b}'] = Linear(
-                c_s,
-                c_skip,
-                init="final"
-            )
-            self.trunk[f'post_seq_{b}'] = Linear(
-                tfmr_in, c_s, init="final")
+            # self.trunk[f'seq_skip_embed_{b}'] = Linear(
+            #     c_s,
+            #     c_skip,
+            #     init="final"
+            # )
+            # self.trunk[f'post_seq_{b}'] = Linear(
+            #     tfmr_in, c_s, init="final")
             self.trunk[f'node_transition_{b}'] = StructureModuleTransition(
                 c=c_s)
             self.trunk[f'bb_update_{b}'] = BackboneUpdate(c_s)

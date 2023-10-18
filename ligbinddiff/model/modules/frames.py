@@ -854,8 +854,11 @@ class GraphInvariantPointAttention(nn.Module):
         # [N_edge, H]
         pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
 
+        edge_mask = mask[edge_index[0]] * mask[edge_index[1]]
+        edge_mask = self.inf * (edge_mask - 1)
         # [N_edge, H]
         a = a + pt_att
+        a = a + edge_mask[..., None]
         a = pygu.softmax(a, edge_index[1], num_nodes=n_nodes)
 
         ################

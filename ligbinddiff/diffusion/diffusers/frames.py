@@ -389,7 +389,6 @@ class GraphFrameDiff(nn.Module):
         bb_x_t = ru.Rigid.from_tensor_7(data[self.bb_x_t_key])
         t = data['t']
         data_lens = get_data_lens(data, 'x')
-        t = batchwise_to_nodewise(t, data_lens)
         bb_x_0_pred = denoiser_output[self.bb_x_0_pred_key]
         rots_x_t = bb_x_t.get_rots()
         rots_x_0_pred = bb_x_0_pred.get_rots()
@@ -401,12 +400,13 @@ class GraphFrameDiff(nn.Module):
         )
         rot_score = rot_score.squeeze(0)
 
+        t_per_node = batchwise_to_nodewise(t, data_lens)
         trans_x_t = bb_x_t.get_trans()
         trans_x_0_pred = bb_x_0_pred.get_trans()
         trans_score = self.se3_noiser.calc_trans_score(
             trans_x_t,
             trans_x_0_pred,
-            t[:, None],
+            t_per_node[:, None],
             use_torch=True
         )
 
@@ -555,7 +555,6 @@ class PSAEBFrameDiff(nn.Module):
         bb_x_t = ru.Rigid.from_tensor_7(data[self.bb_x_t_key])
         t = data['t']
         data_lens = get_data_lens(data, 'x')
-        t = batchwise_to_nodewise(t, data_lens)
         bb_x_0_pred = denoiser_output[self.bb_x_0_pred_key]
         rots_x_t = bb_x_t.get_rots()
         rots_x_0_pred = bb_x_0_pred.get_rots()
@@ -567,12 +566,13 @@ class PSAEBFrameDiff(nn.Module):
         )
         rot_score = rot_score.squeeze(0)
 
+        t_per_node = batchwise_to_nodewise(t, data_lens)
         trans_x_t = bb_x_t.get_trans()
         trans_x_0_pred = bb_x_0_pred.get_trans()
         trans_score = self.se3_noiser.calc_trans_score(
             trans_x_t,
             trans_x_0_pred,
-            t[:, None],
+            t_per_node[:, None],
             use_torch=True
         )
 

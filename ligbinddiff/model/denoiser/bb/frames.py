@@ -82,26 +82,29 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
         noising_mask = intermediates['noising_mask']
         x_mask = data['x_mask']
 
-        node_s_update = self.attn_seq(
-            s=node_features,
-            z=seq_edge_features,
-            edge_index=seq_edge_index,
-            r=rigids,
-            mask=~x_mask
-        )
-        node_features = self.ln_s1(node_features + node_s_update * (~x_mask)[..., None])
-
         node_s_update = self.attn_spatial(
             s=node_features,
             z=edge_features,
             edge_index=edge_index,
             r=rigids,
-            mask=~x_mask
+            mask=(~x_mask).float()
         )
-        node_features = self.ln_s2(node_features + node_s_update * (~x_mask)[..., None])
+        node_s_update = node_s_update * (~x_mask)[..., None]
+        node_features = self.ln_s1(node_features + node_s_update)
+
+        node_s_update = self.attn_seq(
+            s=node_features,
+            z=seq_edge_features,
+            edge_index=seq_edge_index,
+            r=rigids,
+            mask=(~x_mask).float()
+        )
+        node_s_update = node_s_update * (~x_mask)[..., None]
+        node_features = self.ln_s2(node_features + node_s_update)
+
 
         node_features = self.node_transition(node_features)
-        node_features = node_features  * (~x_mask)[..., None]
+        node_features = node_features * (~x_mask)[..., None]
         rigids_update = self.bb_update(
             node_features * noising_mask[..., None])
 
@@ -175,14 +178,16 @@ class GraphIpaFrameDenoiser(nn.Module):
         # center the training example at the mean of the x_cas
         center = ru.batchwise_center(rigids_t, data.batch)
         rigids_t = rigids_t.translate(-center)
-        rigids_t = rigids_t.scale_translation(0.1)
 
         # generate sequence edges
         seq_local_edge_index = []
+        residx = []
         offset = 0
         for i in range(data.batch.max().item() + 1):
             select = (data.batch == i)
             subset_num_nodes = select.sum().item()
+            local_residx = torch.arange(subset_num_nodes, device=device)
+            residx.append(local_residx)
             seq_local_edge_index.append(
                 sequence_local_graph(subset_num_nodes, data['x_mask'][select]) + offset
             )
@@ -204,7 +209,7 @@ class GraphIpaFrameDenoiser(nn.Module):
         embedded_time = self.time_mlp(fourier_time)  # (N_node x h_time)
 
         # generate node features
-        residx = torch.arange(num_nodes, device=device)
+        residx = torch.cat(residx, dim=-1)
         res_pos = _node_positional_embeddings(
             residx,
             num_embeddings=self.c_s,
@@ -216,8 +221,10 @@ class GraphIpaFrameDenoiser(nn.Module):
                 data['noising_mask'].float()[..., None]
             ], dim=-1)
         )
+        node_features = node_features * (~x_mask)[..., None]
 
         ## denoising
+        rigids_t = rigids_t.scale_translation(0.1)
         rigids = rigids_t
 
         for i, layer in enumerate(self.denoiser):
