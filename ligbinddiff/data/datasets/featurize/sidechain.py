@@ -274,7 +274,8 @@ def featurize_atomic(protein,
             diff_feats_t = diffuser.forward_marginal(
                 rigids_0=rigids_0,
                 t=t,
-                diffuse_mask=None
+                diffuse_mask=None,
+                batch=torch.zeros_like(x_mask)
             )
             diff_feats_t['rigids_0'] = rigids_0.to_tensor_7()
             diff_feats_t['t'] = t

@@ -147,7 +147,7 @@ def frames_to_atom14_pos(
     return pred_positions
 
 
-def compute_backbone(bb_rigids, psi_torsions):
+def compute_backbone(bb_rigids, psi_torsions, impute_O=True):
     torsion_angles = torch.tile(
         psi_torsions[..., None, :],
         tuple([1 for _ in range(len(bb_rigids.shape))]) + (7, 1)
@@ -169,6 +169,22 @@ def compute_backbone(bb_rigids, psi_torsions):
     atom37_bb_pos[..., 3, :] = atom14_pos[..., 4, :]
     atom37_bb_pos[..., 4, :] = atom14_pos[..., 3, :]
     atom37_mask = torch.any(atom37_bb_pos, axis=-1)
+
+    # if impute_O:
+    #     eps=1e-6
+    #     N, CA, C = atom14_pos[..., 0, :], atom14_pos[..., 1, :], atom14_pos[..., 2, :]
+    #     O_dummy = atom14_pos[..., 3, :]
+    #     O_dist = torch.linalg.vector_norm(O_dummy - C, dim=-1)
+    #     CA_to_C = C[..., :-1, :] - CA[..., :-1, :]
+    #     CA_to_C = CA_to_C / torch.linalg.vector_norm(CA_to_C + eps, dim=-1)[..., None]
+    #     N_to_C = C[..., :-1, :] - N[..., 1:, :]
+    #     N_to_C = N_to_C / torch.linalg.vector_norm(N_to_C + eps, dim=-1)[..., None]
+    #     bisector = CA_to_C + N_to_C
+    #     bisector = bisector / torch.linalg.vector_norm(bisector + eps, dim=-1)[..., None]
+    #     O = O_dist[..., :-1, None] * bisector + C[..., :-1, :]
+    #     atom14_pos[..., :-1, 3, :] = O
+    #     atom37_bb_pos[..., :-1, 4, :] = O
+
     return atom37_bb_pos, atom37_mask, aatype, atom14_pos
 
 

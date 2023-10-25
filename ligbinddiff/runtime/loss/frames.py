@@ -81,7 +81,7 @@ def all_atom_fape_loss(pred_atom91,
     return all_atom_fape
     return _elemwise_to_graphwise(all_atom_fape, data_lens, frame_mask)
 
-def angle_axis_rot_loss(
+def angle_axis_rot_score_loss(
         pred_rot_score,
         ref_rot_score,
         score_scaling,
@@ -111,5 +111,31 @@ def angle_axis_rot_loss(
     )
     angle_loss *= angle_loss_weight
     angle_loss *= t[~x_mask] > angle_loss_t_threshold
+    rot_loss = angle_loss + axis_loss
+    return _nodewise_to_graphwise(rot_loss, data_lens, x_mask)
+
+def angle_axis_rot_cond_v_loss(
+        pred_rot_score,
+        ref_rot_score,
+        data_lens,
+        x_mask):
+    gt_rot_score = ref_rot_score[~x_mask]
+    pred_rot_score = pred_rot_score[~x_mask]
+
+    gt_rot_angle = torch.norm(gt_rot_score, dim=-1, keepdim=True)
+    gt_rot_axis = gt_rot_score / (gt_rot_angle + 1e-6)
+
+    pred_rot_angle = torch.norm(pred_rot_score, dim=-1, keepdim=True)
+    pred_rot_axis = pred_rot_score / (pred_rot_angle + 1e-6)
+
+    # Separate loss on the axis
+    axis_loss = torch.square(gt_rot_axis - pred_rot_axis).sum(dim=-1)
+
+    # Separate loss on the angle
+    angle_loss = (gt_rot_angle - pred_rot_angle)**2
+    angle_loss = torch.sum(
+        angle_loss,
+        dim=-1
+    )
     rot_loss = angle_loss + axis_loss
     return _nodewise_to_graphwise(rot_loss, data_lens, x_mask)

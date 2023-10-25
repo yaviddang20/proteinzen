@@ -18,12 +18,13 @@ from ligbinddiff.runtime.loss.latent import so3_embedding_kl, so3_embedding_mse
 from ligbinddiff.runtime.loss.utils import (_nodewise_to_graphwise, _elemwise_to_graphwise)
 from ligbinddiff.utils.atom_reps import atom91_atom_masks
 
-from .frames import all_atom_fape_loss, angle_axis_rot_loss
+from .frames import all_atom_fape_loss, angle_axis_rot_score_loss, angle_axis_rot_cond_v_loss
 from .openfold import compute_fape
 
 from ligbinddiff.utils.openfold import rigid_utils as ru
 
 from ligbinddiff.model.utils.graph import batchwise_to_nodewise
+from ligbinddiff.stoch_interp.interpolate.so3_helpers import matrix_to_axis_angle
 
 
 def seq_cce_loss(ref_seq,
@@ -1292,7 +1293,7 @@ def frame_diffusion_loss(batch,
     trans_score_loss = _nodewise_to_graphwise(trans_score_loss[total_mask], data_lens, ~total_mask)
 
     # Rotation score loss
-    rot_score_loss = angle_axis_rot_loss(
+    rot_score_loss = angle_axis_rot_score_loss(
         pred_rot_score,
         ref_rot_score,
         rot_score_scaling_nodewise,
@@ -1333,6 +1334,128 @@ def frame_diffusion_loss(batch,
         "bb_angles_loss": bb_conn_angles
     }
 
+def debug_inpaint_frame_latent_loss_fn(batch,
+                                 latent_outputs,
+                                 decoder_outputs,
+                                 time_threshold=0.25):
+    bb_frame_diffusion_loss_dict = frame_diffusion_loss(batch,
+                                                        latent_outputs,
+                                                        decoder_outputs)
+    hbond_loss_dict = bb_hbond_params_loss(batch, decoder_outputs)
+    bb_denoising_loss = (
+        bb_frame_diffusion_loss_dict["pred_x_ca_mse"] / 100 +
+        bb_frame_diffusion_loss_dict["rot_score_loss"]
+    )
+    bb_denoising_finegrain_loss = (
+        bb_frame_diffusion_loss_dict["pred_bb_mse"]
+        + bb_frame_diffusion_loss_dict["dist_mat_loss"]
+        # + bb_frame_diffusion_loss_dict["bb_dihedrals_loss"]
+        # + bb_frame_diffusion_loss_dict["bb_conn_mse"]
+        # + bb_frame_diffusion_loss_dict["bb_angles_loss"]
+        # + hbond_loss_dict["mse_delta_HA"]
+        # + hbond_loss_dict["mse_Theta"]
+        # + hbond_loss_dict["mse_Psi"]
+        # + hbond_loss_dict["mse_X"]
+    ) * (latent_outputs['t'] < time_threshold)
+
+    loss = (bb_denoising_loss + 0.25 * bb_denoising_finegrain_loss).mean()
+
+    out_dict = {"loss": loss}
+    out_dict.update(bb_frame_diffusion_loss_dict)
+    out_dict.update(hbond_loss_dict)
+    return out_dict
+
+def frame_flow_matching_loss(batch,
+                         noised_data,
+                         denoiser_outputs):
+    x_mask = batch['x_mask']
+    device = x_mask.device
+    noising_mask = noised_data['noising_mask']
+    # if we don't noise anything, just eval on everything as a sanity check
+    if (~noising_mask).all():
+        noising_mask = ~noising_mask
+    total_mask = ~x_mask & noising_mask
+
+    data_splits = batch._slice_dict['x']
+    data_lens = (data_splits[1:] - data_splits[:-1]).tolist()
+
+    if isinstance(noised_data['rigids_t'], torch.Tensor):
+        noised_bb_frames = ru.Rigid.from_tensor_7(noised_data['rigids_t'].to(device))
+    else:
+        noised_bb_frames = noised_data['rigids_t']
+        dtype = noised_bb_frames._trans.dtype
+        noised_bb_frames = ru.Rigid(
+            rots=noised_bb_frames._rots.to(device=device, dtype=dtype),
+            trans=noised_bb_frames._trans.to(device)
+        )
+
+    denoised_bb_frames = denoiser_outputs['final_rigids']
+
+    X_ca = batch['bb'][:, 1]
+    pred_frame_X_ca = denoised_bb_frames.get_trans()
+    ref_frame_X_ca = noised_bb_frames.get_trans()
+    pred_X_ca_se = torch.square(X_ca - pred_frame_X_ca).sum(dim=-1)
+    pred_X_ca_mse = _nodewise_to_graphwise(pred_X_ca_se[total_mask], data_lens, ~total_mask)
+    ref_X_ca_se = torch.square(X_ca - ref_frame_X_ca).sum(dim=-1)
+    ref_X_ca_mse = _nodewise_to_graphwise(ref_X_ca_se[total_mask], data_lens, ~total_mask)
+
+    bb = batch['atom14'][:, :5]
+    bb_mask = batch['atom14_mask'][:, :5].any(dim=-1)
+    denoised_bb = denoiser_outputs['denoised_bb']
+    backbone_mse = torch.square(denoised_bb - bb).sum(dim=-1)
+    backbone_mse = backbone_mse[~bb_mask]
+    backbone_mse = _elemwise_to_graphwise(backbone_mse, data_lens, bb_mask)
+
+    pred_rot_cond_v, pred_trans_cond_v = denoiser_outputs['pred_bb_cond_v']
+    pred_rot_cond_v = matrix_to_axis_angle(pred_rot_cond_v)
+    ref_rot_cond_v = matrix_to_axis_angle(noised_data['rot_cond_v'])
+    ref_trans_cond_v = noised_data['trans_cond_v']
+
+    # Translation score loss
+    trans_cond_v_se = (ref_trans_cond_v - pred_trans_cond_v)**2 * total_mask[..., None]
+    trans_cond_v_loss = trans_cond_v_se.sum(dim=-1)
+    trans_cond_v_loss = _nodewise_to_graphwise(trans_cond_v_loss[total_mask], data_lens, ~total_mask)
+
+    # Rotation score loss
+    rot_cond_v_loss = angle_axis_rot_cond_v_loss(
+        pred_rot_cond_v,
+        ref_rot_cond_v,
+        data_lens,
+        x_mask
+    )
+
+    dist_mat_loss = framediff_local_atomic_context_loss(
+        denoised_bb,
+        bb,
+        batch.batch,
+        x_mask
+    )
+
+    bb_dihedrals_loss = backbone_dihedrals_loss(
+        denoised_bb[:, :3],
+        bb[:, :3],
+        data_lens,
+        ~noising_mask)
+
+    bb_conn_lens, bb_conn_angles = chain_constraints_loss(
+        denoised_bb[:, :3],
+        bb[:, :3],
+        data_lens,
+        batch.batch,
+        ~noising_mask)
+
+    return {
+        "rot_cond_v_loss": rot_cond_v_loss,
+        "trans_cond_v_loss": trans_cond_v_loss,
+        "pred_x_ca_mse": pred_X_ca_mse,
+        "pred_bb_mse": backbone_mse,
+        "ref_x_ca_mse": ref_X_ca_mse,
+        "dist_mat_loss": dist_mat_loss,
+        "bb_dihedrals_loss": bb_dihedrals_loss,
+        "bb_conn_mse": bb_conn_lens,
+        "bb_angles_loss": bb_conn_angles
+    }
+
 def bb_hbond_params_loss(batch,
                          bb_outputs):
     bb = batch['atom14'][:, :4]
@@ -1350,28 +1473,28 @@ def bb_hbond_params_loss(batch,
         "mse_X": mse_X
     }
 
-def debug_inpaint_frame_latent_loss_fn(batch,
+def debug_inpaint_frameflow_latent_loss_fn(batch,
                                  latent_outputs,
                                  decoder_outputs,
                                  time_threshold=0.25):
-    bb_frame_diffusion_loss_dict = frame_diffusion_loss(batch,
+    bb_frame_diffusion_loss_dict = frame_flow_matching_loss(batch,
                                                         latent_outputs,
                                                         decoder_outputs)
     hbond_loss_dict = bb_hbond_params_loss(batch, decoder_outputs)
     bb_denoising_loss = (
-        bb_frame_diffusion_loss_dict["pred_x_ca_mse"] / 100 +
-        bb_frame_diffusion_loss_dict["rot_score_loss"]
+        bb_frame_diffusion_loss_dict["trans_cond_v_loss"] / 100 +
+        bb_frame_diffusion_loss_dict["rot_cond_v_loss"]
     )
     bb_denoising_finegrain_loss = (
         bb_frame_diffusion_loss_dict["pred_bb_mse"]
-        # + bb_frame_diffusion_loss_dict["dist_mat_loss"]
-        + bb_frame_diffusion_loss_dict["bb_dihedrals_loss"]
-        + bb_frame_diffusion_loss_dict["bb_conn_mse"]
-        + bb_frame_diffusion_loss_dict["bb_angles_loss"]
-        + hbond_loss_dict["mse_delta_HA"]
-        + hbond_loss_dict["mse_Theta"]
-        + hbond_loss_dict["mse_Psi"]
-        + hbond_loss_dict["mse_X"]
+        + bb_frame_diffusion_loss_dict["dist_mat_loss"]
+        # + bb_frame_diffusion_loss_dict["bb_dihedrals_loss"]
+        # + bb_frame_diffusion_loss_dict["bb_conn_mse"]
+        # + bb_frame_diffusion_loss_dict["bb_angles_loss"]
+        # + hbond_loss_dict["mse_delta_HA"]
+        # + hbond_loss_dict["mse_Theta"]
+        # + hbond_loss_dict["mse_Psi"]
+        # + hbond_loss_dict["mse_X"]
     ) * (latent_outputs['t'] < time_threshold)
 
     loss = (bb_denoising_loss + 0.25 * bb_denoising_finegrain_loss).mean()
