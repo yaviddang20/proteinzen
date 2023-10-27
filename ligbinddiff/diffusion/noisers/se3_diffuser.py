@@ -71,6 +71,7 @@ class SE3Diffuser:
             t: float,
             diffuse_mask: np.ndarray = None,
             as_tensor_7: bool=True,
+            batch=None,
         ):
         """
         Args:

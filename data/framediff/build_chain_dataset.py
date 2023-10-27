@@ -4,45 +4,26 @@ import os, time, gzip, json
 from mmtf_util import *
 from collections import defaultdict
 import glob
+import traceback
 
 import pandas as pd
 
 import tqdm
 
-MAX_LENGTH = 500
+MAX_LENGTH = 550
 
-df = pd.read_csv("metadata.csv")
-df = df[df.modeled_seq_len <= 512]
-df = df[df.modeled_seq_len  > 60]
-df = df[df.oligomeric_count == "1"]
-df = df[df.coil_percent < 0.5]
-pdb_ids = set(df.pdb_name.tolist())
-
-data_src = "/wynton/group/kortemme/alexjli/databases/PDB/mmtf/"
-
-paths = []
-for path in glob.glob(os.path.join(data_src, "*/*.mmtf")):
-    pdb_id = os.path.basename(path).split(".")[0].lower()
-    # print(pdb_id)
-    if pdb_id in pdb_ids:
-        paths.append(path)
-        # print("henlo")
-    else:
-        pass
-        # print("gdodbye")
-        # print(path, pdb_id)
-        # print(df[df.pdb_name == pdb_id])
-print(len(paths))
+df = pd.read_csv("filtered_metadata.csv")
+pdb_ids = df.pdb_name.tolist()
 
 # Build dataset
 dataset = []
-for chain_ix, path in tqdm.tqdm(enumerate(paths), total=len(paths)):
+for chain_ix, pdb_id in tqdm.tqdm(enumerate(pdb_ids), total=len(pdb_ids)):
     try:
         # Load and parse coordinates
         # print(chain_ix, pdb, chain)
         start = time.time()
         chain_dict = mmtf_parse(
-            path,
+            pdb_id,
             target_atoms=[
                 "N", "CA", "C", "O",
                 "CB",
@@ -54,21 +35,16 @@ for chain_ix, path in tqdm.tqdm(enumerate(paths), total=len(paths)):
             ])
         stop = time.time() - start
 
+        chain = chain_dict['chain']
+        chain_name = pdb_id + '.' + chain
+        chain_dict['name'] = chain_name
         if len(chain_dict['seq']) <= MAX_LENGTH:
-            pdb = os.path.basename(path).split(".")[0]
-            chain = chain_dict['chain']
-            chain_name = pdb + '.' + chain
-            chain_dict['name'] = chain_name
-            print(chain_name)
-            # print(pdb, chain, chain_dict['num_chains'], chain_dict['seq'])
-            if set([c for c in chain_dict['seq']]).issubset(set(['A','G','T','C','U'])):
-                raise ValueError("this is a dumb way of catching if something is DNA/RNA")
             dataset.append(chain_dict)
         else:
-            print('Too long')
+            print("Too long", chain_name, len(chain_dict['seq']))
     except Exception as e:
-        print(chain_ix, path)
-        print(e)
+        print(chain_ix, pdb_id)
+        print(traceback.print_exc())
 
 outfile = 'chain_set.jsonl'
 with open(outfile, 'w') as f:

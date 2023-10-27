@@ -12,7 +12,7 @@ from torch_geometric.utils import sort_edge_index
 
 from ligbinddiff.data.datasets.featurize.common import _node_positional_embeddings, _edge_positional_embeddings, _rbf
 from ligbinddiff.model.modules.common import RBF
-from ligbinddiff.model.modules.frames import Linear, flatten_final_dims, ipa_point_weights_init_, permute_final_dims
+from ligbinddiff.model.modules.openfold.frames import Linear, flatten_final_dims, ipa_point_weights_init_
 from ligbinddiff.model.utils.graph import get_data_lens, batchwise_to_nodewise, gen_spatial_graph_features, sample_inv_cubic_edges, sequence_local_graph
 from ligbinddiff.utils.openfold.rigid_utils import Rigid, batchwise_center
 from ligbinddiff.utils.framediff.all_atom import compute_backbone

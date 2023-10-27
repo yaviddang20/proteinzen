@@ -11,6 +11,8 @@ from ligbinddiff.model.modules.equiformer_v2.so3 import CoefficientMappingModule
 from ligbinddiff.model.modules.equiformer_v2.layer_norm import MultiResEquivariantRMSNormArraySphericalHarmonicsV2 as NormSO3
 from ligbinddiff.model.modules.equiformer_v2.transformer_block import FeedForwardNetwork, MultiResFeedForwardNetwork, TransBlockV2
 from ligbinddiff.model.modules.equiformer_v2.edge_rot_mat import init_edge_rot_mat
+from ligbinddiff.model.modules.layers.node.attention import PointSetAttentionWithEdgeBias
+from ligbinddiff.model.modules.layers.node.sitewise import BackboneUpdateVectorBias, LocalFrameUpdate, NodeTransition, VectorLayerNorm
 from ligbinddiff.utils.openfold import rigid_utils as ru
 from ligbinddiff.diffusion.noisers.se3 import _extract_rots_trans, _assemble_rigid
 
@@ -18,7 +20,7 @@ from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddin
 
 from ligbinddiff.utils.frames import backbone_frames_to_bb_atoms
 
-from ligbinddiff.model.modules.frames import PointSetAttentionWithEdgeBias, EdgeTransition, NodeTransition, BackboneUpdateVectorBias, VectorLayerNorm, LocalFrameUpdate
+from ligbinddiff.model.modules.layers.edge.sitewise import EdgeTransition
 
 from ligbinddiff.model.utils.graph import sample_inv_cubic_edges, sequence_local_graph
 

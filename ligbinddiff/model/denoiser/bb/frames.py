@@ -3,13 +3,16 @@
 import torch
 from torch import nn
 from ligbinddiff.model.modules.common import RBF
+from ligbinddiff.model.modules.layers.edge.sitewise import EdgeTransition
+from ligbinddiff.model.modules.layers.node.attention import GraphInvariantPointAttention, PointSetAttentionWithEdgeBias
+from ligbinddiff.model.modules.layers.node.sitewise import BackboneUpdateVectorBias, ChannelwiseVectorGateUpdate, LocalFrameUpdate, NodeTransition, VectorLayerNorm
 
 from ligbinddiff.utils.openfold import rigid_utils as ru
 from ligbinddiff.utils.framediff.all_atom import compute_backbone
 
 from ligbinddiff.data.datasets.featurize.common import _node_positional_embeddings
 
-from ligbinddiff.model.modules.frames import GraphInvariantPointAttention, PointSetAttentionWithEdgeBias, EdgeTransition, NodeTransition, BackboneUpdate, StructureModuleTransition, BackboneUpdateVectorBias, VectorLayerNorm, LocalFrameUpdate
+from ligbinddiff.model.modules.openfold.frames import BackboneUpdate, StructureModuleTransition
 
 from ligbinddiff.model.utils.graph import sample_inv_cubic_edges, sequence_local_graph, gen_spatial_graph_features, batchwise_to_nodewise, get_data_lens
 
@@ -294,7 +297,12 @@ class PSAEBFrameDenoisingLayer(nn.Module):
             no_v_points=num_v_pts,
             gen_vectors=False
         )
-        self.local_update = LocalFrameUpdate(
+        self.local_channel_update = ChannelwiseVectorGateUpdate(
+            c_s,
+            c_v,
+            c_hidden
+        )
+        self.local_rot_update = LocalFrameUpdate(
             c_s,
             c_v,
             c_hidden
@@ -341,9 +349,6 @@ class PSAEBFrameDenoisingLayer(nn.Module):
         noising_mask = intermediates['noising_mask']
         x_mask = data['x_mask']
 
-        edge_features = self.edge_transition(node_features, edge_features, edge_index)
-        seq_edge_features = self.seq_edge_transition(node_features, seq_edge_features, seq_edge_index)
-
         node_s_update, node_v_update = self.attn_seq(
             node_features,
             rigids,
@@ -369,7 +374,15 @@ class PSAEBFrameDenoisingLayer(nn.Module):
         node_features = self.ln_s2(node_features + node_s_update * (~x_mask)[..., None])
         node_vectors = self.ln_v2(node_vectors + node_v_update * (~x_mask)[..., None, None])
 
-        node_s_update, node_v_update = self.local_update(
+        node_s_update, node_v_update = self.local_channel_update(
+            node_features,
+            node_vectors,
+            rigids
+        )
+        node_features = node_features + node_s_update * (~x_mask)[..., None]
+        node_vectors = node_vectors + node_v_update * (~x_mask)[..., None, None]
+
+        node_s_update, node_v_update = self.local_rot_update(
             node_features,
             node_vectors,
             rigids
@@ -384,12 +397,14 @@ class PSAEBFrameDenoisingLayer(nn.Module):
         node_vectors = node_vectors  * (~x_mask)[..., None, None]
         rigids_update = self.bb_update(
             node_features * noising_mask[..., None],
-            node_vectors * noising_mask[..., None, None])
+            node_vectors * noising_mask[..., None, None],
+            rigids)
 
         rigids = rigids.compose_q_update_vec(
             rigids_update * noising_mask[..., None]
         )
-
+        edge_features = self.edge_transition(node_features, edge_features, edge_index)
+        seq_edge_features = self.seq_edge_transition(node_features, seq_edge_features, seq_edge_index)
 
         return node_features, rigids, edge_features, seq_edge_features, node_vectors
 

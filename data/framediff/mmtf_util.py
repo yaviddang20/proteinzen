@@ -8,9 +8,28 @@ import mdtraj as md
 from Bio.PDB import PDBIO
 from Bio.PDB.mmtf import MMTFParser
 
+def download_cached(url, target_location):
+    """ Download with caching """
+    target_dir = os.path.dirname(target_location)
+    if not os.path.isfile(target_location):
+        if not os.path.exists(target_dir):
+            os.makedirs(target_dir)
 
-def mmtf_fetch(path):
-    mmtf_record = mmtf.parse(path)
+        # Use MMTF for speed
+        response = urllib.request.urlopen(url)
+        size = int(float(response.headers['Content-Length']) / 1e3)
+        # print('Downloading {}, {} KB'.format(target_location, size))
+        with open(target_location, 'wb') as f:
+            f.write(response.read())
+    return target_location
+
+
+def mmtf_fetch(pdb, cache_dir='cath/mmtf/'):
+    """ Retrieve mmtf record from PDB with local caching """
+    mmtf_file = cache_dir + pdb + '.mmtf.gz'
+    url = 'http://mmtf.rcsb.org/v1.0/full/' + pdb + '.mmtf.gz'
+    mmtf_file = download_cached(url, mmtf_file)
+    mmtf_record = mmtf.parse_gzip(mmtf_file)
     return mmtf_record
 
 
@@ -41,18 +60,19 @@ def compute_dssp(mmtf_path, chain):
     return pdb_ss
 
 
-def mmtf_parse(path, target_atoms = ['N', 'CA', 'C', 'O']):
+def mmtf_parse(pdb_id, target_atoms = ['N', 'CA', 'C', 'O'], cache_dir='mmtf/'):
     """ Parse mmtf file to extract C-alpha coordinates """
     # MMTF traversal derived from the specification
     # https://github.com/rcsb/mmtf/blob/master/spec.md
-    A = mmtf_fetch(path)
+    A = mmtf_fetch(pdb_id, cache_dir=cache_dir)
+
 
     # Build a dictionary
     mmtf_dict = {}
     mmtf_dict['seq'] = []
     mmtf_dict['coords'] = {code:[] for code in target_atoms}
 
-    chains = A.chain_id_list
+    chains = A.chain_name_list
     # print(chains)
     # print(A.__dict__.keys())
     # print([entity.keys() for entity in A.entity_list])

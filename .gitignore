@@ -119,3 +119,4 @@ data/framediff/*.jsonl
 scripts/submit_scripts/autogen_scripts
 outputs/
 _debug/
+prelim_experiments/
