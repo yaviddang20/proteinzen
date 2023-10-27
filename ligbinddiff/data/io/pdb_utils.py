@@ -1,7 +1,9 @@
 """ Utils for loading and editing PDBs """
+import os
 
 from Bio.PDB import Atom, Residue, Chain, Model, Structure
 from Bio.PDB.PDBIO import PDBIO
+from Bio.PDB.PDBParser import PDBParser
 import numpy as np
 
 from ligbinddiff.utils.atom_reps import restype_1to3, sidechain_atoms, atom91_start_end
@@ -77,6 +79,54 @@ def atom91_to_pdb(seq, atom91, name):
     chain = atom91_to_chain(seq, atom91, "A")
     struct = chains_to_struct([chain])
     save_struct(struct, name + ".pdb")
+
+
+def chain_to_atom91(chain):
+    atom91 = []
+    bb_atoms = ["N", "CA", "C", "O"]
+    for residue in chain.get_residues():
+        residue_91 = np.zeros((91, 3)) * np.nan
+        aa_3lt = residue.get_resname()
+        sidechain_atom_labels = sidechain_atoms[aa_3lt]
+        atoms = list(residue.get_atoms())
+        for atom in atoms:
+            atom_name = atom.get_name()
+            if atom_name in bb_atoms:
+                sidechain_atom_idx = bb_atoms.index(atom_name)
+                residue_91[sidechain_atom_idx] = atom.get_coord()
+            else:
+                sidechain_atom_idx = sidechain_atom_labels.index(atom_name)
+                local_atom_idx = atom91_start_end[aa_3lt][0] + sidechain_atom_idx
+                residue_91[local_atom_idx] = atom.get_coord()
+        atom91.append(residue_91)
+    return np.stack(atom91, axis=0)
+
+
+def struct_to_atom91(struct):
+    atom91 = []
+    for chain in struct.get_chains():
+        atom91.append(chain_to_atom91(chain))
+    return np.concatenate(atom91, axis=0)
+
+
+def pdb_to_atom91(pdb_path, silent=False):
+    parser = PDBParser(QUIET=silent)
+    name = os.path.splitext(
+        os.path.basename(pdb_path)
+    )[0]
+    struct = parser.get_structure(name, pdb_path)
+    atom91 = struct_to_atom91(struct)
+    atom91_mask = np.isnan(atom91)
+    atom91[atom91_mask] = 0
+    return atom91, atom91_mask
+
+def pdb_to_structure(pdb_path, silent=False):
+    parser = PDBParser(QUIET=silent)
+    name = os.path.splitext(
+        os.path.basename(pdb_path)
+    )[0]
+    struct = parser.get_structure(name, pdb_path)
+    return struct
 
 
 if __name__ == '__main__':

@@ -249,6 +249,7 @@ class GraphIpaFrameDenoiser(nn.Module):
         denoised_bb_items = compute_backbone(rigids.unsqueeze(0), psi.unsqueeze(0))
         denoised_bb = denoised_bb_items[-1].squeeze(0)[:, :5]
         ret['denoised_bb'] = denoised_bb
+        ret['psi'] = psi
         ret['node_features'] = node_features
 
         return ret

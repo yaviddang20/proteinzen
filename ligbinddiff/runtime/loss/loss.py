@@ -1483,7 +1483,7 @@ def debug_inpaint_frameflow_latent_loss_fn(batch,
     hbond_loss_dict = bb_hbond_params_loss(batch, decoder_outputs)
     bb_denoising_loss = (
         bb_frame_diffusion_loss_dict["trans_cond_v_loss"] / 100 +
-        bb_frame_diffusion_loss_dict["rot_cond_v_loss"]
+        bb_frame_diffusion_loss_dict["rot_cond_v_loss"] * 0.5
     )
     bb_denoising_finegrain_loss = (
         bb_frame_diffusion_loss_dict["pred_bb_mse"]
