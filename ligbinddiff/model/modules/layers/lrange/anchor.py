@@ -182,7 +182,7 @@ class LinearPoolUpdate(PoolUpdate):
             mu = nodes.mean(dim=0)
             var = nodes.var(dim=0)
             kl = 0.5 * (var + mu.square() - 1 - var.log()).sum()
-            node_kl.append(kl[None])
+            node_kl.append(kl)
         node_kl = torch.stack(node_kl)
 
         a2n_anchors = nearest(node_proj, anchor_proj, batch, anchor_batch)
@@ -193,7 +193,7 @@ class LinearPoolUpdate(PoolUpdate):
         offset = 0
         for i in range(anchor_batch.max().item() + 1):
             select = (anchor_batch == i)
-            num_node = select.numel()
+            num_node = select.sum().long().item()
             dst = torch.arange(num_node, device=select.device)
             dst = torch.tile(dst, dims=(num_node, 1))
             src = dst.T
@@ -202,7 +202,7 @@ class LinearPoolUpdate(PoolUpdate):
             )
             a2a_edge_index.append(anchor_edge_index + offset)
             offset += num_node
-        a2a_edge_index = torch.cat(a2a_edge_index, dim=0)
+        a2a_edge_index = torch.cat(a2a_edge_index, dim=-1)
 
         a2a_edge_features = anchor_proj[a2a_edge_index[0]] - anchor_proj[a2a_edge_index[1]]
         a2n_edge_features = node_proj[a2n_edge_index[0]] - anchor_proj[a2n_edge_index[1]]

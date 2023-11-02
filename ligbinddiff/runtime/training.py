@@ -287,9 +287,9 @@ def debug_inpaint_train_loop(diffuser,
                 if nan_param_grad:
                     optimizer.zero_grad()
                     with torch.autograd.detect_anomaly():
-                        latent_data, decoder_outputs = diffuser.forward(batch, warmup=warmup)
+                        latent_data, decoder_outputs = diffuser.forward(batch)
 
-                        loss_dict = loss_fn(batch, latent_data, decoder_outputs, warmup=warmup)
+                        loss_dict = loss_fn(batch, latent_data, decoder_outputs)
                         loss = loss_dict["loss"]
                     if debug:
                         loss.backward()
