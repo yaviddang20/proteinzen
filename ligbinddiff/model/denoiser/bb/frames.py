@@ -18,6 +18,9 @@ from ligbinddiff.model.utils.graph import sample_inv_cubic_edges, sequence_local
 
 from .framediff import TorsionAngles
 
+
+from ligbinddiff.model.modules.layers.lrange.anchor import LinearPoolUpdate
+
 class GraphIpaFrameDenoisingLayer(nn.Module):
     """ Denoising layer on sidechain densities """
     def __init__(self,
@@ -52,6 +55,8 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
         )
         self.ln_s1 = nn.LayerNorm(c_s)
         self.ln_s2 = nn.LayerNorm(c_s)
+
+        self.pool_update = LinearPoolUpdate(c_s, min_a=0.1, connect_dim=3)
 
         self.bb_update = BackboneUpdate(
             c_s
@@ -105,6 +110,7 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
         node_s_update = node_s_update * (~x_mask)[..., None]
         node_features = self.ln_s2(node_features + node_s_update)
 
+        node_features, anchor_kl, node_kl = self.pool_update(rigids.get_trans(), node_features, edge_index, data.batch)
 
         node_features = self.node_transition(node_features)
         node_features = node_features * (~x_mask)[..., None]
@@ -117,7 +123,7 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
         edge_features = self.edge_transition(node_features, edge_features, edge_index)
         seq_edge_features = self.seq_edge_transition(node_features, seq_edge_features, seq_edge_index)
 
-        return node_features, rigids, edge_features, seq_edge_features
+        return node_features, rigids, edge_features, seq_edge_features, anchor_kl, node_kl
 
 class GraphIpaFrameDenoiser(nn.Module):
     """ Denoising model on sidechain densities """
@@ -230,8 +236,10 @@ class GraphIpaFrameDenoiser(nn.Module):
         rigids_t = rigids_t.scale_translation(0.1)
         rigids = rigids_t
 
+        anchor_kl = []
+        node_kl = []
         for i, layer in enumerate(self.denoiser):
-            node_features, rigids, edge_features, seq_edge_features = layer(
+            node_features, rigids, edge_features, seq_edge_features, a_kl, n_kl = layer(
                 node_features,
                 rigids,
                 edge_features,
@@ -241,6 +249,8 @@ class GraphIpaFrameDenoiser(nn.Module):
                 data,
                 data,
             )
+            anchor_kl.append(a_kl)
+            node_kl.append(n_kl)
 
         psi, _ = self.torsion_angles(node_features)
 
@@ -254,6 +264,8 @@ class GraphIpaFrameDenoiser(nn.Module):
         ret['denoised_bb'] = denoised_bb
         ret['psi'] = psi
         ret['node_features'] = node_features
+        ret['anchor_kl'] = anchor_kl
+        ret['node_kl'] = node_kl
 
         return ret
 

@@ -1358,9 +1358,12 @@ def debug_inpaint_frame_latent_loss_fn(batch,
         # + hbond_loss_dict["mse_X"]
     ) * (latent_outputs['t'] < time_threshold)
 
-    loss = (bb_denoising_loss + 0.25 * bb_denoising_finegrain_loss).mean()
+    kl = torch.mean(torch.stack(decoder_outputs['anchor_kl']), dim=0) + torch.mean(torch.stack(decoder_outputs['node_kl']), dim=0)
+    kl = kl.view(-1)
 
-    out_dict = {"loss": loss}
+    loss = (bb_denoising_loss + 0.25 * bb_denoising_finegrain_loss + kl).mean()
+
+    out_dict = {"loss": loss, "kl": kl}
     out_dict.update(bb_frame_diffusion_loss_dict)
     out_dict.update(hbond_loss_dict)
     return out_dict

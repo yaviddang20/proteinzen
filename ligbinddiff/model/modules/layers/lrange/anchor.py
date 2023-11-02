@@ -52,28 +52,29 @@ class PoolUpdate(nn.Module, abc.ABC):
 
     def forward(self, node_x, node_features, edge_index, batch):
         anchor_x, anchor_features, anchor_batch = self.select(node_x, node_features, edge_index, batch)
-        a2n_edge_index, anchor_proj_kl, node_proj_kl = self.connect(anchor_x, anchor_features, node_x, node_features, edge_index, batch, anchor_batch)
+        a2n_edge_index, a2n_edge_features, a2a_edge_index, a2a_edge_features, anchor_proj_kl, node_proj_kl = self.connect(anchor_x, anchor_features, node_x, node_features, edge_index, batch, anchor_batch)
         n2a_edge_index = torch.flip(a2n_edge_index, dims=(0,))
-        anchor_features = self.node_to_anchor(anchor_x, anchor_features, node_x, node_features, a2n_edge_index)
-        anchor_features = self.anchor_update(anchor_x, anchor_features, anchor_batch)
-        node_features = self.anchor_to_node(anchor_x, anchor_features, node_x, node_features, n2a_edge_index)
-        print(anchor_proj_kl, node_proj_kl)
+        n2a_edge_features = -a2n_edge_features
+        anchor_features = self.node_to_anchor(anchor_x, anchor_features, node_x, node_features, a2n_edge_index, a2n_edge_features)
+        anchor_features = self.anchor_update(anchor_x, anchor_features, a2a_edge_index, a2a_edge_features, anchor_batch)
+        node_features = self.anchor_to_node(anchor_x, anchor_features, node_x, node_features, n2a_edge_index, n2a_edge_features)
+        # print(anchor_proj_kl, node_proj_kl)
         return node_features, anchor_proj_kl, node_proj_kl
 
 
 class Node2AnchorAttention(nn.Module):
-    def __init__(self, h_node):
+    def __init__(self, h_node, h_edge):
         super().__init__()
         self.h_node = h_node
         self.q_anchor = nn.Linear(h_node, h_node)
-        self.kv_node = nn.Linear(h_node, 2 * h_node)
+        self.kv_node = nn.Linear(h_node + h_edge, 2 * h_node)
 
-    def forward(self, anchor_features, node_features, a2n_edge_index):
+    def forward(self, anchor_features, node_features, a2n_edge_index, a2n_edge_features):
         anchor_q = self.q_anchor(anchor_features)
-        node_kv = self.kv_node(node_features)
+        node_dst = torch.cat([node_features[a2n_edge_index[0]], a2n_edge_features], dim=-1)
 
         anchor_q_src = anchor_q[a2n_edge_index[1]]
-        node_kv_dst = node_kv[a2n_edge_index[0]]
+        node_kv_dst = self.kv_node(node_dst)
         node_k_dst, node_v_dst = node_kv_dst.split(self.h_node, dim=-1)
 
         attn = torch.sum(anchor_q_src * node_k_dst, dim=-1)
@@ -115,7 +116,7 @@ class LinearPoolUpdate(PoolUpdate):
         self.project_node = nn.Linear(h_node, connect_dim, bias=False)
 
         # n2a
-        self.n2a = Node2AnchorAttention(h_node)
+        self.n2a = Node2AnchorAttention(h_node, connect_dim)
         self.n2a_ln = nn.LayerNorm(h_node)
 
         # a2a
@@ -123,12 +124,13 @@ class LinearPoolUpdate(PoolUpdate):
             in_channels=h_node,
             hidden_channels=h_node*2,
             out_channels=h_node,
-            num_layers=2
+            num_layers=2,
+            edge_dim=connect_dim
         )
 
         # a2n
         self.a2n = nn.Sequential(
-            nn.Linear(2 * h_node, h_node),
+            nn.Linear(2 * h_node + connect_dim, h_node),
             nn.ReLU(),
             nn.Linear(h_node, h_node),
             nn.ReLU(),
@@ -186,23 +188,8 @@ class LinearPoolUpdate(PoolUpdate):
         a2n_anchors = nearest(node_proj, anchor_proj, batch, anchor_batch)
         a2n_nodes = torch.arange(node_features.shape[0], device=a2n_anchors.device)
         a2n_edge_index = torch.stack([a2n_nodes, a2n_anchors])
-        return a2n_edge_index, anchor_kl, node_kl
 
-    def node_to_anchor(self,
-                anchor_x,
-                anchor_features,
-                node_x,
-                node_features,
-                a2n_edge_index):
-        anchor_update = self.n2a(anchor_features, node_features, a2n_edge_index)
-        anchor_features = self.n2a_ln(anchor_features + anchor_update)
-        return anchor_features
-
-    def anchor_update(self,
-                anchor_x,
-                anchor_features,
-                anchor_batch):
-        anchor_edge_index = []
+        a2a_edge_index = []
         offset = 0
         for i in range(anchor_batch.max().item() + 1):
             select = (anchor_batch == i)
@@ -210,27 +197,51 @@ class LinearPoolUpdate(PoolUpdate):
             dst = torch.arange(num_node, device=select.device)
             dst = torch.tile(dst, dims=(num_node, 1))
             src = dst.T
-            edge_index = torch.stack(
+            anchor_edge_index = torch.stack(
                 [dst.reshape(-1), src.reshape(-1)]
             )
-            anchor_edge_index.append(edge_index + offset)
+            a2a_edge_index.append(anchor_edge_index + offset)
             offset += num_node
-        anchor_edge_index = torch.cat(anchor_edge_index, dim=0)
+        a2a_edge_index = torch.cat(a2a_edge_index, dim=0)
 
-        return self.a2a(anchor_features, anchor_edge_index)
+        a2a_edge_features = anchor_proj[a2a_edge_index[0]] - anchor_proj[a2a_edge_index[1]]
+        a2n_edge_features = node_proj[a2n_edge_index[0]] - anchor_proj[a2n_edge_index[1]]
+
+        return a2n_edge_index, a2n_edge_features, a2a_edge_index, a2a_edge_features, anchor_kl, node_kl
+
+    def node_to_anchor(self,
+                anchor_x,
+                anchor_features,
+                node_x,
+                node_features,
+                a2n_edge_index,
+                a2n_edge_features):
+        anchor_update = self.n2a(anchor_features, node_features, a2n_edge_index, a2n_edge_features)
+        anchor_features = self.n2a_ln(anchor_features + anchor_update)
+        return anchor_features
+
+    def anchor_update(self,
+                anchor_x,
+                anchor_features,
+                a2a_edge_index,
+                a2a_edge_features,
+                anchor_batch):
+
+        return self.a2a(anchor_features, a2a_edge_index, edge_attr=a2a_edge_features)
 
     def anchor_to_node(self,
                        anchor_x,
                        anchor_features,
                        node_x,
                        node_features,
-                       n2a_edge_index):
+                       n2a_edge_index,
+                       n2a_edge_features):
         node_expand = node_features[n2a_edge_index[1]]
         anchor_expand = anchor_features[n2a_edge_index[0]]
 
         node_update = self.a2n(
             torch.cat(
-                [node_expand, anchor_expand], dim=-1
+                [node_expand, anchor_expand, n2a_edge_features], dim=-1
             )
         )
         # this is probably redundant but i'll just keep it here
