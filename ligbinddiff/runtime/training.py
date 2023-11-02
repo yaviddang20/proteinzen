@@ -291,10 +291,10 @@ def debug_inpaint_train_loop(diffuser,
 
                         loss_dict = loss_fn(batch, latent_data, decoder_outputs)
                         loss = loss_dict["loss"]
-                    if debug:
-                        loss.backward()
-                    else:
-                        fabric.backward(loss)
+                        if debug:
+                            loss.backward()
+                        else:
+                            fabric.backward(loss)
                 else:
                     optimizer.step()
 

@@ -357,11 +357,14 @@ class GraphFrameDiff(nn.Module):
                  bb_x_0_key='rigids_0',
                  bb_x_0_pred_key='final_rigids',
                  bb_x_t_key='rigids_t',
+                 self_conditioning=False,
+                 graph_conditioning=False,
                  ):
         super().__init__()
         self.bb_x_0_key = bb_x_0_key
         self.bb_x_0_pred_key = bb_x_0_pred_key
         self.bb_x_t_key = bb_x_t_key
+        self.self_conditioning = self_conditioning
 
         self.denoiser = GraphIpaFrameDenoiser(
             c_s=c_s,
@@ -370,14 +373,22 @@ class GraphFrameDiff(nn.Module):
             num_heads=num_heads,
             num_qk_pts=num_qk_pts,
             num_v_pts=num_v_pts,
-            n_layers=num_layers
+            n_layers=num_layers,
+            self_conditioning=self_conditioning,
+            graph_conditioning=graph_conditioning
         )
         self.time_dist = dist.Uniform(0, 1)
         self.time_T = 1
         self.se3_noiser = se3_noiser
 
     def reverse_noising(self, data):
-        denoiser_output = self.denoiser(data)
+        if self.self_conditioning and np.random.uniform() > 0.5:
+            with torch.no_grad():
+                self_conditioning = self.denoiser(data)
+        else:
+            self_conditioning = None
+        print(self_conditioning is not None)
+        denoiser_output = self.denoiser(data, self_conditioning)
         x_mask = data['x_mask']
         noising_mask = ~data['fixed_mask'].bool()
         mask = x_mask | ~noising_mask

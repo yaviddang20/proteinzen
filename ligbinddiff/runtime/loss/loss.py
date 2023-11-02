@@ -1272,6 +1272,7 @@ def frame_diffusion_loss(batch,
     bb = batch['atom14'][:, :5]
     bb_mask = batch['atom14_mask'][:, :5].any(dim=-1)
     denoised_bb = denoiser_outputs['denoised_bb']
+    bb[bb_mask] = 0.0
     backbone_mse = torch.square(denoised_bb - bb).sum(dim=-1)
     backbone_mse = backbone_mse[~bb_mask]
     backbone_mse = _elemwise_to_graphwise(backbone_mse, data_lens, bb_mask)
@@ -1358,7 +1359,8 @@ def debug_inpaint_frame_latent_loss_fn(batch,
         # + hbond_loss_dict["mse_X"]
     ) * (latent_outputs['t'] < time_threshold)
 
-    kl = torch.mean(torch.stack(decoder_outputs['anchor_kl']), dim=0) + torch.mean(torch.stack(decoder_outputs['node_kl']), dim=0)
+    # kl = torch.mean(torch.stack(decoder_outputs['anchor_kl']), dim=0) + torch.mean(torch.stack(decoder_outputs['node_kl']), dim=0)
+    kl = torch.mean(torch.stack(decoder_outputs['node_kl']), dim=0)
 
     loss = (bb_denoising_loss + 0.25 * bb_denoising_finegrain_loss + kl).mean()
 

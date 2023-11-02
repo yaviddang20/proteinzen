@@ -167,8 +167,14 @@ def gen_spatial_graph_features(X_ca, edge_index, num_rbf_embed, num_pos_embed):
     edge_dist_vec = X_ca[edge_index[0]] - X_ca[edge_index[1]]
     edge_dist = torch.linalg.vector_norm(edge_dist_vec, dim=-1)
     edge_dist_rbf = _rbf(edge_dist, device=edge_dist.device, D_count=num_rbf_embed)  # edge_channels_list
-    edge_dist_rel_pos = _edge_positional_embeddings(edge_index, num_embeddings=num_pos_embed, device=edge_dist.device)  # edge_channels_list
-    edge_features = torch.cat([edge_dist_rbf, edge_dist_rel_pos], dim=-1)
+    if num_pos_embed > 0:
+        edge_dist_rel_pos = _edge_positional_embeddings(edge_index, num_embeddings=num_pos_embed, device=edge_dist.device)  # edge_channels_list
+
+    if num_pos_embed > 0:
+        edge_features = torch.cat([edge_dist_rbf, edge_dist_rel_pos], dim=-1)
+    else:
+        edge_features = edge_dist_rbf
+
     return edge_features, edge_dist_vec
 
 def get_data_lens(pyg_graph, key=None):

@@ -95,11 +95,11 @@ class Node2AnchorAttention(nn.Module):
 class LinearPoolUpdate(PoolUpdate):
     def __init__(self,
                  h_node,
-                 min_a,
+                 ratio,
                  connect_dim):
         super().__init__()
         self.h_node = h_node
-        self.min_a = min_a
+        self.ratio = ratio
 
         # select
         self.score_layer = nn.Sequential(
@@ -109,11 +109,11 @@ class LinearPoolUpdate(PoolUpdate):
             nn.ReLU(),
             # nn.Linear(h_node, 1)
         )
-        self.topk = SelectTopK(h_node, ratio=0.1)#min_score=min_a)
+        self.topk = SelectTopK(h_node, ratio=ratio)
 
         # connect
-        self.project_anchor = nn.Linear(h_node, connect_dim, bias=False)
-        self.project_node = nn.Linear(h_node, connect_dim, bias=False)
+        self.project_anchor = nn.Linear(h_node, connect_dim)
+        self.project_node = nn.Linear(h_node, connect_dim)
 
         # n2a
         self.n2a = Node2AnchorAttention(h_node, connect_dim)

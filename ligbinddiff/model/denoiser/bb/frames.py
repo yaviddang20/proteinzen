@@ -2,6 +2,7 @@
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from ligbinddiff.model.modules.common import RBF
 from ligbinddiff.model.modules.layers.edge.sitewise import EdgeTransition
 from ligbinddiff.model.modules.layers.node.attention import GraphInvariantPointAttention, PointSetAttentionWithEdgeBias
@@ -56,7 +57,7 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
         self.ln_s1 = nn.LayerNorm(c_s)
         self.ln_s2 = nn.LayerNorm(c_s)
 
-        self.pool_update = LinearPoolUpdate(c_s, min_a=0.1, connect_dim=3)
+        self.pool_update = LinearPoolUpdate(c_s, ratio=0.05, connect_dim=3)
 
         self.bb_update = BackboneUpdate(
             c_s
@@ -125,6 +126,7 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
 
         return node_features, rigids, edge_features, seq_edge_features, anchor_kl, node_kl
 
+
 class GraphIpaFrameDenoiser(nn.Module):
     """ Denoising model on sidechain densities """
     def __init__(self,
@@ -135,26 +137,43 @@ class GraphIpaFrameDenoiser(nn.Module):
                  num_qk_pts,
                  num_v_pts,
                  h_time=64,
-                 scalar_h_dim=128,
                  n_layers=4,
                  knn_k=20,
-                 lrange_k=30):
+                 lrange_k=30,
+                 self_conditioning=False,
+                 graph_conditioning=True):
         super().__init__()
 
         self.c_s = c_s
         self.c_z = c_z
+        self.self_conditioning = self_conditioning
+        if graph_conditioning:
+            assert self_conditioning, "graph conditioning requires self-conditioning"
+        self.graph_conditioning = graph_conditioning
+        self.n_layers = n_layers
 
         self.h_time = h_time
         self.time_rbf = RBF(n_basis=h_time//2)
-        self.time_mlp = nn.Sequential(
-            nn.Linear(h_time, scalar_h_dim),
-            nn.ReLU(),
-            nn.Linear(scalar_h_dim, h_time),
-            nn.ReLU()
-        )
 
-        self.embed_node = nn.Linear(
-            c_s + h_time + 1, c_s
+        self.embed_node = nn.Sequential(
+            nn.Linear(
+                # node_embedding + time_embedding + fixed_mask + self_conditioning
+                c_s + h_time + 1 + self_conditioning * (c_s + 7),
+                c_s
+            ),
+            nn.ReLU(),
+            nn.Linear(c_s, c_s),
+            nn.ReLU(),
+            nn.Linear(c_s, c_s),
+            nn.LayerNorm(c_s)
+        )
+        self.embed_edge = nn.Sequential(
+            nn.Linear(c_z + self_conditioning * (c_z//2), c_z),
+            nn.ReLU(),
+            nn.Linear(c_z, c_z),
+            nn.ReLU(),
+            nn.Linear(c_z, c_z),
+            nn.LayerNorm(c_z)
         )
 
         self.denoiser = nn.ModuleList([
@@ -164,16 +183,16 @@ class GraphIpaFrameDenoiser(nn.Module):
                  c_hidden,
                  num_heads,
                  num_qk_pts,
-                 num_v_pts,
+                 num_v_pts
             )
-            for i in range(n_layers)
+            for _ in range(n_layers)
         ])
         self.knn_k = knn_k
         self.lrange_k = lrange_k
 
         self.torsion_angles = TorsionAngles(c_s, 1)
 
-    def forward(self, data):
+    def forward(self, data, self_condition=None):
         ## prep features
         data_lens = get_data_lens(data, key='x')
         ts = data['t']  # (B,)
@@ -205,9 +224,15 @@ class GraphIpaFrameDenoiser(nn.Module):
 
         # generate spatial edges
         X_ca = rigids_t.get_trans()
-        masked_X_ca = X_ca.clone()
-        masked_X_ca[x_mask] = torch.inf
-        edge_index = sample_inv_cubic_edges(masked_X_ca, x_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k)
+        if self.graph_conditioning and self_condition is not None:
+            self_cond_X_ca = self_condition['final_rigids'].get_trans()
+            masked_X_ca = self_cond_X_ca.clone()
+            masked_X_ca[x_mask] = torch.inf
+            edge_index = sample_inv_cubic_edges(masked_X_ca, x_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k)
+        else:
+            masked_X_ca = X_ca.clone()
+            masked_X_ca[x_mask] = torch.inf
+            edge_index = sample_inv_cubic_edges(masked_X_ca, x_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k)
 
         # compute edge features
         edge_features, _ = gen_spatial_graph_features(X_ca, edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=self.c_z//2)
@@ -215,7 +240,7 @@ class GraphIpaFrameDenoiser(nn.Module):
 
         ## create time embedding
         fourier_time = self.time_rbf(ts.unsqueeze(-1))  # (N_node x h_time,)
-        embedded_time = self.time_mlp(fourier_time)  # (N_node x h_time)
+        # embedded_time = self.time_mlp(fourier_time)  # (N_node x h_time)
 
         # generate node features
         residx = torch.cat(residx, dim=-1)
@@ -223,14 +248,51 @@ class GraphIpaFrameDenoiser(nn.Module):
             residx,
             num_embeddings=self.c_s,
             device=device)
-        node_features = self.embed_node(
-            torch.cat([
+        node_input = torch.cat([
                 res_pos,
-                embedded_time,
+                fourier_time,
                 data['noising_mask'].float()[..., None]
             ], dim=-1)
-        )
+        if self.self_conditioning and self_condition is not None:
+            self_cond_rigids = self_condition['final_rigids']
+            self_cond_nodes = self_condition['node_features']
+
+            trans_rel = self_cond_rigids.get_trans() - rigids_t.get_trans()
+            rigids_t_quat = rigids_t.get_rots().get_quats()
+            self_cond_quat = self_cond_rigids.get_rots().get_quats()
+            quat_rel = ru.quat_multiply(
+                ru.invert_quat(rigids_t_quat),
+                self_cond_quat
+            )
+
+            t7_rel = torch.cat([quat_rel, trans_rel], dim=-1)
+
+
+            node_input = torch.cat(
+                [node_input, self_cond_nodes, t7_rel],
+                dim=-1
+            )
+
+            self_cond_X_ca = self_cond_rigids.get_trans()
+            self_cond_edge_features, _ = gen_spatial_graph_features(self_cond_X_ca, edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=0)
+            edge_features = torch.cat(
+                [edge_features, self_cond_edge_features],
+                dim=-1
+            )
+
+        elif self.self_conditioning:
+            node_input = F.pad(
+                node_input,
+                (0, self.c_s + 7)
+            )
+            edge_features = F.pad(
+                edge_features,
+                (0, self.c_z//2)
+            )
+        node_features = self.embed_node(node_input)
         node_features = node_features * (~x_mask)[..., None]
+        edge_features = self.embed_edge(edge_features)
+
 
         ## denoising
         rigids_t = rigids_t.scale_translation(0.1)
