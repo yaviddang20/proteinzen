@@ -1360,7 +1360,8 @@ def debug_inpaint_frame_latent_loss_fn(batch,
     ) * (latent_outputs['t'] < time_threshold)
 
     # kl = torch.mean(torch.stack(decoder_outputs['anchor_kl']), dim=0) + torch.mean(torch.stack(decoder_outputs['node_kl']), dim=0)
-    kl = torch.mean(torch.stack(decoder_outputs['node_kl']), dim=0)
+    # kl = torch.mean(torch.stack(decoder_outputs['node_kl']), dim=0)
+    kl = torch.zeros(batch.num_graphs, device=batch['x'].device)
 
     loss = (bb_denoising_loss + 0.25 * bb_denoising_finegrain_loss + kl).mean()
 
