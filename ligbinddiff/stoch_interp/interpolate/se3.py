@@ -59,6 +59,7 @@ class SE3FlowMatcher:
             diffuse_mask: Optional[torch.Tensor] = None,
             as_tensor_7: bool=True,
             batch=None,
+            t_clip=0.1
         ):
         """
         Args:
@@ -93,7 +94,7 @@ class SE3FlowMatcher:
             # rot_cond_v = so3.cond_v_field(rot_t, rot_0, t)
             rot_t = self.so3_cfm.sample_xt(rot_0, rot_1, t, if_matrix_format=True)
             rot_t = torch.as_tensor(rot_t).float()
-            rot_cond_v = self.so3_cfm.compute_conditional_flow(rot_t, rot_0, t)
+            rot_cond_v = self.so3_cfm.compute_conditional_flow(rot_t, rot_0, t, t_clip=t_clip)
             # print(rot_t.shape, rot_cond_v.shape)
         else:
             rot_t = rot_0.clone()
@@ -101,7 +102,7 @@ class SE3FlowMatcher:
 
         if self.diffuse_trans:
             trans_t = r3.linear_interpolant(trans_0, trans_1, t)
-            trans_cond_v = r3.cond_v_field(trans_0, trans_1, torch.ones_like(t))
+            trans_cond_v = r3.cond_v_field(trans_0, trans_1, torch.ones_like(t), t_clip=t_clip)
         else:
             trans_t = trans_0.clone()
             trans_cond_v = torch.zeros_like(trans_0)
@@ -134,12 +135,12 @@ class SE3FlowMatcher:
             'rot_cond_v': rot_cond_v,
         }
 
-    def calc_trans_cond_v(self, trans_t, trans_0, t, batch):
-        return r3.cond_v_field(trans_0, trans_t, t, batch=batch, t_clip=0)
+    def calc_trans_cond_v(self, trans_t, trans_0, t, batch, t_clip=0):
+        return r3.cond_v_field(trans_0, trans_t, t, batch=batch, t_clip=t_clip)
 
-    def calc_rot_cond_v(self, rots_t, rots_0, t):
+    def calc_rot_cond_v(self, rots_t, rots_0, t, t_clip):
         # return so3.cond_v_field(rots_t, rots_0, t)
-        return self.so3_cfm.compute_conditional_flow(rots_t.get_rot_mats(), rots_0.get_rot_mats(), t)
+        return self.so3_cfm.compute_conditional_flow(rots_t.get_rot_mats(), rots_0.get_rot_mats(), t, t_clip=t_clip)
 
     def _apply_mask(self, x_diff, x_fixed, diff_mask):
         return diff_mask * x_diff + (1 - diff_mask) * x_fixed
@@ -152,7 +153,7 @@ class SE3FlowMatcher:
             t: float,
             dt: float,
             diffuse_mask: np.ndarray = None,
-            anneal=10,
+            anneal=20,
         ):
         """Reverse sampling function from (t) to (t-1).
 
@@ -199,12 +200,12 @@ class SE3FlowMatcher:
 
         if diffuse_mask is not None:
             trans_t_1 = self._apply_mask(
-                trans_t_1, trans_t, diffuse_mask[..., None])
+                trans_t_1, trans_t, diffuse_mask[..., None]).numpy(force=True)
             rot_t = Rotation.from_matrix(rot_t.get_rot_mats().numpy(force=True)).as_rotvec()
             rot_t_1 = Rotation.from_matrix(rot_t_1.get_rot_mats().numpy(force=True)).as_rotvec()
             rot_t_1 = self._apply_mask(
-                rot_t_1, rot_t, diffuse_mask[..., None])
-            return _assemble_rigid(rot_t_1, trans_t_1)
+                rot_t_1, rot_t, diffuse_mask[..., None].numpy(force=True))
+            return _assemble_rigid(rot_t_1, trans_t_1).to(rigid_t.device)
         else:
             return ru.Rigid(rots=rot_t_1, trans=trans_t_1)
 

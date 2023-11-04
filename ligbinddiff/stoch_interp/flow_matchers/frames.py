@@ -45,16 +45,16 @@ class GraphFrameFlow(nn.Module):
         self.time_T = 1
         self.se3_interp = se3_interp
 
-    def reverse_noising(self, data):
+    def reverse_noising(self, data, t_clip=0.1):
         denoiser_output = self.denoiser(data)
         x_mask = data['x_mask']
         noising_mask = ~data['fixed_mask'].bool()
         mask = x_mask | ~noising_mask
-        pred_bb_cond_v = self.bb_cond_v(data, denoiser_output, mask)
+        pred_bb_cond_v = self.bb_cond_v(data, denoiser_output, mask, t_clip=t_clip)
         denoiser_output["pred_bb_cond_v"] = pred_bb_cond_v
         return denoiser_output
 
-    def bb_cond_v(self, data, denoiser_output, mask):
+    def bb_cond_v(self, data, denoiser_output, mask, t_clip=0):
         bb_x_t = ru.Rigid.from_tensor_7(data[self.bb_x_t_key])
         t = data['t']
         data_lens = get_data_lens(data, 'x')
@@ -66,6 +66,7 @@ class GraphFrameFlow(nn.Module):
             rots_x_t,
             rots_x_0_pred,
             t_per_node,
+            t_clip=t_clip
         )
         rot_cond_v = rot_cond_v.squeeze(0)
 
@@ -75,7 +76,8 @@ class GraphFrameFlow(nn.Module):
             trans_x_t,
             trans_x_0_pred,
             t_per_node,
-            data.batch
+            data.batch,
+            t_clip=t_clip
         )
 
         rot_cond_v = rot_cond_v * ~mask[..., None, None]
@@ -122,7 +124,8 @@ class GraphFrameFlow(nn.Module):
         rot_cond_v, trans_cond_v = self.bb_cond_v(
             data,
             denoiser_output,
-            mask
+            mask,
+            t_clip=0
         )
 
         bb_x_tm1 = self.se3_interp.reverse(
@@ -153,6 +156,7 @@ class GraphFrameFlow(nn.Module):
         delta_t = self.time_T / steps
         intermediates['t'] = torch.ones(1, device=device)
         bb_x_t = intermediates[self.bb_x_t_key]
+        intermediates[self.bb_x_t_key] = bb_x_t.to(device)
         denoiser_output = None
 
         with torch.no_grad():

@@ -58,7 +58,7 @@ class SO3ConditionalFlowMatcher:
         xt = self.vec_manifold.matrix_from_rotation_vector(xt)
         return xt
 
-    def compute_conditional_flow(self, xt, x0, t):
+    def compute_conditional_flow(self, xt, x0, t, t_clip=0.0):
         """
         Function which computes the general vector field for k(t) = 1-t.
         """
@@ -92,7 +92,7 @@ class SO3ConditionalFlowMatcher:
         xt = xt.float()
         #delta_r = torch.transpose(x0, dim0=-2, dim1=-1) @ xt#.double()
         delta_r = torch.transpose(xt, dim0=-2, dim1=-1) @ x0 #.double()
-        ut = xt @ log(delta_r)/t[:, None, None]
+        ut = xt @ log(delta_r)/t[:, None, None].clip(min=t_clip)
         # Above is faster than taking the time derivative like in [2]
         return ut
 
