@@ -31,6 +31,7 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
                  num_heads,
                  num_qk_pts,
                  num_v_pts,
+                 use_anchors=True,
                  ):
         """
         Args
@@ -57,7 +58,9 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
         self.ln_s1 = nn.LayerNorm(c_s)
         self.ln_s2 = nn.LayerNorm(c_s)
 
-        self.pool_update = LinearPoolUpdate(c_s, ratio=0.05, connect_dim=3)
+        self.use_anchors = use_anchors
+        if self.use_anchors:
+            self.pool_update = LinearPoolUpdate(c_s, ratio=0.05, connect_dim=3)
 
         self.bb_update = BackboneUpdate(
             c_s
@@ -111,7 +114,11 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
         node_s_update = node_s_update * (~x_mask)[..., None]
         node_features = self.ln_s2(node_features + node_s_update)
 
-        node_features, anchor_kl, node_kl = self.pool_update(rigids.get_trans(), node_features, edge_index, data.batch)
+        if self.use_anchors:
+            node_features, anchor_kl, node_kl = self.pool_update(rigids.get_trans(), node_features, edge_index, data.batch)
+        else:
+            anchor_kl = torch.zeros(data.num_graphs, device=node_features.device)
+            node_kl = torch.zeros(data.num_graphs, device=node_features.device)
 
         node_features = self.node_transition(node_features)
         node_features = node_features * (~x_mask)[..., None]
@@ -141,7 +148,8 @@ class GraphIpaFrameDenoiser(nn.Module):
                  knn_k=20,
                  lrange_k=30,
                  self_conditioning=False,
-                 graph_conditioning=True):
+                 graph_conditioning=False,
+                 use_anchors=True):
         super().__init__()
 
         self.c_s = c_s
@@ -183,7 +191,8 @@ class GraphIpaFrameDenoiser(nn.Module):
                  c_hidden,
                  num_heads,
                  num_qk_pts,
-                 num_v_pts
+                 num_v_pts,
+                 use_anchors=use_anchors
             )
             for _ in range(n_layers)
         ])

@@ -186,12 +186,14 @@ class LinearPoolUpdate(PoolUpdate):
         node_kl = torch.stack(node_kl)
 
         a2n_anchors = nearest(node_proj, anchor_proj, batch, anchor_batch)
-        a2n_nodes = torch.arange(node_features.shape[0], device=a2n_anchors.device)
+        a2n_nodes = torch.arange(node_features.shape[0], device=node_features.device)
         a2n_edge_index = torch.stack([a2n_nodes, a2n_anchors])
 
         a2a_edge_index = []
+        a2n_dist_score = []
         offset = 0
         for i in range(anchor_batch.max().item() + 1):
+            # gen a2a_edge_index per graph
             select = (anchor_batch == i)
             num_node = select.sum().long().item()
             dst = torch.arange(num_node, device=select.device)
@@ -201,11 +203,30 @@ class LinearPoolUpdate(PoolUpdate):
                 [dst.reshape(-1), src.reshape(-1)]
             )
             a2a_edge_index.append(anchor_edge_index + offset)
+
+            node_select = (batch == i)
+            node_subset = node_proj[node_select]  # n_node x h_dim
+            anchor_subset = anchor_proj[select]  # n_anchor x h_dim
+            proj_dist_mat = torch.linalg.vector_norm(node_subset[:, None] - anchor_subset[None], dim=-1)
+            proj_dist_score = torch.softmax(-proj_dist_mat, dim=-1)
+            proj_dist_score = torch.gather(
+                proj_dist_score, 
+                1, 
+                (a2n_anchors[node_select] - offset)[..., None]
+            ).squeeze(-1)
+            a2n_dist_score.append(
+                proj_dist_score
+            )
+            
             offset += num_node
+
+
         a2a_edge_index = torch.cat(a2a_edge_index, dim=-1)
+        a2n_dist_score = torch.cat(a2n_dist_score, dim=-1)
 
         a2a_edge_features = anchor_proj[a2a_edge_index[0]] - anchor_proj[a2a_edge_index[1]]
         a2n_edge_features = node_proj[a2n_edge_index[0]] - anchor_proj[a2n_edge_index[1]]
+        a2n_edge_features = a2n_edge_features * a2n_dist_score[..., None]
 
         return a2n_edge_index, a2n_edge_features, a2a_edge_index, a2a_edge_features, anchor_kl, node_kl
 

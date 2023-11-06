@@ -359,6 +359,7 @@ class GraphFrameDiff(nn.Module):
                  bb_x_t_key='rigids_t',
                  self_conditioning=False,
                  graph_conditioning=False,
+                 use_anchors=False,
                  ):
         super().__init__()
         self.bb_x_0_key = bb_x_0_key
@@ -375,7 +376,8 @@ class GraphFrameDiff(nn.Module):
             num_v_pts=num_v_pts,
             n_layers=num_layers,
             self_conditioning=self_conditioning,
-            graph_conditioning=graph_conditioning
+            graph_conditioning=graph_conditioning,
+            use_anchors=use_anchors
         )
         self.time_dist = dist.Uniform(0, 1)
         self.time_T = 1
@@ -387,7 +389,7 @@ class GraphFrameDiff(nn.Module):
                 self_conditioning = self.denoiser(data)
         else:
             self_conditioning = None
-        print(self_conditioning is not None)
+        # print(self_conditioning is not None)
         denoiser_output = self.denoiser(data, self_conditioning)
         x_mask = data['x_mask']
         noising_mask = ~data['fixed_mask'].bool()
@@ -459,7 +461,11 @@ class GraphFrameDiff(nn.Module):
         data = Batch.from_data_list([data])
         data = data.to(t.device)
 
-        denoiser_output = self.denoiser(data)
+        if self.self_conditioning and "self_condition" in intermediates.keys():
+                denoiser_output = self.denoiser(data, self_condition=intermediates['self_condition'])
+        else:
+            denoiser_output = self.denoiser(data)
+
         rot_score, trans_score = self.bb_score_fn(
             data,
             denoiser_output,
@@ -502,6 +508,8 @@ class GraphFrameDiff(nn.Module):
                 bb_x_tm1, tm1, denoiser_output = self.reverse_step(intermediates, delta_t, noise_scale=noise_scale)
                 intermediates['t'] = tm1
                 intermediates[self.bb_x_t_key] = bb_x_tm1
+                if self.self_conditioning:
+                    intermediates['self_condition'] = denoiser_output
 
                 if show_progress:
                     pbar.update(1)
