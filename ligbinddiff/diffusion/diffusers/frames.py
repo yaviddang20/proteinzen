@@ -866,6 +866,7 @@ class HybridSO3FrameDiff(nn.Module):
     def __init__(self,
                  se3_noiser,
                  c_s=128,
+                 c_v=16,
                  c_z=64,
                  c_hidden=128,
                  num_qk_pts=8,
@@ -886,6 +887,7 @@ class HybridSO3FrameDiff(nn.Module):
 
         self.denoiser = HybridSO3FrameDenoiser(
             c_s=c_s,
+            c_v=c_v,
             c_z=c_z,
             c_hidden=c_hidden,
             num_heads=num_heads,
@@ -1040,6 +1042,7 @@ class SO3FrameDiff(nn.Module):
     def __init__(self,
                  se3_noiser,
                  c_s=128,
+                 c_v=16,
                  c_z=64,
                  c_hidden=128,
                  num_qk_pts=8,
@@ -1060,6 +1063,7 @@ class SO3FrameDiff(nn.Module):
 
         self.denoiser = SO3FrameDenoiser(
             c_s=c_s,
+            c_v=c_v,
             c_z=c_z,
             c_hidden=c_hidden,
             num_heads=num_heads,

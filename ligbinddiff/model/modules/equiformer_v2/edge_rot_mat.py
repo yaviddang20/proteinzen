@@ -9,7 +9,7 @@ def sanitize_edge_index(edge_index, edge_distance_vec):
     return edge_index[:, edge_select], edge_distance_vec[edge_select], edge_dist[edge_select]
 
 
-def init_edge_rot_mat(edge_distance_vec):
+def init_edge_rot_mat(edge_distance_vec, grad=False):
     edge_vec_0 = edge_distance_vec
     edge_vec_0_distance = torch.sqrt(torch.sum(edge_vec_0**2, dim=1))
 
@@ -76,4 +76,7 @@ def init_edge_rot_mat(edge_distance_vec):
     edge_rot_mat_inv = torch.cat([norm_z, norm_x, norm_y], dim=2)
     edge_rot_mat = torch.transpose(edge_rot_mat_inv, 1, 2)
 
-    return edge_rot_mat.detach()
+    if grad:
+        return edge_rot_mat
+    else:
+        return edge_rot_mat.detach()

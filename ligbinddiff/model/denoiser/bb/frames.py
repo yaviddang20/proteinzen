@@ -23,6 +23,9 @@ from .framediff import TorsionAngles
 
 from ligbinddiff.model.modules.layers.lrange.anchor import LinearPoolUpdate
 
+from torch_geometric.utils import coalesce
+
+
 class GraphIpaFrameDenoisingLayer(nn.Module):
     """ Denoising layer on sidechain densities """
     def __init__(self,
@@ -1007,6 +1010,7 @@ class HybridSO3FrameDenoisingLayer(nn.Module):
     """ Denoising layer on sidechain densities """
     def __init__(self,
                  c_s,
+                 c_v,
                  c_z,
                  c_hidden,
                  num_heads,
@@ -1019,15 +1023,7 @@ class HybridSO3FrameDenoisingLayer(nn.Module):
         """
         super().__init__()
 
-        self.attn_seq = GraphInvariantPointAttention(
-            c_s=c_s,
-            c_z=c_z,
-            c_hidden=c_hidden,
-            no_heads=num_heads,
-            no_qk_points=num_qk_pts,
-            no_v_points=num_v_pts,
-        )
-        self.attn_spatial = GraphInvariantPointAttention(
+        self.ipa = GraphInvariantPointAttention(
             c_s=c_s,
             c_z=c_z,
             c_hidden=c_hidden,
@@ -1040,7 +1036,7 @@ class HybridSO3FrameDenoisingLayer(nn.Module):
         self.ln_s2 = nn.LayerNorm(c_s)
         self.ln_s3 = nn.LayerNorm(c_s)
 
-        h_equi = c_s // 4
+        h_equi = c_v
 
         node_lmax_list = [1]
         self.node_SO3_rotation_list = nn.ModuleList()
@@ -1057,9 +1053,10 @@ class HybridSO3FrameDenoisingLayer(nn.Module):
                 )
             self.node_SO3_grid_list.append(SO3_m_grid)
         self.mappingReduced = CoefficientMappingModule(node_lmax_list, node_lmax_list)
-        self.trans_compress = nn.Linear(c_s + h_equi, h_equi)
+        self.trans_compress = nn.Linear(c_s + h_equi, h_equi // 2)
+        self.trans_proj_vecs = nn.Linear(c_s + h_equi, (h_equi // 2) * 3)
         self.so3_trans = TransBlockV2(
-            sphere_channels=h_equi,
+            sphere_channels=h_equi + h_equi // 2,
             attn_hidden_channels=h_equi,
             num_heads=num_heads,
             attn_alpha_channels=num_qk_pts,
@@ -1075,18 +1072,13 @@ class HybridSO3FrameDenoisingLayer(nn.Module):
         )
         self.trans_expand = nn.Linear(h_equi, c_s)
 
-        self.bb_update = BackboneUpdate(
-            c_s
+        self.bb_update = BackboneUpdateVectorBias(
+            c_s, h_equi
         )
-        self.node_transition = StructureModuleTransition(
-            c_s
+        self.node_transition = NodeTransition(
+            c_s, h_equi
         )
         self.edge_transition = EdgeTransition(
-            node_embed_size=c_s,
-            edge_embed_in=c_z,
-            edge_embed_out=c_z
-        )
-        self.seq_edge_transition = EdgeTransition(
             node_embed_size=c_s,
             edge_embed_in=c_z,
             edge_embed_out=c_z
@@ -1099,16 +1091,15 @@ class HybridSO3FrameDenoisingLayer(nn.Module):
             rigids,
             edge_features,
             edge_index,
-            seq_edge_features,
-            seq_edge_index,
             data,
             intermediates,
-            node_so3_embed
+            node_so3_embed,
+            edge_rot_grad=False,
     ):
         noising_mask = intermediates['noising_mask']
         x_mask = data['x_mask']
 
-        node_s_update = self.attn_spatial(
+        node_s_update = self.ipa(
             s=node_features,
             z=edge_features,
             edge_index=edge_index,
@@ -1118,19 +1109,10 @@ class HybridSO3FrameDenoisingLayer(nn.Module):
         node_s_update = node_s_update * (~x_mask)[..., None]
         node_features = self.ln_s1(node_features + node_s_update)
 
-        node_s_update = self.attn_seq(
-            s=node_features,
-            z=seq_edge_features,
-            edge_index=seq_edge_index,
-            r=rigids,
-            mask=(~x_mask).float()
-        )
-        node_features = self.ln_s2(node_features + node_s_update * (~x_mask)[..., None])
-
         # set up cache stores
         X_ca = rigids.get_trans()
         edge_distance_vec = X_ca[edge_index[1]] - X_ca[edge_index[0]]
-        edge_rot_mat = init_edge_rot_mat(edge_distance_vec)
+        edge_rot_mat = init_edge_rot_mat(edge_distance_vec, grad=edge_rot_grad)
         for rot in self.node_SO3_rotation_list:
             rot.set_wigner(edge_rot_mat)
 
@@ -1139,31 +1121,46 @@ class HybridSO3FrameDenoisingLayer(nn.Module):
         embed_scalars = self.trans_compress(
             torch.cat([so3_scalars, node_features], dim=-1)
         )
-        node_so3_embed.set_invariant_features(embed_scalars)
+        embed_vecs = self.trans_proj_vecs(
+            torch.cat([so3_scalars, node_features], dim=-1)
+        ).reshape(data.num_nodes, -1, 3)
+        embed_vecs = rigids[..., None].apply(embed_vecs)
+        embed = torch.cat([embed_scalars[..., None, :], embed_vecs.transpose(-1, -2)], dim=-2)
+        
+        node_so3_embed.set_embedding(
+            torch.cat(
+                [node_so3_embed.embedding, embed],
+                dim=-1
+            )
+        )
         node_so3_embed = self.so3_trans(node_so3_embed, edge_features, edge_index)
         so3_scalars = node_so3_embed.get_invariant_features(flat=True)
         node_s_update = self.trans_expand(so3_scalars)
         node_features = self.ln_s3(node_features + node_s_update * (~x_mask)[..., None])
 
+        node_vectors = node_so3_embed.embedding[..., 1:4, :].transpose(-1, -2)
 
-        node_features = self.node_transition(node_features)
+        node_features, node_vectors = self.node_transition(node_features, node_vectors)
         node_features = node_features  * (~x_mask)[..., None]
+        node_vectors =  node_vectors * (~x_mask)[..., None, None]
         rigids_update = self.bb_update(
-            node_features * noising_mask[..., None])
+            node_features * noising_mask[..., None],
+            node_vectors * noising_mask[..., None, None],
+            rigids)
 
         rigids = rigids.compose_q_update_vec(
             rigids_update * noising_mask[..., None]
         )
         edge_features = self.edge_transition(node_features, edge_features, edge_index)
-        seq_edge_features = self.seq_edge_transition(node_features, seq_edge_features, seq_edge_index)
 
-        return node_features, rigids, edge_features, seq_edge_features, node_so3_embed
+        return node_features, rigids, edge_features, node_so3_embed
 
 
 class HybridSO3FrameDenoiser(nn.Module):
     """ Denoising model on sidechain densities """
     def __init__(self,
                  c_s,
+                 c_v,
                  c_z,
                  c_hidden,
                  num_heads,
@@ -1178,6 +1175,7 @@ class HybridSO3FrameDenoiser(nn.Module):
         super().__init__()
 
         self.c_s = c_s
+        self.c_v = c_v
         self.c_z = c_z
         self.self_conditioning = self_conditioning
         if graph_conditioning:
@@ -1212,6 +1210,7 @@ class HybridSO3FrameDenoiser(nn.Module):
         self.denoiser = nn.ModuleList([
             HybridSO3FrameDenoisingLayer(
                  c_s,
+                 c_v,
                  c_z,
                  c_hidden,
                  num_heads,
@@ -1266,10 +1265,13 @@ class HybridSO3FrameDenoiser(nn.Module):
             masked_X_ca = X_ca.clone()
             masked_X_ca[x_mask] = torch.inf
             edge_index = sample_inv_cubic_edges(masked_X_ca, x_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k)
+        edge_index = coalesce(
+            torch.cat([edge_index, seq_local_edge_index], dim=-1)
+        ) 
 
         # compute edge features
         edge_features, _ = gen_spatial_graph_features(X_ca, edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=self.c_z//2)
-        seq_edge_features, _ = gen_spatial_graph_features(X_ca, seq_local_edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=self.c_z//2)
+        # seq_edge_features, _ = gen_spatial_graph_features(X_ca, seq_local_edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=self.c_z//2)
 
         ## create time embedding
         fourier_time = self.time_rbf(ts.unsqueeze(-1))  # (N_node x h_time,)
@@ -1334,18 +1336,16 @@ class HybridSO3FrameDenoiser(nn.Module):
         node_so3_embed = SO3_Embedding(
             num_nodes,
             lmax_list=[1],
-            num_channels=self.c_s//4,
+            num_channels=self.c_v,
             device=node_features.device,
             dtype=node_features.dtype
         )
         for i, layer in enumerate(self.denoiser):
-            node_features, rigids, edge_features, seq_edge_features, node_so3_embed = layer(
+            node_features, rigids, edge_features, node_so3_embed = layer(
                 node_features,
                 rigids,
                 edge_features,
                 edge_index,
-                seq_edge_features,
-                seq_local_edge_index,
                 data,
                 data,
                 node_so3_embed=node_so3_embed
@@ -1371,6 +1371,7 @@ class SO3FrameDenoisingLayer(nn.Module):
     """ Denoising layer on sidechain densities """
     def __init__(self,
                  c_s,
+                 c_v,
                  c_z,
                  c_hidden,
                  num_heads,
@@ -1398,10 +1399,26 @@ class SO3FrameDenoisingLayer(nn.Module):
                 )
             self.node_SO3_grid_list.append(SO3_m_grid)
         self.mappingReduced = CoefficientMappingModule(node_lmax_list, node_lmax_list)
-        h_equi = c_s // 4
+        h_equi = c_v
 
         self.trans_compress = nn.Linear(c_s + h_equi, h_equi)
+        self.trans_proj_vec = nn.Linear(c_s + h_equi, h_equi * 3)
         self.attn_spatial = TransBlockV2(
+            sphere_channels=h_equi*2,
+            attn_hidden_channels=h_equi,
+            num_heads=num_heads,
+            attn_alpha_channels=num_qk_pts,
+            attn_value_channels=num_v_pts,
+            ffn_hidden_channels=h_equi*2,
+            output_channels=h_equi,
+            lmax_list=node_lmax_list,
+            mmax_list=node_lmax_list,
+            SO3_rotation=self.node_SO3_rotation_list,
+            SO3_grid=self.node_SO3_grid_list,
+            mappingReduced=self.mappingReduced,
+            edge_channels_list=[c_z, c_z, c_z]
+        )
+        self.attn2 = TransBlockV2(
             sphere_channels=h_equi,
             attn_hidden_channels=h_equi,
             num_heads=num_heads,
@@ -1416,21 +1433,37 @@ class SO3FrameDenoisingLayer(nn.Module):
             mappingReduced=self.mappingReduced,
             edge_channels_list=[c_z, c_z, c_z]
         )
-        self.attn_seq = TransBlockV2(
-            sphere_channels=h_equi,
-            attn_hidden_channels=h_equi,
-            num_heads=num_heads,
-            attn_alpha_channels=num_qk_pts,
-            attn_value_channels=num_v_pts,
-            ffn_hidden_channels=h_equi*2,
-            output_channels=h_equi,
-            lmax_list=node_lmax_list,
-            mmax_list=node_lmax_list,
-            SO3_rotation=self.node_SO3_rotation_list,
-            SO3_grid=self.node_SO3_grid_list,
-            mappingReduced=self.mappingReduced,
-            edge_channels_list=[c_z, c_z, c_z]
-        )
+        # self.attn3 = TransBlockV2(
+        #     sphere_channels=h_equi,
+        #     attn_hidden_channels=h_equi,
+        #     num_heads=num_heads,
+        #     attn_alpha_channels=num_qk_pts,
+        #     attn_value_channels=num_v_pts,
+        #     ffn_hidden_channels=h_equi*2,
+        #     output_channels=h_equi,
+        #     lmax_list=node_lmax_list,
+        #     mmax_list=node_lmax_list,
+        #     SO3_rotation=self.node_SO3_rotation_list,
+        #     SO3_grid=self.node_SO3_grid_list,
+        #     mappingReduced=self.mappingReduced,
+        #     edge_channels_list=[c_z, c_z, c_z]
+        # )
+
+        # self.attn_seq = TransBlockV2(
+        #     sphere_channels=h_equi*2,
+        #     attn_hidden_channels=h_equi,
+        #     num_heads=num_heads,
+        #     attn_alpha_channels=num_qk_pts,
+        #     attn_value_channels=num_v_pts,
+        #     ffn_hidden_channels=h_equi*2,
+        #     output_channels=h_equi,
+        #     lmax_list=node_lmax_list,
+        #     mmax_list=node_lmax_list,
+        #     SO3_rotation=self.node_SO3_rotation_list,
+        #     SO3_grid=self.node_SO3_grid_list,
+        #     mappingReduced=self.mappingReduced,
+        #     edge_channels_list=[c_z, c_z, c_z]
+        # )
         self.trans_expand = nn.Linear(h_equi, c_s)
 
         self.ln_s1 = nn.LayerNorm(c_s)
@@ -1446,11 +1479,11 @@ class SO3FrameDenoisingLayer(nn.Module):
             edge_embed_in=c_z,
             edge_embed_out=c_z
         )
-        self.seq_edge_transition = EdgeTransition(
-            node_embed_size=c_s,
-            edge_embed_in=c_z,
-            edge_embed_out=c_z
-        )
+        # self.seq_edge_transition = EdgeTransition(
+        #     node_embed_size=c_s,
+        #     edge_embed_in=c_z,
+        #     edge_embed_out=c_z
+        # )
 
 
     def forward(
@@ -1459,8 +1492,8 @@ class SO3FrameDenoisingLayer(nn.Module):
             rigids,
             edge_features,
             edge_index,
-            seq_edge_features,
-            seq_edge_index,
+            # seq_edge_features,
+            # seq_edge_index,
             data,
             intermediates,
             node_so3_embed
@@ -1469,26 +1502,41 @@ class SO3FrameDenoisingLayer(nn.Module):
         x_mask = data['x_mask']
 
         so3_scalars = node_so3_embed.get_invariant_features(flat=True)
+        # embed_scalars = self.trans_compress(
+        #     torch.cat([so3_scalars, node_features], dim=-1)
+        # )
+        # node_so3_embed.set_invariant_features(embed_scalars)
         embed_scalars = self.trans_compress(
             torch.cat([so3_scalars, node_features], dim=-1)
         )
-        node_so3_embed.set_invariant_features(embed_scalars)
+        embed_vecs = self.trans_proj_vec(
+            torch.cat([so3_scalars, node_features], dim=-1)
+        ).reshape(data.num_nodes, -1, 3)
+        embed_vecs = rigids[..., None].apply(embed_vecs)
+        embed = torch.cat([embed_scalars[..., None, :], embed_vecs.transpose(-1, -2)], dim=-2)
+        
+        node_so3_embed.set_embedding(
+            torch.cat(
+                [node_so3_embed.embedding, embed],
+                dim=-1
+            )
+        )
 
         # set up cache stores
         X_ca = rigids.get_trans()
-        edge_distance_vec = X_ca[seq_edge_index[1]] - X_ca[seq_edge_index[0]]
-        edge_rot_mat = init_edge_rot_mat(edge_distance_vec)
-        for rot in self.node_SO3_rotation_list:
-            rot.set_wigner(edge_rot_mat)
-        node_embed_update = self.attn_seq(
-            node_so3_embed,
-            seq_edge_features,
-            seq_edge_index,
-        )
-        node_so3_embed = node_embed_update
+        # edge_distance_vec = X_ca[seq_edge_index[1]] - X_ca[seq_edge_index[0]]
+        # edge_rot_mat = init_edge_rot_mat(edge_distance_vec, grad=True)
+        # for rot in self.node_SO3_rotation_list:
+        #     rot.set_wigner(edge_rot_mat)
+        # node_embed_update = self.attn_seq(
+        #     node_so3_embed,
+        #     seq_edge_features,
+        #     seq_edge_index,
+        # )
+        # node_so3_embed = node_embed_update
 
         edge_distance_vec = X_ca[edge_index[1]] - X_ca[edge_index[0]]
-        edge_rot_mat = init_edge_rot_mat(edge_distance_vec)
+        edge_rot_mat = init_edge_rot_mat(edge_distance_vec, grad=True)
         for rot in self.node_SO3_rotation_list:
             rot.set_wigner(edge_rot_mat)
 
@@ -1497,6 +1545,17 @@ class SO3FrameDenoisingLayer(nn.Module):
             edge_features,
             edge_index,
         )
+        node_embed_update = self.attn2(
+            node_embed_update,
+            edge_features,
+            edge_index,
+        )
+        # node_embed_update = self.attn3(
+        #     node_embed_update,
+        #     edge_features,
+        #     edge_index,
+        # )
+
         node_so3_embed = node_embed_update
 
         so3_scalars = node_so3_embed.get_invariant_features(flat=True)
@@ -1517,15 +1576,16 @@ class SO3FrameDenoisingLayer(nn.Module):
             rigids_update * noising_mask[..., None]
         )
         edge_features = self.edge_transition(node_features, edge_features, edge_index)
-        seq_edge_features = self.seq_edge_transition(node_features, seq_edge_features, seq_edge_index)
+        # seq_edge_features = self.seq_edge_transition(node_features, seq_edge_features, seq_edge_index)
 
-        return node_features, rigids, edge_features, seq_edge_features, node_so3_embed
+        return node_features, rigids, edge_features, node_so3_embed
 
 
 class SO3FrameDenoiser(nn.Module):
     """ Denoising model on sidechain densities """
     def __init__(self,
                  c_s,
+                 c_v,
                  c_z,
                  c_hidden,
                  num_heads,
@@ -1540,6 +1600,7 @@ class SO3FrameDenoiser(nn.Module):
         super().__init__()
 
         self.c_s = c_s
+        self.c_v = c_v
         self.c_z = c_z
         self.self_conditioning = self_conditioning
         if graph_conditioning:
@@ -1574,6 +1635,7 @@ class SO3FrameDenoiser(nn.Module):
         self.denoiser = nn.ModuleList([
             SO3FrameDenoisingLayer(
                  c_s,
+                 c_v,
                  c_z,
                  c_hidden,
                  num_heads,
@@ -1628,10 +1690,13 @@ class SO3FrameDenoiser(nn.Module):
             masked_X_ca = X_ca.clone()
             masked_X_ca[x_mask] = torch.inf
             edge_index = sample_inv_cubic_edges(masked_X_ca, x_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k)
+        edge_index = coalesce(
+            torch.cat([edge_index, seq_local_edge_index], dim=-1)
+        ) 
 
         # compute edge features
         edge_features, _ = gen_spatial_graph_features(X_ca, edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=self.c_z//2)
-        seq_edge_features, _ = gen_spatial_graph_features(X_ca, seq_local_edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=self.c_z//2)
+        # seq_edge_features, _ = gen_spatial_graph_features(X_ca, seq_local_edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=self.c_z//2)
 
         ## create time embedding
         fourier_time = self.time_rbf(ts.unsqueeze(-1))  # (N_node x h_time,)
@@ -1696,22 +1761,31 @@ class SO3FrameDenoiser(nn.Module):
         node_so3_embed = SO3_Embedding(
             num_nodes,
             lmax_list=[1],
-            num_channels=self.c_s//4,
+            num_channels=self.c_v,
             device=node_features.device,
             dtype=node_features.dtype
         )
         for i, layer in enumerate(self.denoiser):
-            node_features, rigids, edge_features, seq_edge_features, node_so3_embed = layer(
+            node_features, rigids, edge_features, node_so3_embed = layer(
                 node_features,
                 rigids,
                 edge_features,
                 edge_index,
-                seq_edge_features,
-                seq_local_edge_index,
                 data,
                 data,
                 node_so3_embed=node_so3_embed
             )
+            # node_features, rigids, edge_features, seq_edge_features, node_so3_embed = layer(
+            #     node_features,
+            #     rigids,
+            #     edge_features,
+            #     edge_index,
+            #     seq_edge_features,
+            #     seq_local_edge_index,
+            #     data,
+            #     data,
+            #     node_so3_embed=node_so3_embed
+            # )
 
         psi, _ = self.torsion_angles(node_features)
 
