@@ -205,6 +205,7 @@ class SO3_Embedding():
         num_channels,
         device,
         dtype,
+        embedding=None
     ):
         super().__init__()
         self.num_channels = num_channels
@@ -218,17 +219,22 @@ class SO3_Embedding():
                 (lmax_list[i] + 1) ** 2
             )
 
-        embedding = torch.zeros(
-            length,
-            self.num_coefficients,
-            self.num_channels,
-            device=self.device,
-            dtype=self.dtype,
-        )
+        if embedding is None:
+            embedding = torch.zeros(
+                length,
+                self.num_coefficients,
+                self.num_channels,
+                device=self.device,
+                dtype=self.dtype,
+            )
+        else:
+            assert self.num_coefficients == embedding.shape[1]
+            assert self.num_channels == embedding.shape[2]
+            self.device = embedding.device
+            self.dtype = embedding.dtype
 
         self.set_embedding(embedding)
         self.set_lmax_mmax(lmax_list, lmax_list.copy())
-
 
     # Clone an embedding of irreps
     def clone(self):

@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 import torch_cluster
 from torch_geometric.data import Data, HeteroData
+import torch_geometric.utils as pygu
 from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddings, _rbf
 from ligbinddiff.model.utils.graph import sequence_local_graph
 
@@ -442,17 +443,16 @@ def atom14_to_ca_graph(atom14, atom14_mask):
         torch.cumsum(num_atoms_per_residue, dim=0)[:-1]
     ], dim=0)
 
-    residue_dst = torch.arange(14)
-    residue_src = torch.ones(14)  # ca is index 1
-    residue_graph = torch.stack([
+    residue_dst = torch.arange((~atom14_mask).sum().item())
+    residue_src = torch.ones((num_res, 14)) + atom_idx_offset[:, None]  # ca is index 1
+    residue_src = residue_src[~atom14_mask].view(-1)
+    atom14_to_ca_edge_index = torch.stack([
         residue_dst,
         residue_src
-    ], dim=-1)
-    residue_graph = residue_graph[residue_dst != 1]  # no self edge to ca
-    atom14_to_ca_graph = residue_graph.unsqueeze(0).expand(num_res, -1, -1) + atom_idx_offset[:, None, None]
-
-    atom14_mask_no_ca = atom14_mask[:, residue_dst != 1]
-    atom14_to_ca_edge_index = atom14_to_ca_graph[~atom14_mask_no_ca].transpose(-1, -2)
+    ], dim=0)
+    # atom14_to_ca_edge_index, _ = pygu.remove_self_loops(atom14_to_ca_edge_index)
+    select = atom14_to_ca_edge_index[0] == atom14_to_ca_edge_index[1]
+    atom14_to_ca_edge_index = atom14_to_ca_edge_index[:, ~select]
 
     atom_to_res_map = torch.arange(num_res)[:, None].expand(-1, 14)
     atom_to_res_map = atom_to_res_map[~atom14_mask]

@@ -61,7 +61,7 @@ def cath_inference_loop(diffuser,
 
         denoised_batch, denoiser_outputs = diffuser.sample(batch, steps=num_steps, show_progress=show_progress)
 
-        loss_dict = loss_fn(denoised_batch, denoiser_outputs, use_channel_weights=use_channel_weights)
+        loss_dict = loss_fn(batch, denoised_batch, denoiser_outputs)
         print(batch.name)
         print(loss_dict)
         denoising_loss = loss_dict["denoising_loss"]
@@ -71,13 +71,13 @@ def cath_inference_loop(diffuser,
         bond_angle_loss = loss_dict["bond_angle_loss"]
         chi_loss = loss_dict["chi_loss"]
 
-        data_splits = batch._slice_dict['x']
+        data_splits = batch._slice_dict['residue']['x']
         data_lens = (data_splits[1:] - data_splits[:-1]).tolist()
 
         pred_seq = denoiser_outputs['seq_logits'].argmax(dim=-1).tolist()
         pred_seq = "".join([num_to_letter[i] for i in pred_seq])
-        ref_seq = "".join([num_to_letter[i] for i in denoised_batch['seq'].tolist()])
-        per_seq_recov = seq_recov(denoised_batch['seq'], denoiser_outputs['seq_logits'], num_nodes=data_lens, mask=denoised_batch['x_mask'])
+        ref_seq = "".join([num_to_letter[i] for i in batch['residue']['seq'].tolist()])
+        per_seq_recov = seq_recov(batch['residue']['seq'], denoiser_outputs['seq_logits'], num_nodes=data_lens, mask=batch['residue']['x_mask'])
         print()
         print("pred seq:\t", pred_seq)
         print("ref seq:\t", ref_seq)

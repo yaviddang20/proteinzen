@@ -38,7 +38,8 @@ class Atom91Encoder(nn.Module):
                  num_heads=8,
                  h_channels=32,
                  num_layers=4,
-                 k=30
+                 k=30,
+                 n_aa=20,
                  ):
         super().__init__()
         self.node_lmax_list = node_lmax_list
@@ -50,11 +51,13 @@ class Atom91Encoder(nn.Module):
         self.atom_super_SO3_rotation = atom_super_SO3_rotation
         self.bb_super_SO3_rotation = bb_super_SO3_rotation
 
+        self.embed_seq = nn.Embedding(n_aa, n_aa)
+
         self.embed_bb = ProjectLayer(
             in_lmax_list=bb_lmax_list,
-            in_channels=bb_channels,
+            in_channels=6+n_aa,
             out_lmax_list=node_lmax_list,
-            out_channels=h_channels,
+            out_channels=h_channels // 2,
             edge_channels_list=edge_channels_list,
             mappingReduced_super=mappingReduced_super_bb,
             super_SO3_rotation=bb_super_SO3_rotation,
@@ -65,7 +68,7 @@ class Atom91Encoder(nn.Module):
             in_lmax_list=atom_lmax_list,
             in_channels=atom_channels,
             out_lmax_list=node_lmax_list,
-            out_channels=h_channels,
+            out_channels=h_channels // 2,
             edge_channels_list=edge_channels_list,
             mappingReduced_super=mappingReduced_super_atoms,
             super_SO3_rotation=atom_super_SO3_rotation,
@@ -75,13 +78,13 @@ class Atom91Encoder(nn.Module):
         self.transformer = nn.ModuleList(
             [
                 TransBlockV2(
-                    sphere_channels=h_channels * 2,
+                    sphere_channels=h_channels,
                     attn_hidden_channels=h_channels,
                     num_heads=num_heads,
                     attn_alpha_channels=h_channels // 2,
-                    attn_value_channels=h_channels // 4,
+                    attn_value_channels=h_channels // 2,
                     ffn_hidden_channels=h_channels,
-                    output_channels=h_channels * 2,
+                    output_channels=h_channels,
                     lmax_list=node_lmax_list[0:1],
                     mmax_list=node_lmax_list[0:1],
                     SO3_rotation=node_SO3_rotation,
@@ -98,18 +101,18 @@ class Atom91Encoder(nn.Module):
                 EdgeUpdate(
                     node_lmax_list=node_lmax_list,
                     edge_channels_list=edge_channels_list,
-                    h_channels=h_channels * 2
+                    h_channels=h_channels
                 )
                 for _ in range(num_layers)
             ]
         )
 
         self.output_mu = TransBlockV2(
-            sphere_channels=h_channels * 2,
+            sphere_channels=h_channels,
             attn_hidden_channels=h_channels,
             num_heads=num_heads,
             attn_alpha_channels=h_channels // 2,
-            attn_value_channels=h_channels // 4,
+            attn_value_channels=h_channels // 2,
             ffn_hidden_channels=h_channels,
             output_channels=h_channels,
             lmax_list=node_lmax_list[0:1],
@@ -121,11 +124,11 @@ class Atom91Encoder(nn.Module):
         )
 
         self.output_logvar = TransBlockV2(
-            sphere_channels=h_channels * 2,
+            sphere_channels=h_channels,
             attn_hidden_channels=h_channels,
             num_heads=num_heads,
             attn_alpha_channels=h_channels // 2,
-            attn_value_channels=h_channels // 4,
+            attn_value_channels=h_channels // 2,
             ffn_hidden_channels=h_channels,
             output_channels=h_channels,
             lmax_list=node_lmax_list[0:1],
@@ -149,6 +152,7 @@ class Atom91Encoder(nn.Module):
         bb_features = {
             0: torch.cat([
                 dihedrals,  # 6
+                self.embed_seq(graph['residue']['seq'])
             ], dim=-1).unsqueeze(-1),  # total 26
             1: torch.nan_to_num(
                 torch.cat([
@@ -193,7 +197,7 @@ class Atom91Encoder(nn.Module):
         res_features = SO3_Embedding(
             num_nodes,
             lmax_list=self.node_lmax_list,
-            num_channels=self.h_channels*2,
+            num_channels=self.h_channels,
             device=bb_features.device,
             dtype=bb_features.dtype
         )
@@ -242,10 +246,11 @@ class Atom91Decoder(nn.Module):
         self.atom_lmax_list = atom_lmax_list
         self.atom_channels = atom_channels
         self.h_channels = h_channels
+        self.bb_channels = bb_channels
 
-        self.embed_bb = ProjectLayer(
+        self.embed = ProjectLayer(
             in_lmax_list=bb_lmax_list,
-            in_channels=bb_channels,
+            in_channels=bb_channels + h_channels,
             out_lmax_list=node_lmax_list,
             out_channels=h_channels,
             edge_channels_list=edge_channels_list,
@@ -257,19 +262,21 @@ class Atom91Decoder(nn.Module):
         self.transformer = nn.ModuleList(
             [
                 TransBlockV2(
-                    sphere_channels=h_channels * 2,
+                    sphere_channels=h_channels,
                     attn_hidden_channels=h_channels,
                     num_heads=num_heads,
                     attn_alpha_channels=h_channels // 2,
-                    attn_value_channels=h_channels // 4,
+                    attn_value_channels=h_channels // 2,
                     ffn_hidden_channels=h_channels,
-                    output_channels=h_channels * 2,
+                    output_channels=h_channels,
                     lmax_list=node_lmax_list[0:1],
                     mmax_list=node_lmax_list[0:1],
                     SO3_rotation=node_SO3_rotation,
                     SO3_grid=node_SO3_grid,
                     edge_channels_list=edge_channels_list,
-                    mappingReduced=mappingReduced_nodes
+                    mappingReduced=mappingReduced_nodes,
+                    alpha_drop=0.1,
+                    proj_drop=0.1,
                 )
                 for _ in range(num_layers)
             ]
@@ -280,27 +287,27 @@ class Atom91Decoder(nn.Module):
                 EdgeUpdate(
                     node_lmax_list=node_lmax_list,
                     edge_channels_list=edge_channels_list,
-                    h_channels=h_channels * 2
+                    h_channels=h_channels
                 )
                 for _ in range(num_layers)
             ]
         )
 
-        self.project = TransBlockV2(
-            sphere_channels=h_channels * 2,
-            attn_hidden_channels=h_channels,
-            num_heads=num_heads,
-            attn_alpha_channels=h_channels // 2,
-            attn_value_channels=h_channels // 4,
-            ffn_hidden_channels=h_channels,
-            output_channels=h_channels,
-            lmax_list=node_lmax_list[0:1],
-            mmax_list=node_lmax_list[0:1],
-            SO3_rotation=node_SO3_rotation,
-            SO3_grid=node_SO3_grid,
-            edge_channels_list=edge_channels_list,
-            mappingReduced=mappingReduced_nodes
-        )
+        # self.project = TransBlockV2(
+        #     sphere_channels=h_channels * 2,
+        #     attn_hidden_channels=h_channels,
+        #     num_heads=num_heads,
+        #     attn_alpha_channels=h_channels // 2,
+        #     attn_value_channels=h_channels // 4,
+        #     ffn_hidden_channels=h_channels,
+        #     output_channels=h_channels,
+        #     lmax_list=node_lmax_list[0:1],
+        #     mmax_list=node_lmax_list[0:1],
+        #     SO3_rotation=node_SO3_rotation,
+        #     SO3_grid=node_SO3_grid,
+        #     edge_channels_list=edge_channels_list,
+        #     mappingReduced=mappingReduced_nodes
+        # )
 
         self.output_atoms = ProjectLayer(
             in_lmax_list=node_lmax_list,
@@ -318,10 +325,11 @@ class Atom91Decoder(nn.Module):
         self.atom_super_SO3_rotation_list = atom_super_SO3_rotation
 
         self.seq_head = nn.Sequential(
-            nn.LayerNorm(atom_channels),
-            nn.Linear(atom_channels, atom_channels),
+            nn.Linear(h_channels, h_channels*2),
             nn.ReLU(),
-            nn.Linear(atom_channels, 20),
+            nn.Linear(h_channels*2, h_channels),
+            nn.ReLU(),
+            nn.Linear(h_channels, 20),
             nn.LogSoftmax(dim=-1)
         )
 
@@ -349,7 +357,6 @@ class Atom91Decoder(nn.Module):
                 ], dim=-2) #1
             )  # total 7
         }
-
         bb_features = type_l_to_so3(bb_features)
 
         masked_X_ca = X_ca.clone()
@@ -371,28 +378,26 @@ class Atom91Decoder(nn.Module):
         for rot in self.atom_super_SO3_rotation_list:
             rot.set_wigner(edge_rot_mat)
 
-        bb_features = self.embed_bb(bb_features, edge_features, edge_index)
-
         res_features = SO3_Embedding(
             num_res,
             lmax_list=self.node_lmax_list,
-            num_channels=self.h_channels*2,
+            num_channels=self.h_channels + self.bb_channels,
             device=bb_features.device,
             dtype=bb_features.dtype
         )
         res_features.set_embedding(
             torch.cat([bb_features.embedding, node_features.embedding], dim=-1)
         )
+        res_features = self.embed(res_features, edge_features, edge_index)
 
         for node_layer, edge_layer in zip(self.transformer, self.edge_update):
             res_features = node_layer(res_features, edge_features, edge_index)
             edge_features = edge_layer(res_features, edge_features, edge_index)
 
-        res_features = self.project(res_features, edge_features, edge_index)
+        # res_features = self.project(res_features, edge_features, edge_index)
         atom_features = self.output_atoms(res_features, edge_features, edge_index)
 
-        atom_invariants = atom_features.get_invariant_features(flat=True)
-        seq_logits = self.seq_head(atom_invariants)
+        seq_logits = self.seq_head(res_features.get_invariant_features(flat=True))
 
         out_dict = {}
         out_dict['decoded_latent'] = atom_features.embedding[..., 1:4, :].transpose(-1, -2)

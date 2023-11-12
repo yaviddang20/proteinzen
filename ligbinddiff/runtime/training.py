@@ -4,7 +4,6 @@ import tqdm
 import numpy as np
 import torch
 
-from ligbinddiff.runtime.loss.loss import discriminator_loss
 from ligbinddiff.runtime.utils import format_list, gen_pbar_str, update_epoch_loss_dict
 
 def unbatch_density(density_dict, batch_num_nodes):
@@ -216,7 +215,7 @@ def inpaint_train_loop(diffuser,
             epoch_loss = np.mean(epoch_dict['loss'])
             pbar_str = f"epoch_loss: {np.mean(epoch_loss):.4f}, "
             pbar_str += gen_pbar_str(loss_dict)
-            pbar_str += f"t: {format_list(latent_data['t'].unique(sorted=False), '{:.4f}')}"
+            pbar_str += f"t: {format_list(latent_data['t'], '{:.4f}')}"
             pbar.set_description(pbar_str)
 
             if torch.isnan(loss).any():

@@ -1147,6 +1147,16 @@ class HybridSO3FrameDenoisingLayer(nn.Module):
             node_features * noising_mask[..., None],
             node_vectors * noising_mask[..., None, None],
             rigids)
+        
+        update_quat = F.pad(
+            rigids_update[..., :3],
+            (1, 0),
+            value=1
+        )
+        update_quat = update_quat / torch.linalg.vector_norm(update_quat, dim=-1)[..., None]
+        update_rot = ru.quat_to_rot(update_quat)
+        node_vectors = update_rot[..., None, :, :] @ node_vectors[..., None]
+        node_so3_embed.embedding[..., 1:4, :] = node_vectors.squeeze(-1).transpose(-1, -2)
 
         rigids = rigids.compose_q_update_vec(
             rigids_update * noising_mask[..., None]

@@ -27,9 +27,9 @@ def so3_embedding_kl(so3_mu, so3_logvar, num_nodes, x_mask):
             splits.append(2*l+1)
     split_mu = so3_mu.embedding[~x_mask].split(splits, dim=1)
     split_logvar = so3_logvar.embedding[~x_mask].split(splits, dim=1)
-    kl_div = 0
+    kl_div = []
     for m, mu, logvar in zip(splits, split_mu, split_logvar):
-        comp_kl_div = -0.5 * (logvar.sum(dim=-2) - mu.square().sum(dim=-2) - logvar.exp().sum(dim=-2) + m)
-        kl_div = kl_div + comp_kl_div.mean(dim=-1)
+        comp_kl_div = -0.5 * (logvar - mu.square() - logvar.exp() + 1)
+        kl_div.append(comp_kl_div.sum(dim=(-1, -2)))
 
-    return _nodewise_to_graphwise(kl_div, num_nodes, x_mask)
+    return [_nodewise_to_graphwise(kl, num_nodes, x_mask) for kl in kl_div]

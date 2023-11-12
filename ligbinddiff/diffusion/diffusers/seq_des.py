@@ -7,8 +7,8 @@ from torch import nn
 import tqdm
 import numpy as np
 
-from ligbinddiff.model.autoencoder.atom91 import Atom91Decoder
-from ligbinddiff.model.autoencoder.atomic import AtomicSidechainEncoder
+from ligbinddiff.model.autoencoder.atom91 import Atom91Encoder, Atom91Decoder
+from ligbinddiff.model.autoencoder.atomic import AtomicSidechainEncoder, MultiscaleSidechainEncoder
 from ligbinddiff.utils.so3_embedding import so3_add, so3_sub, so3_mult, so3_randn_like, so3_ones_like, gen_so3_unop
 from ligbinddiff.model.modules.equiformer_v2.so3 import SO3_Embedding
 
@@ -47,7 +47,8 @@ class Diffuser(nn.Module, abc.ABC):
                  _randn_like,
                  x_0_key,
                  x_0_pred_key,
-                 x_t_key):
+                 x_t_key,
+        ):
         super().__init__()
 
         self.denoiser = denoiser
@@ -88,6 +89,10 @@ class Diffuser(nn.Module, abc.ABC):
         scaled_x_0 = self._mult(data_coeff, x_0)
         x_t = self._add(scaled_x_0, scaled_noise)
         intermediates[self.x_t_key] = x_t
+        noising_mask = torch.ones_like(noise_coeff).view(-1).bool()
+        intermediates["latent_sidechain_score_scaling"] = noising_mask.float()
+        intermediates['noising_mask'] = noising_mask
+
         return intermediates
 
     def reverse_noising(self, data, intermediates):
@@ -157,11 +162,11 @@ class Diffuser(nn.Module, abc.ABC):
         else:
             steps = self.scheduler.T
 
+        delta_t = - self.scheduler.T // steps
         intermediates = {}
         intermediates['t'] = torch.ones([num_nodes], device=device).view(
-            -1, 1, 1).float() * (steps - 1)
+            -1, 1, 1).float() * (self.scheduler.T + delta_t)
         intermediates[self.x_t_key] = x_T
-        delta_t = - self.scheduler.T // steps
 
         with torch.no_grad():
             if show_progress:
@@ -177,6 +182,8 @@ class Diffuser(nn.Module, abc.ABC):
 
             if show_progress:
                 pbar.close()
+        intermediates[self.x_0_pred_key] = intermediates[self.x_t_key]
+        intermediates[self.x_t_key] = x_T
 
         return intermediates, denoiser_output
 
@@ -193,6 +200,7 @@ class LatentDiffuser(Diffuser):
                  bb_channels=7,
                  atom_lmax_list=[1],
                  atom_in_channels=18+1+5+1,
+                 atom_h_channels=8,
                  atom_out_channels=91,
                  num_heads=8,
                  h_channels=32,
@@ -281,25 +289,58 @@ class LatentDiffuser(Diffuser):
                          _randn_like=so3_randn_like,
                          x_0_key='latent_sidechain',
                          x_0_pred_key='denoised_latent_sidechain',
-                         x_t_key='noised_latent_sidechain')
-        self.encoder = AtomicSidechainEncoder(
+                         x_t_key='noised_latent_sidechain',)
+        # self.encoder = AtomicSidechainEncoder(
+        #     node_lmax_list=node_lmax_list,
+        #     edge_channels_list=edge_channels_list,
+        #     mappingReduced_nodes=mappingReduced_nodes,
+        #     mappingReduced_atoms=mappingReduced_atoms,
+        #     mappingReduced_super_atoms=mappingReduced_super_atoms,
+        #     node_SO3_rotation=node_SO3_rotation_list,
+        #     node_SO3_grid=node_SO3_grid_list,
+        #     atom_SO3_rotation=atom_super_SO3_rotation_list,
+        #     atom_SO3_grid=atom_super_SO3_grid_list,
+        #     atom_super_SO3_rotation=atom_super_SO3_rotation_list,
+        #     atom_super_SO3_grid=atom_super_SO3_grid_list,
+        #     atom_lmax_list=atom_lmax_list,
+        #     atom_channels=atom_in_channels,
+        #     num_heads=num_heads,
+        #     h_channels=h_channels,
+        #     num_layers=num_layers
+        # )
+        # self.encoder = MultiscaleSidechainEncoder(
+        #     lmax_list=node_lmax_list,
+        #     edge_channels_list=edge_channels_list,
+        #     mappingReduced=mappingReduced_nodes,
+        #     SO3_rotation=node_SO3_rotation_list,
+        #     SO3_grid=node_SO3_grid_list,
+        #     atom_channels=atom_in_channels,
+        #     num_heads=num_heads,
+        #     atom_h_channels=atom_h_channels,
+        #     node_h_channels=h_channels,
+        #     num_layers=num_layers-1
+        # )
+        self.encoder = Atom91Encoder(
             node_lmax_list=node_lmax_list,
             edge_channels_list=edge_channels_list,
             mappingReduced_nodes=mappingReduced_nodes,
-            mappingReduced_atoms=mappingReduced_atoms,
+            mappingReduced_super_bb=mappingReduced_super_bb,
             mappingReduced_super_atoms=mappingReduced_super_atoms,
             node_SO3_rotation=node_SO3_rotation_list,
             node_SO3_grid=node_SO3_grid_list,
-            atom_SO3_rotation=atom_super_SO3_rotation_list,
-            atom_SO3_grid=atom_super_SO3_grid_list,
+            bb_super_SO3_rotation=bb_super_SO3_rotation_list,
+            bb_super_SO3_grid=bb_super_SO3_grid_list,
             atom_super_SO3_rotation=atom_super_SO3_rotation_list,
             atom_super_SO3_grid=atom_super_SO3_grid_list,
+            bb_lmax_list=bb_lmax_list,
+            bb_channels=bb_channels,
             atom_lmax_list=atom_lmax_list,
-            atom_channels=atom_in_channels,
+            atom_channels=atom_out_channels,
             num_heads=num_heads,
             h_channels=h_channels,
             num_layers=num_layers
         )
+
         self.decoder = Atom91Decoder(
             node_lmax_list=node_lmax_list,
             edge_channels_list=edge_channels_list,
@@ -341,7 +382,6 @@ class LatentDiffuser(Diffuser):
         return latent
 
     def forward(self, data, warmup=False, deterministic=False):
-
         latent_data = self.encoder(data)
         if deterministic:
             latent_data[self.x_0_key] = latent_data['latent_mu']
@@ -360,12 +400,23 @@ class LatentDiffuser(Diffuser):
                 )
             )
 
-        decoded_outputs = self.decoder(data, latent_data)
+        # decoded_outputs = self.decoder(data, latent_data)
         noised_latent = self.forward_noising(data, latent_data)
         latent_outputs = self.reverse_noising(data, noised_latent)
         latent_outputs.update(noised_latent)
 
-        return latent_outputs, decoded_outputs, decoded_outputs  # dummy for passthrough outputs
+        # x_0 = latent_data[self.x_0_key]
+        # latent_data[self.x_0_key] = latent_outputs[self.x_0_pred_key]
+        decoded_outputs = self.decoder(data, latent_data)
+        # latent_data[self.x_0_key] = x_0 
+        # x_0 = latent_data[self.x_0_key]
+        # latent_data[self.x_0_key] = latent_outputs[self.x_0_pred_key]
+        # passthrough_outputs = self.decoder(data, latent_data)
+        # latent_data[self.x_0_key] = x_0 
+        passthrough_outputs = None
+
+
+        return latent_outputs, decoded_outputs, passthrough_outputs  # dummy for passthrough outputs
 
     def sample(self,
                data,
@@ -384,6 +435,8 @@ class LatentDiffuser(Diffuser):
         latent_outputs[self.x_0_key] = encoder_outputs['latent_mu']
         latent_outputs.update(encoder_outputs)
         latent_outputs['loss_weight'] = 1
+        latent_outputs['noising_mask'] = torch.ones_like(data['residue'].x_mask, device=device).bool()
+        latent_outputs['latent_sidechain_score_scaling'] = torch.ones_like(data['residue'].x_mask, device=device).float()
         decoded_outputs['seq_logits'] = decoded_outputs['decoded_seq_logits']
 
         return latent_outputs, decoded_outputs
