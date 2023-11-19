@@ -355,6 +355,12 @@ def featurize_cross_scale_atomic(protein,
             torch.arange(atom_to_residue_map.numel(), device=atom_to_residue_map.device)
         ], dim=0)
 
+        X_n = nan_to_num(coords[:, 0])
+        X_ca = nan_to_num(coords[:, 1])
+        X_c = nan_to_num(coords[:, 2])
+        # TODO: i don't know why this is this order...
+        rigids_0 = ru.Rigid.from_3_points(X_c, X_ca, X_n)
+
         residue_dict = {
             "x": nan_to_num(X_ca),
             "x_mask": x_mask,
@@ -363,6 +369,7 @@ def featurize_cross_scale_atomic(protein,
             "bb": nan_to_num(coords),
             "bb_s": nan_to_num(node_s),
             "bb_v": nan_to_num(node_v),
+            'rigids_0': rigids_0.to_tensor_7(),
             # "edge_index": edge_index,
             "edge_s": nan_to_num(edge_s),
             "edge_v": nan_to_num(edge_v),

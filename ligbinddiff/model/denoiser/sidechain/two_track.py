@@ -4,7 +4,7 @@ import torch
 from torch import nn
 import numpy as np
 from torch_cluster import knn_graph
-from ligbinddiff.model.modules.common import EdgeUpdate, ProjectLayer
+from ligbinddiff.model.modules.common import EdgeUpdate
 
 from ligbinddiff.model.modules.equiformer_v2.so2_ops import Nodewise_SO3_Convolution
 from ligbinddiff.model.modules.equiformer_v2.so3 import CoefficientMappingModule, SO3_Embedding, SO3_Rotation, SO3_Grid, SO3_LinearV2
@@ -13,22 +13,16 @@ from ligbinddiff.model.modules.equiformer_v2.transformer_block import FeedForwar
 from ligbinddiff.model.modules.equiformer_v2.edge_rot_mat import init_edge_rot_mat
 
 from ligbinddiff.utils.atom_reps import atom91_start_end
-from ligbinddiff.data.datasets.featurize.sidechain import _orientations, _ideal_virtual_Cb, _dihedrals
-from ligbinddiff.utils.so3_embedding import type_l_to_so3
 
 
-class LatentDenoisingLayer(nn.Module):
+class TwoTrackDenoisingLayer(nn.Module):
     """ Denoising layer on sidechain densities """
     def __init__(self,
                  node_lmax_list,
-                 latent_lmax_list,
                  edge_channels_list,
                  mappingReduced_nodes,
                  node_SO3_rotation,
                  node_SO3_grid,
-                 mappingReduced_super,
-                 super_SO3_rotation,
-                 super_SO3_grid,
                  num_heads=8,
                  h_channels=32,
                  ):
@@ -43,16 +37,7 @@ class LatentDenoisingLayer(nn.Module):
         self.node_SO3_rotation = node_SO3_rotation
         self.node_SO3_grid = node_SO3_grid
 
-        self.node_update = ProjectLayer(
-            in_lmax_list=latent_lmax_list,
-            in_channels=h_channels,
-            out_lmax_list=node_lmax_list,
-            out_channels=h_channels,
-            edge_channels_list=edge_channels_list,
-            mappingReduced_super=mappingReduced_super,
-            super_SO3_rotation=super_SO3_rotation,
-            super_SO3_grid=super_SO3_grid
-        ) 
+        self.node_l0_fuse = nn.Linear(h_channels * 3, h_channels * 2)
 
         self.attention = TransBlockV2(
             sphere_channels=h_channels*2,
@@ -83,24 +68,21 @@ class LatentDenoisingLayer(nn.Module):
             SO3_grid=node_SO3_grid
         ) 
 
-
+        self.res_update = SO3_LinearV2(
+            in_features=h_channels*2,
+            out_features=h_channels,
+            lmax=max(node_lmax_list)
+        ) 
         self.res_ln = NormSO3(
             lmax_list=node_lmax_list,
             num_channels=h_channels
         )
-        self.res_update = ProjectLayer(
-            in_lmax_list=node_lmax_list,
-            in_channels=h_channels,
-            out_lmax_list=latent_lmax_list,
-            out_channels=h_channels,
-            edge_channels_list=edge_channels_list,
-            mappingReduced_super=mappingReduced_super,
-            super_SO3_rotation=super_SO3_rotation,
-            super_SO3_grid=super_SO3_grid
-        ) 
- 
-        # with torch.no_grad():
-        #     self.res_update.weight.fill_(0.0)  # i think this will help?
+
+        self.seq_update = nn.Linear(h_channels, h_channels) 
+        self.seq_ln = nn.LayerNorm(h_channels)
+        with torch.no_grad():
+            self.res_update.weight.fill_(0.0)  # i think this will help?
+            self.seq_update.weight.fill_(0.0)  # i think this will help?
 
         self.edge_update = EdgeUpdate(
             node_lmax_list,
@@ -112,13 +94,19 @@ class LatentDenoisingLayer(nn.Module):
             self,
             node_features: SO3_Embedding,
             res_features: SO3_Embedding,
+            seq_features: torch.Tensor,
             edge_features: torch.Tensor,
             edge_index
     ):
-        input_features = self.node_update(res_features, edge_features, edge_index)
+        input_features = res_features.clone()
         input_features.set_embedding(
             torch.cat([input_features.embedding, node_features.embedding], dim=-1)
         )
+        input_invariants = input_features.get_invariant_features(flat=True)
+        input_invariants = self.node_l0_fuse(
+            torch.cat([input_invariants, seq_features], dim=-1)
+        )
+        input_features.set_invariant_features(input_invariants)
 
         # transformer block
         node_update = self.attention(
@@ -131,12 +119,17 @@ class LatentDenoisingLayer(nn.Module):
 
         new_node_features = self.node_transition(new_node_features)
 
-        input_features = new_node_features.clone()
-        input_features.embedding = self.res_ln(input_features.embedding)
-        res_update = self.res_update(new_node_features, edge_features, edge_index)
+        input_features = res_features.clone()
+        input_features.set_embedding(
+            torch.cat([input_features.embedding, new_node_features.embedding], dim=-1)
+        )
+        res_update = self.res_update(input_features)
 
         new_res_features = res_features.clone()
         new_res_features.embedding = new_res_features.embedding + res_update.embedding
+
+        new_seq_features = self.seq_update(new_node_features.get_invariant_features(flat=True))
+        new_seq_features = seq_features + new_seq_features
 
         # update edges
         edge_features = self.edge_update(
@@ -144,7 +137,7 @@ class LatentDenoisingLayer(nn.Module):
             edge_features,
             edge_index
         )
-        return new_node_features, new_res_features, edge_features
+        return new_node_features, new_res_features, new_seq_features, edge_features
 
 
 # adapted from https://github.com/jmclong/random-fourier-features-pytorch/blob/main/rff/layers.py
@@ -160,18 +153,14 @@ class RBF(nn.Module):
         return torch.cat([torch.cos(tp), torch.sin(tp)], dim=-1)
 
 
-class LatentSidechainDenoiser(nn.Module):
+class LatentTwoTrackDenoiser(nn.Module):
     """ Denoising model on sidechain densities """
     def __init__(self,
                  node_lmax_list,
-                 latent_lmax_list,
                  edge_channels_list,
                  mappingReduced_nodes,
                  node_SO3_rotation,
                  node_SO3_grid,
-                 mappingReduced_super,
-                 super_SO3_rotation,
-                 super_SO3_grid,
                  num_heads=8,
                  h_channels=32,
                  h_time=64,
@@ -186,9 +175,6 @@ class LatentSidechainDenoiser(nn.Module):
         self.mappingReduced_nodes = mappingReduced_nodes
         self.node_SO3_rotation_list = node_SO3_rotation
         self.node_SO3_grid_list = node_SO3_grid
-        self.mappingReduced_super = mappingReduced_super
-        self.super_SO3_rotation_list = super_SO3_rotation
-        self.super_SO3_grid_list = super_SO3_grid
 
         self.h_time = h_time
         self.time_rbf = RBF(n_basis=h_time//2)
@@ -199,41 +185,18 @@ class LatentSidechainDenoiser(nn.Module):
             nn.ReLU()
         )
 
-        self.embed_bb = ProjectLayer(
-            in_lmax_list=node_lmax_list,
-            in_channels=7,
-            out_lmax_list=node_lmax_list,
-            out_channels=h_channels,
-            edge_channels_list=edge_channels_list,
-            mappingReduced_super=mappingReduced_nodes,
-            super_SO3_rotation=node_SO3_rotation,
-            super_SO3_grid=node_SO3_grid
-        )
         self.embed_node_l0 = nn.Linear(
             h_channels + h_time, h_channels
         )
-        self.embed_edge = nn.Sequential(
-            nn.Linear(h_channels, h_channels),
-            nn.ReLU(),
-            nn.Linear(h_channels, h_channels),
-            nn.ReLU(),
-            nn.Linear(h_channels, h_channels),
-            nn.LayerNorm(h_channels)
-        )
-
 
 
         self.denoiser = nn.ModuleList([
-            LatentDenoisingLayer(
+            TwoTrackDenoisingLayer(
                 node_lmax_list=node_lmax_list,
-                latent_lmax_list=latent_lmax_list,
                 edge_channels_list=edge_channels_list,
                 mappingReduced_nodes=mappingReduced_nodes,
                 node_SO3_rotation=self.node_SO3_rotation_list,
                 node_SO3_grid=self.node_SO3_grid_list,
-                mappingReduced_super=mappingReduced_super,
-                super_SO3_rotation=self.super_SO3_rotation_list,
-                super_SO3_grid=self.super_SO3_grid_list,
                 num_heads=num_heads,
                 h_channels=h_channels)
             for _ in range(n_layers)
@@ -245,27 +208,9 @@ class LatentSidechainDenoiser(nn.Module):
     def forward(self, data, intermediates):
         ## prep features
         res_features = intermediates['noised_latent_sidechain']
-
-        X_ca = data['residue']['x']
-        bb = data['residue']['bb']
-        orientations = _orientations(X_ca)
-        virtual_Cb = _ideal_virtual_Cb(bb) - X_ca
-        dihedrals = _dihedrals(bb)
-        bb_rel = bb - X_ca.unsqueeze(-2)
-        bb_features = {
-            0: torch.cat([
-                dihedrals,  # 6
-            ], dim=-1).unsqueeze(-1),  # total 26
-            1: torch.nan_to_num(
-                torch.cat([
-                    bb_rel,  # 4
-                    orientations,  # 2
-                    virtual_Cb.unsqueeze(-2)
-                ], dim=-2) #1
-            )  # total 7
-        }
-        bb_features = type_l_to_so3(bb_features)
-        bb_features.embedding = torch.zeros_like(bb_features.embedding)
+        seq_features = intermediates['noised_latent_seq']
+        node_features = res_features.clone()
+        node_features.embedding = torch.zeros_like(node_features.embedding)
         ts = intermediates['t']  # (B, 1, 1)
 
         ## create time embedding
@@ -277,6 +222,14 @@ class LatentSidechainDenoiser(nn.Module):
             embedded_time[i].view(1, -1).expand(l, -1) for i, l in enumerate(data_lens)
         ])  # n_res x h_time
 
+        # fuse time embedding into node features
+        node_num_l0 = len(self.node_lmax_list)
+        node_l0 = node_features.get_invariant_features()  # n_res x (node_num_m0 x h_channels)
+        time_expanded = embedded_time.unsqueeze(-2).expand(-1, node_num_l0, -1)
+        node_l0 = self.embed_node_l0(
+            torch.cat([node_l0, time_expanded], dim=-1)
+        )
+        node_features.set_invariant_features(node_l0)
 
         # init SO3_rotation and SO3_grid
         X_ca = data['residue']['x']
@@ -287,29 +240,17 @@ class LatentSidechainDenoiser(nn.Module):
         edge_rot_mat = init_edge_rot_mat(edge_distance_vec)
         for rot in self.node_SO3_rotation_list:
             rot.set_wigner(edge_rot_mat)
-        for rot in self.super_SO3_rotation_list:
-            rot.set_wigner(edge_rot_mat)
         edge_features = data['residue']['edge_s']
-        edge_features = self.embed_edge(edge_features)
-
-        node_features = self.embed_bb(bb_features, edge_features, edge_index)
-
-        # fuse time embedding into node features
-        node_num_l0 = len(self.node_lmax_list)
-        node_l0 = node_features.get_invariant_features()  # n_res x (node_num_m0 x h_channels)
-        time_expanded = embedded_time.unsqueeze(-2).expand(-1, node_num_l0, -1)
-        node_l0 = self.embed_node_l0(
-            torch.cat([node_l0, time_expanded], dim=-1)
-        )
-        node_features.set_invariant_features(node_l0)
 
         ## denoising
         f_V = node_features
         f_L = res_features
+        f_S = seq_features
         f_E = edge_features
 
         for layer in self.denoiser:
-            f_V, f_L, f_E = layer(f_V, f_L, f_E, edge_index)
+            f_V, f_L, f_S, f_E = layer(f_V, f_L, f_S, f_E, edge_index)
 
         intermediates['denoised_latent_sidechain'] = f_L
+        intermediates['denoised_latent_seq'] = f_S
         return intermediates

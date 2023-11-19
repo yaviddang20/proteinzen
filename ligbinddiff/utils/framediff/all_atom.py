@@ -169,23 +169,32 @@ def compute_backbone(bb_rigids, psi_torsions, impute_O=True):
     atom37_bb_pos[..., 3, :] = atom14_pos[..., 4, :]
     atom37_bb_pos[..., 4, :] = atom14_pos[..., 3, :]
     atom37_mask = torch.any(atom37_bb_pos, axis=-1)
-
-    # if impute_O:
-    #     eps=1e-6
-    #     N, CA, C = atom14_pos[..., 0, :], atom14_pos[..., 1, :], atom14_pos[..., 2, :]
-    #     O_dummy = atom14_pos[..., 3, :]
-    #     O_dist = torch.linalg.vector_norm(O_dummy - C, dim=-1)
-    #     CA_to_C = C[..., :-1, :] - CA[..., :-1, :]
-    #     CA_to_C = CA_to_C / torch.linalg.vector_norm(CA_to_C + eps, dim=-1)[..., None]
-    #     N_to_C = C[..., :-1, :] - N[..., 1:, :]
-    #     N_to_C = N_to_C / torch.linalg.vector_norm(N_to_C + eps, dim=-1)[..., None]
-    #     bisector = CA_to_C + N_to_C
-    #     bisector = bisector / torch.linalg.vector_norm(bisector + eps, dim=-1)[..., None]
-    #     O = O_dist[..., :-1, None] * bisector + C[..., :-1, :]
-    #     atom14_pos[..., :-1, 3, :] = O
-    #     atom37_bb_pos[..., :-1, 4, :] = O
-
     return atom37_bb_pos, atom37_mask, aatype, atom14_pos
+
+
+def compute_all_atom14(bb_rigids, psi_torsions, sidechain_torsions, n_aa=20):
+    bb_torsion_angles = torch.tile(
+        psi_torsions[..., None, :],
+        tuple([1 for _ in range(len(bb_rigids.shape))]) + (n_aa, 3, 1)
+    ).to(bb_rigids.device)
+    sidechain_torsion_angles = torch.tile(
+        sidechain_torsions,
+        tuple([1 for _ in range(len(bb_rigids.shape))]) + (1, 1, 1)
+    ).to(bb_rigids.device)
+    torsion_angles = torch.cat([bb_torsion_angles, sidechain_torsion_angles], dim=-2)
+
+    bb_rigids = bb_rigids.unsqueeze(-1)
+    aatype = torch.arange(n_aa).tile(list(bb_rigids.shape))
+
+    all_frames = feats.torsion_angles_to_frames(
+        bb_rigids,
+        torsion_angles,
+        aatype,
+        DEFAULT_FRAMES.to(bb_rigids.device))
+    atom14_pos = frames_to_atom14_pos(
+        all_frames,
+        aatype)
+    return atom14_pos
 
 
 def calculate_neighbor_angles(R_ac, R_ab):

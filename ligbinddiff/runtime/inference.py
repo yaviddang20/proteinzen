@@ -208,9 +208,9 @@ def inpaint_inference_loop(diffuser,
         pbar.set_description(pbar_str)
 
         if save:
-            denoised_x_ca = latent_outputs['denoised_bb'][..., 1, :]
+            denoised_x_ca = batch['residue'].x # denoised_x_ca = latent_outputs['denoised_bb'][..., 1, :]
             atom91_uncentered = decoder_outputs['decoded_latent'] + denoised_x_ca.unsqueeze(-2)
-            atom91_uncentered[..., :4, :] = latent_outputs['denoised_bb']  # set backbone atoms to those from denoiser
+            atom91_uncentered[..., :4, :] = batch['residue'].bb # latent_outputs['denoised_bb']  # set backbone atoms to those from denoiser
             atom91_to_pdb(ref_seq, atom91_uncentered.numpy(force=True), batch.name[0] + "_native_seq")
             atom91_to_pdb(pred_seq, atom91_uncentered.numpy(force=True), batch.name[0] + "_designed_seq")
 

@@ -178,41 +178,22 @@ def cath_latent_loss_fn2(batch, latent_outputs, decoder_outputs, passthrough_out
     latent_loss_dict = latent_sidechain_diffusion_loss2(batch, latent_outputs, None)
 
     vae_loss = (
-        autoenc_loss_dict["atom91_mse"] 
-        + autoenc_loss_dict["kl_div_l0"]
-        + autoenc_loss_dict["kl_div_l1"]
-        # + autoenc_loss_dict["seq_loss"]
-        + autoenc_loss_dict["bond_length_mse"] * 0.5 
-        + autoenc_loss_dict["sidechain_dists_mse"] * 0.5 
+        autoenc_loss_dict["atom91_rmsd"] 
+        # autoenc_loss_dict["atom91_mse"] 
+        + autoenc_loss_dict["kl_div_l0"] * 1e-2 
+        # + autoenc_loss_dict["kl_div_l1"] * 1e-6 
+        + autoenc_loss_dict["seq_loss"]
+        + autoenc_loss_dict["bond_length_mse"].sqrt() * 0.5 
+        + autoenc_loss_dict["sidechain_dists_mse"].sqrt() * 0.5 
         + autoenc_loss_dict["bond_angle_loss"] * 0.5 
         + autoenc_loss_dict["chi_loss"]
     )
 
-    if passthrough_outputs is not None:
-        pt_loss_dict = autoencoder_losses2(batch, latent_outputs, passthrough_outputs)
-        pt_loss = (
-            pt_loss_dict["atom91_mse"] 
-            + pt_loss_dict["kl_div_l0"]
-            + pt_loss_dict["kl_div_l1"]
-            + pt_loss_dict["seq_loss"]
-            + pt_loss_dict["bond_length_mse"] * 0.5 
-            + pt_loss_dict["sidechain_dists_mse"] * 0.5 
-            + pt_loss_dict["bond_angle_loss"] * 0.5 
-            + pt_loss_dict["chi_loss"]
-        )
-    else:
-        pt_loss_dict = {}
-        pt_loss = vae_loss
-
-    # pt_loss = pt_loss * (latent_outputs["t"] < 250)
-
-    loss = (vae_loss + pt_loss)/2 + latent_loss_dict["latent_denoising_loss"]
+    loss = vae_loss + 0.1 * latent_loss_dict["latent_denoising_loss"]
 
     ret = {"loss": loss.mean()}
     for key, value in autoenc_loss_dict.items():
         ret[f"autoenc_{key}"] = value
-    for key, value in pt_loss_dict.items():
-        ret[f"pt_{key}"] = value
     ret.update(latent_loss_dict)
     return ret  
 
@@ -319,7 +300,7 @@ def autoencoder_losses2(batch,
         "bond_angle_loss": bond_angle_loss,
         "chi_loss": chi_loss,
         "kl_div_l0": kl_div[0],
-        "kl_div_l1": kl_div[1],
+        #  "kl_div_l1": kl_div[1],
     }
 
     if use_fape:
@@ -334,7 +315,6 @@ def autoencoder_losses2(batch,
         out_dict.update({"all_atom_fape": fape})
 
     return out_dict
-
 
 def latent_sidechain_diffusion_loss2(batch,
                                     latent_outputs,
@@ -371,6 +351,321 @@ def latent_sidechain_diffusion_loss2(batch,
         "latent_denoising_loss": latent_denoising_loss,
         "latent_ref_noise": latent_ref_noise,
     }
+
+def twotrack_autoencoder_losses(batch,
+                       latent_outputs,
+                       decoder_outputs,
+                       absolute_error=False,
+                       use_fape=False,
+                       use_noise_mask=False):
+    atom91_centered = batch['residue']['atom91_centered']
+    bb = batch['residue']['bb'][:, :3]  # we're moving O to the sidechain
+    seq = batch['residue']['seq']
+    X_ca = batch['residue']['x']
+    x_mask = batch['residue']['x_mask']
+    atom91_mask = batch['residue']['atom91_mask']
+
+    if absolute_error:
+        atom91 = atom91_centered + X_ca.unsqueeze(-2)
+        denoised_bb = latent_outputs['denoised_bb']
+        denoised_x_ca = denoised_bb[..., 1, :]
+        decoded_atom91 = decoder_outputs['decoded_latent'] + denoised_x_ca.unsqueeze(-2)
+        decoded_atom91[..., :3, :] = denoised_bb
+    else:
+        atom91 = atom91_centered
+        decoded_atom91 = decoder_outputs['decoded_latent']
+        bb_rel = bb - X_ca.unsqueeze(-2)
+        decoded_atom91[..., :3, :] = bb_rel
+    seq_logits = decoder_outputs['decoded_seq_logits']
+
+    if use_noise_mask:
+        noising_mask = latent_outputs['noising_mask']
+        # if we don't noise anything, just eval on everything as a sanity check
+        if (~noising_mask).all():
+            noising_mask = ~noising_mask
+        x_mask[~noising_mask] = True
+        atom91_mask[~noising_mask] = True
+
+    data_splits = batch._slice_dict['residue']['x']
+    data_lens = (data_splits[1:] - data_splits[:-1]).tolist()
+
+    autoencoder_loss = atom91_mse_loss(atom91, decoded_atom91, data_lens, atom91_mask, no_bb=False)
+    seq_loss = seq_cce_loss(seq, seq_logits, data_lens, x_mask)
+    atom91_rmsd = autoencoder_loss.sqrt()
+    sidechain_dists_mse = distance_loss(atom91_centered, decoded_atom91, data_lens, atom91_mask.any(dim=-1), no_bb=False)
+    bond_length_mse = bond_length_loss(atom91_centered, decoded_atom91, data_lens, atom91_mask.any(dim=-1), no_bb=False)
+    bond_angle_loss = angle_loss(atom91_centered, decoded_atom91, data_lens, atom91_mask.any(dim=-1), no_bb=False)
+    chi_loss = torsion_loss(atom91_centered, decoded_atom91, data_lens, atom91_mask.any(dim=-1))
+
+    latent_mu = latent_outputs['latent_mu']
+    latent_logvar = latent_outputs['latent_logvar']
+    kl_div = so3_embedding_kl(latent_mu, latent_logvar, data_lens, x_mask)
+    seq_mu = latent_outputs['seq_mu']
+    seq_logvar = latent_outputs['seq_logvar']
+    seq_kl_div = torch.sum(
+        -0.5 * (seq_logvar - seq_mu.square() - seq_logvar.exp() + 1) ,
+        dim=-1
+    )
+    seq_kl_div = _nodewise_to_graphwise(seq_kl_div[~x_mask], data_lens, x_mask)
+
+    out_dict = {
+        "seq_loss": seq_loss,
+        "atom91_mse": autoencoder_loss,
+        "atom91_rmsd": atom91_rmsd,
+        "sidechain_dists_mse": sidechain_dists_mse,
+        "bond_length_mse": bond_length_mse,
+        "bond_angle_loss": bond_angle_loss,
+        "chi_loss": chi_loss,
+        "kl_div_l0": kl_div[0],
+        "kl_div_l1": kl_div[1],
+        "seq_kl_div": seq_kl_div
+    }
+
+    if use_fape:
+        fape = all_atom_fape_loss(
+            pred_atom91=decoded_atom91,
+            ref_atom91=atom91,
+            seq=seq,
+            data_lens=data_lens,
+            x_mask=x_mask,
+            no_bb=True
+        )
+        out_dict.update({"all_atom_fape": fape})
+
+    return out_dict
+
+def latent_twotrack_diffusion_loss(batch,
+                                    latent_outputs,
+                                    decoder_outputs=None):
+    x_mask = batch['residue']['x_mask']
+    noising_mask = latent_outputs['noising_mask']
+    # if we don't noise anything, just eval on everything as a sanity check
+    if (~noising_mask).all():
+        noising_mask = ~noising_mask
+    total_mask = ~x_mask & noising_mask
+
+    latent = latent_outputs['latent_sidechain']
+    noised_latent = latent_outputs['noised_latent_sidechain']
+    denoised_latent = latent_outputs['denoised_latent_sidechain']
+    latent_score_scaling = latent_outputs['latent_sidechain_score_scaling']
+
+    data_splits = batch._slice_dict['residue']['x']
+    data_lens = (data_splits[1:] - data_splits[:-1]).tolist()
+
+    latent_denoising_loss = so3_embedding_mse(
+        latent,
+        denoised_latent,
+        data_lens,
+        ~total_mask,
+        scaling=latent_score_scaling
+    )
+    latent_ref_noise = so3_embedding_mse(
+        latent,
+        noised_latent,
+        data_lens,
+        ~total_mask,
+        scaling=latent_score_scaling)
+
+    seq = latent_outputs['latent_seq']
+    noised_seq = latent_outputs['noised_latent_seq']
+    denoised_seq = latent_outputs['denoised_latent_seq']
+
+    seq_denoising_loss = torch.square(denoised_seq - seq).sum(dim=-1)
+    seq_denoising_loss = _nodewise_to_graphwise(seq_denoising_loss[total_mask], data_lens, ~total_mask)
+    seq_ref_noise = torch.square(noised_seq - seq).sum(dim=-1)
+    seq_ref_noise = _nodewise_to_graphwise(seq_ref_noise[total_mask], data_lens, ~total_mask)
+        
+    return {
+        "latent_denoising_loss": latent_denoising_loss,
+        "latent_ref_noise": latent_ref_noise,
+        "seq_denoising_loss": seq_denoising_loss,
+        "seq_ref_noise": seq_ref_noise,
+    }
+
+def cath_latent_scalars_loss_fn(batch, latent_outputs, decoder_outputs, passthrough_outputs=None, warmup=False, ae_loss_weight=1):
+    autoenc_loss_dict = autoencoder_losses3(batch, latent_outputs, decoder_outputs)
+    latent_loss_dict = latent_scalar_sidechain_diffusion_loss(batch, latent_outputs, None)
+
+    vae_loss = (
+        #autoenc_loss_dict["atom91_rmsd"] 
+        autoenc_loss_dict["atom91_mse"] 
+        + autoenc_loss_dict["kl_div"] * 1e-6 
+        + autoenc_loss_dict["seq_loss"]
+        # + autoenc_loss_dict["bond_length_mse"].sqrt() * 0.5 
+        # + autoenc_loss_dict["sidechain_dists_mse"].sqrt() * 0.5 
+        # + autoenc_loss_dict["bond_angle_loss"] * 0.5 
+        + autoenc_loss_dict["chi_loss"]
+    )
+
+    loss = vae_loss + 0.1 * latent_loss_dict["latent_denoising_loss"]
+
+    ret = {"loss": loss.mean()}
+    for key, value in autoenc_loss_dict.items():
+        ret[f"autoenc_{key}"] = value
+    ret.update(latent_loss_dict)
+    return ret  
+
+
+def autoencoder_losses3(batch,
+                       latent_outputs,
+                       decoder_outputs,
+                       absolute_error=False,
+                       use_fape=False,
+                       use_noise_mask=False):
+    atom91_centered = batch['residue']['atom91_centered']
+    bb = batch['residue']['bb'][:, :3]  # we're moving O to the sidechain
+    seq = batch['residue']['seq']
+    X_ca = batch['residue']['x']
+    x_mask = batch['residue']['x_mask']
+    atom91_mask = batch['residue']['atom91_mask']
+
+    if absolute_error:
+        atom91 = atom91_centered + X_ca.unsqueeze(-2)
+        denoised_bb = latent_outputs['denoised_bb']
+        denoised_x_ca = denoised_bb[..., 1, :]
+        decoded_atom91 = decoder_outputs['decoded_latent'] + denoised_x_ca.unsqueeze(-2)
+        decoded_atom91[..., :3, :] = denoised_bb
+    else:
+        atom91 = atom91_centered
+        decoded_atom91 = decoder_outputs['decoded_latent']
+        bb_rel = bb - X_ca.unsqueeze(-2)
+        decoded_atom91[..., :3, :] = bb_rel
+    seq_logits = decoder_outputs['decoded_seq_logits']
+
+    if use_noise_mask:
+        noising_mask = latent_outputs['noising_mask']
+        # if we don't noise anything, just eval on everything as a sanity check
+        if (~noising_mask).all():
+            noising_mask = ~noising_mask
+        x_mask[~noising_mask] = True
+        atom91_mask[~noising_mask] = True
+
+    data_splits = batch._slice_dict['residue']['x']
+    data_lens = (data_splits[1:] - data_splits[:-1]).tolist()
+
+    autoencoder_loss = atom91_mse_loss(atom91, decoded_atom91, data_lens, atom91_mask, no_bb=False)
+    seq_loss = seq_cce_loss(seq, seq_logits, data_lens, x_mask)
+    atom91_rmsd = autoencoder_loss.sqrt()
+    sidechain_dists_mse = distance_loss(atom91_centered, decoded_atom91, data_lens, atom91_mask.any(dim=-1), no_bb=False)
+    bond_length_mse = bond_length_loss(atom91_centered, decoded_atom91, data_lens, atom91_mask.any(dim=-1), no_bb=False)
+    bond_angle_loss = angle_loss(atom91_centered, decoded_atom91, data_lens, atom91_mask.any(dim=-1), no_bb=False)
+    chi_loss = torsion_loss(atom91_centered, decoded_atom91, data_lens, atom91_mask.any(dim=-1))
+
+    latent_mu = latent_outputs['latent_mu']
+    latent_logvar = latent_outputs['latent_logvar']
+    kl_div = -0.5 * (latent_logvar - latent_mu.square() - latent_logvar.exp() + 1).sum(dim=-1)
+    kl_div = _nodewise_to_graphwise(kl_div[~x_mask], data_lens, x_mask)
+
+
+    out_dict = {
+        "seq_loss": seq_loss,
+        "atom91_mse": autoencoder_loss,
+        "atom91_rmsd": atom91_rmsd,
+        "sidechain_dists_mse": sidechain_dists_mse,
+        "bond_length_mse": bond_length_mse,
+        "bond_angle_loss": bond_angle_loss,
+        "chi_loss": chi_loss,
+        "kl_div": kl_div
+    } 
+
+    return out_dict
+
+
+def latent_scalar_sidechain_diffusion_loss(batch,
+                                    latent_outputs,
+                                    decoder_outputs=None):
+    x_mask = batch['residue']['x_mask']
+    noising_mask = latent_outputs['noising_mask']
+    # if we don't noise anything, just eval on everything as a sanity check
+    if (~noising_mask).all():
+        noising_mask = ~noising_mask
+    total_mask = ~x_mask & noising_mask
+
+    latent = latent_outputs['latent_sidechain']
+    noised_latent = latent_outputs['noised_latent_sidechain']
+    denoised_latent = latent_outputs['denoised_latent_sidechain']
+    latent_score_scaling = latent_outputs['latent_sidechain_score_scaling']
+
+    data_splits = batch._slice_dict['residue']['x']
+    data_lens = (data_splits[1:] - data_splits[:-1]).tolist()
+
+    latent_denoising_loss = torch.square(denoised_latent - latent).sum(dim=-1)
+    latent_denoising_loss = _nodewise_to_graphwise(latent_denoising_loss[total_mask], data_lens, ~total_mask)
+
+    latent_ref_noise = torch.square(noised_latent - latent).sum(dim=-1)
+    latent_ref_noise = _nodewise_to_graphwise(latent_ref_noise[total_mask], data_lens, ~total_mask)
+    return {
+        "latent_denoising_loss": latent_denoising_loss,
+        "latent_ref_noise": latent_ref_noise,
+    }
+
+def cath_latent_twotrack_loss_fn(batch, latent_outputs, decoder_outputs, passthrough_outputs=None, warmup=False, ae_loss_weight=1):
+    autoenc_loss_dict = twotrack_autoencoder_losses(batch, latent_outputs, decoder_outputs)
+    latent_loss_dict = latent_twotrack_diffusion_loss(batch, latent_outputs, None)
+
+    vae_loss = (
+        autoenc_loss_dict["atom91_rmsd"] 
+        + autoenc_loss_dict["kl_div_l0"] 
+        + autoenc_loss_dict["kl_div_l1"]
+        + autoenc_loss_dict["seq_kl_div"] 
+        + autoenc_loss_dict["seq_loss"]
+        + autoenc_loss_dict["bond_length_mse"] * 0.5 
+        + autoenc_loss_dict["sidechain_dists_mse"] * 0.5 
+        + autoenc_loss_dict["bond_angle_loss"] * 0.5 
+        + autoenc_loss_dict["chi_loss"]
+    )
+    if passthrough_outputs is not None:
+        pt_loss_dict = twotrack_autoencoder_losses(batch, latent_outputs, passthrough_outputs)
+        pt_loss = (
+            pt_loss_dict["atom91_mse"] 
+            + pt_loss_dict["kl_div_l0"]
+            + pt_loss_dict["kl_div_l1"]
+            + pt_loss_dict["seq_loss"]
+            + pt_loss_dict["bond_length_mse"] * 0.5 
+            + pt_loss_dict["sidechain_dists_mse"] * 0.5 
+            + pt_loss_dict["bond_angle_loss"] * 0.5 
+            + pt_loss_dict["chi_loss"]
+        )
+    else:
+        pt_loss_dict = {}
+        pt_loss = vae_loss
+
+    # pt_loss = pt_loss * (latent_outputs["t"] < 250)
+
+    denoising_loss = latent_loss_dict["latent_denoising_loss"] + latent_loss_dict["seq_denoising_loss"]
+    loss = (vae_loss + pt_loss)/2 + denoising_loss * 0.01 
+
+
+    ret = {
+        "loss": loss.mean(),
+    }
+    for key, value in autoenc_loss_dict.items():
+        ret[f"autoenc_{key}"] = value
+    for key, value in pt_loss_dict.items():
+        ret[f"pt_{key}"] = value
+    ret.update(latent_loss_dict)
+    return ret  
+
+def cath_latent_twotrack_seq_only_loss_fn(batch, latent_outputs, decoder_outputs, passthrough_outputs=None, warmup=False, ae_loss_weight=1):
+    autoenc_loss_dict = twotrack_autoencoder_losses(batch, latent_outputs, decoder_outputs)
+    latent_loss_dict = latent_twotrack_diffusion_loss(batch, latent_outputs, None)
+
+    vae_loss = (
+        + autoenc_loss_dict["kl_div_l0"] 
+        + autoenc_loss_dict["kl_div_l1"] 
+        + autoenc_loss_dict["seq_kl_div"] 
+        + autoenc_loss_dict["seq_loss"]
+    )
+
+    loss = vae_loss + latent_loss_dict["seq_denoising_loss"]
+
+    ret = {
+        "loss": loss.mean(),
+    }
+    for key, value in autoenc_loss_dict.items():
+        ret[f"autoenc_{key}"] = value
+    ret.update(latent_loss_dict)
+    return ret  
 
 
 def inpaint_latent_loss_fn(batch,

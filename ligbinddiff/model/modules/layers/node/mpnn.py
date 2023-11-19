@@ -64,7 +64,6 @@ class IPMP(nn.Module):
         z: Optional[torch.Tensor],
         edge_index: torch.Tensor,
         r: Rigid,
-        mask: torch.Tensor,
         eps=1e-8
     ) -> torch.Tensor:
         """
