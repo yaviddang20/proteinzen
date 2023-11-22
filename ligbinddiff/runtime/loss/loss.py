@@ -178,14 +178,14 @@ def cath_latent_loss_fn2(batch, latent_outputs, decoder_outputs, passthrough_out
     latent_loss_dict = latent_sidechain_diffusion_loss2(batch, latent_outputs, None)
 
     vae_loss = (
-        autoenc_loss_dict["atom91_rmsd"] 
-        # autoenc_loss_dict["atom91_mse"] 
-        + autoenc_loss_dict["kl_div_l0"] * 1e-2 
-        # + autoenc_loss_dict["kl_div_l1"] * 1e-6 
+        autoenc_loss_dict["atom91_rmsd"]
+        # autoenc_loss_dict["atom91_mse"]
+        + autoenc_loss_dict["kl_div_l0"] * 1e-2
+        # + autoenc_loss_dict["kl_div_l1"] * 1e-6
         + autoenc_loss_dict["seq_loss"]
-        + autoenc_loss_dict["bond_length_mse"].sqrt() * 0.5 
-        + autoenc_loss_dict["sidechain_dists_mse"].sqrt() * 0.5 
-        + autoenc_loss_dict["bond_angle_loss"] * 0.5 
+        + autoenc_loss_dict["bond_length_mse"].sqrt() * 0.5
+        + autoenc_loss_dict["sidechain_dists_mse"].sqrt() * 0.5
+        + autoenc_loss_dict["bond_angle_loss"] * 0.5
         + autoenc_loss_dict["chi_loss"]
     )
 
@@ -195,7 +195,7 @@ def cath_latent_loss_fn2(batch, latent_outputs, decoder_outputs, passthrough_out
     for key, value in autoenc_loss_dict.items():
         ret[f"autoenc_{key}"] = value
     ret.update(latent_loss_dict)
-    return ret  
+    return ret
 
 def cath_latent_seq_only_loss_fn(batch, latent_outputs, decoder_outputs, passthrough_outputs=None, warmup=False, ae_loss_weight=1):
     autoenc_loss_dict = autoencoder_losses2(batch, latent_outputs, decoder_outputs)
@@ -210,13 +210,13 @@ def cath_latent_seq_only_loss_fn(batch, latent_outputs, decoder_outputs, passthr
     # if passthrough_outputs is not None:
     #     pt_loss_dict = autoencoder_losses2(batch, latent_outputs, passthrough_outputs)
     #     pt_loss = (
-    #         pt_loss_dict["atom91_mse"] 
+    #         pt_loss_dict["atom91_mse"]
     #         + pt_loss_dict["kl_div_l0"] * 1e-1
     #         + pt_loss_dict["kl_div_l1"] * 1e-1
     #         + pt_loss_dict["seq_loss"] * 2
-    #         + pt_loss_dict["bond_length_mse"] * 0.5 
-    #         + pt_loss_dict["sidechain_dists_mse"] * 0.5 
-    #         + pt_loss_dict["bond_angle_loss"] * 0.5 
+    #         + pt_loss_dict["bond_length_mse"] * 0.5
+    #         + pt_loss_dict["sidechain_dists_mse"] * 0.5
+    #         + pt_loss_dict["bond_angle_loss"] * 0.5
     #         + pt_loss_dict["chi_loss"]
     #     )
     # else:
@@ -239,7 +239,7 @@ def cath_latent_seq_only_loss_fn(batch, latent_outputs, decoder_outputs, passthr
     # for key, value in pt_loss_dict.items():
     #     ret[f"pt_{key}"] = value
     ret.update(latent_loss_dict)
-    return ret  
+    return ret
 
 
 def autoencoder_losses2(batch,
@@ -474,7 +474,7 @@ def latent_twotrack_diffusion_loss(batch,
     seq_denoising_loss = _nodewise_to_graphwise(seq_denoising_loss[total_mask], data_lens, ~total_mask)
     seq_ref_noise = torch.square(noised_seq - seq).sum(dim=-1)
     seq_ref_noise = _nodewise_to_graphwise(seq_ref_noise[total_mask], data_lens, ~total_mask)
-        
+
     return {
         "latent_denoising_loss": latent_denoising_loss,
         "latent_ref_noise": latent_ref_noise,
@@ -487,13 +487,13 @@ def cath_latent_scalars_loss_fn(batch, latent_outputs, decoder_outputs, passthro
     latent_loss_dict = latent_scalar_sidechain_diffusion_loss(batch, latent_outputs, None)
 
     vae_loss = (
-        #autoenc_loss_dict["atom91_rmsd"] 
-        autoenc_loss_dict["atom91_mse"] 
-        + autoenc_loss_dict["kl_div"] * 1e-6 
+        #autoenc_loss_dict["atom91_rmsd"]
+        autoenc_loss_dict["atom91_mse"]
+        + autoenc_loss_dict["kl_div"] * 1e-2
         + autoenc_loss_dict["seq_loss"]
-        # + autoenc_loss_dict["bond_length_mse"].sqrt() * 0.5 
-        # + autoenc_loss_dict["sidechain_dists_mse"].sqrt() * 0.5 
-        # + autoenc_loss_dict["bond_angle_loss"] * 0.5 
+        # + autoenc_loss_dict["bond_length_mse"].sqrt() * 0.5
+        # + autoenc_loss_dict["sidechain_dists_mse"].sqrt() * 0.5
+        # + autoenc_loss_dict["bond_angle_loss"] * 0.5
         + autoenc_loss_dict["chi_loss"]
     )
 
@@ -503,7 +503,7 @@ def cath_latent_scalars_loss_fn(batch, latent_outputs, decoder_outputs, passthro
     for key, value in autoenc_loss_dict.items():
         ret[f"autoenc_{key}"] = value
     ret.update(latent_loss_dict)
-    return ret  
+    return ret
 
 
 def autoencoder_losses3(batch,
@@ -566,7 +566,7 @@ def autoencoder_losses3(batch,
         "bond_angle_loss": bond_angle_loss,
         "chi_loss": chi_loss,
         "kl_div": kl_div
-    } 
+    }
 
     return out_dict
 
@@ -604,26 +604,26 @@ def cath_latent_twotrack_loss_fn(batch, latent_outputs, decoder_outputs, passthr
     latent_loss_dict = latent_twotrack_diffusion_loss(batch, latent_outputs, None)
 
     vae_loss = (
-        autoenc_loss_dict["atom91_rmsd"] 
-        + autoenc_loss_dict["kl_div_l0"] 
+        autoenc_loss_dict["atom91_rmsd"]
+        + autoenc_loss_dict["kl_div_l0"]
         + autoenc_loss_dict["kl_div_l1"]
-        + autoenc_loss_dict["seq_kl_div"] 
+        + autoenc_loss_dict["seq_kl_div"]
         + autoenc_loss_dict["seq_loss"]
-        + autoenc_loss_dict["bond_length_mse"] * 0.5 
-        + autoenc_loss_dict["sidechain_dists_mse"] * 0.5 
-        + autoenc_loss_dict["bond_angle_loss"] * 0.5 
+        + autoenc_loss_dict["bond_length_mse"] * 0.5
+        + autoenc_loss_dict["sidechain_dists_mse"] * 0.5
+        + autoenc_loss_dict["bond_angle_loss"] * 0.5
         + autoenc_loss_dict["chi_loss"]
     )
     if passthrough_outputs is not None:
         pt_loss_dict = twotrack_autoencoder_losses(batch, latent_outputs, passthrough_outputs)
         pt_loss = (
-            pt_loss_dict["atom91_mse"] 
+            pt_loss_dict["atom91_mse"]
             + pt_loss_dict["kl_div_l0"]
             + pt_loss_dict["kl_div_l1"]
             + pt_loss_dict["seq_loss"]
-            + pt_loss_dict["bond_length_mse"] * 0.5 
-            + pt_loss_dict["sidechain_dists_mse"] * 0.5 
-            + pt_loss_dict["bond_angle_loss"] * 0.5 
+            + pt_loss_dict["bond_length_mse"] * 0.5
+            + pt_loss_dict["sidechain_dists_mse"] * 0.5
+            + pt_loss_dict["bond_angle_loss"] * 0.5
             + pt_loss_dict["chi_loss"]
         )
     else:
@@ -633,7 +633,7 @@ def cath_latent_twotrack_loss_fn(batch, latent_outputs, decoder_outputs, passthr
     # pt_loss = pt_loss * (latent_outputs["t"] < 250)
 
     denoising_loss = latent_loss_dict["latent_denoising_loss"] + latent_loss_dict["seq_denoising_loss"]
-    loss = (vae_loss + pt_loss)/2 + denoising_loss * 0.01 
+    loss = (vae_loss + pt_loss)/2 + denoising_loss * 0.01
 
 
     ret = {
@@ -644,16 +644,16 @@ def cath_latent_twotrack_loss_fn(batch, latent_outputs, decoder_outputs, passthr
     for key, value in pt_loss_dict.items():
         ret[f"pt_{key}"] = value
     ret.update(latent_loss_dict)
-    return ret  
+    return ret
 
 def cath_latent_twotrack_seq_only_loss_fn(batch, latent_outputs, decoder_outputs, passthrough_outputs=None, warmup=False, ae_loss_weight=1):
     autoenc_loss_dict = twotrack_autoencoder_losses(batch, latent_outputs, decoder_outputs)
     latent_loss_dict = latent_twotrack_diffusion_loss(batch, latent_outputs, None)
 
     vae_loss = (
-        + autoenc_loss_dict["kl_div_l0"] 
-        + autoenc_loss_dict["kl_div_l1"] 
-        + autoenc_loss_dict["seq_kl_div"] 
+        + autoenc_loss_dict["kl_div_l0"]
+        + autoenc_loss_dict["kl_div_l1"]
+        + autoenc_loss_dict["seq_kl_div"]
         + autoenc_loss_dict["seq_loss"]
     )
 
@@ -665,7 +665,7 @@ def cath_latent_twotrack_seq_only_loss_fn(batch, latent_outputs, decoder_outputs
     for key, value in autoenc_loss_dict.items():
         ret[f"autoenc_{key}"] = value
     ret.update(latent_loss_dict)
-    return ret  
+    return ret
 
 
 def inpaint_latent_loss_fn(batch,
@@ -1660,8 +1660,8 @@ def debug_inpaint_frame_latent_loss_fn(batch,
     ) * (latent_outputs['t'] < time_threshold)
 
     # kl = torch.mean(torch.stack(decoder_outputs['anchor_kl']), dim=0) + torch.mean(torch.stack(decoder_outputs['node_kl']), dim=0)
-    # kl = torch.mean(torch.stack(decoder_outputs['node_kl']), dim=0)
-    kl = torch.zeros(batch.num_graphs, device=batch['x'].device)
+    kl = torch.mean(torch.stack(decoder_outputs['node_kl']), dim=0)
+    # kl = torch.zeros(batch.num_graphs, device=batch['x'].device)
 
     loss = (bb_denoising_loss + 0.25 * bb_denoising_finegrain_loss + kl).mean()
 

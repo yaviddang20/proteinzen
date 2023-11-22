@@ -9,7 +9,8 @@ import numpy as np
 
 from ligbinddiff.model.autoencoder.atom91 import Atom91Encoder, Atom91Decoder
 # from ligbinddiff.model.autoencoder.torsion import Atom91Decoder
-from ligbinddiff.model.autoencoder.atomic import AtomicSidechainEncoder, MultiscaleSidechainEncoder
+# from ligbinddiff.model.autoencoder.atomic import AtomicSidechainEncoder, MultiscaleSidechainEncoder
+from ligbinddiff.model.autoencoder.hybrid import MultiscaleSidechainEncoder
 from ligbinddiff.model.autoencoder.ipmp import IPMPEncoder, IPMPDecoder
 from ligbinddiff.model.denoiser.sidechain.ipmp_latent import IPMPDenoiser
 from ligbinddiff.model.autoencoder.two_track import Atom91SeqEncoder, Atom91SeqDecoder
@@ -188,7 +189,7 @@ class Diffuser(nn.Module, abc.ABC):
 
             if show_progress:
                 pbar.close()
-        intermediates[self.x_0_pred_key] = intermediates[self.x_t_key]
+        intermediates[self.x_0_pred_key] = denoiser_output[self.x_0_pred_key] #intermediates[self.x_t_key]
         intermediates[self.x_t_key] = x_T
 
         return intermediates, denoiser_output
@@ -480,7 +481,7 @@ class LatentDiffuser(Diffuser):
         # x_0 = latent_data[self.x_0_key]
         # latent_data[self.x_0_key] = latent_outputs[self.x_0_pred_key]
         # passthrough_outputs = self.decoder(data, latent_data)
-        # latent_data[self.x_0_key] = x_0 
+        # latent_data[self.x_0_key] = x_0
         passthrough_outputs = None
         # decoded_outputs = passthrough_outputs
 
@@ -502,6 +503,7 @@ class LatentDiffuser(Diffuser):
         # we do this to recover the "ground truth" encoding
         encoder_outputs = self.encoder(data)
         latent_outputs[self.x_0_key] = encoder_outputs['latent_mu']
+
         latent_outputs.update(encoder_outputs)
         latent_outputs['loss_weight'] = 1
         latent_outputs['noising_mask'] = torch.ones_like(data['residue'].x_mask, device=device).bool()
@@ -548,7 +550,7 @@ class LatentIPMPDiffuser(Diffuser):
             num_layers=num_layers
         )
         self.c_s = c_s
-        self._apply_so3 = lambda x: x 
+        self._apply_so3 = lambda x: x
 
     def sample_prior(self, num_nodes, device):
         latent = torch.randn((num_nodes, self.c_s), device=device)
@@ -584,7 +586,283 @@ class LatentIPMPDiffuser(Diffuser):
         # x_0 = latent_data[self.x_0_key]
         # latent_data[self.x_0_key] = latent_outputs[self.x_0_pred_key]
         # passthrough_outputs = self.decoder(data, latent_data)
-        # latent_data[self.x_0_key] = x_0 
+        # latent_data[self.x_0_key] = x_0
+        passthrough_outputs = None
+        # decoded_outputs = passthrough_outputs
+
+        return latent_outputs, decoded_outputs, passthrough_outputs  # dummy for passthrough outputs
+
+
+    def noise(self, data, intermediates, data_coeff, noise_coeff):
+        data_splits = data._slice_dict['residue']['x']
+        data_lens = data_splits[1:] - data_splits[:-1]
+
+        data_coeff = torch.cat([
+            data_coeff[i].expand(l) for i, l in enumerate(data_lens)
+        ]).view(-1, 1)
+        noise_coeff = torch.cat([
+            noise_coeff[i].expand(l) for i, l in enumerate(data_lens)
+        ]).view(-1, 1)
+
+        x_0 = intermediates[self.x_0_key]
+        noise = self._randn_like(x_0)
+        scaled_noise = self._mult(noise_coeff, noise)
+        scaled_x_0 = self._mult(data_coeff, x_0)
+        x_t = self._add(scaled_x_0, scaled_noise)
+        intermediates[self.x_t_key] = x_t
+        noising_mask = torch.ones_like(noise_coeff).view(-1).bool()
+        intermediates["latent_sidechain_score_scaling"] = noising_mask.float()
+        intermediates['noising_mask'] = noising_mask
+
+        return intermediates
+
+
+    def sample(self,
+               data,
+               steps=None,
+               show_progress=False,
+               device=None,
+               select_task=None):
+        if device is None:
+            device = data['residue']['x'].device
+        num_nodes = data['residue'].num_nodes
+        x_T = self.sample_prior(num_nodes, device)
+
+        if steps is not None:
+            if self.scheduler.discrete:
+                assert self.scheduler.T % steps == 0
+        else:
+            steps = self.scheduler.T
+
+        delta_t = - self.scheduler.T // steps
+        intermediates = {}
+        intermediates['t'] = torch.ones([num_nodes], device=device).view(
+            -1, 1).float() * (self.scheduler.T + delta_t)
+        intermediates[self.x_t_key] = x_T
+
+        with torch.no_grad():
+            if show_progress:
+                pbar = tqdm.tqdm(total=steps)
+
+            while (intermediates['t'] > 0).all():
+                x_tm1, tm1, denoiser_output = self.reverse_step(data, intermediates, delta_t)
+                intermediates['t'] = tm1
+                intermediates[self.x_t_key] = x_tm1
+
+                if show_progress:
+                    pbar.update(1)
+
+            if show_progress:
+                pbar.close()
+        intermediates[self.x_0_pred_key] = intermediates[self.x_t_key]
+        intermediates[self.x_t_key] = x_T
+
+        latent_outputs, denoiser_output = intermediates, denoiser_output
+
+        latent_outputs[self.x_0_key] = denoiser_output[self.x_0_pred_key]
+        decoded_outputs = self.decoder(data, latent_outputs)
+        # we do this to recover the "ground truth" encoding
+        encoder_outputs = self.encoder(data)
+        latent_outputs[self.x_0_key] = encoder_outputs['latent_mu']
+        latent_outputs.update(encoder_outputs)
+        latent_outputs['loss_weight'] = 1
+        latent_outputs['noising_mask'] = torch.ones_like(data['residue'].x_mask, device=device).bool()
+        latent_outputs['latent_sidechain_score_scaling'] = torch.ones_like(data['residue'].x_mask, device=device).float()
+        decoded_outputs['seq_logits'] = decoded_outputs['decoded_seq_logits']
+
+        return latent_outputs, decoded_outputs
+
+## TODO: is there a way to not break the original structure?
+class LatentHybridDiffuser(Diffuser):
+    def __init__(self,
+                 scheduler,
+                 node_lmax_list,
+                 latent_lmax_list,
+                 edge_channels_list,
+                 h_time=64,
+                 scalar_h_dim=128,
+                 bb_lmax_list=[1],
+                 bb_channels=7,
+                 atom_lmax_list=[1],
+                 atom_in_channels=18+1+5+1,
+                 atom_h_channels=8,
+                 atom_out_channels=91,
+                 num_heads=8,
+                 h_channels=32,
+                 num_layers=4,
+                 ):
+        c_s = h_channels
+        c_z = h_channels
+        c_hidden = h_channels
+        denoiser = IPMPDenoiser(
+            c_s=c_s,
+            c_z=c_z,
+            c_hidden=c_hidden,
+            num_layers=num_layers
+        )
+        # init late so we can use common structure
+        super().__init__(denoiser,
+                         scheduler,
+                         _add=operator.add,
+                         _sub=operator.sub,
+                         _mult=operator.mul,
+                         _randn_like=torch.randn_like,
+                         x_0_key='latent_sidechain',
+                         x_0_pred_key='denoised_latent_sidechain',
+                         x_t_key='noised_latent_sidechain',)
+        # build these expensive coeff stores
+        atom_super_lmax_list = [max(l1, l2) for l1, l2 in zip(atom_lmax_list, node_lmax_list)]
+        bb_super_lmax_list = [max(l1, l2) for l1, l2 in zip(bb_lmax_list, node_lmax_list)]
+        latent_super_lmax_list = [max(l1, l2) for l1, l2 in zip(latent_lmax_list, node_lmax_list)]
+
+        atom_super_SO3_rotation_list = nn.ModuleList()
+        bb_super_SO3_rotation_list = nn.ModuleList()
+        latent_super_SO3_rotation_list = nn.ModuleList()
+        atom_SO3_rotation_list = nn.ModuleList()
+        node_SO3_rotation_list = nn.ModuleList()
+        latent_SO3_rotation_list = nn.ModuleList()
+        for lmax in atom_super_lmax_list:
+            atom_super_SO3_rotation_list.append(
+                SO3_Rotation(lmax)
+            )
+        for lmax in bb_super_lmax_list:
+            bb_super_SO3_rotation_list.append(
+                SO3_Rotation(lmax)
+            )
+        for lmax in latent_super_lmax_list:
+            latent_super_SO3_rotation_list.append(
+                SO3_Rotation(lmax)
+            )
+        for lmax in atom_lmax_list:
+            atom_SO3_rotation_list.append(
+                SO3_Rotation(lmax)
+            )
+        for lmax in node_lmax_list:
+            node_SO3_rotation_list.append(
+                SO3_Rotation(lmax)
+            )
+        for lmax in latent_lmax_list:
+            latent_SO3_rotation_list.append(
+                SO3_Rotation(lmax)
+            )
+
+        atom_super_SO3_grid_list = nn.ModuleList()
+        bb_super_SO3_grid_list = nn.ModuleList()
+        latent_super_SO3_grid_list = nn.ModuleList()
+        atom_SO3_grid_list = nn.ModuleList()
+        node_SO3_grid_list = nn.ModuleList()
+        latent_SO3_grid_list = nn.ModuleList()
+        for l in range(max(atom_super_lmax_list) + 1):
+            SO3_m_grid = nn.ModuleList()
+            for m in range(l + 1):
+                SO3_m_grid.append(
+                    SO3_Grid(l, m)
+                )
+            atom_super_SO3_grid_list.append(SO3_m_grid)
+        for l in range(max(bb_super_lmax_list) + 1):
+            SO3_m_grid = nn.ModuleList()
+            for m in range(l + 1):
+                SO3_m_grid.append(
+                    SO3_Grid(l, m)
+                )
+            bb_super_SO3_grid_list.append(SO3_m_grid)
+        for l in range(max(latent_super_lmax_list) + 1):
+            SO3_m_grid = nn.ModuleList()
+            for m in range(l + 1):
+                SO3_m_grid.append(
+                    SO3_Grid(l, m)
+                )
+            latent_super_SO3_grid_list.append(SO3_m_grid)
+        for l in range(max(atom_lmax_list) + 1):
+            SO3_m_grid = nn.ModuleList()
+            for m in range(l + 1):
+                SO3_m_grid.append(
+                    SO3_Grid(l, m)
+                )
+            atom_SO3_grid_list.append(SO3_m_grid)
+        for l in range(max(node_lmax_list) + 1):
+            SO3_m_grid = nn.ModuleList()
+            for m in range(l + 1):
+                SO3_m_grid.append(
+                    SO3_Grid(l, m)
+                )
+            node_SO3_grid_list.append(SO3_m_grid)
+        for l in range(max(latent_lmax_list) + 1):
+            SO3_m_grid = nn.ModuleList()
+            for m in range(l + 1):
+                SO3_m_grid.append(
+                    SO3_Grid(l, m)
+                )
+            latent_SO3_grid_list.append(SO3_m_grid)
+
+        mappingReduced_super_atoms = CoefficientMappingModule(atom_super_lmax_list, atom_super_lmax_list)
+        mappingReduced_super_latent = CoefficientMappingModule(latent_super_lmax_list, latent_super_lmax_list)
+        mappingReduced_super_bb = CoefficientMappingModule(bb_super_lmax_list, bb_super_lmax_list)
+        mappingReduced_atoms = CoefficientMappingModule(atom_lmax_list, atom_lmax_list)
+        mappingReduced_nodes = CoefficientMappingModule(node_lmax_list, node_lmax_list)
+        mappingReduced_latent = CoefficientMappingModule(latent_lmax_list, latent_lmax_list)
+
+        self.encoder = MultiscaleSidechainEncoder(
+            node_lmax_list=node_lmax_list,
+            latent_lmax_list=latent_lmax_list,
+            edge_channels_list=edge_channels_list,
+            mappingReduced_node=mappingReduced_nodes,
+            mappingReduced_super_latent=mappingReduced_super_atoms,
+            node_SO3_rotation=node_SO3_rotation_list,
+            node_SO3_grid=node_SO3_grid_list,
+            latent_super_SO3_rotation=latent_super_SO3_rotation_list,
+            latent_super_SO3_grid=latent_super_SO3_grid_list,
+            atom_channels=atom_in_channels,
+            num_heads=num_heads,
+            atom_h_channels=atom_h_channels,
+            node_h_channels=h_channels,
+            num_layers=num_layers
+        )
+        self.decoder = IPMPDecoder(
+            c_s=h_channels,
+            c_z=edge_channels_list[0],
+            c_hidden=h_channels,
+            num_layers=num_layers
+        )
+
+        self.c_s = c_s
+        self._apply_so3 = lambda x: x
+
+    def sample_prior(self, num_nodes, device):
+        latent = torch.randn((num_nodes, self.c_s), device=device)
+        return latent
+
+    def forward(self, data, warmup=False, deterministic=False):
+        latent_data = self.encoder(data)
+        if deterministic:
+            latent_data[self.x_0_key] = latent_data['latent_mu']
+        else:
+            latent_sigma = self._apply_so3(torch.exp)(
+                self._mult(
+                    latent_data['latent_logvar'],
+                    0.5
+                ),
+            )
+            latent_data[self.x_0_key] = self._add(
+                latent_data['latent_mu'],
+                self._mult(
+                    latent_sigma,
+                    self._randn_like(latent_sigma)
+                )
+            )
+
+        # decoded_outputs = self.decoder(data, latent_data)
+        noised_latent = self.forward_noising(data, latent_data)
+        latent_outputs = self.reverse_noising(data, noised_latent)
+        latent_outputs.update(noised_latent)
+
+        # x_0 = latent_data[self.x_0_key]
+        # latent_data[self.x_0_key] = latent_outputs[self.x_0_pred_key]
+        decoded_outputs = self.decoder(data, latent_data)
+        # x_0 = latent_data[self.x_0_key]
+        # latent_data[self.x_0_key] = latent_outputs[self.x_0_pred_key]
+        # passthrough_outputs = self.decoder(data, latent_data)
+        # latent_data[self.x_0_key] = x_0
         passthrough_outputs = None
         # decoded_outputs = passthrough_outputs
 

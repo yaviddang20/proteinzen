@@ -21,7 +21,7 @@ from ligbinddiff.model.utils.graph import sample_inv_cubic_edges, sequence_local
 from .framediff import TorsionAngles
 
 
-from ligbinddiff.model.modules.layers.lrange.anchor import LinearPoolUpdate
+from ligbinddiff.model.modules.layers.lrange.anchor import ProjectivePoolUpdate, AnchorUpdate
 
 from torch_geometric.utils import coalesce
 
@@ -64,7 +64,8 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
 
         self.use_anchors = use_anchors
         if self.use_anchors:
-            self.pool_update = LinearPoolUpdate(c_s, ratio=0.05, connect_dim=3)
+            self.pool_update = AnchorUpdate(c_s, c_z, ratio=0.1)
+            # self.pool_update = ProjectivePoolUpdate(c_s, ratio=0.05, connect_dim=3)
 
         self.bb_update = BackboneUpdate(
             c_s
@@ -119,7 +120,8 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
         node_features = self.ln_s2(node_features + node_s_update)
 
         if self.use_anchors:
-            node_features, anchor_kl, node_kl = self.pool_update(rigids.get_trans(), node_features, edge_index, data.batch)
+            node_features, anchor_kl, node_kl = self.pool_update(rigids.get_trans(), node_features, edge_index, data.batch, (~x_mask).float())
+            # node_features, anchor_kl, node_kl = self.pool_update(rigids.get_trans(), node_features, edge_index, data.batch)
         else:
             anchor_kl = torch.zeros(data.num_graphs, device=node_features.device)
             node_kl = torch.zeros(data.num_graphs, device=node_features.device)
@@ -153,7 +155,7 @@ class GraphIpaFrameDenoiser(nn.Module):
                  lrange_k=30,
                  self_conditioning=False,
                  graph_conditioning=False,
-                 use_anchors=True):
+                 use_anchors=False):
         super().__init__()
 
         self.c_s = c_s
@@ -374,7 +376,7 @@ class GraphIpmpFrameDenoisingLayer(nn.Module):
         self.ln_s1 = nn.LayerNorm(c_s)
         self.ln_s2 = nn.LayerNorm(c_s)
 
-        self.pool_update = LinearPoolUpdate(c_s, ratio=0.05, connect_dim=3)
+        self.pool_update = ProjectivePoolUpdate(c_s, ratio=0.05, connect_dim=3)
 
         self.bb_update = BackboneUpdate(
             c_s
@@ -1126,7 +1128,7 @@ class HybridSO3FrameDenoisingLayer(nn.Module):
         ).reshape(data.num_nodes, -1, 3)
         embed_vecs = rigids[..., None].apply(embed_vecs)
         embed = torch.cat([embed_scalars[..., None, :], embed_vecs.transpose(-1, -2)], dim=-2)
-        
+
         node_so3_embed.set_embedding(
             torch.cat(
                 [node_so3_embed.embedding, embed],
@@ -1147,7 +1149,7 @@ class HybridSO3FrameDenoisingLayer(nn.Module):
             node_features * noising_mask[..., None],
             node_vectors * noising_mask[..., None, None],
             rigids)
-        
+
         update_quat = F.pad(
             rigids_update[..., :3],
             (1, 0),
@@ -1277,7 +1279,7 @@ class HybridSO3FrameDenoiser(nn.Module):
             edge_index = sample_inv_cubic_edges(masked_X_ca, x_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k)
         edge_index = coalesce(
             torch.cat([edge_index, seq_local_edge_index], dim=-1)
-        ) 
+        )
 
         # compute edge features
         edge_features, _ = gen_spatial_graph_features(X_ca, edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=self.c_z//2)
@@ -1524,7 +1526,7 @@ class SO3FrameDenoisingLayer(nn.Module):
         ).reshape(data.num_nodes, -1, 3)
         embed_vecs = rigids[..., None].apply(embed_vecs)
         embed = torch.cat([embed_scalars[..., None, :], embed_vecs.transpose(-1, -2)], dim=-2)
-        
+
         node_so3_embed.set_embedding(
             torch.cat(
                 [node_so3_embed.embedding, embed],
@@ -1702,7 +1704,7 @@ class SO3FrameDenoiser(nn.Module):
             edge_index = sample_inv_cubic_edges(masked_X_ca, x_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k)
         edge_index = coalesce(
             torch.cat([edge_index, seq_local_edge_index], dim=-1)
-        ) 
+        )
 
         # compute edge features
         edge_features, _ = gen_spatial_graph_features(X_ca, edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=self.c_z//2)

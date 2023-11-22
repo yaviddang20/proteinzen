@@ -130,7 +130,7 @@ class Atom91Encoder(nn.Module):
             mappingReduced_super=mappingReduced_super_latent,
             super_SO3_rotation=latent_super_SO3_rotation,
             super_SO3_grid=latent_super_SO3_grid
-        ) 
+        )
 
         self.logvar_ln = NormSO3(
             lmax_list=latent_lmax_list,
@@ -145,7 +145,7 @@ class Atom91Encoder(nn.Module):
             mappingReduced_super=mappingReduced_super_latent,
             super_SO3_rotation=latent_super_SO3_rotation,
             super_SO3_grid=latent_super_SO3_grid
-        ) 
+        )
         self.k = k
 
     def forward(self, graph):
@@ -405,7 +405,7 @@ class Atom91Decoder(nn.Module):
         edge_dist_rel_pos = _edge_positional_embeddings(edge_index, num_embeddings=16, device=edge_dist.device)  # edge_channels_list
         edge_features = torch.cat([edge_dist_rbf, edge_dist_rel_pos], dim=-1)
 
-        node_features = intermediates['latent_sidechain']
+        node_features = intermediates['latent_sidechain'].clone()
         node_features.embedding = self.latent_ln(node_features.embedding)
 
         for rot in self.node_SO3_rotation_list:
@@ -432,7 +432,7 @@ class Atom91Decoder(nn.Module):
         for node_layer, edge_layer in zip(self.transformer, self.edge_update):
             res_features = node_layer(res_features, edge_features, edge_index)
             edge_features = edge_layer(res_features, edge_features, edge_index)
-        
+
 
         # res_features = self.project(res_features, edge_features, edge_index)
         atom_features = self.output_atoms(res_features, edge_features, edge_index)
