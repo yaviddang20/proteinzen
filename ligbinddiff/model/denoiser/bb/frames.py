@@ -22,6 +22,7 @@ from .framediff import TorsionAngles
 
 
 from ligbinddiff.model.modules.layers.lrange.anchor import ProjectivePoolUpdate, AnchorUpdate
+from ligbinddiff.model.modules.layers.interres import OneParamPairwiseEquilibrate
 
 from torch_geometric.utils import coalesce
 
@@ -36,6 +37,7 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
                  num_qk_pts,
                  num_v_pts,
                  use_anchors=True,
+                 interres_equilibrate=True,
                  ):
         """
         Args
@@ -64,8 +66,8 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
 
         self.use_anchors = use_anchors
         if self.use_anchors:
-            self.pool_update = AnchorUpdate(c_s, c_z, ratio=0.1)
-            # self.pool_update = ProjectivePoolUpdate(c_s, ratio=0.05, connect_dim=3)
+            # self.pool_update = AnchorUpdate(c_s, c_z, ratio=0.1)
+            self.pool_update = ProjectivePoolUpdate(c_s, ratio=0.05, connect_dim=3)
 
         self.bb_update = BackboneUpdate(
             c_s
@@ -120,8 +122,8 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
         node_features = self.ln_s2(node_features + node_s_update)
 
         if self.use_anchors:
-            node_features, anchor_kl, node_kl = self.pool_update(rigids.get_trans(), node_features, edge_index, data.batch, (~x_mask).float())
-            # node_features, anchor_kl, node_kl = self.pool_update(rigids.get_trans(), node_features, edge_index, data.batch)
+            # node_features, anchor_kl, node_kl = self.pool_update(rigids.get_trans(), node_features, edge_index, data.batch, (~x_mask).float())
+            node_features, anchor_kl, node_kl = self.pool_update(rigids.get_trans(), node_features, edge_index, data.batch)
         else:
             anchor_kl = torch.zeros(data.num_graphs, device=node_features.device)
             node_kl = torch.zeros(data.num_graphs, device=node_features.device)
@@ -155,7 +157,8 @@ class GraphIpaFrameDenoiser(nn.Module):
                  lrange_k=30,
                  self_conditioning=False,
                  graph_conditioning=False,
-                 use_anchors=False):
+                 use_anchors=False,
+                 interres_equilibrate=False):
         super().__init__()
 
         self.c_s = c_s
@@ -204,6 +207,17 @@ class GraphIpaFrameDenoiser(nn.Module):
         ])
         self.knn_k = knn_k
         self.lrange_k = lrange_k
+
+        self.interres_equilibrate = interres_equilibrate
+        if interres_equilibrate:
+            self.equilibrate = OneParamPairwiseEquilibrate(
+                 c_s,
+                 c_z,
+                 c_hidden,
+                 num_heads,
+                 num_qk_pts,
+                 num_v_pts,
+            )
 
         self.torsion_angles = TorsionAngles(c_s, 1)
 
@@ -329,6 +343,15 @@ class GraphIpaFrameDenoiser(nn.Module):
             anchor_kl.append(a_kl)
             node_kl.append(n_kl)
 
+        if self.interres_equilibrate:
+            node_features, rigids = self.equilibrate(
+                node_features,
+                edge_features,
+                edge_index,
+                rigids,
+                (~x_mask).float()
+            )
+
         psi, _ = self.torsion_angles(node_features)
 
         rigids = rigids.scale_translation(10)
@@ -343,6 +366,7 @@ class GraphIpaFrameDenoiser(nn.Module):
         ret['node_features'] = node_features
         ret['anchor_kl'] = anchor_kl
         ret['node_kl'] = node_kl
+        ret['edge_index'] = edge_index
 
         return ret
 

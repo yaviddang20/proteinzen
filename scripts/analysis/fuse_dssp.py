@@ -41,11 +41,11 @@ df_sc['length'] = [int(name.split("_")[1]) for name in df_sc['name'].tolist()]
 print((df_sc['sc_rmsd'] < 2).mean())
 
 df_sc_hbond = pd.read_csv(os.path.join("framediff_self_cond_hbond", tail))
-df_sc_hbond['condition'] = ["+sparse +batching -local +hbond +self_condition"] * len(df_mod)
+df_sc_hbond['condition'] = ["+sparse +batching +hbond +self_condition"] * len(df_mod)
 df_sc_hbond['length'] = [int(name.split("_")[1]) for name in df_sc_hbond['name'].tolist()]
 print((df_sc_hbond['sc_rmsd'] < 2).mean())
 
-full_df = pd.concat([df, df_mod_time_batch, df_mod, df_sc, df_mod_both, df_mod_hbond, df_sc_hbond])
+full_df = pd.concat([df, df_mod_time_batch, df_mod, df_sc, df_mod_hbond, df_mod_both, df_sc_hbond])
 ax = sns.violinplot(full_df, x="length", y="sc_rmsd", hue="condition", cut=0)
 sns.move_legend(ax, "upper left", bbox_to_anchor=(1, 1))
 os.chdir(cwd)

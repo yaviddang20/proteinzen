@@ -360,6 +360,7 @@ class GraphFrameDiff(nn.Module):
                  self_conditioning=False,
                  graph_conditioning=False,
                  use_anchors=False,
+                 interres_equilibrate=False,
                  ):
         super().__init__()
         self.bb_x_0_key = bb_x_0_key
@@ -377,7 +378,8 @@ class GraphFrameDiff(nn.Module):
             n_layers=num_layers,
             self_conditioning=self_conditioning,
             graph_conditioning=graph_conditioning,
-            use_anchors=use_anchors
+            use_anchors=use_anchors,
+            interres_equilibrate=interres_equilibrate
         )
         self.time_dist = dist.Uniform(0, 1)
         self.time_T = 1

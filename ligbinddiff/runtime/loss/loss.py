@@ -18,7 +18,7 @@ from ligbinddiff.runtime.loss.latent import so3_embedding_kl, so3_embedding_mse
 from ligbinddiff.runtime.loss.utils import (_nodewise_to_graphwise, _elemwise_to_graphwise)
 from ligbinddiff.utils.atom_reps import atom91_atom_masks
 
-from .frames import all_atom_fape_loss, angle_axis_rot_score_loss, angle_axis_rot_cond_v_loss
+from .frames import all_atom_fape_loss, angle_axis_rot_score_loss, angle_axis_rot_cond_v_loss, full_dist_mat_loss
 from .openfold import compute_fape
 
 from ligbinddiff.utils.openfold import rigid_utils as ru
@@ -177,23 +177,55 @@ def cath_latent_loss_fn2(batch, latent_outputs, decoder_outputs, passthrough_out
     autoenc_loss_dict = autoencoder_losses2(batch, latent_outputs, decoder_outputs)
     latent_loss_dict = latent_sidechain_diffusion_loss2(batch, latent_outputs, None)
 
-    vae_loss = (
-        autoenc_loss_dict["atom91_rmsd"]
-        # autoenc_loss_dict["atom91_mse"]
-        + autoenc_loss_dict["kl_div_l0"] * 1e-2
-        # + autoenc_loss_dict["kl_div_l1"] * 1e-6
-        + autoenc_loss_dict["seq_loss"]
-        + autoenc_loss_dict["bond_length_mse"].sqrt() * 0.5
-        + autoenc_loss_dict["sidechain_dists_mse"].sqrt() * 0.5
-        + autoenc_loss_dict["bond_angle_loss"] * 0.5
-        + autoenc_loss_dict["chi_loss"]
-    )
 
-    loss = vae_loss + 0.1 * latent_loss_dict["latent_denoising_loss"]
+    if passthrough_outputs is not None:
+        vae_loss = (
+            autoenc_loss_dict["atom91_rmsd"]
+            # autoenc_loss_dict["atom91_mse"]
+            + autoenc_loss_dict["kl_div_l0"] * 1e-6#2
+            # + autoenc_loss_dict["kl_div_l1"] * 1e-6
+            # + autoenc_loss_dict["seq_loss"]
+            + autoenc_loss_dict["bond_length_mse"].sqrt() * 0.5
+            + autoenc_loss_dict["sidechain_dists_mse"].sqrt() * 0.5
+            + autoenc_loss_dict["bond_angle_loss"] * 0.5
+            + autoenc_loss_dict["chi_loss"]
+        )
+        pt_autoenc_loss_dict = autoencoder_losses2(batch, latent_outputs, passthrough_outputs)
+
+        pt_loss = (
+            pt_autoenc_loss_dict["atom91_rmsd"]
+            + pt_autoenc_loss_dict["kl_div_l0"] * 1e-6#2
+            # + pt_autoenc_loss_dict["kl_div_l1"] * 1e-6
+            + pt_autoenc_loss_dict["seq_loss"] * 2
+            + pt_autoenc_loss_dict["bond_length_mse"].sqrt() * 0.5
+            + pt_autoenc_loss_dict["sidechain_dists_mse"].sqrt() * 0.5
+            + pt_autoenc_loss_dict["bond_angle_loss"] * 0.5
+            + pt_autoenc_loss_dict["chi_loss"]
+        )
+        ae_loss = (vae_loss + pt_loss)/2
+
+    else:
+        ae_loss = (
+            autoenc_loss_dict["atom91_rmsd"]
+            # autoenc_loss_dict["atom91_mse"]
+            + autoenc_loss_dict["kl_div_l0"] * 1e-6
+            # + autoenc_loss_dict["kl_div_l1"] * 1e-6
+            + autoenc_loss_dict["seq_loss"]
+            + autoenc_loss_dict["bond_length_mse"]
+            + autoenc_loss_dict["sidechain_dists_mse"]
+            + autoenc_loss_dict["bond_angle_loss"]
+            + autoenc_loss_dict["chi_loss"]
+        )
+
+
+    loss = ae_loss + 0.1 * latent_loss_dict["latent_denoising_loss"]
 
     ret = {"loss": loss.mean()}
     for key, value in autoenc_loss_dict.items():
         ret[f"autoenc_{key}"] = value
+    if passthrough_outputs is not None:
+        for key, value in pt_autoenc_loss_dict.items():
+            ret[f"pt_{key}"] = value
     ret.update(latent_loss_dict)
     return ret
 
@@ -489,7 +521,7 @@ def cath_latent_scalars_loss_fn(batch, latent_outputs, decoder_outputs, passthro
     vae_loss = (
         #autoenc_loss_dict["atom91_rmsd"]
         autoenc_loss_dict["atom91_mse"]
-        + autoenc_loss_dict["kl_div"] * 1e-2
+        # + autoenc_loss_dict["kl_div"] * 1e-6
         + autoenc_loss_dict["seq_loss"]
         # + autoenc_loss_dict["bond_length_mse"].sqrt() * 0.5
         # + autoenc_loss_dict["sidechain_dists_mse"].sqrt() * 0.5
@@ -1623,6 +1655,8 @@ def frame_diffusion_loss(batch,
         batch.batch,
         ~noising_mask)
 
+    edge_dist_loss = full_dist_mat_loss(pred_frame_X_ca, ref_frame_X_ca, batch.batch, x_mask)
+
     return {
         "rot_score_loss": rot_score_loss,
         "trans_score_loss": trans_score_loss,
@@ -1630,6 +1664,7 @@ def frame_diffusion_loss(batch,
         "pred_bb_mse": backbone_mse,
         "ref_x_ca_mse": ref_X_ca_mse,
         "dist_mat_loss": dist_mat_loss,
+        "edge_dist_loss": edge_dist_loss,
         "bb_dihedrals_loss": bb_dihedrals_loss,
         "bb_conn_mse": bb_conn_lens,
         "bb_angles_loss": bb_conn_angles
@@ -1657,6 +1692,7 @@ def debug_inpaint_frame_latent_loss_fn(batch,
         # + hbond_loss_dict["mse_Theta"]
         # + hbond_loss_dict["mse_Psi"]
         # + hbond_loss_dict["mse_X"]
+        # + bb_frame_diffusion_loss_dict["edge_dist_loss"]
     ) * (latent_outputs['t'] < time_threshold)
 
     # kl = torch.mean(torch.stack(decoder_outputs['anchor_kl']), dim=0) + torch.mean(torch.stack(decoder_outputs['node_kl']), dim=0)

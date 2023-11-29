@@ -107,3 +107,4 @@ if __name__ == '__main__':
         collapsed_df.append(sub_df[sub_df['sc_rmsd'] == min_rmsd])
     collapsed_df = pd.concat(collapsed_df)
     collapsed_df.to_csv("best_sc_rmsd.csv")
+    print("Num designable:", len(collapsed_df[collapsed_df.sc_rmsd < 2]))

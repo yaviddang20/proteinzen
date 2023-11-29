@@ -5,7 +5,7 @@ from torch_cluster import knn_graph
 from ligbinddiff.model.modules.layers.node.mpnn import IPMP
 from ligbinddiff.model.modules.openfold.frames import  StructureModuleTransition
 from ligbinddiff.model.modules.layers.edge.sitewise import EdgeTransition
-from ligbinddiff.data.datasets.featurize.sidechain import _dihedrals
+from ligbinddiff.data.datasets.featurize.sidechain import _dihedrals, _ideal_virtual_Cb
 from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddings, _rbf
 
 from ligbinddiff.utils.openfold import rigid_utils as ru
@@ -29,23 +29,23 @@ class IPMPUpdateLayer(nn.Module):
         self.ln = nn.LayerNorm(c_s)
         self.node_transition = StructureModuleTransition(
             c_s
-        ) 
+        )
         self.edge_transition = EdgeTransition(
             node_embed_size=c_s,
             edge_embed_in=c_z,
             edge_embed_out=c_z
-        ) 
-    
-    def forward(self, 
-                node_features, 
-                edge_features, 
-                edge_index, 
+        )
+
+    def forward(self,
+                node_features,
+                edge_features,
+                edge_index,
                 rigids,
                 node_mask):
         node_update = self.ipmp(
-            s=node_features, 
-            z=edge_features, 
-            edge_index=edge_index, 
+            s=node_features,
+            z=edge_features,
+            edge_index=edge_index,
             r=rigids)
         node_features = self.ln(node_features + node_update * node_mask[..., None])
         node_features = self.node_transition(node_features) * node_mask[..., None]
@@ -55,9 +55,9 @@ class IPMPUpdateLayer(nn.Module):
 
 
 class IPMPEncoder(nn.Module):
-    def __init__(self, 
-                 c_s, 
-                 c_z, 
+    def __init__(self,
+                 c_s,
+                 c_z,
                  c_hidden,
                  c_s_in=6,
                  num_rbf=16,
@@ -68,7 +68,7 @@ class IPMPEncoder(nn.Module):
         self.c_z = c_z
         self.c_hidden = c_hidden
         self.num_rbf = num_rbf
-        self.c_z_in = num_rbf * (16 + 1)
+        self.c_z_in = num_rbf * (25 + 1)
 
         self.embed_node = nn.Sequential(
             nn.Linear(c_s_in, 2*c_s),
@@ -103,6 +103,8 @@ class IPMPEncoder(nn.Module):
         ## prep features
         X_ca = graph['residue']['x']
         bb = graph['residue']['bb']
+        virtual_Cb = _ideal_virtual_Cb(bb)
+        bb = torch.cat([bb, virtual_Cb[..., None, :]], dim=-2)
         x_mask = graph['residue'].x_mask
         rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_0)
         dihedrals = _dihedrals(bb)
@@ -132,10 +134,10 @@ class IPMPEncoder(nn.Module):
                 rigids,
                 (~x_mask).float()
             )
-        
+
         latent_mu = self.output_mu(node_features)
         latent_logvar = self.output_logvar(node_features)
-        
+
         out_dict = {}
         out_dict['latent_mu'] = latent_mu
         out_dict['latent_logvar'] = latent_logvar
@@ -144,9 +146,9 @@ class IPMPEncoder(nn.Module):
 
 
 class IPMPDecoder(nn.Module):
-    def __init__(self, 
-                 c_s, 
-                 c_z, 
+    def __init__(self,
+                 c_s,
+                 c_z,
                  c_hidden,
                  c_s_in=6,
                  num_rbf=16,
@@ -157,7 +159,7 @@ class IPMPDecoder(nn.Module):
         self.c_z = c_z
         self.c_hidden = c_hidden
         self.num_rbf = num_rbf
-        self.c_z_in = num_rbf * (16 + 1)
+        self.c_z_in = num_rbf * (25 + 1)
 
         self.embed_node = nn.Sequential(
             nn.Linear(c_s_in, 2*c_s),
@@ -193,6 +195,8 @@ class IPMPDecoder(nn.Module):
         num_nodes = graph['residue'].num_nodes
         X_ca = graph['residue']['x']
         bb = graph['residue']['bb']
+        virtual_Cb = _ideal_virtual_Cb(bb)
+        bb = torch.cat([bb, virtual_Cb[..., None, :]], dim=-2)
         x_mask = graph['residue'].x_mask
         rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_0)
         dihedrals = _dihedrals(bb)
@@ -233,15 +237,15 @@ class IPMPDecoder(nn.Module):
         atom91 = torch.zeros((num_nodes, 91, 3), device=all_atom14.device)
         atom91[..., :4, :] = all_atom14[..., 0, :4, :]
         for i in range(20):
-            aa = restype_1to3[restypes[i]] 
+            aa = restype_1to3[restypes[i]]
             start, end = atom91_start_end[aa]
             atom91[..., start:end, :] = all_atom14[..., i, 4:4+(end-start), :]
         atom91 = atom91 - rigids.get_trans()[..., None, :]
-        
+
         seq_logits = self.seq_head(node_features)
 
         out_dict = {}
-        out_dict['decoded_latent'] = atom91 
+        out_dict['decoded_latent'] = atom91
         out_dict['decoded_seq_logits'] = seq_logits
-        
-        return out_dict 
+
+        return out_dict

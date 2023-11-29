@@ -191,7 +191,7 @@ class Atom91Encoder(nn.Module):
             dtype=torch.float
         )
         atom_features.embedding[:, 1:4] = graph['residue']['atom91_centered'].transpose(-1, -2)
-        atom_features.embedding = torch.zeros_like(atom_features.embedding)
+        # atom_features.embedding = torch.zeros_like(atom_features.embedding)
 
         for rot in self.node_SO3_rotation:
             rot.set_wigner(edge_rot_mat)
@@ -360,14 +360,15 @@ class Atom91Decoder(nn.Module):
         self.atom_super_SO3_rotation_list = atom_super_SO3_rotation
         self.latent_super_SO3_rotation_list = latent_super_SO3_rotation
 
-        self.seq_head = nn.Sequential(
-            nn.Linear(h_channels, h_channels*2),
-            nn.ReLU(),
-            nn.Linear(h_channels*2, h_channels),
-            nn.ReLU(),
-            nn.Linear(h_channels, 20),
-            nn.LogSoftmax(dim=-1)
-        )
+        # self.seq_head = nn.Sequential(
+        #     nn.Linear(h_channels, h_channels*2),
+        #     nn.ReLU(),
+        #     nn.Linear(h_channels*2, h_channels),
+        #     nn.ReLU(),
+        #     nn.Linear(h_channels, 20),
+        #     nn.LogSoftmax(dim=-1)
+        # )
+        self.seq_head = nn.Linear(h_channels, 20)
 
         self.k = k
 

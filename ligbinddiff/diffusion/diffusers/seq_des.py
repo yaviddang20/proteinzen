@@ -470,14 +470,14 @@ class LatentDiffuser(Diffuser):
                 )
             )
 
-        # decoded_outputs = self.decoder(data, latent_data)
+        decoded_outputs = self.decoder(data, latent_data)
         noised_latent = self.forward_noising(data, latent_data)
         latent_outputs = self.reverse_noising(data, noised_latent)
         latent_outputs.update(noised_latent)
 
         # x_0 = latent_data[self.x_0_key]
         # latent_data[self.x_0_key] = latent_outputs[self.x_0_pred_key]
-        decoded_outputs = self.decoder(data, latent_data)
+        # decoded_outputs = self.decoder(data, latent_data)
         # x_0 = latent_data[self.x_0_key]
         # latent_data[self.x_0_key] = latent_outputs[self.x_0_pred_key]
         # passthrough_outputs = self.decoder(data, latent_data)

@@ -139,3 +139,34 @@ def angle_axis_rot_cond_v_loss(
     )
     rot_loss = angle_loss + axis_loss
     return _nodewise_to_graphwise(rot_loss, data_lens, x_mask)
+
+
+def edge_index_dist_loss(pred_x_ca, ref_x_ca, edge_index, data_lens, x_mask, eps=1e-8):
+    pred_src = pred_x_ca[edge_index[1]]
+    pred_dst = pred_x_ca[edge_index[0]]
+    pred_dist = torch.linalg.vector_norm(pred_src - pred_dst + eps, dim=-1)
+
+    ref_src = ref_x_ca[edge_index[1]]
+    ref_dst = ref_x_ca[edge_index[0]]
+    ref_dist = torch.linalg.vector_norm(ref_src - ref_dst + eps, dim=-1)
+
+    dist_mse = torch.square(pred_dist - ref_dist)
+    return _nodewise_to_graphwise(dist_mse[~x_mask], data_lens, x_mask)
+
+
+def full_dist_mat_loss(pred_x_ca, ref_x_ca, batch, x_mask, eps=1e-8):
+    ret = []
+    for i in range(batch.max().item()+1):
+        select = (batch == i)
+        pred = pred_x_ca[select]
+        ref = ref_x_ca[select]
+
+        pred_dist_mat = torch.linalg.vector_norm(pred[:, None] - pred[None] + eps, dim=-1)
+        ref_dist_mat = torch.linalg.vector_norm(ref[:, None] - ref[None] + eps, dim=-1)
+        mask = ~x_mask[select]
+        edge_mask = mask[None] * mask[..., None]
+
+        dist_mse = torch.square(pred_dist_mat / (ref_dist_mat + eps) - 1)
+        dist_mse = torch.sum(dist_mse * edge_mask) / edge_mask.long().sum()
+        ret.append(dist_mse)
+    return torch.stack(ret, dim=0)
