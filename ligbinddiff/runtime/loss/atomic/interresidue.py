@@ -4,7 +4,7 @@ from ligbinddiff.runtime.loss.atomic.common import atom91_to_atom14, atoms_to_an
 
 import torch
 
-from ligbinddiff.runtime.loss.utils import _elemwise_to_graphwise, _nodewise_to_graphwise, vec_norm
+from ligbinddiff.runtime.loss.utils import _nodewise_to_graphwise, vec_norm
 
 
 def compute_backbone_connections(bb, batch, eps=1e-8):
@@ -52,7 +52,7 @@ def chain_constraints_loss(pred_bb, ref_bb, num_nodes, batch_mask, x_mask, eps=1
 
     lens_loss = _nodewise_to_graphwise(lens_mse, num_conn, conn_mask)
     conn_mask_expand = conn_mask[:, None].expand(-1, 2)
-    angle_loss = _elemwise_to_graphwise(angle_diff.flatten(), num_conn, conn_mask_expand)
+    angle_loss = _nodewise_to_graphwise(angle_diff.flatten(), num_conn, conn_mask_expand)
     return lens_loss, angle_loss
 
 
@@ -73,7 +73,7 @@ def backbone_dihedrals_loss(pred_bb, ref_bb, num_nodes, x_mask, eps=1e-8):
     dihedral_diff = torch.linalg.vector_norm(dihedral_diff + eps, dim=-1)
     dihedral_diff = dihedral_diff[~x_mask]
     x_mask_expand = x_mask[:, None].expand(-1, 3)
-    return _elemwise_to_graphwise(dihedral_diff.flatten(), num_nodes, x_mask_expand)
+    return _nodewise_to_graphwise(dihedral_diff.flatten(), num_nodes, x_mask_expand)
 
 
 def intersidechain_clash_loss(pred_atom91,
@@ -98,4 +98,4 @@ def intersidechain_clash_loss(pred_atom91,
 
     interres_dists = vec_norm(res_src - res_dst, dim=-1)  # n_edge x n_atoms x n_atoms
     interres_dists = torch.clip(clash_dist - interres_dists[~total_mask], min=0)
-    return _elemwise_to_graphwise(interres_dists, num_edges, total_mask.flatten(-2, -1), reduction='sum')
+    return _nodewise_to_graphwise(interres_dists, num_edges, total_mask.flatten(-2, -1), reduction='sum')

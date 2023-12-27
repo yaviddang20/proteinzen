@@ -10,12 +10,15 @@ TODO:
     2. Remove indexing when the shape is the same.
     3. Move some functions outside classes and to separate files.
 """
+from __future__ import annotations
+from typing import Optional
 
 import os
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numbers
 import numpy as np
 
 try:
@@ -205,7 +208,7 @@ class SO3_Embedding():
         num_channels,
         device,
         dtype,
-        embedding=None
+        embedding: Optional[torch.Tensor] = None
     ):
         super().__init__()
         self.num_channels = num_channels
@@ -236,8 +239,103 @@ class SO3_Embedding():
         self.set_embedding(embedding)
         self.set_lmax_mmax(lmax_list, lmax_list.copy())
 
+
+    def __add__(self, other) -> SO3_Embedding:
+        if isinstance(other, (numbers.Number, torch.Tensor)):
+            ret = self.clone()
+            ret.embedding = ret.embedding + other
+            return ret
+        elif isinstance(other, self.__class__):
+            ret = self.clone()
+            ret.embedding = ret.embedding + other.embedding
+            return ret
+        else:
+            raise ValueError(f"unsupported addition arg type {type(other)}")
+
+    def __radd__(self, other) -> SO3_Embedding:
+        return self.__add__(other)
+
+    def __neg__(self) -> SO3_Embedding:
+        ret = self.clone()
+        ret.embedding = -ret.embedding
+        return ret
+
+    def __sub__(self, other) -> SO3_Embedding:
+        if isinstance(other, (numbers.Number, torch.Tensor)):
+            ret = self.clone()
+            ret.embedding = ret.embedding - other
+            return ret
+        elif isinstance(other, self.__class__):
+            ret = self.clone()
+            ret.embedding = ret.embedding - other.embedding
+            return ret
+        else:
+            raise ValueError(f"unsupported subtr arg type {type(other)}")
+
+    def __rsub__(self, other) -> SO3_Embedding:
+        return -self.__sub__(other)
+
+    def __mul__(self, other) -> SO3_Embedding:
+        if isinstance(other, (numbers.Number, torch.Tensor)):
+            ret = self.clone()
+            ret.embedding = ret.embedding * other
+            return ret
+        elif isinstance(other, self.__class__):
+            ret = self.clone()
+            ret.embedding = ret.embedding * other.embedding
+            return ret
+        else:
+            raise ValueError(f"unsupported mult arg type {type(other)}")
+
+    def __rmul__(self, other) -> SO3_Embedding:
+        return self.__mul__(other)
+
+    def __div__(self, other) -> SO3_Embedding:
+        if isinstance(other, (numbers.Number, torch.Tensor)):
+            ret = self.clone()
+            ret.embedding = ret.embedding / other
+            return ret
+        elif isinstance(other, self.__class__):
+            ret = self.clone()
+            ret.embedding = ret.embedding / other.embedding
+            return ret
+        else:
+            raise ValueError(f"unsupported div arg type {type(other)}")
+
+    def __rdiv__(self, other) -> SO3_Embedding:
+        if isinstance(other, (numbers.Number, torch.Tensor)):
+            ret = self.clone()
+            ret.embedding = other / ret.embedding
+            return ret
+        elif isinstance(other, self.__class__):
+            ret = self.clone()
+            ret.embedding = other.embedding / ret.embedding
+            return ret
+        else:
+            raise ValueError(f"unsupported div arg type {type(other)}")
+
+    def __pow__(self, other) -> SO3_Embedding:
+        if isinstance(other, numbers.Number):
+            ret = self.clone()
+            ret.embedding = torch.pow(ret.embedding, other)
+            return ret
+        else:
+            raise ValueError(f"unsupported div arg type {type(other)}")
+
+    def __getitem__(self, s) -> SO3_Embedding:
+        ret = self.clone()
+        ret.embedding = ret.embedding[s]
+        return ret
+
+    def __setitem__(self, s, v):
+        self.embedding[s] = v
+
+    @property
+    def shape(self):
+        return self.embedding.shape
+
     # Clone an embedding of irreps
-    def clone(self):
+    def clone(self) -> SO3_Embedding:
         clone = SO3_Embedding(
             0,
             self.lmax_list.copy(),
@@ -247,7 +345,6 @@ class SO3_Embedding():
         )
         clone.set_embedding(self.embedding.clone())
         return clone
-
 
     # Initialize an embedding of irreps
     def set_embedding(self, embedding):

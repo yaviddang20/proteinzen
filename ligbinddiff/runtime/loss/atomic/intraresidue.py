@@ -3,7 +3,7 @@ import torch
 from ligbinddiff.runtime.loss.atomic.common import atoms_to_angles, atoms_to_torsions
 
 
-from ligbinddiff.runtime.loss.utils import _elemwise_to_graphwise, vec_norm
+from ligbinddiff.runtime.loss.utils import _nodewise_to_graphwise, vec_norm
 
 from ligbinddiff.utils.atom_reps import atom91_residue_angles, atom91_residue_bonds, atom91_sidechain_angles, atom91_sidechain_bonds, atom91_start_end, chi_atom_idxs, chi_pi_periodic, nonbonded_sidechain_atom_pairs
 
@@ -25,7 +25,7 @@ def atom91_rmsd_loss(ref_atom91,
     # eps for numerical stability
     diff = diff + eps
     sd = torch.square(diff).sum(dim=-1)
-    msd = _elemwise_to_graphwise(sd, num_nodes, ~select_sidechain_atom)
+    msd = _nodewise_to_graphwise(sd, num_nodes, ~select_sidechain_atom)
     rmsd = torch.sqrt(msd + eps)
     return rmsd
 
@@ -47,7 +47,7 @@ def atom91_mse_loss(ref_atom91,
     # eps for numerical stability
     diff = diff + eps
     se = torch.square(diff).sum(dim=-1)
-    mse = _elemwise_to_graphwise(se, num_nodes, ~select_sidechain_atom)
+    mse = _nodewise_to_graphwise(se, num_nodes, ~select_sidechain_atom)
     return mse
 
 
@@ -77,7 +77,7 @@ def bond_length_loss(ref_atom91,
     pred_dist = vec_norm(pred_dst - pred_src, dim=-1)  # (n_bond x n_res)
 
     bond_length_diff = ref_dist - pred_dist
-    bond_length_mse = _elemwise_to_graphwise(bond_length_diff.square(), num_nodes, bond_mask)
+    bond_length_mse = _nodewise_to_graphwise(bond_length_diff.square(), num_nodes, bond_mask)
 
     return bond_length_mse
 
@@ -124,7 +124,7 @@ def torsion_loss(ref_atom91,   # n_res x n_atom x 3
     # print("pi diff", pi_diff)
 
     loss = torch.minimum(diff, pi_diff)
-    graphwise_loss = _elemwise_to_graphwise(loss, num_nodes, chi_mask)
+    graphwise_loss = _nodewise_to_graphwise(loss, num_nodes, chi_mask)
     # reswise_num_elem = (~chi_mask).long().sum(dim=-1)
     # num_elem_per_graph = [t.sum().item() for t in torch.split(reswise_num_elem, num_nodes)]
     # print("chi loss", loss.shape, num_elem_per_graph, num_nodes, graphwise_loss.shape)
@@ -159,7 +159,7 @@ def angle_loss(ref_atom91,   # n_res x n_atom x 3
     pred_angles = atoms_to_angles(pred_angle_atoms[~angle_mask])
 
     diff = vec_norm(ref_angles - pred_angles, dim=-1)
-    graphwise_loss = _elemwise_to_graphwise(diff, num_nodes, angle_mask)
+    graphwise_loss = _nodewise_to_graphwise(diff, num_nodes, angle_mask)
 
     return graphwise_loss
 
@@ -197,7 +197,7 @@ def distance_loss(ref_atom91,
     pred_dist = vec_norm(pred_src - pred_dst, dim=-1)
 
     dist_diff = (ref_dist - pred_dist).square() / 2  # we double-count bonds here
-    graphwise_loss = _elemwise_to_graphwise(dist_diff, num_nodes, total_mask)
+    graphwise_loss = _nodewise_to_graphwise(dist_diff, num_nodes, total_mask)
 
     return graphwise_loss
 
@@ -222,4 +222,4 @@ def intrasidechain_clash_loss(pred_atom91,
     pred_dist = vec_norm(pred_src - pred_dst, dim=-1)
 
     dist_diff = torch.clip(clash_dist - pred_dist, min=0)
-    return _elemwise_to_graphwise(dist_diff, num_nodes, total_mask, reduction='sum')
+    return _nodewise_to_graphwise(dist_diff, num_nodes, total_mask, reduction='sum')

@@ -177,7 +177,7 @@ class BackboneUpdate(nn.Module):
 
 
 class StructureModuleTransition(nn.Module):
-    def __init__(self, c):
+    def __init__(self, c, dropout=0.):
         super(StructureModuleTransition, self).__init__()
 
         self.c = c
@@ -187,6 +187,10 @@ class StructureModuleTransition(nn.Module):
         self.linear_3 = Linear(self.c, self.c, init="final")
         self.relu = nn.ReLU()
         self.ln = nn.LayerNorm(self.c)
+        if dropout > 0:
+            self.dropout = nn.Dropout(dropout)
+        else:
+            self.dropout = None
 
     def forward(self, s):
         s_initial = s
@@ -195,6 +199,8 @@ class StructureModuleTransition(nn.Module):
         s = self.linear_2(s)
         s = self.relu(s)
         s = self.linear_3(s)
+        if self.dropout is not None:
+            s = self.dropout(s)
         s = s + s_initial
         s = self.ln(s)
 

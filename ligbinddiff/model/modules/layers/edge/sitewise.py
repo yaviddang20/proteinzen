@@ -14,7 +14,8 @@ class EdgeTransition(nn.Module):
             edge_embed_in,
             edge_embed_out,
             num_layers=2,
-            node_dilation=2
+            node_dilation=2,
+            dropout=0.
         ):
         super().__init__()
 
@@ -30,6 +31,11 @@ class EdgeTransition(nn.Module):
         self.final_layer = Linear(hidden_size, edge_embed_out, init="final")
         self.layer_norm = nn.LayerNorm(edge_embed_out)
 
+        if dropout > 0:
+            self.dropout = nn.Dropout(dropout)
+        else:
+            self.dropout = None
+
     def forward(self, node_embed, edge_embed, edge_index):
         node_embed = self.initial_embed(node_embed)
 
@@ -42,7 +48,10 @@ class EdgeTransition(nn.Module):
         ], dim=-1)
 
         edge_embed = torch.cat([edge_embed, edge_bias], dim=-1)
-        edge_embed = self.final_layer(self.trunk(edge_embed) + edge_embed)
+        edge_update = self.trunk(edge_embed)
+        if self.dropout is not None:
+            edge_update = self.dropout(edge_update)
+        edge_embed = self.final_layer(edge_update + edge_embed)
         edge_embed = self.layer_norm(edge_embed)
         return edge_embed
 

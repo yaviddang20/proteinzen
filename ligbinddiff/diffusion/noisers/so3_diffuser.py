@@ -242,7 +242,7 @@ class SO3Diffuser:
         x = np.random.rand(n_samples)
         return np.interp(x, self._cdf[self.t_to_idx(t)], self.discrete_omega)
 
-    def torch_sample_igso3(
+    def nodewise_sample_igso3(
             self,
             t: torch.Tensor):
         """Uses the inverse cdf to sample an angle of rotation from IGSO(3).
@@ -254,10 +254,14 @@ class SO3Diffuser:
         Returns:
             [n_samples] angles of rotation.
         """
-        if not np.isscalar(t):
-            raise ValueError(f'{t} must be a scalar.')
-        x = torch.randn_like(t)
-        return np.interp(x, self._cdf[self.t_to_idx(t)], self.discrete_omega)
+        x = np.random.rand(t.numel())
+        out = np.empty_like(x)
+        for _t in t.unique().tolist():
+            select = (t == _t).numpy(force=True)
+            sub_x = x[select]
+            sub_out = np.interp(sub_x, self._cdf[self.t_to_idx(_t)], self.discrete_omega)
+            out[select] = sub_out
+        return out
 
     def sample(
             self,
@@ -276,7 +280,7 @@ class SO3Diffuser:
         x /= np.linalg.norm(x, axis=-1, keepdims=True)
         return x * self.sample_igso3(t, n_samples=n_samples)[:, None]
 
-    def torch_sample(
+    def nodewise_sample(
             self,
             t: torch.Tensor):
         """Generates rotation vector(s) from IGSO(3).
@@ -288,9 +292,9 @@ class SO3Diffuser:
         Returns:
             [n_samples, 3] axis-angle rotation vectors sampled from IGSO(3).
         """
-        x = torch.randn(t.numel(), 3)
-        x /= torch.linalg.vector_norm(x, dim=-1, keepdims=True)
-        return x * self.sample_igso3(t, n_samples=n_samples)[:, None]
+        x = np.random.randn(t.numel(), 3)
+        x /= np.linalg.norm(x, axis=-1, keepdims=True)
+        return x * self.nodewise_sample_igso3(t)[:, None]
 
     def sample_ref(self, n_samples: float=1):
         return self.sample(1, n_samples=n_samples)
@@ -315,6 +319,43 @@ class SO3Diffuser:
             raise ValueError(f'{t} must be a scalar.')
         torch_score = self.torch_score(torch.tensor(vec), torch.tensor(t)[None])
         return torch_score.numpy()
+
+    def nodewise_score(
+            self,
+            vec: torch.tensor,
+            t: torch.tensor,
+            eps: float=1e-6,
+        ):
+        """Computes the score of IGSO(3) density as a rotation vector.
+
+        Same as score function but uses pytorch and performs a look-up.
+
+        Args:
+            vec: [..., 3] array of axis-angle rotation vectors.
+            t: continuous time in [0, 1].
+
+        Returns:
+            [..., 3] score vector in the direction of the sampled vector with
+            magnitude given by _score_norms.
+        """
+        # TODO: can i do this without the for loop?
+        vec = torch.as_tensor(vec)
+        t = torch.as_tensor(t)
+
+        omega = torch.linalg.norm(vec, dim=-1) + eps
+        omega_scores_t_list = []
+
+        for _t in t.unique().tolist():
+            select = (_t == t)
+            sub_sigma = self.discrete_sigma[self.t_to_idx(np.array([_t]))]
+            sub_sigma = torch.as_tensor(sub_sigma).to(vec.device)
+            sub_omega = omega[select][None]
+            omega_vals = igso3_expansion(sub_omega, sub_sigma[:, None], use_torch=True)
+            omega_scores_t = score(omega_vals, sub_omega, sub_sigma[:, None], use_torch=True)
+            omega_scores_t_list.append(omega_scores_t)
+
+        ret = torch.cat(omega_scores_t_list, dim=1).squeeze(0)[..., None] * vec / (omega[..., None] + eps)
+        return ret.numpy()
 
     def torch_score(
             self,
@@ -400,14 +441,14 @@ class SO3Diffuser:
             rot_score: [..., 3] score of rot_t as a rotation vector.
         """
         n_samples = np.cumprod(rot_0.shape[:-1])[-1]
-        sampled_rots = self.sample(t, n_samples=n_samples)
+        sampled_rots = self.torch_sample(t, n_samples=n_samples)
         rot_score = self.score(sampled_rots, t).reshape(rot_0.shape)
 
         # Right multiply.
         rot_t = du.compose_rotvec(rot_0, sampled_rots).reshape(rot_0.shape)
         return rot_t, rot_score
 
-    def torch_forward_marginal(self, rot_0: torch.Tensor, t: torch.Tensor):
+    def nodewise_forward_marginal(self, rot_0: torch.Tensor, t: torch.Tensor):
         """Samples from the forward diffusion process at time index t.
 
         Args:
@@ -418,13 +459,13 @@ class SO3Diffuser:
             rot_t: [..., 3] noised rotation vectors.
             rot_score: [..., 3] score of rot_t as a rotation vector.
         """
-        n_samples = np.cumprod(rot_0.shape[:-1])[-1]
-        sampled_rots = self.sample(t, n_samples=n_samples)
-        rot_score = self.torch_score(sampled_rots, t).reshape(rot_0.shape)
+        device = t.device
+        sampled_rots = self.nodewise_sample(t)
+        rot_score = self.nodewise_score(sampled_rots, t).reshape(rot_0.shape)
 
         # Right multiply.
         rot_t = du.compose_rotvec(rot_0, sampled_rots).reshape(rot_0.shape)
-        return rot_t, rot_score
+        return torch.as_tensor(rot_t, device=device), torch.as_tensor(rot_score, device=device)
 
     def reverse(
             self,

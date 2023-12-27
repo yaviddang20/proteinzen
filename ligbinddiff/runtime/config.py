@@ -1,0 +1,184 @@
+import torch
+from hydra_zen import store, just, builds, make_custom_builds_fn, make_config, kwargs_of
+import omegaconf
+
+from lightning import Trainer
+from lightning.pytorch.callbacks import ModelCheckpoint
+
+from ligbinddiff.data.datasets.datamodule import ProteinDataModule
+
+from ligbinddiff.diffusion.noisers.se3_diffuser import SE3Diffuser
+from ligbinddiff.diffusion.noisers.latent import SidechainDiffuser
+from ligbinddiff.stoch_interp.interpolate.se3 import SE3FlowMatcher
+
+from ligbinddiff.model.denoiser.bb.frames import GraphIpaFrameDenoiser
+from ligbinddiff.model.denoiser.sidechain.ipmp_latent import IPMPDenoiser
+from ligbinddiff.stoch_interp.flow_matchers.frames import GraphFrameFlow
+
+from ligbinddiff.model.autoencoder.ipmp import IPMPEncoder, IPMPDecoder
+from ligbinddiff.model.autoencoder.ipa import IPAEncoder, IPADecoder
+from ligbinddiff.model.wrappers.sidechain import LatentSidechainWrapper, IPMPLatentSidechainWrapper
+
+
+from ligbinddiff.tasks.diffusion.bb import BackboneFrameNoising
+from ligbinddiff.tasks.diffusion.sidechain import DesignLatentSidechainNoising
+
+from ligbinddiff.runtime.optim import get_std_opt
+
+# targets ZenStore
+# pylint: disable=not-callable
+
+pbuilds = make_custom_builds_fn(zen_partial=True, populate_full_signature=True)
+
+se3_diffusion_cfg = {
+    "diffuse_rot": True,
+    "diffuse_trans": True,
+    "so3": {
+        "schedule": "logarithmic",
+        "min_sigma": 0.1,
+        "max_sigma": 1.5,
+        "num_sigma": 1000,
+        "num_omega": 1000,
+        "cache_dir": '.cache/',
+        "use_cached_score": False,
+    },
+    "r3": {
+        "min_b": 0.1,
+        "max_b": 20,
+        "coordinate_scaling": 0.1,
+    }
+}
+
+def config_hydra_store():
+    ## switches to allow for hot-swapping between paradigms and domains
+    paradigm_store = store(group="paradigm")
+    paradigm_store({"paradigm": "diffusion"}, name="diffusion")
+    paradigm_store({"paradigm": "fm"}, name="fm")
+
+    domain_store = store(group="domain")
+    domain_store({"domain": "backbone"}, name="bb")
+    domain_store({"domain": "sidechain"}, name="sidechain")
+    domain_store({"domain": "all_atom"}, name="all_atom")
+
+    corruption_store = store(group="corrupter")
+    corruption_store(
+        SE3Diffuser,
+        se3_conf=se3_diffusion_cfg,
+        name="diffusion_bb")
+    corruption_store(
+        SidechainDiffuser,
+        name="diffusion_sidechain")
+    corruption_store(
+        SE3FlowMatcher,
+        name="fm_bb")
+
+    datamodule_store = store(group="datamodule")
+    datamodule_store(
+        pbuilds(
+            ProteinDataModule,
+            # data_dir="/wynton/home/kortemme/alexjli/projects/ligbinddiff/data/framediff",
+            data_dir="/wynton/home/kortemme/alexjli/projects/ligbinddiff/data/cath",
+            batch_size=3000,
+            num_workers=4
+        ),
+        name="default")
+
+    model_store = store(group="model")
+    model_store(GraphIpaFrameDenoiser, name="diffusion_bb")
+    model_store(
+        IPMPLatentSidechainWrapper,
+        name="diffusion_sidechain")
+
+    task_store = store(group="tasks")
+    task_store(pbuilds(BackboneFrameNoising), name="diffusion_bb")
+    task_store(pbuilds(DesignLatentSidechainNoising), name="diffusion_sidechain")
+
+    exp_store = store(group="experiment")
+    exp_store({
+        "warm_start": None,
+    }, name="default")
+    lightning_store = exp_store(group="experiment/lightning")
+    lightning_store(pbuilds(Trainer), name="default")
+
+    optim_store = exp_store(group="experiment/optim")
+    optim_store(pbuilds(torch.optim.Adam), name="adam")
+    optim_store(pbuilds(get_std_opt, d_model=128), name="noam")
+
+    exp_store(
+        pbuilds(
+            ModelCheckpoint,
+            dirpath="ckpt",
+            every_n_train_steps=50,
+        ),
+        group="experiment/checkpointer",
+        name="default")
+
+    exp_store(
+        {"offline": True},
+        group="experiment/wandb",
+        name="default"
+    )
+
+    # breaking the hydra_zen/hydra/omegaconf abstraction here a little
+    # but this allows for nice swappable configs
+    ExperimentConfig = make_config(
+        debug=False,
+        hydra_defaults=[
+            {"paradigm": "diffusion"},
+            {"domain": "bb"},
+            {"datamodule": "default"},
+            {"corrupter": "${paradigm}_${domain}"},
+            {"model": "${paradigm}_${domain}"},
+            {"tasks": "${paradigm}_${domain}"},
+            {"experiment": "default"},
+            {"experiment/optim": "adam"},
+            {"experiment/lightning": "default"},
+            {"experiment/checkpointer": "default"},
+            {"experiment/wandb": "default"},
+            '_self_'
+        ],
+    )
+
+    store(ExperimentConfig, name="main")
+    store.add_to_hydra_store()
+
+
+def remove_zen_keys(cfg, keys=['_target_', '_partial_']):
+    def remove_key(cfg):
+        for key in keys:
+            if hasattr(cfg, key):
+                delattr(cfg, key)
+            elif isinstance(cfg, dict) and key in cfg:
+                del cfg[key]
+
+        if isinstance(cfg, (omegaconf.DictConfig, dict)):
+            for value in cfg.values():
+                remove_key(value)
+        elif isinstance(cfg, omegaconf.ListConfig):
+            for value in cfg:
+                remove_key(value)
+        return cfg
+
+    return remove_key(cfg.copy())
+
+
+if __name__ == '__main__':
+    from hydra_zen import zen
+
+    def main(model, corruption, trainer, datamodule, zen_cfg):
+        print(model)
+        print(corruption)
+        print(trainer)
+        print(datamodule)
+        print(zen_cfg)
+
+    def preprocess_cfg(cfg):
+        print(cfg)
+        return cfg
+
+    config_hydra_store()
+
+    zen(main, pre_call=preprocess_cfg).hydra_main(
+        config_name="main",
+        version_base="1.1"
+    )

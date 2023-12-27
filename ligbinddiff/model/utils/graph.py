@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-from torch_geometric.utils import sort_edge_index
+from torch_geometric.utils import sort_edge_index, scatter
 from ligbinddiff.data.datasets.featurize.common import _rbf
 
 from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddings
@@ -148,19 +148,9 @@ def sequence_local_graph(num_nodes, x_mask, half_local_size=5):
     return edge_index
 
 
-def nodewise_to_batchwise(t_per_node, data_lens):
-    assert t_per_node.numel() == sum(data_lens)
-    partition_points = np.cumsum(data_lens)[:-1]
-    return torch.cat([
-        t_per_node[l] for l in partition_points
-    ])
 
-
-def batchwise_to_nodewise(t_per_graph, data_lens):
-    assert t_per_graph.numel() == len(data_lens)
-    return torch.cat([
-        t_per_graph[i] * torch.ones(l, device=t_per_graph.device) for i, l in enumerate(data_lens)
-    ])
+def batchwise_to_nodewise(t_per_graph, batch):
+    return t_per_graph[batch]
 
 
 def gen_spatial_graph_features(X_ca, edge_index, num_rbf_embed, num_pos_embed):
@@ -177,15 +167,21 @@ def gen_spatial_graph_features(X_ca, edge_index, num_rbf_embed, num_pos_embed):
 
     return edge_features, edge_dist_vec
 
-def get_data_lens(pyg_graph, key=None):
+def get_data_lens(pyg_graph, key=None, hetero_key=None):
     if key is None:
-        batch = pyg_graph.batch
+        if hetero_key is not None:
+            batch = pyg_graph[hetero_key].batch
+        else:
+            batch = pyg_graph.batch
         num_nodes = []
         for i in range(batch.max().item() + 1):
             select = (batch == i)
             num_nodes.append(select.long().sum().item())
         return num_nodes
     else:
-        data_splits = pyg_graph._slice_dict[key]
+        if hetero_key is not None:
+            data_splits = pyg_graph._slice_dict[hetero_key][key]
+        else:
+            data_splits = pyg_graph._slice_dict[key]
         data_lens = data_splits[1:] - data_splits[:-1]
         return data_lens

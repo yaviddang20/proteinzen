@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from ligbinddiff.utils.atom_reps import num_to_letter, atom91_atom_masks
-from ligbinddiff.data.io.pdb_utils import atom91_to_pdb
+from ligbinddiff.data.io.atom91 import atom91_to_pdb
 
 from .utils import format_list, gen_pbar_str, update_epoch_loss_dict
 

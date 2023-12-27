@@ -2,6 +2,7 @@ from ligbinddiff.runtime.loss.utils import _nodewise_to_graphwise, vec_norm
 
 
 import torch
+import torch.nn.functional as F
 
 
 def so3_embedding_mse(ref_so3, pred_so3, num_nodes, x_mask, scaling=None):
@@ -19,7 +20,6 @@ def so3_embedding_mse(ref_so3, pred_so3, num_nodes, x_mask, scaling=None):
 
     return _nodewise_to_graphwise(nodewise_loss, num_nodes, x_mask)
 
-
 def so3_embedding_kl(so3_mu, so3_logvar, num_nodes, x_mask):
     splits = []
     for lmax in so3_mu.lmax_list:
@@ -33,3 +33,8 @@ def so3_embedding_kl(so3_mu, so3_logvar, num_nodes, x_mask):
         kl_div.append(comp_kl_div.sum(dim=(-1, -2)))
 
     return [_nodewise_to_graphwise(kl, num_nodes, x_mask) for kl in kl_div]
+
+def scalars_kl_div(mu, logvar, batch, mask):
+    kl_div = -0.5 * (logvar - mu.square() - logvar.exp() + 1)
+    kl_div = kl_div.sum(dim=-1)
+    return _nodewise_to_graphwise(kl_div, batch, mask)

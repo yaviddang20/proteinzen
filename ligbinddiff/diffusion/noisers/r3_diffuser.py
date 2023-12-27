@@ -108,6 +108,27 @@ class R3Diffuser:
         x_t = self._unscale(x_t)
         return x_t, score_t
 
+    def nodewise_forward_marginal(self, x_0: np.ndarray, t: np.ndarray):
+        """Samples marginal p(x(t) | x(0)).
+
+        Args:
+            x_0: [..., n, 3] initial positions in Angstroms.
+            t: continuous time in [0, 1].
+
+        Returns:
+            x_t: [..., n, 3] positions at time t in Angstroms.
+            score_t: [..., n, 3] score at time t in scaled Angstroms.
+        """
+        x_0 = self._scale(x_0)
+        t = t[..., None]
+        x_t = np.random.normal(
+            loc=np.exp(-1/2*self.marginal_b_t(t)) * x_0,
+            scale=np.sqrt(1 - np.exp(-self.marginal_b_t(t)))
+        )
+        score_t = self.score(x_t, x_0, t)
+        x_t = self._unscale(x_t)
+        return x_t, score_t
+
     def score_scaling(self, t: float):
         return 1 / np.sqrt(self.conditional_var(t))
 

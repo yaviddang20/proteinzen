@@ -1,24 +1,23 @@
 import torch
 from torch_geometric.nn import radius_graph
-from torch_geometric.utils import sort_edge_index
+from torch_geometric.utils import sort_edge_index, scatter
 
 from ligbinddiff.runtime.loss.atomic.common import atom91_to_atom14
-from ligbinddiff.runtime.loss.utils import _elemwise_to_graphwise, vec_norm
+from ligbinddiff.runtime.loss.utils import _nodewise_to_graphwise, vec_norm
 
 
 def framediff_local_atomic_context_loss(
     pred_bb,
     ref_bb,
     batch,
-    x_mask,
+    res_mask,
     r=6,
     eps=1e-6,
-    max_num_neighbors=32
+    max_num_neighbors=32,
 ):
-    # chop off CB
-    flat_ref_bb = ref_bb[~x_mask, :4].view(-1, 3)
-    flat_pred_bb = pred_bb[~x_mask, :4].view(-1, 3)
-    batch_expand = batch[~x_mask].repeat_interleave(4, dim=0)
+    flat_ref_bb = ref_bb[res_mask].reshape(-1, 3)
+    flat_pred_bb = pred_bb[res_mask].reshape(-1, 3)
+    batch_expand = batch[res_mask].repeat_interleave(5, dim=0)
     edge_index = radius_graph(flat_ref_bb, r, batch_expand, max_num_neighbors=max_num_neighbors)
     edge_index = sort_edge_index(edge_index, sort_by_row=False)
 
@@ -30,25 +29,29 @@ def framediff_local_atomic_context_loss(
 
     dist_se = torch.square(pred_dists - ref_dists)
 
-    data_lens = [0]
-    num_res = []
-    for i in range(batch.max().item() + 1):
-        select = (batch == i)
-        sub_x_mask = ~x_mask[select]
-        data_lens.append(sub_x_mask.long().sum() * 4)  # 4 bb atoms per residue
-        num_res.append(sub_x_mask.long().sum())
-
-    partitions = torch.cumsum(torch.as_tensor(data_lens, device=batch.device), dim=0)
-    edge_index_batch_id = torch.bucketize(edge_index[1], partitions, right=True) - 1
-    edge_data_lens = [(edge_index_batch_id == i).sum().item() for i in range(batch.max().item() + 1)]
-
-    dist_se_split = torch.split(dist_se, edge_data_lens)
-    # i don't really know where the -n came from
-    dist_mse = torch.stack(
-        [sub_se.sum() / (sub_se.shape[0] - n) for sub_se, n in zip(dist_se_split, num_res)],
-        dim=0
+    edge_batch = batch_expand[edge_index[1]]
+    num_graph = batch_expand.max().item() + 1
+    graphwise_dist_se = scatter(
+        dist_se,
+        edge_batch,
+        dim=0,
+        dim_size=num_graph
     )
-    return dist_mse
+    graphwise_num_edges = scatter(
+        torch.ones_like(edge_batch),
+        edge_batch,
+        dim=0,
+        dim_size=num_graph
+    )
+    graphwise_num_res = scatter(
+        res_mask.long(),
+        batch,
+        dim=0,
+        dim_size=num_graph
+    )
+    return graphwise_dist_se / (graphwise_num_edges - graphwise_num_res)
+
+
 
 
 def atomic_neighborhood_dist_loss(ref_atom91,
@@ -85,4 +88,4 @@ def atomic_neighborhood_dist_loss(ref_atom91,
 
     dist_mse = (ref_interres_dists - pred_interres_dists).square()
 
-    return _elemwise_to_graphwise(dist_mse, num_edges, total_mask.flatten(-2, -1))
+    return _nodewise_to_graphwise(dist_mse, num_edges, total_mask.flatten(-2, -1))

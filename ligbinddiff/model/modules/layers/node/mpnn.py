@@ -11,6 +11,18 @@ import math
 from typing import Optional, Sequence, Tuple
 
 
+class PositionWiseFeedForward(nn.Module):
+    def __init__(self, num_hidden, num_ff):
+        super().__init__()
+        self.W_in = nn.Linear(num_hidden, num_ff, bias=True)
+        self.W_out = nn.Linear(num_ff, num_hidden, bias=True)
+        self.act = torch.nn.GELU()
+    def forward(self, h_V):
+        h = self.act(self.W_in(h_V))
+        h = self.W_out(h)
+        return h
+
+
 class IPMP(nn.Module):
     """
     A (close) implementation of IPMP from PIPPack
@@ -21,6 +33,7 @@ class IPMP(nn.Module):
         c_z,
         c_hidden,
         no_points=8,
+        dropout=0.1,
         inf: float = 1e5,
         eps: float = 1e-8,
     ):
@@ -47,40 +60,54 @@ class IPMP(nn.Module):
         self.inf = inf
         self.eps = eps
 
-        self.linear_pts = Linear(self.c_s, self.no_points * 3)
-        self.ln = nn.LayerNorm(c_s)
-        self.mlp = nn.Sequential(
-            Linear(2 * c_s + c_z + 8 * no_points + no_points ** 2, c_hidden),
+        self.dropout = nn.Dropout(dropout)
+        self.p_dropout = dropout
+
+        premsg_dim = (
+            2 * c_s  # each node
+            + c_z  # edge
+            + 8 * no_points  # (1)-(4) point features
+            # + no_points ** 2,
+            + no_points  # (5) point features
+        )
+
+        self.node_pts = Linear(self.c_s, self.no_points * 3)
+        self.node_msg_mlp = nn.Sequential(
+            Linear(
+                premsg_dim,
+                c_hidden
+            ),
             nn.ReLU(),
             Linear(c_hidden, c_hidden),
             nn.ReLU(),
             Linear(c_hidden, c_s, init='final'),
         )
+        self.node_ln1 = nn.LayerNorm(c_s)
+        self.node_ffn = PositionWiseFeedForward(c_s, c_s*4)
+        self.node_ln2 = nn.LayerNorm(c_s)
 
+        self.edge_pts = Linear(self.c_s, self.no_points * 3)
+        self.edge_msg_mlp = nn.Sequential(
+            Linear(
+                premsg_dim,
+                c_hidden
+            ),
+            nn.ReLU(),
+            Linear(c_hidden, c_hidden),
+            nn.ReLU(),
+            Linear(c_hidden, c_z, init='final'),
+        )
+        self.edge_ln = nn.LayerNorm(c_z)
 
-    def forward(
+    def _gen_premessage(
         self,
         s: torch.Tensor,
-        z: Optional[torch.Tensor],
+        z: torch.Tensor,
         edge_index: torch.Tensor,
         r: Rigid,
-        eps=1e-8
-    ) -> torch.Tensor:
-        """
-        Args:
-            s:
-                [N_res, C_s] single representation, scalars
-            z:
-                [N_edge, C_e] pair representation
-            edge_index:
-                [2, N_edge] edge index
-            r:
-                [N_res] transformation object
-            mask:
-                [N_res] mask
-        Returns:
-            [N_res, C_s] single scalar representation update
-        """
+        eps=1e-8,
+        edge=False,
+    ):
         n_nodes = s.shape[0]
         n_edges = z.shape[0]
         src = edge_index[1]
@@ -96,7 +123,10 @@ class IPMP(nn.Module):
         #######################################
         # [N_res, C_pts, 3]
         # 1. Node i's local points
-        pts_local = self.linear_pts(s)
+        if edge:
+            pts_local = self.edge_pts(s)
+        else:
+            pts_local = self.node_pts(s)
         pts_local = pts_local.view(n_nodes, -1, 3)
         pts_local_src = pts_local[src]
 
@@ -113,12 +143,12 @@ class IPMP(nn.Module):
 
         # 5. Distance between node i's global points and node j's global points
         pts_global_src = pts_global[src]
-        pts_rel_dist = torch.linalg.norm(
-            pts_global_src[..., None, :] - pts_global_dst[..., None, :, :] + eps,
-            dim=-1
-        ).view(n_edges, -1)
+        # pts_rel_dist = torch.linalg.norm(
+        #     pts_global_src[..., None, :] - pts_global_dst[..., None, :, :] + eps,
+        #     dim=-1
+        # ).view(n_edges, -1)
         # their code suggests this but this doesn't make sense to me
-        # pts_rel_dist = torch.linalg.norm(pts_global_src - pts_global_dst + eps, dim=-1)
+        pts_rel_dist = torch.linalg.norm(pts_global_src - pts_global_dst + eps, dim=-1)
 
         premessage = torch.cat([
             s_src,
@@ -130,17 +160,54 @@ class IPMP(nn.Module):
             pts_dst_in_src_local_norm,
             pts_rel_dist
         ], dim=-1)
+        return premessage
 
-        msg = self.mlp(premessage)
-        update = pygu.scatter(
-            msg,
-            edge_index[1],
+    def forward(
+        self,
+        s: torch.Tensor,
+        z: torch.Tensor,
+        edge_index: torch.Tensor,
+        r: Rigid,
+        mask: torch.Tensor,
+        eps=1e-8
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            s:
+                [N_res, C_s] single representation, scalars
+            z:
+                [N_edge, C_e] pair representation
+            edge_index:
+                [2, N_edge] edge index
+            r:
+                [N_res] transformation object
+            mask:
+                [N_res] mask
+        Returns:
+            [N_res, C_s] single scalar representation update
+        """
+        n_nodes = s.shape[0]
+
+        dropout_edge_index, dropout_edge_mask = pygu.dropout_edge(edge_index, p=self.p_dropout, training=self.training)
+        dropout_z = z[dropout_edge_mask]
+
+        node_premessage = self._gen_premessage(s, dropout_z, dropout_edge_index, r, edge=False)
+        node_msg = self.node_msg_mlp(node_premessage)
+        node_update = pygu.scatter(
+            node_msg,
+            dropout_edge_index[1],
             dim=0,
             dim_size=n_nodes,
             reduce='mean'
         )
+        s = self.node_ln1(s + self.dropout(node_update) * mask[..., None])
+        s = self.node_ln2(s + self.node_ffn(s) * mask[..., None])
 
-        return update
+        edge_premessage = self._gen_premessage(s, z, edge_index, r, edge=True)
+        edge_message = self.edge_msg_mlp(edge_premessage)
+        z = self.edge_ln(z + self.dropout(edge_message))
+
+        return s, z
 
 
 class VectorBiasIPMP(nn.Module):

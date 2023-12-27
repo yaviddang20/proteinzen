@@ -6,15 +6,6 @@ import torch
 
 from ligbinddiff.runtime.utils import format_list, gen_pbar_str, update_epoch_loss_dict
 
-def unbatch_density(density_dict, batch_num_nodes):
-    densities = [{} for _ in batch_num_nodes]
-    for l, batched_v in density_dict.items():
-        vecs = torch.split(batched_v, batch_num_nodes, dim=-3)
-        for density, vec in zip(densities, vecs):
-            density[l] = vec
-
-    return densities
-
 
 def cath_train_loop(diffuser,
                     dataloader,

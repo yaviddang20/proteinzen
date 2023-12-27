@@ -24,7 +24,7 @@ dcgmi stats -g $gpuprof -e
 dcgmi stats -g $gpuprof -s $JOB_ID
 
 cd ~/projects/ligbinddiff
-python train.py "$@" job_id=${JOB_ID}
+python train.py "$@" +job_id=${JOB_ID}
 # args = ARGS
 
 dcgmi stats -g $gpuprof -x $JOB_ID

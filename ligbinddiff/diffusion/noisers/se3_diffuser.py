@@ -33,8 +33,8 @@ def _assemble_rigid(rotvec, trans):
         rotvec_shape[:-1] + (3, 3))
     return ru.Rigid(
             rots=ru.Rotation(
-                rot_mats=torch.Tensor(rotmat)),
-            trans=torch.tensor(trans))
+                rot_mats=torch.as_tensor(rotmat)),
+            trans=torch.as_tensor(trans))
 
 def _torch_assemble_rigid(rotvec, trans):
     rotmat = so3_utils.Exp(rotvec)
@@ -135,7 +135,7 @@ class SE3Diffuser:
             'rot_score_scaling': rot_score_scaling,
         }
 
-    def torch_forward_marginal(
+    def nodewise_forward_marginal(
             self,
             rigids_0: ru.Rigid,
             t: torch.Tensor,
@@ -163,9 +163,9 @@ class SE3Diffuser:
                 torch.ones_like(t)
             )
         else:
-            rot_t, rot_score = self._so3_diffuser.forward_marginal(
+            rot_t, rot_score = self._so3_diffuser.nodewise_forward_marginal(
                 rot_0, t)
-            rot_score_scaling = self._so3_diffuser.score_scaling(t)
+            rot_score_scaling = self._so3_diffuser.score_scaling(t.numpy(force=True))
 
         if not self._diffuse_trans:
             trans_t, trans_score, trans_score_scaling = (
@@ -174,9 +174,9 @@ class SE3Diffuser:
                 np.ones_like(t)
             )
         else:
-            trans_t, trans_score = self._r3_diffuser.forward_marginal(
-                trans_0, t)
-            trans_score_scaling = self._r3_diffuser.score_scaling(t)
+            trans_t, trans_score = self._r3_diffuser.nodewise_forward_marginal(
+                trans_0.numpy(force=True), t.numpy(force=True))
+            trans_score_scaling = self._r3_diffuser.score_scaling(t.numpy(force=True))
 
         if diffuse_mask is not None:
             # diffuse_mask = torch.tensor(diffuse_mask).to(rot_t.device)

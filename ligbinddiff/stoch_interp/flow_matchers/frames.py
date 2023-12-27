@@ -6,7 +6,7 @@ import torch.distributions as dist
 import numpy as np
 
 from ligbinddiff.model.denoiser.bb.framediff import IpaScoreWrapper, KnnIpaScoreWrapper
-from ligbinddiff.model.denoiser.bb.frames import GraphIpaFrameDenoiser, PSAEBFrameDenoiser
+from ligbinddiff.model.denoiser.bb.frames import GraphIpaFrameDenoiser
 from ligbinddiff.utils.openfold import rigid_utils as ru
 from ligbinddiff.model.utils.graph import batchwise_to_nodewise, get_data_lens
 
@@ -57,8 +57,7 @@ class GraphFrameFlow(nn.Module):
     def bb_cond_v(self, data, denoiser_output, mask, t_clip=0):
         bb_x_t = ru.Rigid.from_tensor_7(data[self.bb_x_t_key])
         t = data['t']
-        data_lens = get_data_lens(data, 'x')
-        t_per_node = batchwise_to_nodewise(t, data_lens)
+        t_per_node = batchwise_to_nodewise(t, data.batch)
         bb_x_0_pred = denoiser_output[self.bb_x_0_pred_key]
         rots_x_t = bb_x_t.get_rots()
         rots_x_0_pred = bb_x_0_pred.get_rots()

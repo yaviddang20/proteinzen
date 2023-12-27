@@ -10,6 +10,7 @@ from ligbinddiff.data.datasets.featurize.sidechain import _dihedrals
 from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddings, _rbf
 
 from ligbinddiff.utils.openfold import rigid_utils as ru
+from ligbinddiff.model.utils.graph import batchwise_to_nodewise
 
 
 class IPMPUpdateLayer(nn.Module):
@@ -26,51 +27,53 @@ class IPMPUpdateLayer(nn.Module):
             c_z=c_z,
             c_hidden=c_hidden,
         )
-        self.node_ln = nn.LayerNorm(c_s)
-        self.node_transition = StructureModuleTransition(
-            c_s
-        ) 
+        # self.node_ln = nn.LayerNorm(c_s)
+        # self.node_transition = StructureModuleTransition(
+        #     c_s
+        # )
 
         self.latent_update = nn.Linear(c_s, c_s)
         self.latent_ln = nn.LayerNorm(c_s)
 
-        self.edge_transition = EdgeTransition(
-            node_embed_size=c_s,
-            edge_embed_in=c_z,
-            edge_embed_out=c_z
-        ) 
-    
-    def forward(self, 
+        # self.edge_transition = EdgeTransition(
+        #     node_embed_size=c_s,
+        #     edge_embed_in=c_z,
+        #     edge_embed_out=c_z
+        # )
+
+    def forward(self,
                 latent_features,
-                node_features, 
-                edge_features, 
-                edge_index, 
+                node_features,
+                edge_features,
+                edge_index,
                 rigids,
                 node_mask):
 
         input_features = self.fuse_inputs(
             torch.cat([node_features, latent_features], dim=-1)
         )
-        node_update = self.ipmp(
-            s=input_features, 
-            z=edge_features, 
-            edge_index=edge_index, 
-            r=rigids)
-        node_features = self.node_ln(node_features + node_update * node_mask[..., None])
-        node_features = self.node_transition(node_features) * node_mask[..., None]
+        # node_update = self.ipmp(
+        node_features, edge_features = self.ipmp(
+            s=input_features,
+            z=edge_features,
+            edge_index=edge_index,
+            r=rigids,
+            mask=node_mask)
+        # node_features = self.node_ln(node_features + node_update * node_mask[..., None])
+        # node_features = self.node_transition(node_features) * node_mask[..., None]
 
         latent_update = self.latent_update(node_features)
         latent_features = latent_features + self.latent_ln(latent_update)
 
-        edge_features = self.edge_transition(node_features, edge_features, edge_index)
+        # edge_features = self.edge_transition(node_features, edge_features, edge_index)
         return latent_features, node_features, edge_features
 
 
 class IPMPDenoiser(nn.Module):
-    def __init__(self, 
-                 c_s, 
-                 c_z, 
-                 c_hidden,
+    def __init__(self,
+                 c_s=256,
+                 c_z=128,
+                 c_hidden=256,
                  c_s_in=6,
                  c_time=64,
                  num_rbf=16,
@@ -112,30 +115,25 @@ class IPMPDenoiser(nn.Module):
 
         self.k = k
 
-    def forward(self, graph, intermediates, eps=1e-8):
+    def forward(self, graph, intermediates, self_condition=None, eps=1e-8):
         latent_features = intermediates['noised_latent_sidechain']
 
         ## prep features
-        num_nodes = graph['residue'].num_nodes
-        X_ca = graph['residue']['x']
-        bb = graph['residue']['bb']
-        x_mask = graph['residue'].x_mask
+        X_ca = graph['residue']['x'].float()
+        bb = graph['residue']['bb'].float()
+        x_mask = ~graph['residue'].res_mask
         rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_0)
         dihedrals = _dihedrals(bb)
 
         ## create time embedding
-        ts = intermediates['t']
+        ts = graph['residue']['t']
         fourier_time = self.time_rbf(ts.unsqueeze(-1))  # (B x h_time,)
-        data_splits = graph._slice_dict['residue']['x']
-        data_lens = data_splits[1:] - data_splits[:-1]
-        fourier_time = torch.cat([
-            fourier_time[i].view(1, -1).expand(l, -1) for i, l in enumerate(data_lens)
-        ])  # n_res x h_time
+        fourier_time = batchwise_to_nodewise(fourier_time, graph['residue'].batch)
         node_features = torch.cat([dihedrals, fourier_time], dim=-1)
         node_features = self.embed_node(node_features)
 
         masked_X_ca = X_ca.clone()
-        masked_X_ca[graph['residue']['x_mask']] = torch.inf
+        masked_X_ca[x_mask] = torch.inf
         edge_index = knn_graph(masked_X_ca, self.k, graph['residue'].batch)
 
         edge_bb_src = bb[edge_index[1]]
@@ -160,5 +158,5 @@ class IPMPDenoiser(nn.Module):
                 (~x_mask).float()
             )
 
-        intermediates['denoised_latent_sidechain'] = latent_features 
-        return intermediates 
+        intermediates['pred_latent_sidechain'] = latent_features
+        return intermediates

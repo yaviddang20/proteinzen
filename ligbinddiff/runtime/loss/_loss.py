@@ -15,7 +15,7 @@ from ligbinddiff.runtime.loss.atomic.atomic import atomic_neighborhood_dist_loss
 from ligbinddiff.runtime.loss.atomic.hbond import bb_hbond_loss
 from ligbinddiff.runtime.loss.density import zernike_coeff_loss
 from ligbinddiff.runtime.loss.latent import so3_embedding_kl, so3_embedding_mse
-from ligbinddiff.runtime.loss.utils import (_nodewise_to_graphwise, _elemwise_to_graphwise)
+from ligbinddiff.runtime.loss.utils import (_nodewise_to_graphwise, _nodewise_to_graphwise)
 from ligbinddiff.utils.atom_reps import atom91_atom_masks
 
 from .frames import all_atom_fape_loss, angle_axis_rot_score_loss, angle_axis_rot_cond_v_loss, full_dist_mat_loss
@@ -1082,7 +1082,7 @@ def backbone_frame_diffusion_loss(batch,
     backbone_mse = torch.square(denoised_bb - bb).sum(dim=-1)
     backbone_mse = backbone_mse[total_mask].view(-1)
     total_mask_expand = total_mask[:, None].expand(-1, 3)
-    backbone_mse = _elemwise_to_graphwise(backbone_mse, data_lens, ~total_mask_expand)
+    backbone_mse = _nodewise_to_graphwise(backbone_mse, data_lens, ~total_mask_expand)
 
     bb_fape = compute_fape(
         denoised_bb_frames,
@@ -1468,12 +1468,12 @@ def backbone_r3_diffusion_loss(batch,
     pred_backbone_mse = torch.square(denoised_bb - bb).sum(dim=-1)
     pred_backbone_mse = pred_backbone_mse[total_mask].view(-1)
     total_mask_expand = total_mask[:, None].expand(-1, 4)
-    pred_backbone_mse = _elemwise_to_graphwise(pred_backbone_mse, data_lens, ~total_mask_expand)
+    pred_backbone_mse = _nodewise_to_graphwise(pred_backbone_mse, data_lens, ~total_mask_expand)
 
     ref_backbone_mse = torch.square(noised_bb - bb).sum(dim=-1)
     ref_backbone_mse = ref_backbone_mse[total_mask].view(-1)
     total_mask_expand = total_mask[:, None].expand(-1, 4)
-    ref_backbone_mse = _elemwise_to_graphwise(ref_backbone_mse, data_lens, ~total_mask_expand)
+    ref_backbone_mse = _nodewise_to_graphwise(ref_backbone_mse, data_lens, ~total_mask_expand)
 
     bb_rel = bb - bb[:, 1].unsqueeze(-2)
     denoised_bb_rel = denoised_bb - denoised_bb[:, 1].unsqueeze(-2)
@@ -1482,12 +1482,12 @@ def backbone_r3_diffusion_loss(batch,
     pred_bb_rel_mse = torch.square(denoised_bb_rel - bb_rel)[:, (0, 2, 3)].sum(dim=-1)
     pred_bb_rel_mse = pred_bb_rel_mse[total_mask].view(-1)
     total_mask_expand = total_mask[:, None].expand(-1, 3)
-    pred_bb_rel_mse = _elemwise_to_graphwise(pred_bb_rel_mse, data_lens, ~total_mask_expand)
+    pred_bb_rel_mse = _nodewise_to_graphwise(pred_bb_rel_mse, data_lens, ~total_mask_expand)
 
     ref_bb_rel_mse = torch.square(noised_bb_rel - bb_rel)[:, (0, 2, 3)].sum(dim=-1)
     ref_bb_rel_mse = ref_bb_rel_mse[total_mask].view(-1)
     total_mask_expand = total_mask[:, None].expand(-1, 3)
-    ref_bb_rel_mse = _elemwise_to_graphwise(ref_bb_rel_mse, data_lens, ~total_mask_expand)
+    ref_bb_rel_mse = _nodewise_to_graphwise(ref_bb_rel_mse, data_lens, ~total_mask_expand)
 
     residx = diffusion_outputs['noised_residx']
     if residx.numel() > 0:
@@ -1607,7 +1607,7 @@ def frame_diffusion_loss(batch,
     bb[bb_mask] = 0.0
     backbone_mse = torch.square(denoised_bb - bb).sum(dim=-1)
     backbone_mse = backbone_mse[~bb_mask]
-    backbone_mse = _elemwise_to_graphwise(backbone_mse, data_lens, bb_mask)
+    backbone_mse = _nodewise_to_graphwise(backbone_mse, data_lens, bb_mask)
 
     pred_rot_score, pred_trans_score = denoiser_outputs['pred_bb_score']
     ref_rot_score = noised_data['rot_score']
@@ -1745,7 +1745,7 @@ def frame_flow_matching_loss(batch,
     denoised_bb = denoiser_outputs['denoised_bb']
     backbone_mse = torch.square(denoised_bb - bb).sum(dim=-1)
     backbone_mse = backbone_mse[~bb_mask]
-    backbone_mse = _elemwise_to_graphwise(backbone_mse, data_lens, bb_mask)
+    backbone_mse = _nodewise_to_graphwise(backbone_mse, data_lens, bb_mask)
 
     pred_rot_cond_v, pred_trans_cond_v = denoiser_outputs['pred_bb_cond_v']
     pred_rot_cond_v = matrix_to_axis_angle(pred_rot_cond_v)
