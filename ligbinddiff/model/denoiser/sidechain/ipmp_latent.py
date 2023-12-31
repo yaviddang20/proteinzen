@@ -26,6 +26,8 @@ class IPMPUpdateLayer(nn.Module):
             c_s=c_s,
             c_z=c_z,
             c_hidden=c_hidden,
+            dropout=0.,
+            edge_dropout=0.,
         )
         # self.node_ln = nn.LayerNorm(c_s)
         # self.node_transition = StructureModuleTransition(

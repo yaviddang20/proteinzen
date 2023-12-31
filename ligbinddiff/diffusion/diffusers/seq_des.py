@@ -11,7 +11,7 @@ from ligbinddiff.model.autoencoder.atom91 import Atom91Encoder, Atom91Decoder
 # from ligbinddiff.model.autoencoder.torsion import Atom91Decoder
 # from ligbinddiff.model.autoencoder.atomic import AtomicSidechainEncoder, MultiscaleSidechainEncoder
 from ligbinddiff.model.autoencoder.hybrid import MultiscaleSidechainEncoder
-from ligbinddiff.model.autoencoder.ipmp import IPMPEncoder, IPMPDecoder
+from ligbinddiff.model.design.ipmp import IPMPEncoder, IPMPDecoder
 from ligbinddiff.model.denoiser.sidechain.ipmp_latent import IPMPDenoiser
 from ligbinddiff.model.autoencoder.two_track import Atom91SeqEncoder, Atom91SeqDecoder
 from ligbinddiff.utils.so3_embedding import so3_add, so3_sub, so3_mult, so3_randn_like, so3_ones_like, gen_so3_unop

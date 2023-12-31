@@ -15,9 +15,9 @@ from ligbinddiff.model.denoiser.bb.frames import GraphIpaFrameDenoiser
 from ligbinddiff.model.denoiser.sidechain.ipmp_latent import IPMPDenoiser
 from ligbinddiff.stoch_interp.flow_matchers.frames import GraphFrameFlow
 
-from ligbinddiff.model.autoencoder.ipmp import IPMPEncoder, IPMPDecoder
+from ligbinddiff.model.design.ipmp import IPMPEncoder, IPMPDecoder
 from ligbinddiff.model.autoencoder.ipa import IPAEncoder, IPADecoder
-from ligbinddiff.model.wrappers.sidechain import LatentSidechainWrapper, IPMPLatentSidechainWrapper
+from ligbinddiff.model.wrappers.sidechain import IPMPLatentSidechainWrapper, IPALatentSidechainWrapper, DensityLatentSidechainWrapper
 
 
 from ligbinddiff.tasks.diffusion.bb import BackboneFrameNoising
@@ -86,8 +86,14 @@ def config_hydra_store():
     model_store = store(group="model")
     model_store(GraphIpaFrameDenoiser, name="diffusion_bb")
     model_store(
-        IPMPLatentSidechainWrapper,
+        DensityLatentSidechainWrapper,
         name="diffusion_sidechain")
+    # model_store(
+    #     IPMPLatentSidechainWrapper,
+    #     name="diffusion_sidechain")
+    # model_store(
+    #     IPALatentSidechainWrapper,
+    #     name="diffusion_sidechain")
 
     task_store = store(group="tasks")
     task_store(pbuilds(BackboneFrameNoising), name="diffusion_bb")

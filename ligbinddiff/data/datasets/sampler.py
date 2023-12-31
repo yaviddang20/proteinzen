@@ -99,11 +99,12 @@ class BatchSampler:
             self.batches.append(batch)
 
     def __len__(self):
-        if not self.batches:
+        if not hasattr(self, "batches"):
             self._form_batches()
         return len(self.batches)
 
     def __iter__(self):
         for batch in self.batches:
             yield batch
-        self._form_batches()
+        if self.shuffle:
+            self._form_batches()

@@ -34,6 +34,7 @@ class IPMP(nn.Module):
         c_hidden,
         no_points=8,
         dropout=0.1,
+        edge_dropout=0.2,
         inf: float = 1e5,
         eps: float = 1e-8,
     ):
@@ -62,13 +63,13 @@ class IPMP(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
         self.p_dropout = dropout
+        self.edge_dropout = edge_dropout
 
         premsg_dim = (
             2 * c_s  # each node
             + c_z  # edge
             + 8 * no_points  # (1)-(4) point features
-            # + no_points ** 2,
-            + no_points  # (5) point features
+            + no_points ** 2 # (5) point features
         )
 
         self.node_pts = Linear(self.c_s, self.no_points * 3)
@@ -143,12 +144,12 @@ class IPMP(nn.Module):
 
         # 5. Distance between node i's global points and node j's global points
         pts_global_src = pts_global[src]
-        # pts_rel_dist = torch.linalg.norm(
-        #     pts_global_src[..., None, :] - pts_global_dst[..., None, :, :] + eps,
-        #     dim=-1
-        # ).view(n_edges, -1)
+        pts_rel_dist = torch.linalg.norm(
+            pts_global_src[..., None, :] - pts_global_dst[..., None, :, :] + eps,
+            dim=-1
+        ).view(n_edges, -1)
         # their code suggests this but this doesn't make sense to me
-        pts_rel_dist = torch.linalg.norm(pts_global_src - pts_global_dst + eps, dim=-1)
+        # pts_rel_dist = torch.linalg.norm(pts_global_src - pts_global_dst + eps, dim=-1)
 
         premessage = torch.cat([
             s_src,
@@ -188,7 +189,7 @@ class IPMP(nn.Module):
         """
         n_nodes = s.shape[0]
 
-        dropout_edge_index, dropout_edge_mask = pygu.dropout_edge(edge_index, p=self.p_dropout, training=self.training)
+        dropout_edge_index, dropout_edge_mask = pygu.dropout_edge(edge_index, p=self.edge_dropout, training=self.training)
         dropout_z = z[dropout_edge_mask]
 
         node_premessage = self._gen_premessage(s, dropout_z, dropout_edge_index, r, edge=False)

@@ -226,6 +226,14 @@ class IPMPDecoder(nn.Module):
             + num_pos_embed  # rel pos embed
         )
 
+        self.embed_node = nn.Sequential(
+            nn.Linear(c_s_in, 2*c_s),
+            nn.ReLU(),
+            nn.Linear(2*c_s, 2*c_s),
+            nn.ReLU(),
+            nn.Linear(2*c_s, c_s),
+            nn.LayerNorm(c_s),
+        )
         self.embed_edge = nn.Sequential(
             nn.Linear(self.c_z_in, 2*c_z),
             nn.ReLU(),

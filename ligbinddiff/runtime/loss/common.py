@@ -122,7 +122,8 @@ def latent_scalar_sidechain_diffusion_loss(batch,
     noising_mask = res_data['noising_mask']
     total_mask = x_mask & noising_mask
 
-    latent = latent_outputs['latent_sidechain']
+    # latent = latent_outputs['latent_sidechain']
+    latent = latent_outputs['latent_mu']
     noised_latent = latent_outputs['noised_latent_sidechain']
     denoised_latent = latent_outputs['pred_latent_sidechain']
 

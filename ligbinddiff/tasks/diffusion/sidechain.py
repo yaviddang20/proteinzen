@@ -59,7 +59,10 @@ class DesignLatentSidechainNoising(Task):
         rigids_0 = ru.Rigid.from_tensor_4x4(chain_feats['rigidgroups_gt_frames'])[:, 0]
 
         # compute diffusion time
-        t = torch.rand(num_graphs)
+        if 't' in res_data.keys():
+            t = res_data['t']
+        else:
+            t = torch.rand(num_graphs)
 
         # compute noising mask
         diffuse_mask = self._gen_diffuse_mask(res_data)
@@ -83,6 +86,9 @@ class DesignLatentSidechainNoising(Task):
         diff_feats_t['t'] = t
         diff_feats_t['noising_mask'] = diffuse_mask
 
+        diff_feats_t['atom37'] = chain_feats['all_atom_positions']
+        diff_feats_t['atom37_mask'] = chain_feats['all_atom_mask']
+
         diff_feats_t = tree.map_structure(
             lambda x: torch.as_tensor(x),
             diff_feats_t)
@@ -99,6 +105,7 @@ class DesignLatentSidechainNoising(Task):
                     latent_data['latent_logvar'] * 0.5
                 )
                 latent_data[self.sidechain_x_0_key] = latent_data['latent_mu'] + latent_sigma * torch.randn_like(latent_sigma)
+
             else:
                 latent_data[self.sidechain_x_0_key] = latent_data['latent_mu']
         else:
@@ -112,12 +119,18 @@ class DesignLatentSidechainNoising(Task):
             else:
                 latent_data[self.sidechain_x_0_key] = latent_data['latent_mu']
 
+        # # scaling the latent to stdev=1
+        # latent_sample = latent_data[self.sidechain_x_0_key]
+        # sig_hat = latent_sample.std()
+        # latent_data[self.sidechain_x_0_key] = latent_sample / sig_hat
+
         t = inputs['residue']['t']
         nodewise_t = batchwise_to_nodewise(t, inputs['residue'].batch)
 
         decoder_outputs = model.decoder(inputs, latent_data)
         noised_latent = self.sidechain_noiser.forward_marginal(
-            latent_data[self.sidechain_x_0_key],
+            #latent_data[self.sidechain_x_0_key],
+            latent_data['latent_mu'],
             nodewise_t,
             inputs['residue']['noising_mask']
         )
@@ -152,79 +165,75 @@ class DesignLatentSidechainNoising(Task):
         denoiser_output.update(design_output)
         return denoiser_output
 
-    def reverse_step(self, intermediates, delta_t, noise_scale=1.0):
-        # assert delta_t < 0
-        t = intermediates['t']
-        noising_mask = intermediates['noising_mask']
-        x_mask = torch.zeros_like(noising_mask).bool()
-        mask = x_mask | ~noising_mask
-        bb_x_t = intermediates[self.sidechain_x_t_key]
-
-        data = HeteroData(
-            residue=dict(
-                x=bb_x_t.get_trans(),
-                x_mask=x_mask,
-                noising_mask=noising_mask,
-                fixed_mask=~noising_mask,
-                rigids_t=bb_x_t.to_tensor_7(),
-                t=t
-            )
-        )
-        data = Batch.from_data_list([data])
-        data = data.to(t.device)
-
-        if self.self_conditioning and "self_condition" in intermediates.keys():
-                denoiser_output = self.denoiser(data, self_condition=intermediates['self_condition'])
+    def reverse_step(self, model, data, intermediates, delta_t, self_condition=None, noise_scale=1.0):
+        if self.self_conditioning and self_condition is not None:
+                denoiser_output = model.denoiser(data, intermediates, self_condition=self_condition)
         else:
-            denoiser_output = self.denoiser(data)
+            denoiser_output = model.denoiser(data, intermediates)
 
-        rot_score, trans_score = self.bb_score_fn(
+        score = self.sidechain_score_fn(
             data,
-            denoiser_output,
-            mask
+            denoiser_output
         )
 
-        bb_x_tm1 = self.se3_noiser.reverse(
-            bb_x_t,
-            rot_score.numpy(force=True),
-            trans_score.numpy(force=True),
-            t.item(),
+        res_data = data['residue']
+        sidechain_x_t = intermediates[self.sidechain_x_t_key]
+        t = intermediates['t']
+        nodewise_t = batchwise_to_nodewise(t, res_data.batch)
+        noising_mask = res_data['noising_mask']
+        res_mask = res_data['res_mask']
+        mask = noising_mask & res_mask
+
+        sidechain_x_tm1 = self.sidechain_noiser.reverse(
+            sidechain_x_t,
+            score,
+            nodewise_t,
             delta_t,
-            noising_mask.numpy(force=True),
+            mask,
             noise_scale=noise_scale
         )
-        tm1 = t - np.abs(delta_t) #+ delta_t
+        tm1 = t - np.abs(delta_t)
 
-        return bb_x_tm1, tm1, denoiser_output
+        return sidechain_x_tm1, tm1, denoiser_output
 
-    def sample(self,
-               model,
-               inputs,
-               steps=100,
-               show_progress=False,
-               device=None,
-               noise_scale=1.0):
-        num_nodes = inputs['residue'].num_nodes
+    def run_predict(self,
+                    model,
+                    inputs,
+                    steps=100,
+                    show_progress=True,#False,
+                    device=None,
+                    noise_scale=1.0):
+        res_data = inputs['residue']
+        num_nodes = res_data.num_nodes
         if device is None:
-            device = inputs['residue']['x'].device
-        prior = model.sample_prior(num_nodes, device=device)
-        intermediates = prior
+            device = res_data['x'].device
 
-        delta_t = self.time_T / steps
-        intermediates['t'] = torch.ones(1, device=device)
-        bb_x_t = intermediates[self.sidechain_x_t_key]
+        res_data['t'] = torch.ones(inputs.num_graphs, device=device)
+        data = self.process_input(inputs)
+        prior = model.sample_prior(num_nodes, device=device)
+        intermediates = prior.copy()
+        intermediates['t'] = torch.ones(inputs.num_graphs, device=device)
+
+        delta_t = 1 / steps
         denoiser_output = None
 
         with torch.no_grad():
             if show_progress:
                 pbar = tqdm.tqdm(total=steps)
 
-            while (intermediates['t'] > np.abs(delta_t)).all():
-                bb_x_tm1, tm1, denoiser_output = self.reverse_step(intermediates, delta_t, noise_scale=noise_scale)
+            while (intermediates['t'] > delta_t).all():
+                sidechain_x_tm1, tm1, denoiser_output = self.reverse_step(
+                    model,
+                    data,
+                    intermediates,
+                    delta_t,
+                    self_condition=denoiser_output,
+                    noise_scale=noise_scale
+                )
+                # TODO: remove this redundancy?
                 intermediates['t'] = tm1
-                intermediates[self.bb_x_t_key] = bb_x_tm1
-                if self.self_conditioning:
-                    intermediates['self_condition'] = denoiser_output
+                res_data['t'] = tm1
+                intermediates[self.sidechain_x_t_key] = sidechain_x_tm1
 
                 if show_progress:
                     pbar.update(1)
@@ -232,19 +241,32 @@ class DesignLatentSidechainNoising(Task):
             if show_progress:
                 pbar.close()
 
-        intermediates['t'] = torch.as_tensor(intermediates['t']).view(1, 1)
-        diffusion_outputs = intermediates
-        diffusion_outputs[self.bb_x_0_key] = diffusion_outputs[self.bb_x_t_key]
-        diffusion_outputs[self.bb_x_t_key] = bb_x_t
-        # add a bunch of keys so the loss fn is happy
-        diffusion_outputs.update(denoiser_output)
+        intermediates['t'] = torch.as_tensor(intermediates['t'])
+        # TODO: this is useful, but figure out the underlying sampling issue above
+        intermediates[self.sidechain_x_t_key] = denoiser_output[self.sidechain_x_0_pred_key]
+        # diffusion_outputs = intermediates
+        # # set this to see the starting point
+        # diffusion_outputs[self.sidechain_x_t_key] = prior[self.sidechain_x_t_key]
+        # # set this so we can feed this to the decoder
+        # diffusion_outputs[self.sidechain_x_0_key] = diffusion_outputs[self.sidechain_x_t_key]
 
-        return diffusion_outputs, diffusion_outputs
+        decoder_outputs = model.decoder(
+            data,
+            {self.sidechain_x_0_key: intermediates[self.sidechain_x_t_key]}
+        )
 
-    def run_predict(self, model, inputs):
-        raise NotImplementedError
+        # add encoder outputs as "ground truth" for latent diffusion
+        encoder_outputs = model.encoder(data)
+        decoder_outputs.update(encoder_outputs)
+        decoder_outputs[self.sidechain_x_0_key] = decoder_outputs['latent_mu']
+        decoder_outputs[self.sidechain_x_0_pred_key] = intermediates[self.sidechain_x_t_key]
+        decoder_outputs[self.sidechain_x_t_key] = prior[self.sidechain_x_t_key]
+
+
+        return decoder_outputs
 
     def compute_loss(self, inputs, outputs: Dict):
+        # for design latent, kl 1e-5 and 0.01 on denoising loss seems good
         autoenc_loss_dict = autoencoder_losses(inputs, outputs)
         latent_loss_dict = latent_scalar_sidechain_diffusion_loss(inputs, outputs)
 
@@ -252,10 +274,10 @@ class DesignLatentSidechainNoising(Task):
             autoenc_loss_dict["atom14_mse"]
             + autoenc_loss_dict["seq_loss"]
             + autoenc_loss_dict["chi_loss"]
-            + autoenc_loss_dict["kl_div"] * 1e-6
+            + autoenc_loss_dict["kl_div"] * 1e-1
         )
 
-        loss = vae_loss # + latent_loss_dict["latent_denoising_loss"] * 0.01
+        loss = vae_loss + latent_loss_dict["latent_denoising_loss"] * 0.01
 
         ret = {"loss": loss.mean()}
         for key, value in autoenc_loss_dict.items():

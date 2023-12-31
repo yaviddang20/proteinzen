@@ -189,7 +189,7 @@ class ZernikeTransform:
                 y = y.expand(-1, n_channels, -1, -1)
                 r = r.expand(-1, n_channels, -1, -1)
                 c_nl = (y * r * point_value)  # [n_batch x] n_res x n_channel x n_points x 2l+1
-                c_nl[points_mask] = 0
+                c_nl = c_nl * points_mask[..., None]
 
                 Z[(n, l)] = c_nl.sum(-2)
         return Z  # Dict[Tuple[int, int], Tensor[n_batch x n_res x n_channel x 2l+1]]

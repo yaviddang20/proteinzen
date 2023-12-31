@@ -34,29 +34,31 @@ class ProteinDataModule(L.LightningDataModule):
         self.task_sampler = task_sampler
         self.batch_size = batch_size
         self.num_workers = num_workers
+        csv = "filtered_metadata.csv"
         self.train_dataset = PdbDataset(
-            os.path.join(self.data_dir, "filtered_metadata.csv"),
+            os.path.join(self.data_dir, csv),
             split='train'
         )
         self.val_dataset = PdbDataset(
-            os.path.join(self.data_dir, "filtered_metadata.csv"),
+            os.path.join(self.data_dir, csv),
             split='val'
         )
 
         self.test_dataset = PdbDataset(
-            os.path.join(self.data_dir, "filtered_metadata.csv"),
+            os.path.join(self.data_dir, csv),
             split='test'
         )
 
     def build_dataloader(self, x):
         collate_fn = gen_collate_fn(self.task_sampler)
-        return DataLoader(
+        dataloader = DataLoader(
             x,
             num_workers=self.num_workers,
             batch_sampler=BatchSampler(x, batch_size=self.batch_size),
             collate_fn=collate_fn,
             shuffle=False
         )
+        return dataloader
 
     def train_dataloader(self):
         return self.build_dataloader(self.train_dataset)
@@ -65,4 +67,7 @@ class ProteinDataModule(L.LightningDataModule):
         return self.build_dataloader(self.val_dataset)
 
     def test_dataloader(self):
+        return self.build_dataloader(self.test_dataset)
+
+    def predict_dataloader(self):
         return self.build_dataloader(self.test_dataset)

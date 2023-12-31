@@ -193,7 +193,7 @@ class SidechainDiffuser(nn.Module):
             dt: float,
             mask: Optional[torch.Tensor]=None,
             noise_scale: float=1.0,
-        ) -> SO3_Embedding:
+        ):
         """Simulates the reverse SDE for 1 step
 
         Args:

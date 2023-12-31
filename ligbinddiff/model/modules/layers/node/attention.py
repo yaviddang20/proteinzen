@@ -534,3 +534,253 @@ class GraphInvariantPointAttention(nn.Module):
         )
 
         return s
+
+class InvariantPointMlpAttention(nn.Module):
+    """
+    Implements Algorithm 22.
+    """
+    def __init__(
+        self,
+        c_s,
+        c_z,
+        c_hidden,
+        no_heads,
+        no_qk_points,
+        no_v_points,
+        inf: float = 1e5,
+        eps: float = 1e-8,
+    ):
+        """
+        Args:
+            c_s:
+                Single representation channel dimension
+            c_z:
+                Pair representation channel dimension
+            c_hidden:
+                Hidden channel dimension
+            no_heads:
+                Number of attention heads
+            no_qk_points:
+                Number of query/key points to generate
+            no_v_points:
+                Number of value points to generate
+        """
+        super().__init__()
+        self.c_s = c_s
+        self.c_z = c_z
+        self.c_hidden = c_hidden
+        self.no_heads = no_heads
+        self.no_qk_points = no_qk_points
+        self.no_v_points = no_v_points
+        self.inf = inf
+        self.eps = eps
+
+        # These linear layers differ from their specifications in the
+        # supplement. There, they lack bias and use Glorot initialization.
+        # Here as in the official source, they have bias and use the default
+        # Lecun initialization.
+        self.w_mlp = nn.Sequential(
+            Linear(2*c_s + c_z, c_hidden),
+            nn.ReLU(),
+            Linear(c_hidden, c_hidden),
+            nn.ReLU(),
+            Linear(c_hidden, self.no_heads),
+        )
+        self.v_mlp = nn.Sequential(
+            Linear(c_s + c_z, c_hidden),
+            nn.ReLU(),
+            Linear(c_hidden, c_hidden),
+            nn.ReLU(),
+            Linear(c_hidden, c_hidden),
+        )
+
+        hpq = self.no_heads * self.no_qk_points * 3
+        self.linear_q_points = Linear(self.c_s, hpq)
+
+        hpkv = self.no_heads * (self.no_qk_points + self.no_v_points) * 3
+        self.linear_kv_points = Linear(self.c_s, hpkv)
+
+        self.linear_b = Linear(self.c_z, self.no_heads)
+        self.down_z = Linear(self.c_z, self.c_z // 4)
+
+        self.head_weights = nn.Parameter(torch.zeros((no_heads)))
+        ipa_point_weights_init_(self.head_weights)
+
+        concat_out_dim =  (
+            self.c_z // 4 + self.c_hidden // self.no_heads + self.no_v_points * 4
+        )
+        self.linear_out = Linear(self.no_heads * concat_out_dim, self.c_s, init="final")
+
+        self.softmax = nn.Softmax(dim=-1)
+        self.softplus = nn.Softplus()
+
+    def forward(
+        self,
+        s: torch.Tensor,
+        z: torch.Tensor,
+        edge_index: torch.Tensor,
+        r: Rigid,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            s:
+                [N_res, C_s] single representation, scalars
+            z:
+                [N_edge, C_e] pair representation
+            edge_index:
+                [2, N_edge] edge index
+            r:
+                [N_res] transformation object
+            mask:
+                [N_res] mask
+        Returns:
+            [N_res, C_s] single scalar representation update
+        """
+        n_nodes = s.shape[0]
+        src = edge_index[1]
+        dst = edge_index[0]
+        r = r.scale_translation(1/10)
+
+        #######################################
+        # Generate point activations
+        #######################################
+
+        # [N_res, H * P_q * 3]
+        q_pts = self.linear_q_points(s)
+
+        # This is kind of clunky, but it's how the original does it
+        # [N_res, H * P_q, 3]
+        q_pts = torch.split(q_pts, q_pts.shape[-1] // 3, dim=-1)
+        q_pts = torch.stack(q_pts, dim=-1)
+        q_pts = r[..., None].apply(q_pts)
+
+        # [N_res, H, P_q, 3]
+        q_pts = q_pts.view(
+            q_pts.shape[:-2] + (self.no_heads, self.no_qk_points, 3)
+        )
+        # [N_edge, H, P_q, 3]
+        q_pts_src = q_pts[src]
+
+        # [N_res, H * (P_q + P_v) * 3]
+        kv_pts = self.linear_kv_points(s)
+
+        # [N_res, H * (P_q + P_v), 3]
+        kv_pts = torch.split(kv_pts, kv_pts.shape[-1] // 3, dim=-1)
+        kv_pts = torch.stack(kv_pts, dim=-1)
+        kv_pts = r[..., None].apply(kv_pts)
+
+        # [N_res, H, (P_q + P_v), 3]
+        kv_pts = kv_pts.view(kv_pts.shape[:-2] + (self.no_heads, -1, 3))
+
+        # [N_res, k, H, P_q/P_v, 3]
+        k_pts, v_pts = torch.split(
+            kv_pts, [self.no_qk_points, self.no_v_points], dim=-2
+        )
+
+        ##########################
+        # Compute attention scores
+        ##########################
+        # [*, N_edge, H]
+        b = self.linear_b(z)
+
+        # [N_edge, H]
+        w_ins = torch.cat([
+            s[src],
+            s[dst],
+            z
+        ], dim=-1)
+        a = self.w_mlp(w_ins)
+        a *= math.sqrt(1.0 / (3 * self.c_hidden))
+        a += (math.sqrt(1.0 / 3) * b)
+
+        # [N_edge, H, P_q, 3]
+        k_pts_dst = k_pts[edge_index[0]]
+        pt_displacement = q_pts_src - k_pts_dst
+        pt_att = pt_displacement ** 2
+
+        # [N_edge, H, P_q]
+        pt_att = sum(torch.unbind(pt_att, dim=-1))
+        head_weights = self.softplus(self.head_weights).view(
+            *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
+        )
+        head_weights = head_weights * math.sqrt(
+            1.0 / (3 * (self.no_qk_points * 9.0 / 2))
+        )
+        pt_att = pt_att * head_weights
+
+        # [N_edge, H]
+        pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
+
+        edge_mask = mask[edge_index[0]] * mask[edge_index[1]]
+        edge_mask = self.inf * (edge_mask - 1)
+        # [N_edge, H]
+        a = a + pt_att
+        a = a + edge_mask[..., None]
+        a = pygu.softmax(a, edge_index[1], num_nodes=n_nodes)
+
+        ################
+        # Compute output
+        ################
+        v_dst_in = torch.cat([
+            s[dst],
+            z
+        ], dim=-1)
+        v_dst = self.v_mlp(v_dst_in).view(
+            edge_index.shape[1],
+            self.no_heads,
+            -1
+        )  # [N_res, H, C_hidden // H]
+        # [N_res, H, C_hidden // H]
+        o = pygu.scatter(
+            a[..., None] *  # [N_edge, H]
+            v_dst,  # [N_edge, H, C_hidden // H]
+            edge_index[1],
+            dim=0,
+            dim_size=n_nodes
+        )
+        # [N_res,  H * (C_hidden // H)]
+        o = flatten_final_dims(o, 2)
+
+        # [N_res, H, P_v, 3]
+        v_pts_dst = v_pts[edge_index[0]]
+        o_pt = pygu.scatter(
+            a[..., None, None]  # [N_edge, H, 1, 1]
+            * v_pts_dst,  # [N_edge, H, P_v, 3]
+            edge_index[1],
+            dim=0,
+            dim_size=n_nodes
+        )
+        o_pt = r[..., None, None].invert_apply(o_pt)
+
+        # [N_res, H * P_v]
+        o_pt_dists = torch.sqrt(torch.sum(o_pt ** 2, dim=-1) + self.eps)
+        o_pt_norm_feats = flatten_final_dims(
+            o_pt_dists, 2)
+
+        # [N_res, H * P_v, 3]
+        o_pt = o_pt.reshape(*o_pt.shape[:-3], -1, 3)
+
+        # [N_res, H, C_z // 4]
+        pair_z = self.down_z(z).to(dtype=a.dtype)  # [N_edge, C_z // 4]
+        o_pair = pygu.scatter(
+            a[..., None]  # [N_edge, H, 1]
+            * pair_z[..., None, :],  # [N_edge, 1, C_z // 4]
+            edge_index[1],
+            dim=0,
+            dim_size=n_nodes
+        )
+
+        # [N_res, H * C_z // 4]
+        o_pair = flatten_final_dims(o_pair, 2)
+
+        o_feats = [o, *torch.unbind(o_pt, dim=-1), o_pt_norm_feats, o_pair]
+
+        # [N_res, C_s]
+        s = self.linear_out(
+            torch.cat(
+                o_feats, dim=-1
+            ).to(dtype=z.dtype)
+        )
+
+        return s
