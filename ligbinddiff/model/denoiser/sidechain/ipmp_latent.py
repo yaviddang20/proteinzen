@@ -14,34 +14,39 @@ from ligbinddiff.model.utils.graph import batchwise_to_nodewise
 
 
 class IPMPUpdateLayer(nn.Module):
-    def __init__(self, c_s, c_z, c_hidden):
+    def __init__(self,
+                 c_s,
+                 c_latent,
+                 c_z,
+                 c_hidden,
+                 self_conditioning=True):
         super().__init__()
         self.c_s = c_s
+        self.c_latent = c_latent
         self.c_z = c_z
         self.c_hidden = c_hidden
+        self.self_conditioning = self_conditioning
 
-        self.fuse_inputs = nn.Linear(c_s*2, c_s)
+        h_dim = c_s + c_latent + c_latent*self_conditioning
 
         self.ipmp = IPMP(
-            c_s=c_s,
+            c_s=h_dim,
             c_z=c_z,
             c_hidden=c_hidden,
             dropout=0.,
             edge_dropout=0.,
         )
-        # self.node_ln = nn.LayerNorm(c_s)
-        # self.node_transition = StructureModuleTransition(
-        #     c_s
-        # )
 
-        self.latent_update = nn.Linear(c_s, c_s)
-        self.latent_ln = nn.LayerNorm(c_s)
+        self.latent_update = nn.Linear(h_dim, c_latent)
+        self.latent_gate = nn.Sequential(
+            nn.Linear(h_dim, c_latent),
+            nn.Sigmoid(),
+        )
 
-        # self.edge_transition = EdgeTransition(
-        #     node_embed_size=c_s,
-        #     edge_embed_in=c_z,
-        #     edge_embed_out=c_z
-        # )
+        self.node_update = nn.Linear(
+            h_dim,
+            c_s)
+        self.node_ln = nn.LayerNorm(c_s)
 
     def forward(self,
                 latent_features,
@@ -49,13 +54,19 @@ class IPMPUpdateLayer(nn.Module):
                 edge_features,
                 edge_index,
                 rigids,
-                node_mask):
+                node_mask,
+                self_condition=None):
 
-        input_features = self.fuse_inputs(
-            torch.cat([node_features, latent_features], dim=-1)
-        )
+        input_features = [node_features, latent_features]
+        if self.self_conditioning and self_condition is not None:
+            input_features.append(self_condition['pred_latent_sidechain'])
+        elif self.self_conditioning:
+            input_features.append(torch.zeros_like(latent_features))
+
+        input_features = torch.cat(input_features, dim=-1)
+
         # node_update = self.ipmp(
-        node_features, edge_features = self.ipmp(
+        joint_features, edge_features = self.ipmp(
             s=input_features,
             z=edge_features,
             edge_index=edge_index,
@@ -64,29 +75,32 @@ class IPMPUpdateLayer(nn.Module):
         # node_features = self.node_ln(node_features + node_update * node_mask[..., None])
         # node_features = self.node_transition(node_features) * node_mask[..., None]
 
-        latent_update = self.latent_update(node_features)
-        latent_features = latent_features + self.latent_ln(latent_update)
+        latent_features = latent_features + self.latent_update(joint_features) * self.latent_gate(joint_features)
+        node_features = self.node_ln(node_features + self.node_update(joint_features))
 
-        # edge_features = self.edge_transition(node_features, edge_features, edge_index)
         return latent_features, node_features, edge_features
 
 
 class IPMPDenoiser(nn.Module):
     def __init__(self,
                  c_s=256,
+                 c_latent=128,
                  c_z=128,
                  c_hidden=256,
                  c_s_in=6,
                  c_time=64,
                  num_rbf=16,
                  num_layers=4,
-                 k=30):
+                 k=30,
+                 self_conditioning=True):
         super().__init__()
         self.c_s = c_s
+        self.c_latent = c_latent
         self.c_z = c_z
         self.c_hidden = c_hidden
         self.num_rbf = num_rbf
         self.c_z_in = num_rbf * (16 + 1)
+        self.self_conditioning = self_conditioning
 
         self.time_rbf = RBF(n_basis=c_time//2)
 
@@ -109,8 +123,10 @@ class IPMPDenoiser(nn.Module):
         self.update = nn.ModuleList([
             IPMPUpdateLayer(
                 c_s=c_s,
+                c_latent=c_latent,
                 c_z=c_z,
-                c_hidden=c_hidden
+                c_hidden=c_hidden,
+                self_conditioning=self_conditioning
             )
             for _ in range(num_layers)
         ])
@@ -152,12 +168,13 @@ class IPMPDenoiser(nn.Module):
 
         for layer in self.update:
             latent_features, node_features, edge_features = layer(
-                latent_features,
-                node_features,
-                edge_features,
-                edge_index,
-                rigids,
-                (~x_mask).float()
+                latent_features=latent_features,
+                node_features=node_features,
+                edge_features=edge_features,
+                edge_index=edge_index,
+                rigids=rigids,
+                node_mask=(~x_mask).float(),
+                self_condition=self_condition
             )
 
         intermediates['pred_latent_sidechain'] = latent_features

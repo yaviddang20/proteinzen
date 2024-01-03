@@ -7,6 +7,7 @@ import torch
 import numpy as np
 
 from torch_geometric.data import HeteroData, Batch
+from torch_geometric.utils import scatter
 
 
 from ligbinddiff.data.openfold import data_transforms
@@ -29,7 +30,7 @@ class DesignLatentSidechainNoising(Task):
                  sidechain_noiser: SidechainDiffuser,
                  sample_t_min=0.01,
                  aux_loss_t_max=0.25,
-                 self_conditioning=False):
+                 self_conditioning=True):
         super().__init__()
         self.sidechain_noiser = sidechain_noiser
         self.sample_t_min = sample_t_min
@@ -108,6 +109,37 @@ class DesignLatentSidechainNoising(Task):
 
             else:
                 latent_data[self.sidechain_x_0_key] = latent_data['latent_mu']
+
+            # sampled_sidechain = latent_data[self.sidechain_x_0_key]
+            # sampled_center = scatter(
+            #     sampled_sidechain,
+            #     inputs['residue'].batch,
+            #     dim_size=inputs.num_graphs
+            # )
+            # sampled_count = scatter(
+            #     torch.ones_like(inputs['residue'].batch),
+            #     inputs['residue'].batch,
+            #     dim_size=inputs.num_graphs
+            # )
+            # sampled_center = sampled_center.sum(dim=-1) / (sampled_count * sampled_center.shape[-1])
+            # centered_sidechain = sampled_sidechain - batchwise_to_nodewise(
+            #     sampled_center,
+            #     inputs['residue'].batch
+            # )[..., None]
+
+            # var = scatter(
+            #     centered_sidechain.square(),
+            #     inputs['residue'].batch,
+            #     dim_size=inputs.num_graphs
+            # )
+            # std = torch.sqrt(var.sum(dim=-1) / (sampled_count * var.shape[-1]))
+
+            # latent_data[self.sidechain_x_0_key] = centered_sidechain / batchwise_to_nodewise(
+            #     std,
+            #     inputs['residue'].batch
+            # )[..., None]
+
+
         else:
             if model.training:
                 latent_sigma = gen_so3_unop(torch.exp)(
@@ -129,8 +161,8 @@ class DesignLatentSidechainNoising(Task):
 
         decoder_outputs = model.decoder(inputs, latent_data)
         noised_latent = self.sidechain_noiser.forward_marginal(
-            #latent_data[self.sidechain_x_0_key],
-            latent_data['latent_mu'],
+            latent_data[self.sidechain_x_0_key],
+            # latent_data['latent_mu'],
             nodewise_t,
             inputs['residue']['noising_mask']
         )
@@ -274,10 +306,14 @@ class DesignLatentSidechainNoising(Task):
             autoenc_loss_dict["atom14_mse"]
             + autoenc_loss_dict["seq_loss"]
             + autoenc_loss_dict["chi_loss"]
-            + autoenc_loss_dict["kl_div"] * 1e-1
+            + autoenc_loss_dict["kl_div"] * 1e-2 #1e-6 # 1e-2
         )
 
-        loss = vae_loss + latent_loss_dict["latent_denoising_loss"] * 0.01
+        loss = (
+            vae_loss
+            # + latent_loss_dict["latent_denoising_loss"] * 10
+            + latent_loss_dict["latent_denoising_nll"] #* 0.1
+        )
 
         ret = {"loss": loss.mean()}
         for key, value in autoenc_loss_dict.items():

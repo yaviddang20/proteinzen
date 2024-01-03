@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -114,6 +115,10 @@ def autoencoder_losses(batch,
 
     return out_dict
 
+def _nll(data, mu, logvar):
+    ll = -0.5 * (logvar + torch.square(data - mu) / torch.exp(logvar) + np.log(np.pi * 2))
+    return -ll.sum(dim=-1)
+
 
 def latent_scalar_sidechain_diffusion_loss(batch,
                                            latent_outputs):
@@ -122,8 +127,8 @@ def latent_scalar_sidechain_diffusion_loss(batch,
     noising_mask = res_data['noising_mask']
     total_mask = x_mask & noising_mask
 
-    # latent = latent_outputs['latent_sidechain']
-    latent = latent_outputs['latent_mu']
+    latent = latent_outputs['latent_sidechain']
+    # latent = latent_outputs['latent_mu']
     noised_latent = latent_outputs['noised_latent_sidechain']
     denoised_latent = latent_outputs['pred_latent_sidechain']
 
@@ -133,7 +138,17 @@ def latent_scalar_sidechain_diffusion_loss(batch,
     latent_ref_noise = torch.square(noised_latent - latent).sum(dim=-1) * total_mask
     latent_ref_noise = _nodewise_to_graphwise(latent_ref_noise, res_data.batch, total_mask)
 
+    latent_mu = latent_outputs['latent_mu']
+    latent_logvar = latent_outputs['latent_logvar']
+    latent_denoising_nll = _nll(denoised_latent, latent_mu, latent_logvar)
+    latent_denoising_nll = _nodewise_to_graphwise(latent_denoising_nll, res_data.batch, total_mask)
+
+    latent_ref_noise_nll = _nll(latent, latent_mu, latent_logvar)
+    latent_ref_noise_nll = _nodewise_to_graphwise(latent_ref_noise_nll, res_data.batch, total_mask)
+
     return {
         "latent_denoising_loss": latent_denoising_loss,
         "latent_ref_noise": latent_ref_noise,
+        "latent_denoising_nll": latent_denoising_nll,
+        "latent_ref_noise_nll": latent_ref_noise_nll,
     }

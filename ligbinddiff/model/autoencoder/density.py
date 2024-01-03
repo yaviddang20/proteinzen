@@ -30,9 +30,9 @@ class DensityEncoder(nn.Module):
     def __init__(self,
                  density_nmax=5,
                  node_lmax_list=[1],
-                 c_s=32,
+                 c_s=[32, 16, 8],
                  c_z=128,
-                 c_output=128,
+                 c_output=32,
                  num_heads=4,
                  num_qk=4,
                  num_v=6,
@@ -96,7 +96,7 @@ class DensityEncoder(nn.Module):
             in_lmax_list=self.density_lmax_list,
             in_channels=self.atom37_channels,
             out_lmax_list=node_lmax_list,
-            out_channels=c_s,
+            out_channels=c_s[0],
             edge_channels_list=self.edge_channels_list,
             mappingReduced_super=self.mappingReduced_super,
             super_SO3_rotation=self.super_SO3_rotation,
@@ -119,13 +119,13 @@ class DensityEncoder(nn.Module):
         self.transformer = nn.ModuleList(
             [
                 TransBlockV2(
-                    sphere_channels=c_s,
+                    sphere_channels=c_s_i,
                     attn_hidden_channels=c_z,
                     num_heads=num_heads,
                     attn_alpha_channels=num_qk,
                     attn_value_channels=num_v,
-                    ffn_hidden_channels=c_s*2,
-                    output_channels=c_s,
+                    ffn_hidden_channels=c_s_ip1*2,
+                    output_channels=c_s_ip1,
                     lmax_list=node_lmax_list[0:1],
                     mmax_list=node_lmax_list[0:1],
                     SO3_rotation=self.node_SO3_rotation,
@@ -133,7 +133,7 @@ class DensityEncoder(nn.Module):
                     edge_channels_list=self.edge_channels_list,
                     mappingReduced=self.mappingReduced_nodes
                 )
-                for _ in range(num_layers)
+                for c_s_i, c_s_ip1 in zip(c_s[:-1], c_s[1:])
             ]
         )
 
@@ -142,30 +142,30 @@ class DensityEncoder(nn.Module):
                 EdgeUpdate(
                     node_lmax_list=node_lmax_list,
                     edge_channels_list=self.edge_channels_list,
-                    h_channels=c_s
+                    h_channels=c_s_ip1
                 )
-                for _ in range(num_layers)
+                for c_s_ip1 in c_s[1:]
             ]
         )
 
         self.node_norm = NormSO3(
             lmax_list=node_lmax_list,
-            num_channels=c_s
+            num_channels=c_s[-1]
         )
-        self.scalarize = ProjectLayer(
-            in_lmax_list=node_lmax_list,
-            in_channels=c_s,
-            out_lmax_list=[0],
-            out_channels=c_output,
-            edge_channels_list=self.edge_channels_list,
-            mappingReduced_super=self.mappingReduced_nodes,
-            super_SO3_rotation=self.node_SO3_rotation,
-            super_SO3_grid=self.node_SO3_grid
-        )
-        self.ln = nn.LayerNorm(c_output)
-        # self.frame_feats = nn.Linear(
-        #     c_s * 5,c_output
+        # self.scalarize = ProjectLayer(
+        #     in_lmax_list=node_lmax_list,
+        #     in_channels=c_s,
+        #     out_lmax_list=[0],
+        #     out_channels=c_output,
+        #     edge_channels_list=self.edge_channels_list,
+        #     mappingReduced_super=self.mappingReduced_nodes,
+        #     super_SO3_rotation=self.node_SO3_rotation,
+        #     super_SO3_grid=self.node_SO3_grid
         # )
+        # self.ln = nn.LayerNorm(c_output)
+        self.frame_feats = nn.Linear(
+            c_s[-1] * 5,c_output
+        )
 
 
         self.latent_mu = nn.Linear(c_output, c_output)
@@ -265,13 +265,13 @@ class DensityEncoder(nn.Module):
             edge_features = edge_layer(node_features, edge_features, edge_index)
 
         node_features.embedding = self.node_norm(node_features.embedding)
-        # node_scalars = self._scalarize(
-        #     node_features,
-        #     ru.Rigid.from_tensor_7(res_data['rigids_0'])
-        # )
-        # node_scalars = node_scalars * res_mask[..., None]
-        node_scalars = self.scalarize(node_features, edge_features, edge_index)
-        node_scalars = self.ln(node_scalars.get_invariant_features(flat=True))
+        node_scalars = self._scalarize(
+            node_features,
+            ru.Rigid.from_tensor_7(res_data['rigids_0'])
+        )
+        node_scalars = node_scalars * res_mask[..., None]
+        # node_scalars = self.scalarize(node_features, edge_features, edge_index)
+        # node_scalars = self.ln(node_scalars.get_invariant_features(flat=True))
 
         latent_mu = self.latent_mu(node_scalars)
         latent_logvar = self.latent_logvar(node_scalars)
@@ -286,10 +286,11 @@ class DensityEncoder(nn.Module):
         node_scalars = node_features.embedding[..., 0, :].squeeze(-1)
         node_vecs = node_features.embedding[..., 1:4, :].transpose(-1, -2)
         node_vec_mags = torch.linalg.vector_norm(node_vecs + eps, dim=-1)
-        node_vecs_local_frame = rigids.get_rots().apply(node_vecs)
+        node_vecs_local_frame = rigids[..., None].get_rots().apply(node_vecs)
 
         frame_feats = torch.cat(
-            [node_scalars, node_vec_mags, node_vecs_local_frame.flatten(-2, -1)]
+            [node_scalars, node_vec_mags, node_vecs_local_frame.flatten(-2, -1)],
+            dim=-1
         )
         return self.frame_feats(frame_feats)
 

@@ -35,6 +35,7 @@ class ProteinDataModule(L.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
         csv = "filtered_metadata.csv"
+        # csv = "mini_metadata.csv"
         self.train_dataset = PdbDataset(
             os.path.join(self.data_dir, csv),
             split='train'
