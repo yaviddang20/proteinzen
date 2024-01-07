@@ -141,6 +141,8 @@ class IPMPDenoiser(nn.Module):
         bb = graph['residue']['bb'].float()
         x_mask = ~graph['residue'].res_mask
         rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_0)
+        if self.training:
+            rigids = rigids.translate(torch.randn((*rigids.shape, 3), device=rigids.device) * 0.1)
         dihedrals = _dihedrals(bb)
 
         ## create time embedding

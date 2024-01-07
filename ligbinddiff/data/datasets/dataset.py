@@ -1,4 +1,5 @@
 """ Generic dataset for all input data """
+from typing import Dict
 import logging
 
 import pandas as pd
@@ -121,7 +122,7 @@ class PdbDataset(data.Dataset):
             min_num_res=30,
             max_num_res=500,
             subset=None,
-            split='train'
+            split=None
         ):
         self._log = logging.getLogger(__name__)
         self.csv_path = csv_path
@@ -143,7 +144,8 @@ class PdbDataset(data.Dataset):
             pdb_csv = pdb_csv.iloc[:self.subset]
         pdb_csv = pdb_csv.sort_values('modeled_seq_len', ascending=False)
 
-        pdb_csv = pdb_csv[pdb_csv.splits == self.split]
+        if self.split is not None:
+            pdb_csv = pdb_csv[pdb_csv.splits == self.split]
 
         self.csv = pdb_csv
 
@@ -195,3 +197,43 @@ class PdbDataset(data.Dataset):
         chain_feats = self._process_csv_row(processed_file_path)
         chain_feats['csv_idx'] = torch.ones(1, dtype=torch.long) * idx
         return chain_feats
+
+
+class LengthDataset(data.Dataset):
+    def __init__(
+            self,
+            lengths: Dict[int, int],
+            batch_size: int = 3000,
+        ):
+        self._log = logging.getLogger(__name__)
+        self.lengths = lengths
+        self.batch_size = batch_size
+
+        self.batches = []
+        self.sample_ids = []
+        current_batch = []
+        current_sample_ids = []
+        sample_id = 0
+        for sample_l, num_samples in self.lengths.items():
+            for _ in range(num_samples):
+                if sum(current_batch) >= self.batch_size:
+                    self.batches.append(current_batch)
+                    self.sample_ids.append(current_sample_ids)
+                    current_batch = []
+                    current_sample_ids = []
+                current_batch.append(sample_l)
+                current_sample_ids.append(sample_id)
+                sample_id += 1
+        if len(current_batch) > 0:
+            self.batches.append(current_batch)
+        if len(current_sample_ids) > 0:
+            self.sample_ids.append(current_sample_ids)
+
+    def __len__(self):
+        return len(self.batches)
+
+    def __getitem__(self, idx):
+        return {
+            "num_res": self.batches[idx],
+            "sample_id": self.sample_ids[idx]
+        }

@@ -241,3 +241,108 @@ def vector_projection(R_ab, P_n):
     a_x_b = torch.sum(R_ab * P_n, dim=-1)
     b_x_b = torch.sum(P_n * P_n, dim=-1)
     return R_ab - (a_x_b / b_x_b)[:, None] * P_n
+
+
+
+### modded from FrameFlow
+def transrotpsi_to_atom37(transrotpsi_traj, res_mask, impute_oxy=True):
+    atom37_traj = []
+    res_mask = res_mask.detach().cpu()
+    # num_batch = res_mask.shape[0]
+    for trans, rots, psis in transrotpsi_traj:
+        rigids = Rigid(
+            rots=Rotation(rot_mats=rots),
+            trans=trans
+        )
+        atom37 = compute_backbone(
+            rigids.unsqueeze(0),
+            psis.unsqueeze(0)
+        )[0].squeeze(0)
+        atom37 = atom37.detach().cpu()
+        if impute_oxy:
+            atom37 = adjust_oxygen_pos(atom37, res_mask)
+        atom37_traj.append(atom37)
+    return atom37_traj
+
+
+def adjust_oxygen_pos(
+    atom_37: torch.Tensor, pos_is_known = None
+) -> torch.Tensor:
+    """
+    Imputes the position of the oxygen atom on the backbone by using adjacent frame information.
+    Specifically, we say that the oxygen atom is in the plane created by the Calpha and C from the
+    current frame and the nitrogen of the next frame. The oxygen is then placed c_o_bond_length Angstrom
+    away from the C in the current frame in the direction away from the Ca-C-N triangle.
+
+    For cases where the next frame is not available, for example we are at the C-terminus or the
+    next frame is not available in the data then we place the oxygen in the same plane as the
+    N-Ca-C of the current frame and pointing in the same direction as the average of the
+    Ca->C and Ca->N vectors.
+
+    Args:
+        atom_37 (torch.Tensor): (N, 37, 3) tensor of positions of the backbone atoms in atom_37 ordering
+                                which is ['N', 'CA', 'C', 'CB', 'O', ...]
+        pos_is_known (torch.Tensor): (N,) mask for known residues.
+    """
+
+    N = atom_37.shape[0]
+    assert atom_37.shape == (N, 37, 3)
+
+    # Get vectors to Carbonly from Carbon alpha and N of next residue. (N-1, 3)
+    # Note that the (N,) ordering is from N-terminal to C-terminal.
+
+    # Calpha to carbonyl both in the current frame.
+    calpha_to_carbonyl: torch.Tensor = (atom_37[:-1, 2, :] - atom_37[:-1, 1, :]) / (
+        torch.norm(atom_37[:-1, 2, :] - atom_37[:-1, 1, :], keepdim=True, dim=1) + 1e-7
+    )
+    # For masked positions, they are all 0 and so we add 1e-7 to avoid division by 0.
+    # The positions are in Angstroms and so are on the order ~1 so 1e-7 is an insignificant change.
+
+    # Nitrogen of the next frame to carbonyl of the current frame.
+    nitrogen_to_carbonyl: torch.Tensor = (atom_37[:-1, 2, :] - atom_37[1:, 0, :]) / (
+        torch.norm(atom_37[:-1, 2, :] - atom_37[1:, 0, :], keepdim=True, dim=1) + 1e-7
+    )
+
+    carbonyl_to_oxygen: torch.Tensor = calpha_to_carbonyl + nitrogen_to_carbonyl  # (N-1, 3)
+    carbonyl_to_oxygen = carbonyl_to_oxygen / (
+        torch.norm(carbonyl_to_oxygen, dim=1, keepdim=True) + 1e-7
+    )
+
+    atom_37[:-1, 4, :] = atom_37[:-1, 2, :] + carbonyl_to_oxygen * 1.23
+
+    # Now we deal with frames for which there is no next frame available.
+
+    # Calpha to carbonyl both in the current frame. (N, 3)
+    calpha_to_carbonyl_term: torch.Tensor = (atom_37[:, 2, :] - atom_37[:, 1, :]) / (
+        torch.norm(atom_37[:, 2, :] - atom_37[:, 1, :], keepdim=True, dim=1) + 1e-7
+    )
+    # Calpha to nitrogen both in the current frame. (N, 3)
+    calpha_to_nitrogen_term: torch.Tensor = (atom_37[:, 0, :] - atom_37[:, 1, :]) / (
+        torch.norm(atom_37[:, 0, :] - atom_37[:, 1, :], keepdim=True, dim=1) + 1e-7
+    )
+    carbonyl_to_oxygen_term: torch.Tensor = (
+        calpha_to_carbonyl_term + calpha_to_nitrogen_term
+    )  # (N, 3)
+    carbonyl_to_oxygen_term = carbonyl_to_oxygen_term / (
+        torch.norm(carbonyl_to_oxygen_term, dim=1, keepdim=True) + 1e-7
+    )
+
+    # Create a mask that is 1 when the next residue is not available either
+    # due to this frame being the C-terminus or the next residue is not
+    # known due to pos_is_known being false.
+
+    if pos_is_known is None:
+        pos_is_known = torch.ones((atom_37.shape[0],), dtype=torch.int64, device=atom_37.device)
+
+    next_res_gone: torch.Tensor = ~pos_is_known.bool()  # (N,)
+    next_res_gone = torch.cat(
+        [next_res_gone, torch.ones((1,), device=pos_is_known.device).bool()], dim=0
+    )  # (N+1, )
+    next_res_gone = next_res_gone[1:]  # (N,)
+
+    atom_37[next_res_gone, 4, :] = (
+        atom_37[next_res_gone, 2, :]
+        + carbonyl_to_oxygen_term[next_res_gone, :] * 1.23
+    )
+
+    return atom_37

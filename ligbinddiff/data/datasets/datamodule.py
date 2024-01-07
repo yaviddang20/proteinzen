@@ -8,7 +8,7 @@ import lightning as L
 
 from ligbinddiff.tasks import TaskSampler
 
-from .dataset import PdbDataset
+from .dataset import PdbDataset, LengthDataset
 from .sampler import BatchSampler
 
 
@@ -72,3 +72,70 @@ class ProteinDataModule(L.LightningDataModule):
 
     def predict_dataloader(self):
         return self.build_dataloader(self.test_dataset)
+
+
+class FramediffDataModule(L.LightningDataModule):
+    def __init__(self,
+                 task_sampler: TaskSampler,
+                 data_dir,
+                 batch_size,
+                 num_workers,
+                 lengths={
+                     100: 5,
+                     150: 5,
+                     200: 5,
+                     250: 5
+                 }
+                 ):
+        super().__init__()
+        self.data_dir = data_dir
+        self.task_sampler = task_sampler
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.lengths = lengths
+        csv = "filtered_metadata.csv"
+        # csv = "mini_metadata.csv"
+        self.train_dataset = PdbDataset(
+            os.path.join(self.data_dir, csv),
+        )
+        self.val_dataset = LengthDataset(lengths, batch_size=batch_size)
+
+    def build_dataloader(self, x):
+        collate_fn = gen_collate_fn(self.task_sampler)
+        dataloader = DataLoader(
+            x,
+            num_workers=self.num_workers,
+            batch_sampler=BatchSampler(x, batch_size=self.batch_size),
+            collate_fn=collate_fn,
+            shuffle=False
+        )
+        return dataloader
+
+    def train_dataloader(self):
+        return self.build_dataloader(self.train_dataset)
+
+    # def val_dataloader(self):
+    #     def collate_fn(batch):
+    #         batch = batch[0]
+    #         batch['task'] = self.task_sampler.sample_task()
+    #         return batch
+
+    #     return DataLoader(
+    #         self.val_dataset,
+    #         shuffle=False,
+    #         collate_fn=collate_fn,
+    #         batch_size=1
+    #     )
+
+    def predict_dataloader(self):
+        def collate_fn(batch):
+            batch = batch[0]
+            batch['task'] = self.task_sampler.sample_task()
+            return batch
+
+        return DataLoader(
+            self.val_dataset,
+            shuffle=False,
+            collate_fn=collate_fn,
+            batch_size=1
+        )

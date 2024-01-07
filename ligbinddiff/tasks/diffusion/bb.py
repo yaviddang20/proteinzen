@@ -1,11 +1,12 @@
 
 from typing import Sequence, Dict
 
+import tqdm
 import tree
 import torch
 import numpy as np
 
-from torch_geometric.data import HeteroData
+from torch_geometric.data import HeteroData, Batch
 
 
 from ligbinddiff.data.openfold import data_transforms
@@ -82,6 +83,100 @@ class BackboneFrameNoising(Task):
         pred_bb_score = self.bb_score_fn(inputs, denoiser_output)
         denoiser_output["pred_bb_score"] = pred_bb_score
         return denoiser_output
+
+    def reverse_step(self,
+                     model,
+                     intermediates,
+                     delta_t,
+                     self_condition=None,
+                     noise_scale=1.0):
+        # assert delta_t < 0
+        t = intermediates['t']
+        noising_mask = intermediates['noising_mask']
+        x_mask = torch.zeros_like(noising_mask).bool()
+        mask = x_mask | ~noising_mask
+        bb_x_t = intermediates[self.bb_x_t_key]
+
+        data = dict(
+            x=bb_x_t.get_trans(),
+            x_mask=x_mask,
+            noising_mask=noising_mask,
+            fixed_mask=~noising_mask,
+            rigids_t=bb_x_t.to_tensor_7(),
+            t=t
+        )
+        data = HeteroData(
+            residue=data
+        )
+        data = Batch.from_data_list([data])
+        data = data.to(t.device)
+
+        if self.self_conditioning:
+            denoiser_output = model.denoiser(data, intermediates, self_condition=self_condition)
+        else:
+            denoiser_output = model.denoiser(data, intermediates)
+        rot_score, trans_score = self.bb_score_fn(
+            data,
+            denoiser_output
+        )
+
+        bb_x_tm1 = self.se3_noiser.reverse(
+            bb_x_t,
+            rot_score.numpy(force=True),
+            trans_score.numpy(force=True),
+            t.item(),
+            delta_t,
+            noising_mask.numpy(force=True),
+            noise_scale=noise_scale
+        )
+        tm1 = t - np.abs(delta_t) #+ delta_t
+
+        return bb_x_tm1, tm1, denoiser_output
+
+    def run_predict(self,
+                    model,
+                    inputs,
+                    steps=100,
+                    show_progress=True,
+                    device="cuda:0",#None,
+                    noise_scale=1.0):
+        num_nodes = inputs['num_nodes']
+        prior = model.sample_prior(num_nodes, device=device)
+        intermediates = prior
+
+        delta_t = 1.0 / steps
+        intermediates['t'] = torch.ones(1, device=device)
+        bb_x_t = intermediates[self.bb_x_t_key]
+        denoiser_output = None
+
+        with torch.no_grad():
+            if show_progress:
+                pbar = tqdm.tqdm(total=steps)
+
+            while (intermediates['t'] > np.abs(delta_t)).all():
+                bb_x_tm1, tm1, denoiser_output = self.reverse_step(
+                    model,
+                    intermediates,
+                    delta_t,
+                    self_condition=denoiser_output,
+                    noise_scale=noise_scale)
+                intermediates['t'] = tm1
+                intermediates[self.bb_x_t_key] = bb_x_tm1
+
+                if show_progress:
+                    pbar.update(1)
+
+            if show_progress:
+                pbar.close()
+
+        intermediates['t'] = torch.as_tensor(intermediates['t']).view(1, 1)
+        diffusion_outputs = intermediates
+        diffusion_outputs[self.bb_x_0_key] = diffusion_outputs[self.bb_x_t_key]
+        diffusion_outputs[self.bb_x_t_key] = bb_x_t
+        # add a bunch of keys so the loss fn is happy
+        diffusion_outputs.update(denoiser_output)
+
+        return diffusion_outputs, diffusion_outputs
 
     def bb_score_fn(self, data, denoiser_output):
         res_data = data['residue']

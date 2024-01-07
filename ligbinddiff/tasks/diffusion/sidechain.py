@@ -198,8 +198,8 @@ class DesignLatentSidechainNoising(Task):
         return denoiser_output
 
     def reverse_step(self, model, data, intermediates, delta_t, self_condition=None, noise_scale=1.0):
-        if self.self_conditioning and self_condition is not None:
-                denoiser_output = model.denoiser(data, intermediates, self_condition=self_condition)
+        if self.self_conditioning:
+            denoiser_output = model.denoiser(data, intermediates, self_condition=self_condition)
         else:
             denoiser_output = model.denoiser(data, intermediates)
 
@@ -306,13 +306,13 @@ class DesignLatentSidechainNoising(Task):
             autoenc_loss_dict["atom14_mse"]
             + autoenc_loss_dict["seq_loss"]
             + autoenc_loss_dict["chi_loss"]
-            + autoenc_loss_dict["kl_div"] * 1e-2 #1e-6 # 1e-2
+            + autoenc_loss_dict["kl_div"] * 1e-6 # 1e-2
         )
 
         loss = (
             vae_loss
-            # + latent_loss_dict["latent_denoising_loss"] * 10
-            + latent_loss_dict["latent_denoising_nll"] #* 0.1
+            + latent_loss_dict["latent_denoising_loss"] * 0.01 # * 10
+            # + latent_loss_dict["latent_denoising_nll"] #* 0.1
         )
 
         ret = {"loss": loss.mean()}

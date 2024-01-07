@@ -139,7 +139,7 @@ class DensityLatentSidechainWrapper(nn.Module):
             c_hidden=c_hidden,
             c_s_in=c_s_in,
             num_rbf=num_rbf,
-            num_layers=1,#num_layers,
+            num_layers=num_layers,
             k=k
         )
         self.denoiser = IPMPDenoiser(

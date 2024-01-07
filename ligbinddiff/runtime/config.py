@@ -5,11 +5,12 @@ import omegaconf
 from lightning import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
 
-from ligbinddiff.data.datasets.datamodule import ProteinDataModule
+from ligbinddiff.data.datasets.datamodule import ProteinDataModule, FramediffDataModule
 
 from ligbinddiff.diffusion.noisers.se3_diffuser import SE3Diffuser
 from ligbinddiff.diffusion.noisers.latent import SidechainDiffuser
-from ligbinddiff.stoch_interp.interpolate.se3 import SE3FlowMatcher
+# from ligbinddiff.stoch_interp.interpolate.se3 import SE3FlowMatcher
+from ligbinddiff.stoch_interp.interpolate.interpolant import Interpolant, InterpolantConfig
 
 from ligbinddiff.model.denoiser.bb.frames import GraphIpaFrameDenoiser
 from ligbinddiff.model.denoiser.sidechain.ipmp_latent import IPMPDenoiser
@@ -22,6 +23,7 @@ from ligbinddiff.model.wrappers.sidechain import IPMPLatentSidechainWrapper, IPA
 
 from ligbinddiff.tasks.diffusion.bb import BackboneFrameNoising
 from ligbinddiff.tasks.diffusion.sidechain import DesignLatentSidechainNoising
+from ligbinddiff.tasks.fm.bb import BackboneFrameInterpolation
 
 from ligbinddiff.runtime.optim import get_std_opt
 
@@ -68,8 +70,12 @@ def config_hydra_store():
     corruption_store(
         SidechainDiffuser,
         name="diffusion_sidechain")
+    # corruption_store(
+    #     SE3FlowMatcher,
+    #     name="fm_bb")
     corruption_store(
-        SE3FlowMatcher,
+        Interpolant,
+        cfg=builds(InterpolantConfig),
         name="fm_bb")
 
     datamodule_store = store(group="datamodule")
@@ -81,16 +87,33 @@ def config_hydra_store():
             batch_size=3000,
             num_workers=4
         ),
-        name="default")
+        name="cath")
+    datamodule_store(
+        pbuilds(
+            FramediffDataModule,
+            data_dir="/wynton/home/kortemme/alexjli/projects/ligbinddiff/data/framediff",
+            batch_size=3000,
+            num_workers=4
+        ),
+        name="framediff")
+    datamodule_store(
+        pbuilds(
+            FramediffDataModule,
+            data_dir="/wynton/home/kortemme/alexjli/projects/ligbinddiff/data/frameflow",
+            batch_size=3000,
+            num_workers=4
+        ),
+        name="frameflow")
 
     model_store = store(group="model")
     model_store(GraphIpaFrameDenoiser, name="diffusion_bb")
-    model_store(
-        DensityLatentSidechainWrapper,
-        name="diffusion_sidechain")
+    model_store(GraphIpaFrameDenoiser, name="fm_bb")
     # model_store(
-    #     IPMPLatentSidechainWrapper,
+    #     DensityLatentSidechainWrapper,
     #     name="diffusion_sidechain")
+    model_store(
+        IPMPLatentSidechainWrapper,
+        name="diffusion_sidechain")
     # model_store(
     #     IPALatentSidechainWrapper,
     #     name="diffusion_sidechain")
@@ -98,6 +121,7 @@ def config_hydra_store():
     task_store = store(group="tasks")
     task_store(pbuilds(BackboneFrameNoising), name="diffusion_bb")
     task_store(pbuilds(DesignLatentSidechainNoising), name="diffusion_sidechain")
+    task_store(pbuilds(BackboneFrameInterpolation), name="fm_bb")
 
     exp_store = store(group="experiment")
     exp_store({
@@ -107,7 +131,7 @@ def config_hydra_store():
     lightning_store(pbuilds(Trainer), name="default")
 
     optim_store = exp_store(group="experiment/optim")
-    optim_store(pbuilds(torch.optim.Adam), name="adam")
+    optim_store(pbuilds(torch.optim.Adam, lr=1e-4), name="adam")
     optim_store(pbuilds(get_std_opt, d_model=128), name="noam")
 
     exp_store(
@@ -132,7 +156,7 @@ def config_hydra_store():
         hydra_defaults=[
             {"paradigm": "diffusion"},
             {"domain": "bb"},
-            {"datamodule": "default"},
+            {"datamodule": "cath"},
             {"corrupter": "${paradigm}_${domain}"},
             {"model": "${paradigm}_${domain}"},
             {"tasks": "${paradigm}_${domain}"},

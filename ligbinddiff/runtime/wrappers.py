@@ -110,18 +110,9 @@ class LightningWrapper(L.LightningModule):
         self._log.info(gen_pbar_str(sample_loss_dict))
         return sample_loss_dict
 
-    def predict_step(self, batch):
-        task: TaskList = batch.task
+    def predict_step(self, batch, batch_idx):
+        task: TaskList = batch['task']
         outputs = task.run_predicts(self.model, batch)
-        loss_dict = task.compile_task_losses(batch, outputs)
-
-        log_dict = tree.map_structure(
-            lambda x: torch.mean(x) if torch.is_tensor(x) else x,
-            loss_dict
-        )
-        log_dict = {"sample_" + k: v for k,v in log_dict.items()}
-        self._log.info(gen_pbar_str(log_dict))
-        outputs['loss_dict'] = loss_dict
         return outputs
 
 

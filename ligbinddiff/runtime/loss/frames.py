@@ -11,6 +11,8 @@ from .atomic.atomic import framediff_local_atomic_context_loss
 from .atomic.interresidue import backbone_dihedrals_loss, chain_constraints_loss
 from .openfold import compute_fape
 
+from ligbinddiff.stoch_interp.interpolate import so3_utils as so3_fm_utils
+
 def all_atom_fape_loss(pred_atom91,
                   ref_atom91,
                   seq,
@@ -263,6 +265,107 @@ def bb_frame_diffusion_loss(batch,
         "pred_bb_mse": backbone_mse,
         "ref_x_ca_mse": ref_X_ca_mse,
         "dist_mat_loss": dist_mat_loss,
+        # "edge_dist_loss": edge_dist_loss,
+        # "bb_dihedrals_loss": bb_dihedrals_loss,
+        # "bb_conn_mse": bb_conn_lens,
+        # "bb_angles_loss": bb_conn_angles
+    }
+
+
+def bb_frame_fm_loss(batch,
+                     denoiser_outputs,
+                     t_norm_clip=0.9):
+    res_data = batch['residue']
+    res_mask = res_data['res_mask']
+    noising_mask = res_data['noising_mask']
+    mask = res_mask & noising_mask
+    res_batch = res_data.batch
+    device = res_mask.device
+    total_mask = res_mask & noising_mask
+
+    if isinstance(res_data['rigids_t'], torch.Tensor):
+        noised_bb_frames = ru.Rigid.from_tensor_7(res_data['rigids_t'].to(device))
+    else:
+        noised_bb_frames = res_data['rigids_t']
+        dtype = noised_bb_frames._trans.dtype
+        noised_bb_frames = ru.Rigid(
+            rots=noised_bb_frames._rots.to(device=device, dtype=dtype),
+            trans=noised_bb_frames._trans.to(device)
+        )
+
+    denoised_bb_frames = denoiser_outputs['final_rigids']
+    bb_frames = ru.Rigid.from_tensor_7(res_data['rigids_1'].to(device))
+
+    X_ca = res_data['res_ca']
+    pred_frame_X_ca = denoised_bb_frames.get_trans()
+    ref_frame_X_ca = noised_bb_frames.get_trans()
+    pred_X_ca_se = torch.square(X_ca - pred_frame_X_ca).sum(dim=-1)
+    pred_X_ca_mse = _nodewise_to_graphwise(pred_X_ca_se, res_batch, total_mask)
+    ref_X_ca_se = torch.square(X_ca - ref_frame_X_ca).sum(dim=-1)
+    ref_X_ca_mse = _nodewise_to_graphwise(ref_X_ca_se, res_batch, total_mask)
+
+    bb = res_data['atom37'][:, (0, 1, 2, 4, 3)]
+    bb_mask = res_data['atom37_mask'][:, (0, 1, 2, 4, 3)].bool()
+    denoised_bb = denoiser_outputs['denoised_bb']
+    backbone_mse = torch.square(denoised_bb - bb).sum(dim=-1)
+    backbone_mse = _nodewise_to_graphwise(backbone_mse, res_batch, bb_mask)
+
+    t = batch['t']
+    norm_scale = 1 - torch.min(
+        t, torch.as_tensor(t_norm_clip)
+    )
+    t = batchwise_to_nodewise(t, res_data.batch)
+    nodewise_norm_scale = 1 - torch.min(
+        t, torch.as_tensor(t_norm_clip)
+    )
+    rots_t = noised_bb_frames.get_rots().get_rot_mats()
+    rots_1_pred = denoised_bb_frames.get_rots().get_rot_mats()
+    rots_1 = bb_frames.get_rots().get_rot_mats()
+    pred_rot_vf = so3_fm_utils.calc_rot_vf(rots_t, rots_1_pred)
+    gt_rot_vf = so3_fm_utils.calc_rot_vf(rots_t, rots_1)
+    rot_vf_loss = torch.square(pred_rot_vf - gt_rot_vf).sum(dim=-1) / (nodewise_norm_scale ** 2)
+    rot_vf_loss = _nodewise_to_graphwise(rot_vf_loss, res_data.batch, mask)
+
+    trans_1_pred = denoised_bb_frames.get_trans()
+    trans_1 = bb_frames.get_trans()
+    trans_vf_loss = torch.square(trans_1_pred - trans_1).sum(dim=-1) / (nodewise_norm_scale ** 2)
+    trans_vf_loss = _nodewise_to_graphwise(trans_vf_loss, res_data.batch, mask)
+    trans_vf_loss *= 0.01  # Angstroms to nm
+
+    dist_mat_loss = framediff_local_atomic_context_loss(
+        denoised_bb,
+        bb,
+        res_batch,
+        res_mask
+    )
+
+    scaled_dist_mat_loss = dist_mat_loss / norm_scale * 0.01
+    scaled_backbone_mse = backbone_mse / norm_scale * 0.01
+
+    # bb_dihedrals_loss = backbone_dihedrals_loss(
+    #     denoised_bb[:, :3],
+    #     bb[:, :3],
+    #     data_lens,
+    #     ~noising_mask)
+
+    # bb_conn_lens, bb_conn_angles = chain_constraints_loss(
+    #     denoised_bb[:, :3],
+    #     bb[:, :3],
+    #     data_lens,
+    #     res_data.batch,
+    #     ~noising_mask)
+
+    # edge_dist_loss = full_dist_mat_loss(pred_frame_X_ca, ref_frame_X_ca, res_data.batch, ~res_mask)
+
+    return {
+        "rot_vf_loss": rot_vf_loss,
+        "trans_vf_loss": trans_vf_loss,
+        "pred_x_ca_mse": pred_X_ca_mse,
+        "pred_bb_mse": backbone_mse,
+        "scaled_pred_bb_mse": scaled_backbone_mse,
+        "ref_x_ca_mse": ref_X_ca_mse,
+        "dist_mat_loss": dist_mat_loss,
+        "scaled_dist_mat_loss": scaled_dist_mat_loss,
         # "edge_dist_loss": edge_dist_loss,
         # "bb_dihedrals_loss": bb_dihedrals_loss,
         # "bb_conn_mse": bb_conn_lens,

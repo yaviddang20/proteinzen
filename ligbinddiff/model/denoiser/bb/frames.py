@@ -153,7 +153,7 @@ class GraphIpaFrameDenoiser(nn.Module):
                  h_time=64,
                  n_layers=4,
                  knn_k=20,
-                 lrange_k=30,
+                 lrange_k=40,
                  self_conditioning=False,
                  graph_conditioning=False,
                  use_anchors=False,
@@ -223,7 +223,8 @@ class GraphIpaFrameDenoiser(nn.Module):
     def forward(self, data, self_condition=None):
         res_data = data['residue']
         ## prep features
-        ts = res_data['t']  # (B,)
+        # ts = res_data['t']  # (B,)
+        ts = data['t']  # (B,)
         ts = batchwise_to_nodewise(ts, res_data.batch)
         res_mask = ~((res_data['res_mask']).bool())
         rigids_t = ru.Rigid.from_tensor_7(res_data['rigids_t'])
@@ -350,7 +351,7 @@ class GraphIpaFrameDenoiser(nn.Module):
                 (~res_mask).float()
             )
 
-        psi, _ = self.torsion_angles(node_features)
+        _, psi = self.torsion_angles(node_features)
 
         rigids = rigids.scale_translation(10)
         rigids = rigids.translate(center)
