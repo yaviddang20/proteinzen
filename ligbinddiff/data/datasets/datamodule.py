@@ -9,7 +9,7 @@ import lightning as L
 from ligbinddiff.tasks import TaskSampler
 
 from .dataset import PdbDataset, LengthDataset
-from .sampler import BatchSampler
+from .sampler import BatchSampler, LengthBatchSampler
 
 
 def gen_collate_fn(task_sampler: TaskSampler):
@@ -28,12 +28,14 @@ class ProteinDataModule(L.LightningDataModule):
                  data_dir,
                  batch_size,
                  num_workers,
+                 length_batch=False
                  ):
         super().__init__()
         self.data_dir = data_dir
         self.task_sampler = task_sampler
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.length_batch = length_batch
         csv = "filtered_metadata.csv"
         # csv = "mini_metadata.csv"
         self.train_dataset = PdbDataset(
@@ -52,13 +54,22 @@ class ProteinDataModule(L.LightningDataModule):
 
     def build_dataloader(self, x):
         collate_fn = gen_collate_fn(self.task_sampler)
-        dataloader = DataLoader(
-            x,
-            num_workers=self.num_workers,
-            batch_sampler=BatchSampler(x, batch_size=self.batch_size),
-            collate_fn=collate_fn,
-            shuffle=False
-        )
+        if self.length_batch:
+            dataloader = DataLoader(
+                x,
+                num_workers=self.num_workers,
+                batch_sampler=LengthBatchSampler(x, batch_size=self.batch_size),
+                collate_fn=collate_fn,
+                shuffle=False
+            )
+        else:
+            dataloader = DataLoader(
+                x,
+                num_workers=self.num_workers,
+                batch_sampler=BatchSampler(x, batch_size=self.batch_size),
+                collate_fn=collate_fn,
+                shuffle=False
+            )
         return dataloader
 
     def train_dataloader(self):
@@ -80,35 +91,50 @@ class FramediffDataModule(L.LightningDataModule):
                  data_dir,
                  batch_size,
                  num_workers,
-                 lengths={
+                 max_len=1000,
+                 sample_lengths={
                      100: 5,
                      150: 5,
                      200: 5,
                      250: 5
-                 }
+                 },
+                 length_batch=False
                  ):
         super().__init__()
         self.data_dir = data_dir
         self.task_sampler = task_sampler
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.lengths = lengths
+        self.length_batch = length_batch
+
+        self.sample_lengths = sample_lengths
         csv = "filtered_metadata.csv"
         # csv = "mini_metadata.csv"
         self.train_dataset = PdbDataset(
             os.path.join(self.data_dir, csv),
+            max_num_res=max_len
         )
-        self.val_dataset = LengthDataset(lengths, batch_size=batch_size)
+        self.val_dataset = LengthDataset(self.sample_lengths, batch_size=batch_size)
+
 
     def build_dataloader(self, x):
         collate_fn = gen_collate_fn(self.task_sampler)
-        dataloader = DataLoader(
-            x,
-            num_workers=self.num_workers,
-            batch_sampler=BatchSampler(x, batch_size=self.batch_size),
-            collate_fn=collate_fn,
-            shuffle=False
-        )
+        if self.length_batch:
+            dataloader = DataLoader(
+                x,
+                num_workers=self.num_workers,
+                batch_sampler=LengthBatchSampler(x, batch_size=self.batch_size),
+                collate_fn=collate_fn,
+                shuffle=False
+            )
+        else:
+            dataloader = DataLoader(
+                x,
+                num_workers=self.num_workers,
+                batch_sampler=BatchSampler(x, batch_size=self.batch_size),
+                collate_fn=collate_fn,
+                shuffle=False
+            )
         return dataloader
 
     def train_dataloader(self):

@@ -176,7 +176,12 @@ class IPMPEncoder(nn.Module):
         ## prep features
         res_data = graph['residue']
         res_mask = res_data['res_mask']
-        rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_0)
+        # TODO: fix this inconsistency
+        if "rigids_1" in res_data:
+            rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_1)
+        else:
+            rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_0)
+
 
         node_features, edge_features, edge_index = self._prep_features(graph, eps=eps)
 
@@ -308,7 +313,11 @@ class IPMPDecoder(nn.Module):
         res_data = graph['residue']
         num_nodes = res_data.num_nodes
         res_mask = res_data['res_mask']
-        rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_0)
+        # TODO: fix this inconsistency
+        if "rigids_1" in res_data:
+            rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_1)
+        else:
+            rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_0)
 
         _, edge_features, edge_index = self._prep_features(graph, eps=eps)
 

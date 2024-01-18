@@ -25,6 +25,8 @@ from typing import Tuple, Any, Sequence, Callable, Optional
 import numpy as np
 import torch
 
+import torch_geometric.utils as pygu
+
 
 def rot_matmul(
     a: torch.Tensor,
@@ -1431,13 +1433,23 @@ class Rigid:
         )
 
 
-def batchwise_center(rigids: Rigid, batch: torch.Tensor):
-    center = []
-    for i in range(batch.max().item() + 1):
-        select = (batch == i)
-        num_nodes = select.long().sum()
-        subset_x_ca = rigids.get_trans()[select]
-        subset_mean = subset_x_ca.mean(dim=0)
-        center.append(subset_mean[None, :].expand(num_nodes, -1))
-    center = torch.cat(center, dim=0)
-    return center
+def batchwise_center(rigids: Rigid, batch: torch.Tensor, mask: torch.Tensor):
+    # center = []
+    # for i in range(batch.max().item() + 1):
+    #     select = (batch == i)
+    #     num_nodes = select.long().sum()
+    #     subset_x_ca = rigids.get_trans()[select]
+    #     subset_mean = subset_x_ca.mean(dim=0)
+    #     center.append(subset_mean[None, :].expand(num_nodes, -1))
+    # center = torch.cat(center, dim=0)
+    trans = rigids.get_trans()[mask]
+    masked_batch = batch[mask]
+
+    center = pygu.scatter(
+        trans,
+        index=masked_batch,
+        dim=0,
+        dim_size=int(batch.max().item() + 1),
+        reduce='mean'
+    )
+    return center[batch]

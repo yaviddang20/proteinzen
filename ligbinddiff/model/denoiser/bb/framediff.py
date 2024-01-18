@@ -840,7 +840,7 @@ class IpaScoreWrapper(nn.Module):
 
         # center the training example at the mean of the x_cas
         rigids_t = Rigid.from_tensor_7(data['rigids_t'])
-        center = batchwise_center(rigids_t, data.batch)
+        center = batchwise_center(rigids_t, data.batch, node_mask)
         rigids_t = rigids_t.translate(-center)
         rigids_t = rigids_t.view([t.shape[0], -1])
 
@@ -1399,7 +1399,7 @@ class KnnIpaScoreWrapper(nn.Module):
 
 
         # center the training example at the mean of the x_cas
-        center = batchwise_center(rigids_t, data.batch)
+        center = batchwise_center(rigids_t, data.batch, x_mask)
         rigids_t = rigids_t.translate(-center)
 
         # generate sequence edges

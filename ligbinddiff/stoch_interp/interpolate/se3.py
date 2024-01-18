@@ -58,7 +58,7 @@ class TransConfig:
 class SamplingConfig:
     num_timesteps=100
 
-class InterpolantConfig:
+class SE3InterpolantConfig:
     min_t = 1e-2
     rots=RotConfig()
     trans=TransConfig()
@@ -66,13 +66,15 @@ class InterpolantConfig:
     self_condition=True
 
 
-class Interpolant:
-    def __init__(self, cfg):
+class SE3Interpolant:
+    def __init__(self, cfg, use_batch_ot=False, prealign_noise=True):
         self._cfg = cfg
         self._rots_cfg = cfg.rots
         self._trans_cfg = cfg.trans
         self._sample_cfg = cfg.sampling
         self._igso3 = None
+        self.use_batch_ot = use_batch_ot
+        self.prealign_noise = prealign_noise
         print(self.igso3)
 
     @property
@@ -92,42 +94,42 @@ class Interpolant:
     def _corrupt_trans(self, trans_1, t, res_mask, batch):
         trans_nm_0 = _centered_gaussian(batch, self._device)
         trans_0 = trans_nm_0 * du.NM_TO_ANG_SCALE
+        if self.use_batch_ot:
+            # this requires samples to be length batched
+            sample_len = int((batch == 0).sum().item())
+            assert batch.numel() % sample_len == 0, (
+                f"minibatch OT can only be applied to length batches, "
+                f"but you have {batch.numel()} nodes and sample 0 is length {sample_len}")
+            trans_0 = self._batch_ot(
+                trans_0.view(-1, sample_len, 3),
+                trans_1.view(-1, sample_len, 3),
+                res_mask.view(-1, sample_len)
+            )
+            trans_0 = trans_0.view(-1, 3)
+        else:
+            if self.prealign_noise:
+                # rotate each structure to align as best as possible with noise
+                trans_0, _, _ = du.align_structures(trans_0, batch, trans_1)
         # trans_0 = self._batch_ot(trans_0, trans_1, res_mask)
         trans_t = (1 - t[..., None]) * trans_0 + t[..., None] * trans_1
         trans_t = _trans_diffuse_mask(trans_t, trans_1, res_mask)
         return trans_t * res_mask[..., None]
 
     # TODO: can you do residue-level alignment rather than batch-level alignment?
-    # def _batch_ot(self, trans_0, trans_1, res_mask):
-    #     num_batch, num_res = trans_0.shape[:2]
-    #     noise_idx, gt_idx = torch.where(
-    #         torch.ones(num_batch, num_batch))
-    #     batch_nm_0 = trans_0[noise_idx]
-    #     batch_nm_1 = trans_1[gt_idx]
-    #     batch_mask = res_mask[gt_idx]
-    #     aligned_nm_0, aligned_nm_1, _ = du.batch_align_structures(
-    #         batch_nm_0, batch_nm_1, mask=batch_mask
-    #     )
-    #     aligned_nm_0 = aligned_nm_0.reshape(num_batch, num_batch, num_res, 3)
-    #     aligned_nm_1 = aligned_nm_1.reshape(num_batch, num_batch, num_res, 3)
-    #
-    #     # Compute cost matrix of aligned noise to ground truth
-    #     batch_mask = batch_mask.reshape(num_batch, num_batch, num_res)
-    #     cost_matrix = torch.sum(
-    #         torch.linalg.norm(aligned_nm_0 - aligned_nm_1, dim=-1), dim=-1
-    #     ) / torch.sum(batch_mask, dim=-1)
-    #     noise_perm, gt_perm = linear_sum_assignment(du.to_numpy(cost_matrix))
-    #     return aligned_nm_0[(tuple(gt_perm), tuple(noise_perm))]
     def _batch_ot(self, trans_0, trans_1, res_mask):
-        num_res = res_mask.shape[0]
+        num_batch, num_res = trans_0.shape[:2]
         noise_idx, gt_idx = torch.where(
             torch.ones(num_batch, num_batch))
         batch_nm_0 = trans_0[noise_idx]
         batch_nm_1 = trans_1[gt_idx]
         batch_mask = res_mask[gt_idx]
-        aligned_nm_0, aligned_nm_1, _ = du.batch_align_structures(
-            batch_nm_0, batch_nm_1, mask=batch_mask
-        )
+        if self.prealign_noise:
+            aligned_nm_0, aligned_nm_1, _ = du.batch_align_structures(
+                batch_nm_0, batch_nm_1, mask=batch_mask
+            )
+        else:
+            aligned_nm_0 = batch_nm_0
+            aligned_nm_1 = batch_nm_1
         aligned_nm_0 = aligned_nm_0.reshape(num_batch, num_batch, num_res, 3)
         aligned_nm_1 = aligned_nm_1.reshape(num_batch, num_batch, num_res, 3)
 

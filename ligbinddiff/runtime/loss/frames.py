@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import torch_geometric.utils as pygu
 
 from ligbinddiff.utils.openfold import rigid_utils as ru
 from ligbinddiff.utils.atom_reps import atom14_sidechain_angles, atom14_residue_angles
@@ -342,6 +343,9 @@ def bb_frame_fm_loss(batch,
     scaled_dist_mat_loss = dist_mat_loss / norm_scale * 0.01
     scaled_backbone_mse = backbone_mse / norm_scale * 0.01
 
+    # scaled_dist_mat_loss = dist_mat_loss / (norm_scale ** 2) * 0.01
+    # scaled_backbone_mse = backbone_mse / (norm_scale ** 2) * 0.01
+
     # bb_dihedrals_loss = backbone_dihedrals_loss(
     #     denoised_bb[:, :3],
     #     bb[:, :3],
@@ -370,4 +374,69 @@ def bb_frame_fm_loss(batch,
         # "bb_dihedrals_loss": bb_dihedrals_loss,
         # "bb_conn_mse": bb_conn_lens,
         # "bb_angles_loss": bb_conn_angles
+    }
+
+
+def _radius_of_gyration(rigids: ru.Rigid, batch, mask):
+    trans = rigids.get_trans()
+    nodewise_center = ru.batchwise_center(rigids, batch, mask)
+
+    dev = torch.sum((trans - nodewise_center) ** 2, dim=-1)
+    dev = dev[mask]
+    rg = pygu.scatter(
+        dev,
+        index=batch[mask],
+        dim=0,
+        dim_size=int(batch.max().item()+1),
+        reduce='mean'
+    )
+    return rg
+
+
+def rg_loss(batch,
+            denoiser_outputs,
+            t_max_clip=0.5):
+    res_data = batch['residue']
+    res_mask = res_data['res_mask']
+    noising_mask = res_data['noising_mask']
+    mask = res_mask & noising_mask
+    device = res_mask.device
+
+    denoised_bb_frames = denoiser_outputs['final_rigids'].scale_translation(0.1)
+    bb_frames = ru.Rigid.from_tensor_7(res_data['rigids_1'].to(device)).scale_translation(0.1)
+
+    gt_rg = _radius_of_gyration(bb_frames, res_data.batch, mask)
+    pred_rg = _radius_of_gyration(denoised_bb_frames, res_data.batch, mask)
+
+    rg_diff = torch.square(gt_rg - pred_rg)
+    t = batch['t'].clip(max=t_max_clip)
+
+    loss = rg_diff / ((1 - t)**2)
+    return {
+        "rg_mse": loss
+    }
+
+
+def frame_traj_loss(batch,
+                    denoiser_outputs):
+    res_data = batch['residue']
+    res_mask = res_data['res_mask']
+    noising_mask = res_data['noising_mask']
+    mask = res_mask & noising_mask
+    device = res_mask.device
+
+    bb_frames = ru.Rigid.from_tensor_7(res_data['rigids_1'].to(device))
+    bb_traj = denoiser_outputs['intermediate_rigids']
+
+    gt_X_ca = bb_frames.get_trans()
+    traj_loss = 0
+    # skip the last one since we're already counting it
+    for rigid in bb_traj[:-1]:
+        traj_X_ca = rigid.get_trans()
+        traj_loss += torch.square(traj_X_ca - gt_X_ca).sum(dim=-1)
+
+    traj_loss = _nodewise_to_graphwise(traj_loss, res_data.batch, mask)
+    traj_loss *= 0.01  # Angstroms to nm
+    return {
+        "rigid_traj_loss": traj_loss
     }

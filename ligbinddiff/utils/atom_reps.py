@@ -6,6 +6,8 @@ TODO: generate all constants that are procedurally generated to outputs of gener
 """
 import numpy as np
 
+from ligbinddiff.data.openfold import residue_constants
+
 # i'm roughly using https://physlab.lums.edu.pk/images/f/f6/Franck_ref2.pdf values for now
 # but i should really figure out which reference to use
 van_der_waals_radius = {
@@ -560,6 +562,30 @@ for res_3lt, angles in residue_bond_angles.items():
         angle_idxs.append((idx1, idx2, idx3))
     atom14_residue_angles[res_3lt] = angle_idxs
 
+
+atom14_clash_radius = np.zeros([21, 21, 14, 14])
+atom14_interact_mask = np.zeros([21, 21, 14, 14]).astype(bool)
+for restype_i, atoms_i in restype_name_to_atom14_names.items():
+    radius_i = np.array([
+        residue_constants.van_der_waals_radius[atom[0]]
+        if len(atom) > 0 else float('nan')
+        for atom in atoms_i
+    ])
+    mask_i = np.array([len(atom)>0 for atom in atoms_i])
+    i_idx = residue_constants.resname_to_idx[restype_i]
+    for restype_j, atoms_j in restype_name_to_atom14_names.items():
+        radius_j = np.array([
+            residue_constants.van_der_waals_radius[atom[0]]
+            if len(atom) > 0 else float('nan')
+            for atom in atoms_j
+        ])
+        mask_j = np.array([len(atom)>0 for atom in atoms_j])
+        j_idx = residue_constants.resname_to_idx[restype_j]
+
+        atom14_clash_radius[i_idx][j_idx] = radius_i[..., None] + radius_j[None]
+        atom14_interact_mask[i_idx][j_idx] = mask_i[..., None] & mask_j[None]
+atom14_clash_radius[~atom14_interact_mask] = 0
+assert not np.isnan(atom14_clash_radius).any(), atom14_clash_radius[~atom14_interact_mask]
 
 
 ### Conversion functions

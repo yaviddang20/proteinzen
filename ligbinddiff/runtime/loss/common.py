@@ -152,3 +152,45 @@ def latent_scalar_sidechain_diffusion_loss(batch,
         "latent_denoising_nll": latent_denoising_nll,
         "latent_ref_noise_nll": latent_ref_noise_nll,
     }
+
+
+def latent_scalar_sidechain_fm_loss(batch,
+                                    latent_outputs,
+                                    t_norm_clip=0.9):
+    res_data = batch['residue']
+    x_mask = res_data['res_mask']
+    noising_mask = res_data['noising_mask']
+    total_mask = x_mask & noising_mask
+
+    latent = latent_outputs['latent_sidechain']
+    # latent = latent_outputs['latent_mu']
+    noised_latent = latent_outputs['noised_latent_sidechain']
+    denoised_latent = latent_outputs['pred_latent_sidechain']
+
+    latent_denoising_loss = torch.square(denoised_latent - latent).sum(dim=-1) * total_mask
+    latent_denoising_loss = _nodewise_to_graphwise(latent_denoising_loss, res_data.batch, total_mask)
+
+    t = batch['t']
+    norm_scale = 1 - torch.min(
+        t, torch.as_tensor(t_norm_clip)
+    )
+    latent_fm_loss = latent_denoising_loss / (norm_scale ** 2) * 0.01
+
+    latent_ref_noise = torch.square(noised_latent - latent).sum(dim=-1) * total_mask
+    latent_ref_noise = _nodewise_to_graphwise(latent_ref_noise, res_data.batch, total_mask)
+
+    latent_mu = latent_outputs['latent_mu']
+    latent_logvar = latent_outputs['latent_logvar']
+    latent_denoising_nll = _nll(denoised_latent, latent_mu, latent_logvar)
+    latent_denoising_nll = _nodewise_to_graphwise(latent_denoising_nll, res_data.batch, total_mask)
+
+    latent_ref_noise_nll = _nll(latent, latent_mu, latent_logvar)
+    latent_ref_noise_nll = _nodewise_to_graphwise(latent_ref_noise_nll, res_data.batch, total_mask)
+
+    return {
+        "latent_denoising_loss": latent_denoising_loss,
+        "latent_fm_loss": latent_fm_loss,
+        "latent_ref_noise": latent_ref_noise,
+        "latent_denoising_nll": latent_denoising_nll,
+        "latent_ref_noise_nll": latent_ref_noise_nll,
+    }

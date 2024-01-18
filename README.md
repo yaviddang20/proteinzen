@@ -8,17 +8,16 @@ ligbinddiff
 Substrate-conditioned diffusion for ligand-binding protein generation
 
 ### Requirements
-- pytorch (2.0.1)
+- rdkit
+- pytorch
 - torch_geometric
 - torch_cluster
-- pytorch-lightning (specifically, lightning fabric)
+- torch_scatter
+- lightning
 - biopython
-- jaxtyping
 - hydra-zen
 - pytest
 - e3nn
-- dgl
-- [SE(3)-Transformers as implemented by NVIDIA](https://github.com/NVIDIA/DeepLearningExamples/tree/master/DGLPyTorch/DrugDiscovery/SE3Transformer)
 
 For code-style we use
 - pylint
@@ -26,6 +25,12 @@ For code-style we use
 - isort
 - darglint
 - autoflake
+
+And for visualization
+- matplotlib
+- seaborn
+
+We also include an `environment.yaml` for your convenience.
 
 
 ### Copyright

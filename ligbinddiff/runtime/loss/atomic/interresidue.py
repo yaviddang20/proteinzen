@@ -1,5 +1,6 @@
 from ligbinddiff.data.datasets.featurize.sidechain import _dihedrals
 from ligbinddiff.runtime.loss.atomic.common import atom91_to_atom14, atoms_to_angles, atoms_to_torsions
+from ligbinddiff.utils.atom_reps import atom14_clash_radius, atom14_interact_mask
 
 
 import torch
@@ -76,26 +77,30 @@ def backbone_dihedrals_loss(pred_bb, ref_bb, num_nodes, x_mask, eps=1e-8):
     return _nodewise_to_graphwise(dihedral_diff.flatten(), num_nodes, x_mask_expand)
 
 
-def intersidechain_clash_loss(pred_atom91,
+def intersidechain_clash_loss(pred_atom14,
+                              atom14_mask,
                               seq,
                               edge_index,
-                              num_edges,
-                              x_mask,
-                              clash_dist=2):
+                              edge_batch):
     """ Additional loss to push non-bonded atoms
         out of the van der waals radius of other atoms  """
+    atom14_clash_radius = torch.as_tensor(atom14_clash_radius, device=pred_atom14.device)
 
-    pred_atom14, atom14_mask = atom91_to_atom14(pred_atom91, seq)
-    atom14_mask = atom14_mask.any(dim=-1)
-    atom14_mask[x_mask] = True
+    src = edge_index[1]
+    dst = edge_index[0]
 
-    res_src = pred_atom14[edge_index[0]].unsqueeze(-2)  # n_edge x n_atoms x 1 x 3
-    res_dst = pred_atom14[edge_index[1]].unsqueeze(-3)  # n_edge x 1 x n_atoms x 3
+    res_src = pred_atom14[src].unsqueeze(-2)  # n_edge x n_atoms x 1 x 3
+    res_dst = pred_atom14[dst].unsqueeze(-3)  # n_edge x 1 x n_atoms x 3
 
-    atom14_src_mask = atom14_mask[edge_index[0]].unsqueeze(-1)  # n_edge x n_atom x 1
-    atom14_dst_mask = atom14_mask[edge_index[1]].unsqueeze(-2)  # n_edge x 1 x n_atom
+    atom14_src_mask = atom14_mask[src].unsqueeze(-1)  # n_edge x n_atom x 1
+    atom14_dst_mask = atom14_mask[dst].unsqueeze(-2)  # n_edge x 1 x n_atom
     total_mask = atom14_src_mask | atom14_dst_mask
 
     interres_dists = vec_norm(res_src - res_dst, dim=-1)  # n_edge x n_atoms x n_atoms
-    interres_dists = torch.clip(clash_dist - interres_dists[~total_mask], min=0)
-    return _nodewise_to_graphwise(interres_dists, num_edges, total_mask.flatten(-2, -1), reduction='sum')
+    seq_src = seq[src]
+    seq_dst = seq[dst]
+    clash_dists = atom14_clash_radius[(seq_src, seq_dst)]
+
+    clash_loss = torch.where(interres_dists < clash_dists, clash_dists - interres_dists, 0)
+
+    return _nodewise_to_graphwise(clash_loss, edge_batch, total_mask, reduction='sum')

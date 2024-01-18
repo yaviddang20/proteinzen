@@ -359,6 +359,7 @@ class GraphInvariantPointAttention(nn.Module):
         mask: torch.Tensor,
         _offload_inference: bool = False,
         _z_reference_list: Optional[Sequence[torch.Tensor]] = None,
+        reduce_memory=True,
     ) -> torch.Tensor:
         """
         Args:
@@ -381,6 +382,9 @@ class GraphInvariantPointAttention(nn.Module):
             z = [z]
         n_nodes = s.shape[0]
 
+        src = edge_index[1]
+        dst = edge_index[0]
+
         #######################################
         # Generate scalar and point activations
         #######################################
@@ -391,7 +395,7 @@ class GraphInvariantPointAttention(nn.Module):
         # [N_res, H, C_hidden]
         q = q.view(q.shape[:-1] + (self.no_heads, -1))
         # [N_edge, H, C_hidden]
-        q_src = q[edge_index[1]]
+        q_src = q[src]
 
         # [N_res, H, 2 * C_hidden]
         kv = kv.view(kv.shape[:-1] + (self.no_heads, -1))
@@ -413,7 +417,7 @@ class GraphInvariantPointAttention(nn.Module):
             q_pts.shape[:-2] + (self.no_heads, self.no_qk_points, 3)
         )
         # [N_edge, H, P_q, 3]
-        q_pts_src = q_pts[edge_index[1]]
+        q_pts_src = q_pts[src]
 
         # [N_res, H * (P_q + P_v) * 3]
         kv_pts = self.linear_kv_points(s)
@@ -441,7 +445,7 @@ class GraphInvariantPointAttention(nn.Module):
             z[0] = z[0].cpu()
 
         # [N_edge, H]
-        k_dst = k[edge_index[0]]
+        k_dst = k[dst]
         a = torch.matmul(
             q_src[..., None, :],  # [N_edge, H, 1, C_hidden]
             k_dst[..., :, None],  # [N_edge, H, C_hidden, 1]
@@ -450,7 +454,7 @@ class GraphInvariantPointAttention(nn.Module):
         a += (math.sqrt(1.0 / 3) * b)
 
         # [N_edge, H, P_q, 3]
-        k_pts_dst = k_pts[edge_index[0]]
+        k_pts_dst = k_pts[dst]
         pt_displacement = q_pts_src - k_pts_dst
         pt_att = pt_displacement ** 2
 
@@ -467,12 +471,12 @@ class GraphInvariantPointAttention(nn.Module):
         # [N_edge, H]
         pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
 
-        edge_mask = mask[edge_index[0]] * mask[edge_index[1]]
+        edge_mask = mask[dst] * mask[src]
         edge_mask = self.inf * (edge_mask - 1)
         # [N_edge, H]
         a = a + pt_att
         a = a + edge_mask[..., None]
-        a = pygu.softmax(a, edge_index[1], num_nodes=n_nodes)
+        a = pygu.softmax(a, src, num_nodes=n_nodes)
 
         ################
         # Compute output
@@ -482,7 +486,7 @@ class GraphInvariantPointAttention(nn.Module):
         o = pygu.scatter(
             a[..., None] *  # [N_edge, H]
             v_dst,  # [N_edge, H, C_hidden]
-            edge_index[1],
+            src,
             dim=0,
             dim_size=n_nodes
         )
@@ -494,7 +498,7 @@ class GraphInvariantPointAttention(nn.Module):
         o_pt = pygu.scatter(
             a[..., None, None]  # [N_edge, H, 1, 1]
             * v_pts_dst,  # [N_edge, H, P_v, 3]
-            edge_index[1],
+            src,
             dim=0,
             dim_size=n_nodes
         )
@@ -516,7 +520,7 @@ class GraphInvariantPointAttention(nn.Module):
         o_pair = pygu.scatter(
             a[..., None]  # [N_edge, H, 1]
             * pair_z[..., None, :],  # [N_edge, 1, C_z // 4]
-            edge_index[1],
+            src,
             dim=0,
             dim_size=n_nodes
         )

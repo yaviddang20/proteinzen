@@ -11,7 +11,7 @@
 #$ -l compute_cap=61,gpu_mem=40G
 
 echo "Job ID ${JOB_ID}"
-conda activate binderdiff
+conda activate proteinzen
 
 export CUDA_VISIBLE_DEVICES=$SGE_GPU
 echo $SGE_GPU
