@@ -884,6 +884,8 @@ class Rigid:
         self._rots = rots
         self._trans = trans
 
+        print(self._rots.requires_grad, self._trans.requires_grad)
+
     @staticmethod
     def identity(
         shape: Tuple[int],

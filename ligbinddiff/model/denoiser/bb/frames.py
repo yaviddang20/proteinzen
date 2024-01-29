@@ -9,7 +9,7 @@ from ligbinddiff.model.modules.layers.node.attention import GraphInvariantPointA
 from ligbinddiff.model.modules.layers.lrange.vn import VirtualNodeAttnUpdate, VirtualNodeMPNNUpdate
 
 from ligbinddiff.utils.openfold import rigid_utils as ru
-from ligbinddiff.utils.framediff.all_atom import compute_backbone
+from ligbinddiff.utils.framediff.all_atom import compute_backbone, adjust_oxygen_pos
 
 from ligbinddiff.data.datasets.featurize.common import _node_positional_embeddings
 
@@ -626,7 +626,8 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  self_conditioning=False,
                  graph_conditioning=False,
                  use_anchors=False,
-                 interres_equilibrate=False):
+                 interres_equilibrate=False,
+                 impute_oxy=False):
         super().__init__()
 
         self.c_s = c_s
@@ -638,6 +639,7 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
             assert self_conditioning, "graph conditioning requires self-conditioning"
         self.graph_conditioning = graph_conditioning
         self.n_layers = n_layers
+        self.impute_oxy = impute_oxy
 
         self.h_time = h_time
         self.time_rbf = RBF(n_basis=h_time//2)
@@ -683,7 +685,7 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  num_qk_pts,
                  num_v_pts,
                  self_conditioning=self_conditioning,
-                 last=(i < n_layers-1)
+                 last=(i == n_layers-1)
             )
             for i in range(n_layers)
         ])
@@ -878,7 +880,10 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         ret['intermediate_rigids'] = rigids_history
         ret['final_rigids'] = rigids
         denoised_bb_items = compute_backbone(rigids.unsqueeze(0), psi.unsqueeze(0))
-        denoised_bb = denoised_bb_items[-1].squeeze(0)[:, :5]
+        denoised_bb = denoised_bb_items[-1].squeeze(0)
+        if self.impute_oxy:
+            denoised_bb = adjust_oxygen_pos(denoised_bb, res_mask)
+        denoised_bb = denoised_bb[:, :5]
         ret['denoised_bb'] = denoised_bb
         ret['psi'] = psi
         ret['node_features'] = node_features

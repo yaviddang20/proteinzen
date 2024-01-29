@@ -17,6 +17,8 @@ from ligbinddiff.data.io import utils as du
 from ligbinddiff.data.datasets.featurize.sidechain import featurize_atomic, featurize_density, featurize_cross_scale_atomic
 from ligbinddiff.data.openfold.residue_constants import restype_order_with_x
 
+from ligbinddiff.data.datasets.featurize.molecule import featurize_props
+
 
 class ProteinGraphDataset(data.Dataset):
     '''
@@ -237,3 +239,61 @@ class LengthDataset(data.Dataset):
             "num_res": self.batches[idx],
             "sample_id": self.sample_ids[idx]
         }
+
+
+class GEOMDataset(data.Dataset):
+    def __init__(
+            self,
+            csv_path,
+            subset=None,
+            split=None
+        ):
+        self._log = logging.getLogger(__name__)
+        self.csv_path = csv_path
+        self.subset = subset
+        self.split = split
+        self._init_metadata()
+
+    def _init_metadata(self):
+        """Initialize metadata."""
+
+        # Process CSV with different filtering criterions.
+        pdb_csv = pd.read_csv(self.csv_path)
+        self.raw_csv = pdb_csv
+        if self.subset is not None:
+            if self.subset > 0:
+                pdb_csv = pdb_csv.iloc[:self.subset]
+            elif self.subset < 0:
+                pdb_csv = pdb_csv.iloc[self.subset:]
+
+        if self.split is not None:
+            pdb_csv = pdb_csv[pdb_csv.splits == self.split]
+
+        self.csv = pdb_csv
+
+
+    def _process_csv_row(self, processed_file_path):
+        data_dict = du.read_pkl(processed_file_path)
+        weights = data_dict['boltzmann_weights']
+        rng = np.random.default_rng()
+        conformer_id = rng.choice(
+            a=np.arange(len(weights)),
+            p=np.array(weights) / np.sum(weights)
+        )
+        unprocessed_feats = data_dict['conformer_property_dicts'][int(conformer_id)]
+        graph = featurize_props(unprocessed_feats)
+        graph['rd_mol'] = data_dict['rd_mols']
+
+        return graph
+
+    def __len__(self):
+        return len(self.csv)
+
+    def __getitem__(self, idx):
+        # Sample data example.
+        example_idx = idx
+        csv_row = self.csv.iloc[example_idx]
+        processed_file_path = csv_row['processed_path']
+        mol_feats = self._process_csv_row(processed_file_path)
+        mol_feats['csv_idx'] = torch.ones(1, dtype=torch.long) * idx
+        return mol_feats

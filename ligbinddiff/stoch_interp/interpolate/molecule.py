@@ -5,8 +5,9 @@ from ligbinddiff.model.utils.graph import batchwise_to_nodewise
 
 
 
-def diagonalize(N, edges=[], antiedges=[], a=1, b=0.3, lamb=0., ptr=None):
+def diagonalize(N, edges=[], antiedges=[], a=1, b=0.3, lamb=1e-6, ptr=None):
     J = torch.zeros((N, N), device=edges.device)  # temporary fix
+    edges = edges[:, edges[0] < edges[1]]  # de-duplicate
     for i, j in edges:
         J[i, i] += a
         J[j, j] += a
@@ -15,7 +16,7 @@ def diagonalize(N, edges=[], antiedges=[], a=1, b=0.3, lamb=0., ptr=None):
         J[i, i] -= b
         J[j, j] -= b
         J[i, j] = J[j, i] = b
-    J += torch.diag(lamb)
+    J += torch.diag(torch.ones(N, device=edges.device) * lamb)
     if ptr is None:
         return torch.linalg.eigh(J)
 
@@ -66,14 +67,20 @@ class HarmonicPriorInterpolant:
         t = torch.rand(num_batch, device=self._device)
         return t * (1 - 2 * self.min_t) + self.min_t
 
+    def gen_noising_mask(self, batch):
+        return torch.ones_like(batch['ligand'].batch)
+
     @torch.no_grad()
     def corrupt_batch(self, batch: HeteroData):
         atom_data = batch["ligand"]
+        bond_data = batch["ligand", "bonds", "ligand"]
 
         # [N]
-        atom_mask = atom_data["res_mask"]
-        noising_mask = atom_data["noising_mask"]
-        mask = atom_mask & noising_mask
+        # atom_mask = atom_data["res_mask"]
+        noising_mask = self.gen_noising_mask(batch)
+        atom_data['noising_mask'] = noising_mask
+        # mask = atom_mask & noising_mask
+        mask = noising_mask
 
         # [B]
         if "t" in batch.keys():
@@ -85,11 +92,9 @@ class HarmonicPriorInterpolant:
 
         # Apply corruptions
         atom_pos = atom_data['atom_pos']
-        noised_atoms = self._corrupt_pos(atom_pos, nodewise_t, mask, atom_data.ptr)
-
-        return {
-            "noised_atom_pos": noised_atoms
-        }
+        noised_atoms = self._corrupt_pos(atom_pos, nodewise_t, bond_data.edge_index, mask, atom_data.ptr)
+        atom_data["noised_atom_pos"] = noised_atoms
+        return batch
 
     def _euler_step(self, d_t, t, x_1, x_t):
         x_vf = (x_1 - x_t) / (1 - t)

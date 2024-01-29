@@ -9,12 +9,18 @@ import torch
 import numpy as np
 
 from torch_geometric.data import HeteroData, Batch
+from torch_scatter import scatter_mean
 
 
 from ligbinddiff.tasks import Task
 from ligbinddiff.stoch_interp.interpolate.molecule import HarmonicPriorInterpolant, sample_harmonic_prior
 from ligbinddiff.model.utils.graph import get_data_lens
 from ligbinddiff.runtime.loss.molecular.harmonic import harmonic_fm_loss
+
+
+def batchwise_center(pos, batch):
+    center = scatter_mean(pos, batch, dim=0, dim_size=int(batch.max().item()+1))
+    return pos - center[batch]
 
 
 class HarmonicFlowMatching(Task):
@@ -35,12 +41,14 @@ class HarmonicFlowMatching(Task):
 
     def process_input(self, data: HeteroData):
         data = copy.deepcopy(data)
-        self.se3_noiser.set_device(data['ligand']['atom_pos'].device)
+        atom_data = data['ligand']
+        atom_data['atom_pos'] = batchwise_center(atom_data['atom_pos'], atom_data.batch)
+        self.harmonic_noiser.set_device(atom_data['atom_pos'].device)
         # noise data
         noised_data = self.harmonic_noiser.corrupt_batch(data)
-        data['ligand'].update(noised_data)
+        noised_data['ligand'][self.atom_x_t_key] = batchwise_center(noised_data['ligand'][self.atom_x_t_key], atom_data.batch)
 
-        return data
+        return noised_data
 
     def run_eval(self, model, inputs):
         # TODO: should this be a separate flag?
@@ -64,6 +72,7 @@ class HarmonicFlowMatching(Task):
             inputs['ligand', 'bonds', 'ligand'].edge_index,
             ptr=atom_data.ptr
         )
+        atoms_0 = batchwise_center(atoms_0, atom_data.batch)
 
         # Set-up time
         ts = torch.linspace(self.harmonic_noiser.min_t, 1.0, self.num_timesteps)
@@ -76,7 +85,7 @@ class HarmonicFlowMatching(Task):
             # Run model.
             atom_pos_t_1 = mol_traj[-1]
             atom_data[self.atom_x_t_key] = atom_pos_t_1
-            t = torch.ones(atom_data.num_graphs, device=device) * t_1
+            t = torch.ones(inputs.num_graphs, device=device) * t_1
             inputs["t"] = t
             with torch.no_grad():
                 denoiser_out = model(inputs, self_condition=denoiser_out)
@@ -96,9 +105,9 @@ class HarmonicFlowMatching(Task):
         # We only integrated to min_t, so need to make a final step
         t_1 = ts[-1]
         # Run model.
-        atom_pos_t_1 = mol_traj[-1]
+        atom_pos_t_1 = batchwise_center(mol_traj[-1], atom_data.batch)
         atom_data[self.atom_x_t_key] = atom_pos_t_1
-        t = torch.ones(atom_data.num_graphs, device=device) * t_1
+        t = torch.ones(inputs.num_graphs, device=device) * t_1
         inputs["t"] = t
         with torch.no_grad():
             denoiser_out = model(inputs, self_condition=denoiser_out)
@@ -113,6 +122,14 @@ class HarmonicFlowMatching(Task):
 
         return {
             "samples": clean_traj[-1].split(num_atoms_splits),
+            "clean_trajs": map(
+                torch.stack,
+                zip(*[batch.split(num_atoms_splits) for batch in clean_traj])
+            ),
+            "mol_traj": map(
+                torch.stack,
+                zip(*[batch.split(num_atoms_splits) for batch in mol_traj])
+            ),
             "inputs": inputs
         }
 
@@ -121,7 +138,7 @@ class HarmonicFlowMatching(Task):
             inputs, outputs)
 
         loss = (
-            fm_loss_dict['atom_pos_mse'] / fm_loss_dict['norm_scale']
+            fm_loss_dict['atom_pos_mse'] / fm_loss_dict['fm_norm_scale']
         ).mean()
 
         loss_dict = {"loss": loss}

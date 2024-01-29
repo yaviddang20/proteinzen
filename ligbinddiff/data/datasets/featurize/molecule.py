@@ -78,19 +78,19 @@ max_bond_order = 3
 
 # ordered (featurization, max_value)
 prop_featurization = {
-    "atom_period": ("categorical", max(unique_periods)),
-    "atom_row": ("categorical", max(unique_rows)),
-    "atom_chirality": ("ordinal", 1),
-    "atom_hybridization": ("categorical", len(hybridization)),
-    "atom_implicit_hs": ("ordinal", max_num_bonds),
-    "atom_formal_charge": ("ordinal", 5),
-    "atom_aromatic": None,
-    "atom_ring_props": None,
-    "atom_degree": ("ordinal", max_num_bonds),
-    "bond_order": ("ordinal", max_bond_order),
-    "bond_aromatic": None,
-    "bond_type": "categorical",
-    "bond_conjugated": None,
+    "atom_period": ("categorical", max(unique_periods)),  # 13
+    "atom_row": ("categorical", max(unique_rows)),  # 6
+    "atom_chirality": ("ordinal", 1),  # 1
+    "atom_hybridization": ("categorical", len(hybridization)),  # 5
+    "atom_implicit_hs": ("ordinal", max_num_bonds),  # 1
+    "atom_formal_charge": ("ordinal", 5),  # 1
+    "atom_aromatic": None,  # 1
+    "atom_ring_props": None,  # 7
+    "atom_degree": ("ordinal", max_num_bonds),  # 1
+    "bond_order": ("ordinal", max_bond_order),  # 1
+    "bond_aromatic": None,  # 1
+    "bond_type": "categorical",  # 4
+    "bond_conjugated": None,  # 1
 }
 
 
@@ -240,15 +240,18 @@ def one_hot(cat_feats, max_val):
     one_hot_mat = torch.eye(max_val+1)
     return one_hot_mat[cat_feats]
 
-def featurize_props(mol_props: Dict):
+def featurize_props(mol_props: Dict, center=True):
     mol_props = tree.map_structure(
         torch.as_tensor,
         mol_props
     )
 
     data = HeteroData()
-    data["ligand"].x = mol_props['atom_pos']
-    data["ligand"].atom_pos = mol_props['atom_pos']
+    atom_pos = mol_props['atom_pos']
+    atom_pos = atom_pos - atom_pos.mean(dim=0)[None]
+    data["ligand"].x = atom_pos
+    data["ligand"].atom_pos = atom_pos
+    data["ligand"].atom_mask = torch.ones(atom_pos.shape[0])
     data["ligand", "bonds", "ligand"].edge_index = mol_props["bond_edge_index"].T
 
     for prop, prop_type in prop_featurization.items():
