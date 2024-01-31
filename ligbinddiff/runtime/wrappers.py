@@ -1,5 +1,6 @@
 import logging
 
+import numpy as np
 import torch
 import tree
 import lightning as L
@@ -39,10 +40,19 @@ class LightningWrapper(L.LightningModule):
         outputs = task.run_evals(self.model, batch)
         loss_dict = task.compile_task_losses(batch, outputs)
 
+        stratified_loss = {}
+        for key, loss_value in loss_dict.items():
+            if loss_value.numel() < 2:
+                continue
+            stratified_loss.update(t_stratified_loss(batch['t'], loss_value, loss_name=key))
+
+
         log_dict = tree.map_structure(
             lambda x: torch.mean(x) if torch.is_tensor(x) else x,
             loss_dict
         )
+        log_dict.update(stratified_loss)
+        log_dict = dict(sorted(log_dict.items(), key = lambda x: x[0]))
 
         self.log_dict(
             log_dict,
@@ -52,7 +62,7 @@ class LightningWrapper(L.LightningModule):
             logger=True,
             batch_size=batch.num_graphs,
             sync_dist=True)
-        self._log.info(gen_pbar_str(loss_dict))
+        self._log.info(gen_pbar_str(loss_dict) + ", " + gen_pbar_str(stratified_loss))
         return loss_dict
 
     def validation_step(self, batch, batch_idx):
@@ -144,6 +154,7 @@ class ProteinModule(L.LightningModule):
             lambda x: torch.mean(x) if torch.is_tensor(x) else x,
             loss_dict
         )
+        log_dict.update(stratified_loss)
 
         self.log_dict(
             log_dict,
@@ -231,3 +242,25 @@ class ProteinModule(L.LightningModule):
             self.model.denoiser.parameters()
         )
         return optim_ae, optim_denoiser
+
+
+def t_stratified_loss(batch_t, batch_loss, num_bins=4, loss_name=None):
+    """Stratify loss by binning t."""
+    batch_t = batch_t.numpy(force=True)
+    batch_loss = batch_loss.numpy(force=True)
+    flat_losses = batch_loss.flatten()
+    flat_t = batch_t.flatten()
+    bin_edges = np.linspace(0.0, 1.0 + 1e-3, num_bins+1)
+    bin_idx = np.sum(bin_edges[:, None] <= flat_t[None, :], axis=0) - 1
+    t_binned_loss = np.bincount(bin_idx, weights=flat_losses)
+    t_binned_n = np.bincount(bin_idx)
+    stratified_losses = {}
+    if loss_name is None:
+        loss_name = 'loss'
+    for t_bin in np.unique(bin_idx).tolist():
+        bin_start = bin_edges[t_bin]
+        bin_end = bin_edges[t_bin+1]
+        t_range = f'{loss_name} t=[{bin_start:.2f},{bin_end:.2f})'
+        range_loss = t_binned_loss[t_bin] / t_binned_n[t_bin]
+        stratified_losses[t_range] = range_loss
+    return stratified_losses
