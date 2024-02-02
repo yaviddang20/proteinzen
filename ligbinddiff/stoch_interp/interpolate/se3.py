@@ -100,7 +100,7 @@ class SE3Interpolant:
             assert batch.numel() % sample_len == 0, (
                 f"minibatch OT can only be applied to length batches, "
                 f"but you have {batch.numel()} nodes and sample 0 is length {sample_len}")
-            trans_0 = self._batch_ot(
+            trans_0 = self._trans_batch_ot(
                 trans_0.view(-1, sample_len, 3),
                 trans_1.view(-1, sample_len, 3),
                 res_mask.view(-1, sample_len)
@@ -115,8 +115,7 @@ class SE3Interpolant:
         trans_t = _trans_diffuse_mask(trans_t, trans_1, res_mask)
         return trans_t * res_mask[..., None]
 
-    # TODO: can you do residue-level alignment rather than batch-level alignment?
-    def _batch_ot(self, trans_0, trans_1, res_mask):
+    def _trans_batch_ot(self, trans_0, trans_1, res_mask):
         num_batch, num_res = trans_0.shape[:2]
         noise_idx, gt_idx = torch.where(
             torch.ones(num_batch, num_batch))
@@ -141,10 +140,21 @@ class SE3Interpolant:
         noise_perm, gt_perm = linear_sum_assignment(du.to_numpy(cost_matrix))
         return aligned_nm_0[(tuple(gt_perm), tuple(noise_perm))]
 
-    def _corrupt_rotmats(self, rotmats_1, t, res_mask):
+    def _corrupt_rotmats(self, rotmats_1, t, res_mask, batch):
         num_res = res_mask.shape[0]
         noisy_rotmats = self.igso3.sample(torch.tensor([1.5]), num_res).to(self._device)
         noisy_rotmats = noisy_rotmats.squeeze(0)
+        if self.use_batch_ot:
+            # this requires samples to be length batched
+            sample_len = int((batch == 0).sum().item())
+            assert batch.numel() % sample_len == 0, (
+                f"minibatch OT can only be applied to length batches, "
+                f"but you have {batch.numel()} nodes and sample 0 is length {sample_len}")
+            noisy_rotmats = self._rot_batch_ot(
+                noisy_rotmats.view(-1, sample_len, 3, 3),
+                rotmats_1.view(-1, sample_len, 3, 3),
+                res_mask.view(-1, sample_len))
+            noisy_rotmats = noisy_rotmats.view(-1, 3, 3)
         rotmats_0 = torch.einsum("...ij,...jk->...ik", rotmats_1, noisy_rotmats)
         rotmats_t = so3_utils.geodesic_t(t[..., None], rotmats_1, rotmats_0)
         identity = torch.eye(3, device=self._device)
@@ -152,6 +162,24 @@ class SE3Interpolant:
             ~res_mask[..., None, None]
         )
         return _rots_diffuse_mask(rotmats_t, rotmats_1, res_mask)
+
+    def _rot_batch_ot(self, rot_0, rot_1, res_mask):
+        num_batch, num_res = rot_0.shape[:2]
+        noise_idx, gt_idx = torch.where(
+            torch.ones(num_batch, num_batch))
+        batch_rot_0 = rot_0[noise_idx]
+        batch_rot_1 = rot_1[gt_idx]
+        batch_mask = res_mask[gt_idx]
+
+        cost_matrix = torch.sum(
+            so3_utils.geodesic_dist(batch_rot_0, batch_rot_1), # num_batch ** 2 x num_res x 3 x 3
+            dim=-1
+        ) / torch.sum(batch_mask, dim=-1)  # num_batch ** 2
+        cost_matrix = cost_matrix.view(num_batch, num_batch)
+
+        noise_perm, gt_perm = linear_sum_assignment(du.to_numpy(cost_matrix))
+        batch_rot_0 = batch_rot_0.view(num_batch, num_batch, num_res, 3, 3)
+        return batch_rot_0[(tuple(gt_perm), tuple(noise_perm))]
 
     @torch.no_grad()
     def corrupt_batch(self, batch: HeteroData):
@@ -175,7 +203,7 @@ class SE3Interpolant:
 
         # Apply corruptions
         trans_t = self._corrupt_trans(trans_1, nodewise_t, mask, res_data.batch)
-        rotmats_t = self._corrupt_rotmats(rotmats_1, nodewise_t, mask)
+        rotmats_t = self._corrupt_rotmats(rotmats_1, nodewise_t, mask, res_data.batch)
         rigids_t = ru.Rigid(
             rots=ru.Rotation(rot_mats=rotmats_t), trans=trans_t
         )
