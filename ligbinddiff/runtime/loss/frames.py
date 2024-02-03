@@ -9,7 +9,7 @@ from ligbinddiff.model.utils.graph import batchwise_to_nodewise, get_data_lens
 from .utils import _nodewise_to_graphwise
 from .atomic.common import atom91_to_atom14
 from .atomic.atomic import framediff_local_atomic_context_loss
-from .atomic.interresidue import backbone_dihedrals_loss, chain_constraints_loss
+from .atomic.interresidue import backbone_dihedrals_loss, chain_constraints_loss, bb_clash_loss
 from .openfold import compute_fape
 
 from ligbinddiff.stoch_interp.interpolate import so3_utils as so3_fm_utils
@@ -119,19 +119,19 @@ def angle_axis_rot_score_loss(
     return _nodewise_to_graphwise(rot_loss, batch, res_mask)
 
 
-def angle_axis_rot_cond_v_loss(
-        pred_rot_score,
-        ref_rot_score,
-        data_lens,
-        x_mask):
-    gt_rot_score = ref_rot_score[~x_mask]
-    pred_rot_score = pred_rot_score[~x_mask]
+def angle_axis_rot_vf_loss(
+        pred_rot_vf,
+        ref_rot_vf,
+        batch,
+        res_mask,
+        eps=1e-8):
+    pred_rot_vf = pred_rot_vf
 
-    gt_rot_angle = torch.norm(gt_rot_score, dim=-1, keepdim=True)
-    gt_rot_axis = gt_rot_score / (gt_rot_angle + 1e-6)
+    gt_rot_angle = torch.norm(ref_rot_vf, dim=-1, keepdim=True)
+    gt_rot_axis = ref_rot_vf / (gt_rot_angle + eps)
 
-    pred_rot_angle = torch.norm(pred_rot_score, dim=-1, keepdim=True)
-    pred_rot_axis = pred_rot_score / (pred_rot_angle + 1e-6)
+    pred_rot_angle = torch.norm(pred_rot_vf, dim=-1, keepdim=True)
+    pred_rot_axis = pred_rot_vf / (pred_rot_angle + eps)
 
     # Separate loss on the axis
     axis_loss = torch.square(gt_rot_axis - pred_rot_axis).sum(dim=-1)
@@ -143,7 +143,7 @@ def angle_axis_rot_cond_v_loss(
         dim=-1
     )
     rot_loss = angle_loss + axis_loss
-    return _nodewise_to_graphwise(rot_loss, data_lens, x_mask)
+    return _nodewise_to_graphwise(rot_loss, batch, res_mask)
 
 
 def edge_index_dist_loss(pred_x_ca, ref_x_ca, edge_index, data_lens, x_mask, eps=1e-8):
@@ -275,7 +275,8 @@ def bb_frame_diffusion_loss(batch,
 
 def bb_frame_fm_loss(batch,
                      denoiser_outputs,
-                     t_norm_clip=0.9):
+                     t_norm_clip=0.9,
+                     sep_rot_loss=False):
     res_data = batch['residue']
     res_mask = res_data['res_mask']
     noising_mask = res_data['noising_mask']
@@ -324,8 +325,12 @@ def bb_frame_fm_loss(batch,
     rots_1 = bb_frames.get_rots().get_rot_mats()
     pred_rot_vf = so3_fm_utils.calc_rot_vf(rots_t, rots_1_pred)
     gt_rot_vf = so3_fm_utils.calc_rot_vf(rots_t, rots_1)
-    rot_vf_loss = torch.square(pred_rot_vf - gt_rot_vf).sum(dim=-1) / (nodewise_norm_scale ** 2)
-    rot_vf_loss = _nodewise_to_graphwise(rot_vf_loss, res_data.batch, mask)
+    if sep_rot_loss:
+        rot_vf_loss = angle_axis_rot_vf_loss(pred_rot_vf, gt_rot_vf, res_data.batch, mask)
+    else:
+        rot_vf_loss = torch.square(pred_rot_vf - gt_rot_vf).sum(dim=-1)
+        rot_vf_loss = _nodewise_to_graphwise(rot_vf_loss, res_data.batch, mask)
+    rot_vf_loss = rot_vf_loss / (norm_scale ** 2)
 
     trans_1_pred = denoised_bb_frames.get_trans()
     trans_1 = bb_frames.get_trans()
@@ -340,9 +345,15 @@ def bb_frame_fm_loss(batch,
         res_mask
     )
 
+    # this seems to work well
     scaled_dist_mat_loss = dist_mat_loss / norm_scale * 0.01
     scaled_backbone_mse = backbone_mse / norm_scale * 0.01
 
+    # testing this
+    # scaled_dist_mat_loss = dist_mat_loss * 0.01
+    # scaled_backbone_mse = backbone_mse * 0.01
+
+    # this does not work well
     # scaled_dist_mat_loss = dist_mat_loss / (norm_scale ** 2) * 0.01
     # scaled_backbone_mse = backbone_mse / (norm_scale ** 2) * 0.01
 
@@ -439,4 +450,31 @@ def frame_traj_loss(batch,
     traj_loss *= 0.01  # Angstroms to nm
     return {
         "rigid_traj_loss": traj_loss
+    }
+
+
+def bb_frame_clash_loss(batch,
+                        denoiser_outputs,
+                        t_norm_clip=0.9,
+                        loss_clip=50):
+    res_data = batch['residue']
+    res_mask = res_data['res_mask']
+    noising_mask = res_data['noising_mask']
+    mask = res_mask & noising_mask
+
+    denoised_bb = denoiser_outputs['denoised_bb']
+    clash_loss = bb_clash_loss(
+        denoised_bb,
+        mask,
+        res_data.batch
+    )
+    t = batch['t']
+    norm_scale = 1 - torch.min(
+        t, torch.as_tensor(t_norm_clip)
+    )
+    scaled_clash_loss = clash_loss.clip(max=loss_clip) / norm_scale
+
+    return {
+        "bb_clash_loss": clash_loss,
+        "scaled_bb_clash_loss": scaled_clash_loss
     }

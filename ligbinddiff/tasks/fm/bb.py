@@ -14,7 +14,8 @@ from ligbinddiff.utils.openfold import rigid_utils as ru
 from ligbinddiff.tasks import Task
 from ligbinddiff.model.utils.graph import batchwise_to_nodewise
 
-from ligbinddiff.runtime.loss.frames import bb_frame_fm_loss, rg_loss, frame_traj_loss
+from ligbinddiff.runtime.loss.frames import bb_frame_fm_loss, rg_loss, frame_traj_loss, bb_frame_clash_loss
+from ligbinddiff.runtime.loss.atomic.hbond import bb_hbond_loss
 from ligbinddiff.stoch_interp.interpolate.se3 import SE3Interpolant, _centered_gaussian, _uniform_so3
 import ligbinddiff.stoch_interp.interpolate.utils as du
 from ligbinddiff.utils.framediff import all_atom
@@ -28,12 +29,14 @@ class BackboneFrameInterpolation(Task):
 
     def __init__(self,
                  se3_noiser: SE3Interpolant,
-                 aux_loss_t_min=0.75,
-                 rigid_traj_loss=False):
+                 aux_loss_t_min=0.25,
+                 rigid_traj_loss=False,
+                 sep_rot_loss=False):
         super().__init__()
         self.se3_noiser = se3_noiser
         self.aux_loss_t_min = aux_loss_t_min
         self.rigid_traj_loss = rigid_traj_loss
+        self.sep_rot_loss = sep_rot_loss
 
     def gen_diffuse_mask(self, data: HeteroData):
         return torch.ones_like(data['res_mask']).bool()
@@ -176,7 +179,7 @@ class BackboneFrameInterpolation(Task):
 
         # Convert trajectories to atom37.
         atom37_traj = all_atom.transrotpsi_to_atom37(prot_traj, res_data.res_mask)
-        clean_atom37_traj = all_atom.transrotpsi_to_atom37(clean_traj, res_data.res_mask)
+        clean_atom37_traj = all_atom.transrotpsi_to_atom37(clean_traj, res_data.res_mask, impute_oxy=False)
 
         return {
             "samples": clean_atom37_traj[-1][..., (0, 1, 2, 4, 3), :].split(num_res),
@@ -185,15 +188,24 @@ class BackboneFrameInterpolation(Task):
 
     def compute_loss(self, inputs, outputs: Dict):
         bb_frame_diffusion_loss_dict = bb_frame_fm_loss(
-            inputs, outputs)
+            inputs, outputs, sep_rot_loss=self.sep_rot_loss)
+        # bb_frame_clash_loss_dict = bb_frame_clash_loss(
+        #     inputs, outputs
+        # )
+        # bb_hbond_loss_dict = bb_hbond_loss(
+        #     inputs, outputs
+        # )
         # rg_loss_dict = rg_loss(inputs, outputs)
         bb_denoising_loss = (
             bb_frame_diffusion_loss_dict["trans_vf_loss"] * 2 +
             bb_frame_diffusion_loss_dict["rot_vf_loss"]
         )
+
         bb_denoising_finegrain_loss = (
             bb_frame_diffusion_loss_dict["scaled_pred_bb_mse"]
             + bb_frame_diffusion_loss_dict["scaled_dist_mat_loss"]
+            # + bb_frame_clash_loss_dict["scaled_bb_clash_loss"]
+            # + torch.stack(list(bb_hbond_loss_dict.values())).sum(dim=0)
         ) * (inputs['t'] > self.aux_loss_t_min)
 
         if self.rigid_traj_loss and "intermediate_rigids" in outputs:
@@ -216,6 +228,8 @@ class BackboneFrameInterpolation(Task):
 
         loss_dict = {"loss": loss, "frameflow_loss": ff_loss}
         loss_dict.update(bb_frame_diffusion_loss_dict)
+        # loss_dict.update(bb_frame_clash_loss_dict)
+        # loss_dict.update(bb_hbond_loss_dict)
         if self.rigid_traj_loss and "intermediate_rigids" in outputs:
             loss_dict.update(traj_loss_dict)
         # loss_dict.update(rg_loss_dict)

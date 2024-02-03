@@ -16,7 +16,6 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 import wandb
 
 from ligbinddiff.runtime.config import config_hydra_store, remove_zen_keys
-from ligbinddiff.runtime.wrappers import LightningWrapper
 from ligbinddiff.tasks.task import single_task_sampler
 
 
@@ -44,16 +43,16 @@ class Experiment:
                 **remove_zen_keys(self._exp_cfg.wandb),
             )
 
-            # Checkpoint directory.
-            ckpt_dir = self._exp_cfg.checkpointer.dirpath
-            os.makedirs(ckpt_dir, exist_ok=True)
-            log.info(f"Checkpoints saved to {ckpt_dir}")
+        # Checkpoint directory.
+        ckpt_dir = self._exp_cfg.checkpointer.dirpath
+        os.makedirs(ckpt_dir, exist_ok=True)
+        log.info(f"Checkpoints saved to {ckpt_dir}")
 
-            # Model checkpoints
-            callbacks.append(
-                ModelCheckpoint(
-                    **remove_zen_keys(self._exp_cfg.checkpointer)
-            ))
+        # Model checkpoints
+        callbacks.append(
+            ModelCheckpoint(
+                **remove_zen_keys(self._exp_cfg.checkpointer)
+        ))
 
         if torch.cuda.is_available():
             devices = list(range(torch.cuda.device_count()))
@@ -90,6 +89,7 @@ class Experiment:
 
 def main(model,
          corrupter,
+         lmodule,
          datamodule,
          experiment,
          tasks,
@@ -100,7 +100,8 @@ def main(model,
 
     # datamodule and optim are all partial'd __init__s
     # so we instantiate instances of each
-    model = LightningWrapper(model, experiment['optim'])
+    model = lmodule(model, experiment['optim'])
+    os.makedirs(model.val_dir, exist_ok=True)
     task_sampler = single_task_sampler(tasks(corrupter))
     datamodule_inst = datamodule(task_sampler=task_sampler)
     exp = Experiment(

@@ -1,0 +1,61 @@
+#!/bin/bash
+#$ -S /bin/bash
+#$ -o tmp.log
+#$ -j y
+#$ -r y
+#$ -cwd
+#$ -q gpu.q
+#$ -pe smp 1
+#$ -l mem_free=32G
+#$ -l h_rt=4:00:00
+#$ -l compute_cap=61,gpu_mem=40G
+
+export CUDA_VISIBLE_DEVICES=$SGE_GPU
+echo $SGE_GPU
+echo $CUDA_VISIBLE_DEVICES
+
+ROOT_DIR=$PWD
+cd $1
+RUN_DIR=$PWD
+cd $ROOT_DIR
+
+EPOCH=$2
+OUTPREFIX=$3
+
+## generate samples
+conda activate proteinzen
+
+python predict.py --run_dir=$RUN_DIR --epoch=$EPOCH --out_prefix=$OUTPREFIX
+
+## sample with ProteinMPNN
+cd ~/software/ProteinMPNN/scripts
+conda activate proteinmpnn
+
+folder_with_pdbs=${RUN_DIR}/$OUTPREFIX
+
+output_dir=${folder_with_pdbs}
+if [ ! -d $output_dir ]
+then
+    mkdir -p $output_dir
+fi
+
+path_for_parsed_chains=$output_dir"/parsed_pdbs.jsonl"
+
+python ../helper_scripts/parse_multiple_chains.py --input_path=$folder_with_pdbs --output_path=$path_for_parsed_chains
+
+python ../protein_mpnn_run.py \
+        --jsonl_path $path_for_parsed_chains \
+        --out_folder $output_dir \
+        --num_seq_per_target 8 \
+        --sampling_temp "0.1" \
+        --batch_size 1
+
+## submit ESMFold
+cd $RUN_DIR
+cd $OUTPREFIX
+mkdir esmfold
+cd esmfold
+bash ~/projects/ligbinddiff/scripts/analysis/esmfold.sh > esmfold.log
+conda activate proteinzen
+python ~/projects/ligbinddiff/scripts/analysis/esm_analysis.py --esmlog esmfold.log --folded_folder $PWD --samples ../ | tail -n 1 > ${RUN_DIR}/num_designable.txt
+

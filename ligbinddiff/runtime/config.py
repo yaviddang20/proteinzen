@@ -5,15 +5,17 @@ import omegaconf
 from lightning import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
 
-from ligbinddiff.data.datasets.datamodule import ProteinDataModule, FramediffDataModule
+from ligbinddiff.data.datasets.datamodule import ProteinDataModule, FramediffDataModule, GeomDataModule
 
 from ligbinddiff.diffusion.noisers.se3_diffuser import SE3Diffuser
 from ligbinddiff.diffusion.noisers.latent import SidechainDiffuser
 from ligbinddiff.stoch_interp.interpolate.se3 import SE3Interpolant, SE3InterpolantConfig
 from ligbinddiff.stoch_interp.interpolate.protein import ProteinInterpolant
+from ligbinddiff.stoch_interp.interpolate.molecule import HarmonicPriorInterpolant
 
 from ligbinddiff.model.denoiser.bb.frames import GraphIpaFrameDenoiser, DynamicGraphIpaFrameDenoiser
 from ligbinddiff.model.denoiser.sidechain.ipmp_latent import IPMPDenoiser
+from ligbinddiff.model.denoiser.molecule.tfn import MoleculeDenoiser
 from ligbinddiff.stoch_interp.flow_matchers.frames import GraphFrameFlow
 
 from ligbinddiff.model.design.ipmp import IPMPEncoder, IPMPDecoder
@@ -21,11 +23,13 @@ from ligbinddiff.model.autoencoder.ipa import IPAEncoder, IPADecoder
 from ligbinddiff.model.wrappers.sidechain import IPMPLatentSidechainWrapper, IPALatentSidechainWrapper, DensityLatentSidechainWrapper
 from ligbinddiff.model.wrappers.protein import IPMPLatentWrapper
 
-
 from ligbinddiff.tasks.diffusion.bb import BackboneFrameNoising
 from ligbinddiff.tasks.diffusion.sidechain import DesignLatentSidechainNoising
 from ligbinddiff.tasks.fm.bb import BackboneFrameInterpolation
 from ligbinddiff.tasks.fm.protein import ProteinInterpolation
+from ligbinddiff.tasks.fm.molecule import HarmonicFlowMatching
+
+from ligbinddiff.runtime.lmod import BackboneModule, SidechainModule, ProteinModule, MoleculeModule
 
 from ligbinddiff.runtime.optim import get_std_opt
 
@@ -63,6 +67,7 @@ def config_hydra_store():
     domain_store({"domain": "backbone"}, name="bb")
     domain_store({"domain": "sidechain"}, name="sidechain")
     domain_store({"domain": "protein"}, name="protein")
+    domain_store({"domain": "molecule"}, name="molecule")
 
     corruption_store = store(group="corrupter")
     corruption_store(
@@ -80,6 +85,9 @@ def config_hydra_store():
         ProteinInterpolant,
         se3_cfg=builds(SE3InterpolantConfig),
         name="fm_protein")
+    corruption_store(
+        HarmonicPriorInterpolant,
+        name="fm_molecule")
 
     datamodule_store = store(group="datamodule")
     datamodule_store(
@@ -106,12 +114,39 @@ def config_hydra_store():
             num_workers=4
         ),
         name="frameflow")
+    datamodule_store(
+        pbuilds(
+            GeomDataModule,
+            data_dir="/wynton/home/kortemme/alexjli/projects/ligbinddiff/data/geom_drugs",
+            batch_size=3000,
+            num_workers=4
+        ),
+        name="geom")
+
+    lmodule_store = store(group="lmodule")
+    lmodule_store(
+        pbuilds(BackboneModule),
+        name="bb"
+    )
+    lmodule_store(
+        pbuilds(SidechainModule),
+        name="sidechain"
+    )
+    lmodule_store(
+        pbuilds(MoleculeModule),
+        name="molecule"
+    )
+    lmodule_store(
+        pbuilds(ProteinModule),
+        name="protein"
+    )
 
     model_store = store(group="model")
     model_store(GraphIpaFrameDenoiser, name="diffusion_bb")
     # model_store(GraphIpaFrameDenoiser, name="fm_bb")
     model_store(DynamicGraphIpaFrameDenoiser, name="fm_bb")
     model_store(IPMPLatentWrapper, name="fm_protein")
+    model_store(MoleculeDenoiser, name="fm_molecule")
     # model_store(
     #     DensityLatentSidechainWrapper,
     #     name="diffusion_sidechain")
@@ -127,13 +162,21 @@ def config_hydra_store():
     task_store(pbuilds(DesignLatentSidechainNoising), name="diffusion_sidechain")
     task_store(pbuilds(BackboneFrameInterpolation), name="fm_bb")
     task_store(pbuilds(ProteinInterpolation), name="fm_protein")
+    task_store(pbuilds(HarmonicFlowMatching), name="fm_molecule")
 
     exp_store = store(group="experiment")
     exp_store({
         "warm_start": None,
     }, name="default")
     lightning_store = exp_store(group="experiment/lightning")
-    lightning_store(pbuilds(Trainer), name="default")
+    lightning_store(
+        pbuilds(
+            Trainer,
+            min_epochs=1,
+            max_epochs=-1,
+            check_val_every_n_epoch=1,
+            log_every_n_steps=50,
+        ), name="default")
 
     optim_store = exp_store(group="experiment/optim")
     optim_store(pbuilds(torch.optim.Adam, lr=1e-4), name="adam")
@@ -143,10 +186,28 @@ def config_hydra_store():
         pbuilds(
             ModelCheckpoint,
             dirpath="ckpt",
-            every_n_train_steps=50,
+            every_n_epochs=1,
+            save_on_train_epoch_end=False,
+            save_last=True,
+            save_top_k=3,
+            monitor="valid/non_coil_percent",
+            mode="max"
         ),
         group="experiment/checkpointer",
-        name="default")
+        name="bb")
+    exp_store(
+        pbuilds(
+            ModelCheckpoint,
+            dirpath="ckpt",
+            every_n_epochs=1,
+            save_on_train_epoch_end=False,
+            save_last=True,
+            save_top_k=3,
+            monitor="valid/conf_min_rmsd",
+            mode="max"
+        ),
+        group="experiment/checkpointer",
+        name="molecule")
 
     exp_store(
         {"offline": True},
@@ -162,13 +223,14 @@ def config_hydra_store():
             {"paradigm": "diffusion"},
             {"domain": "bb"},
             {"datamodule": "cath"},
+            {"lmodule": "${domain}"},
             {"corrupter": "${paradigm}_${domain}"},
             {"model": "${paradigm}_${domain}"},
             {"tasks": "${paradigm}_${domain}"},
             {"experiment": "default"},
             {"experiment/optim": "adam"},
             {"experiment/lightning": "default"},
-            {"experiment/checkpointer": "default"},
+            {"experiment/checkpointer": "${domain}"},
             {"experiment/wandb": "default"},
             '_self_'
         ],
