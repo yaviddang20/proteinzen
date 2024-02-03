@@ -296,10 +296,9 @@ class MoleculeModule(L.LightningModule):
             outputs = task.run_predicts(self.model, batch)
             samples = outputs['samples']
             clean_trajs = outputs['clean_trajs']
-            mol_trajs = outputs['mol_trajs']
             rd_mols = batch['rd_mol']
             log_metrics = []
-            for idx, (sample, clean_traj, mol_traj, rd_mol_list) in enumerate(zip(samples, clean_trajs, mol_trajs, rd_mols)):
+            for idx, (sample, clean_traj, rd_mol_list) in enumerate(zip(samples, clean_trajs, rd_mols)):
                 # "copying" a molecule
                 sample_mol = Chem.MolFromSmiles(Chem.MolToSmiles(rd_mol_list[0]))
                 sample_mol = Chem.AddHs(sample_mol)
@@ -334,7 +333,7 @@ class MoleculeModule(L.LightningModule):
                 rmslist = []
                 AllChem.AlignMolConformers(all_confs_mol, RMSlist=rmslist)
 
-                # write the clean trajectory to a PDB file
+                # write the trajectory to a PDB file
                 traj_len = clean_traj.shape[0]
                 out_path = os.path.join(
                     self.val_dir,
@@ -342,25 +341,9 @@ class MoleculeModule(L.LightningModule):
                 )
                 with open(out_path, 'w') as fp:
                     sample_conf = sample_mol.GetConformer(0)
-                    for traj_idx in range(traj_len):
+                    for idx in range(traj_len):
                         for atom_idx in range(sample.shape[0]):
-                            atom_coord = clean_traj[traj_idx][atom_idx]
-                            point = rdGeometry.Point3D(*atom_coord.tolist())
-                            sample_conf.SetAtomPosition(atom_idx, point)
-                        fp.write("MODEL" + "".join([" "] * 8) + f"{idx}\n")
-                        fp.write(Chem.MolToPDBBlock(sample_mol, flavor=1))
-                        fp.write(f"ENDMDL\n")
-                # write the mol trajectory to a PDB file
-                traj_len = mol_traj.shape[0]
-                out_path = os.path.join(
-                    self.val_dir,
-                    f"sample_{idx}_mol_traj.pdb"
-                )
-                with open(out_path, 'w') as fp:
-                    sample_conf = sample_mol.GetConformer(0)
-                    for traj_idx in range(traj_len):
-                        for atom_idx in range(sample.shape[0]):
-                            atom_coord = mol_traj[traj_idx][atom_idx]
+                            atom_coord = clean_traj[idx][atom_idx]
                             point = rdGeometry.Point3D(*atom_coord.tolist())
                             sample_conf.SetAtomPosition(atom_idx, point)
                         fp.write("MODEL" + "".join([" "] * 8) + f"{idx}\n")
@@ -417,10 +400,9 @@ class MoleculeModule(L.LightningModule):
             outputs = task.run_predicts(self.model, batch)
             samples = outputs['samples']
             clean_trajs = outputs['clean_trajs']
-            mol_trajs = outputs['mol_trajs']
             rd_mols = batch['rd_mol']
             log_metrics = []
-            for idx, (sample, clean_traj, mol_traj, rd_mol_list) in enumerate(zip(samples, clean_trajs, mol_trajs, rd_mols)):
+            for idx, (sample, clean_traj, rd_mol_list) in enumerate(zip(samples, clean_trajs, rd_mols)):
                 # "copying" a molecule
                 sample_mol = Chem.MolFromSmiles(Chem.MolToSmiles(rd_mol_list[0]))
                 sample_mol = Chem.AddHs(sample_mol)
@@ -455,7 +437,7 @@ class MoleculeModule(L.LightningModule):
                 rmslist = []
                 AllChem.AlignMolConformers(all_confs_mol, RMSlist=rmslist)
 
-                # write the clean trajectory to a PDB file
+                # write the trajectory to a PDB file
                 traj_len = clean_traj.shape[0]
                 out_path = os.path.join(
                     self.val_dir,
@@ -463,25 +445,9 @@ class MoleculeModule(L.LightningModule):
                 )
                 with open(out_path, 'w') as fp:
                     sample_conf = sample_mol.GetConformer(0)
-                    for traj_idx in range(traj_len):
+                    for idx in range(traj_len):
                         for atom_idx in range(sample.shape[0]):
-                            atom_coord = clean_traj[traj_idx][atom_idx]
-                            point = rdGeometry.Point3D(*atom_coord.tolist())
-                            sample_conf.SetAtomPosition(atom_idx, point)
-                        fp.write("MODEL" + "".join([" "] * 8) + f"{idx}\n")
-                        fp.write(Chem.MolToPDBBlock(sample_mol, flavor=1))
-                        fp.write(f"ENDMDL\n")
-                # write the mol trajectory to a PDB file
-                traj_len = mol_traj.shape[0]
-                out_path = os.path.join(
-                    self.val_dir,
-                    f"sample_{idx}_mol_traj.pdb"
-                )
-                with open(out_path, 'w') as fp:
-                    sample_conf = sample_mol.GetConformer(0)
-                    for traj_idx in range(traj_len):
-                        for atom_idx in range(sample.shape[0]):
-                            atom_coord = mol_traj[traj_idx][atom_idx]
+                            atom_coord = clean_traj[idx][atom_idx]
                             point = rdGeometry.Point3D(*atom_coord.tolist())
                             sample_conf.SetAtomPosition(atom_idx, point)
                         fp.write("MODEL" + "".join([" "] * 8) + f"{idx}\n")

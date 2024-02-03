@@ -48,10 +48,8 @@ def _diffuse_mask(trans_t, trans_1, diffuse_mask):
 
 class HarmonicPriorInterpolant:
     def __init__(self,
-                 min_t=1e-2,
-                 prior_scale=1):
+                 min_t=1e-2):
         self.min_t = min_t
-        self.prior_scale = prior_scale
 
     def set_device(self, device):
         self._device = device
@@ -60,7 +58,6 @@ class HarmonicPriorInterpolant:
         pos_0 = sample_harmonic_prior(
             pos_1.shape[0],
             edge_index,
-            sigma=self.prior_scale,
             ptr=ptr)
         pos_t = (1 - t[..., None]) * pos_0 + t[..., None] * pos_1
         pos_t = _diffuse_mask(pos_t, pos_1, pos_mask)
@@ -71,7 +68,7 @@ class HarmonicPriorInterpolant:
         return t * (1 - 2 * self.min_t) + self.min_t
 
     def gen_noising_mask(self, batch):
-        return torch.ones_like(batch['ligand'].batch).bool()
+        return torch.ones_like(batch['ligand'].batch)
 
     @torch.no_grad()
     def corrupt_batch(self, batch: HeteroData):

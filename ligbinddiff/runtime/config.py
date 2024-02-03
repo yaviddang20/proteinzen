@@ -173,7 +173,6 @@ def config_hydra_store():
         pbuilds(
             Trainer,
             min_epochs=1,
-            max_epochs=-1,
             check_val_every_n_epoch=1,
             log_every_n_steps=50,
         ), name="default")

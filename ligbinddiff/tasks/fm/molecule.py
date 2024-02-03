@@ -126,7 +126,7 @@ class HarmonicFlowMatching(Task):
                 torch.stack,
                 zip(*[batch.split(num_atoms_splits) for batch in clean_traj])
             ),
-            "mol_trajs": map(
+            "mol_traj": map(
                 torch.stack,
                 zip(*[batch.split(num_atoms_splits) for batch in mol_traj])
             ),
@@ -138,10 +138,8 @@ class HarmonicFlowMatching(Task):
             inputs, outputs)
 
         loss = (
-            fm_loss_dict['atom_pos_mse']
-            + fm_loss_dict['atom_pos_traj_mse']
-        ).mean() / 10  # scaling factor for stability
-
+            fm_loss_dict['atom_pos_mse'] / fm_loss_dict['fm_norm_scale']
+        ).mean()
 
         loss_dict = {"loss": loss}
         loss_dict.update(fm_loss_dict)
