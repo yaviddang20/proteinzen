@@ -89,7 +89,7 @@ prop_featurization = {
     "atom_degree": ("ordinal", max_num_bonds),  # 1
     "bond_order": ("ordinal", max_bond_order),  # 1
     "bond_aromatic": None,  # 1
-    "bond_type": "categorical",  # 4
+    "bond_type": ("categorical", max(bonds.values())),  # 4
     "bond_conjugated": None,  # 1
 }
 
@@ -197,9 +197,9 @@ def conformer_props(conformer, smiles, implicit_H=True):
             bond_conjugated.append(bond.GetIsConjugated())
             bond_type.append(
                 safe_lookup(
-                    bonds[bond.GetBondType()],
-                    bond_type,
-                    default=len(bond_type)
+                    bond.GetBondType(),
+                    bonds,
+                    default=0
                 )
             )
 
@@ -251,7 +251,7 @@ def featurize_props(mol_props: Dict, center=True):
     atom_pos = atom_pos - atom_pos.mean(dim=0)[None]
     data["ligand"].x = atom_pos
     data["ligand"].atom_pos = atom_pos
-    data["ligand"].atom_mask = torch.ones(atom_pos.shape[0])
+    data["ligand"].atom_mask = torch.ones(atom_pos.shape[0]).bool()
     data["ligand", "bonds", "ligand"].edge_index = mol_props["bond_edge_index"].T
 
     for prop, prop_type in prop_featurization.items():
