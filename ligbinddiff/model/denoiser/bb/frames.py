@@ -685,7 +685,9 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  num_qk_pts,
                  num_v_pts,
                  self_conditioning=self_conditioning,
-                 last=(i == n_layers-1)
+                 last=True
+                 # last=(i == n_layers-1)
+                 # last=(i < n_layers-1)
             )
             for i in range(n_layers)
         ])

@@ -34,7 +34,7 @@ def keep_smiles(smiles):
 
     return True
 
-def process(smiles_fp, out_folder, splits=None):
+def process(smiles_fp, out_folder, splits=None, include_h=False):
     with open(smiles_fp, 'rb') as fp:
         data = pickle.load(fp)
     smiles = data['smiles']
@@ -47,7 +47,7 @@ def process(smiles_fp, out_folder, splits=None):
         rd_mols = []
         for conf_data in data['conformers']:
             boltzmann_weights.append(conf_data['boltzmannweight'])
-            conf_prop_dicts.append(conformer_props(conf_data['rd_mol'].GetConformer(), smiles))
+            conf_prop_dicts.append(conformer_props(conf_data['rd_mol'].GetConformer(), implicit_H=(not include_h)))
             rd_mols.append(conf_data['rd_mol'])
     except Exception as e:
         print(smiles)
@@ -86,12 +86,13 @@ if __name__ == '__main__':
     parser.add_argument("--data")
     parser.add_argument("--out_folder")
     parser.add_argument("--num_proc", default=1, type=int)
+    parser.add_argument("--include_h", default=False, action="store_true")
     parser.add_argument("--splits", default=None)
     args = parser.parse_args()
 
     files = list(glob.glob(os.path.join(args.data, "*.pickle")))
 
-    process_fn = partial(process, out_folder=args.out_folder, splits=args.splits)
+    process_fn = partial(process, out_folder=args.out_folder, splits=args.splits, include_h=args.include_h)
     if args.num_proc > 1:
         with mp.Pool(args.num_proc) as pool:
             all_metadata = list(tqdm.tqdm(pool.imap(process_fn, files), total=len(files)))

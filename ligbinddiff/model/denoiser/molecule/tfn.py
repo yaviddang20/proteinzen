@@ -54,7 +54,7 @@ class EdgeUpdate(nn.Module):
         return edge_features
 
 
-class RefineLayer(nn.Module):
+class TensorConvLayer(nn.Module):
     def __init__(self,
                  feat_irreps,
                  sh_irreps,
@@ -73,7 +73,7 @@ class RefineLayer(nn.Module):
         self.fc = nn.Sequential(
             nn.Linear(h_edge, h_edge),
             nn.ReLU(),
-            Linear(h_edge, self.tp.weight_numel, init='final')
+            Linear(h_edge, self.tp.weight_numel)#, init='final')
         )
         self.norm = BatchNorm(feat_irreps)
 
@@ -112,6 +112,48 @@ class RefineLayer(nn.Module):
             )
 
         return out, edge_features
+
+class RefineLayer(nn.Module):
+    def __init__(self,
+                 feat_irreps,
+                 sh_irreps,
+                 h_edge,
+                 n_layers=3):
+        super().__init__()
+        self.feat_irreps = feat_irreps
+        self.sh_irreps = sh_irreps
+
+        self.spatial_tpc = nn.ModuleList(
+            [
+                TensorConvLayer(
+                    feat_irreps, sh_irreps, h_edge
+                )
+            for _ in range(n_layers)
+            ]
+        )
+        self.bond_tpc = nn.ModuleList(
+            [
+                TensorConvLayer(
+                    feat_irreps, sh_irreps, h_edge, update_edge=True
+                )
+            for _ in range(n_layers)
+            ]
+        )
+
+    def forward(self,
+                atom_features,
+                bond_features,
+                bond_sh,
+                bond_edge_index,
+                spatial_features,
+                spatial_sh,
+                spatial_edge_index):
+        for bond_tpc, spatial_tpc in zip(self.bond_tpc, self.spatial_tpc):
+            atom_features, bond_features = bond_tpc(atom_features, bond_features, bond_sh, bond_edge_index)
+            atom_features, _ = spatial_tpc(atom_features, spatial_features, spatial_sh, spatial_edge_index)
+
+        return atom_features, bond_features
+
 
 
 class MoleculeDenoiser(nn.Module):
@@ -153,13 +195,12 @@ class MoleculeDenoiser(nn.Module):
             nn.Linear(edge_hidden, edge_hidden),
             nn.LayerNorm(edge_hidden),
         )
-        self.refine_bonds = nn.ModuleList(
+        self.refine_layers = nn.ModuleList(
             [
                 RefineLayer(
                     feat_irreps=self.feat_irreps,
                     sh_irreps=self.sh_irreps,
                     h_edge=edge_hidden,
-                    update_edge=True
                 )
                 for _ in range(n_layers)
             ]
@@ -183,16 +224,6 @@ class MoleculeDenoiser(nn.Module):
                 for _ in range(n_layers)
             ]
         )
-        self.refine_spatial = nn.ModuleList(
-            [
-                RefineLayer(
-                    feat_irreps=self.feat_irreps,
-                    sh_irreps=self.sh_irreps,
-                    h_edge=edge_hidden,
-                )
-                for _ in range(n_layers)
-            ]
-        )
         self.pos_update = nn.ModuleList(
             [
                 o3.Linear(self.feat_irreps, "1x1e")
@@ -209,9 +240,9 @@ class MoleculeDenoiser(nn.Module):
             ]
         )
 
-        # with torch.no_grad():
-        #     for o3_lin in self.pos_update:
-        #         o3_lin.weight.fill_(0.)
+        with torch.no_grad():
+            for o3_lin in self.pos_update:
+                o3_lin.weight.fill_(0.)
         # for o3_lin in self.pos_update:
         #     o3_lin.weight.requires_grad = True
 
@@ -283,9 +314,7 @@ class MoleculeDenoiser(nn.Module):
         elif self.self_conditioning:
             spatial_edge_features = F.pad(spatial_edge_features, (0, self.n_rbf))
 
-
         return spatial_edge_features, spatial_edge_index
-
 
     def forward(self, data, self_condition=None, eps=1e-6):
         atom_pos, atom_features, bond_features, bond_edge_index = self._prep_features(data)
@@ -301,8 +330,8 @@ class MoleculeDenoiser(nn.Module):
 
         atom_traj = []
 
-        for bond_layer, bond_lin, embed_spatial_edge, spatial_layer, pos_update, pos_gate in zip(
-            self.refine_bonds, self.bond_linears, self.embed_spatial_edge, self.refine_spatial, self.pos_update, self.pos_gate
+        for refine_layer, bond_lin, embed_spatial_edge, pos_update, pos_gate in zip(
+            self.refine_layers, self.bond_linears, self.embed_spatial_edge, self.pos_update, self.pos_gate
         ):
             bond_edge_vecs = atom_pos[bond_edge_index[0]] - atom_pos[bond_edge_index[1]]
             bond_sh = o3.spherical_harmonics(self.sh_irreps, bond_edge_vecs, normalize=True, normalization='component')
@@ -327,20 +356,24 @@ class MoleculeDenoiser(nn.Module):
 
             bond_features = bond_lin(bond_features)
 
-
-            atom_features, bond_features = bond_layer(atom_features, bond_features, bond_sh, bond_edge_index)
-
             spatial_edges, spatial_edge_index = self._gen_spatial_edges(atom_pos, data['ligand'].batch, self_condition=self_condition)
             spatial_edge_vecs = atom_pos[spatial_edge_index[0]] - atom_pos[spatial_edge_index[1]]
             spatial_sh = o3.spherical_harmonics(self.sh_irreps, spatial_edge_vecs, normalize=True, normalization='component')
             spatial_edge_features = embed_spatial_edge(spatial_edges)
-            atom_features, _ = spatial_layer(atom_features, spatial_edge_features, spatial_sh, spatial_edge_index)
+
+            atom_features, bond_features = refine_layer(
+                atom_features,
+                bond_features,
+                bond_sh,
+                bond_edge_index,
+                spatial_edge_features,
+                spatial_sh,
+                spatial_edge_index)
 
             update = pos_update(atom_features)
             update_gate = pos_gate(atom_features)
             atom_pos = atom_pos + update * update_gate
             atom_traj.append(atom_pos)
-            atom_pos = atom_pos.detach()
 
         return {
             "pred_atom_pos": atom_pos,

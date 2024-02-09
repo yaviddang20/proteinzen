@@ -7,7 +7,6 @@ from ligbinddiff.model.utils.graph import batchwise_to_nodewise
 
 def diagonalize(N, edges=[], antiedges=[], a=1, b=0.3, lamb=1e-6, ptr=None):
     J = torch.zeros((N, N), device=edges.device)  # temporary fix
-    edges = edges[:, edges[0] < edges[1]]  # de-duplicate
     for i, j in edges:
         J[i, i] += a
         J[j, j] += a
@@ -63,8 +62,9 @@ class HarmonicPriorInterpolant:
             sigma=self.prior_scale,
             ptr=ptr)
         pos_t = (1 - t[..., None]) * pos_0 + t[..., None] * pos_1
-        pos_t = _diffuse_mask(pos_t, pos_1, pos_mask)
-        return pos_t * pos_mask[..., None]
+        # pos_t = _diffuse_mask(pos_t, pos_1, pos_mask)
+        # return pos_t * pos_mask[..., None]
+        return pos_t
 
     def sample_t(self, num_batch):
         t = torch.rand(num_batch, device=self._device)

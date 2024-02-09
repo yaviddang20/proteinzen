@@ -43,16 +43,16 @@ class Experiment:
                 **remove_zen_keys(self._exp_cfg.wandb),
             )
 
-        # Checkpoint directory.
-        ckpt_dir = self._exp_cfg.checkpointer.dirpath
-        os.makedirs(ckpt_dir, exist_ok=True)
-        log.info(f"Checkpoints saved to {ckpt_dir}")
+            # Checkpoint directory.
+            ckpt_dir = self._exp_cfg.checkpointer.dirpath
+            os.makedirs(ckpt_dir, exist_ok=True)
+            log.info(f"Checkpoints saved to {ckpt_dir}")
 
-        # Model checkpoints
-        callbacks.append(
-            ModelCheckpoint(
-                **remove_zen_keys(self._exp_cfg.checkpointer)
-        ))
+            # Model checkpoints
+            callbacks.append(
+                ModelCheckpoint(
+                    **remove_zen_keys(self._exp_cfg.checkpointer)
+            ))
 
         if torch.cuda.is_available():
             devices = list(range(torch.cuda.device_count()))

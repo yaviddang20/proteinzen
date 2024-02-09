@@ -135,12 +135,12 @@ class HarmonicFlowMatching(Task):
 
     def compute_loss(self, inputs, outputs: Dict):
         fm_loss_dict = harmonic_fm_loss(
-            inputs, outputs)
+            inputs, outputs, loss_clip=None)
 
         loss = (
             fm_loss_dict['atom_pos_mse']
             + fm_loss_dict['atom_pos_traj_mse']
-        ).mean() / 10  # scaling factor for stability
+        ).mean()
 
 
         loss_dict = {"loss": loss}

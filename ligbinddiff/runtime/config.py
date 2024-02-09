@@ -187,7 +187,7 @@ def config_hydra_store():
             ModelCheckpoint,
             dirpath="ckpt",
             every_n_epochs=1,
-            save_on_train_epoch_end=False,
+            save_on_train_epoch_end=True,
             save_last=True,
             save_top_k=3,
             monitor="valid/non_coil_percent",
@@ -195,6 +195,19 @@ def config_hydra_store():
         ),
         group="experiment/checkpointer",
         name="bb")
+    exp_store(
+        pbuilds(
+            ModelCheckpoint,
+            dirpath="ckpt",
+            every_n_epochs=1,
+            save_on_train_epoch_end=True,
+            save_last=True,
+            save_top_k=3,
+            monitor="valid/non_coil_percent",
+            mode="max"
+        ),
+        group="experiment/checkpointer",
+        name="sidechain")
     exp_store(
         pbuilds(
             ModelCheckpoint,

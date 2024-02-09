@@ -2,117 +2,107 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch_cluster import knn_graph
+from torch_geometric.utils import dropout_edge
 
 from ligbinddiff.model.modules.layers.node.mpnn import IPMP
-from ligbinddiff.model.modules.common import RBF
-from ligbinddiff.model.modules.openfold.frames import Linear
+from ligbinddiff.model.modules.openfold.frames import  StructureModuleTransition
+from ligbinddiff.model.modules.layers.edge.sitewise import EdgeTransition
 from ligbinddiff.data.datasets.featurize.sidechain import _dihedrals, _ideal_virtual_Cb
 from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddings, _rbf
 
 from ligbinddiff.utils.openfold import rigid_utils as ru
-from ligbinddiff.model.utils.graph import batchwise_to_nodewise
+from ligbinddiff.utils.framediff.all_atom import compute_all_atom14
+from ligbinddiff.utils.atom_reps import restype_1to3, atom91_start_end
+from ligbinddiff.data.openfold.residue_constants import restypes
 
 
 class IPMPUpdateLayer(nn.Module):
-    def __init__(self,
-                 c_s,
-                 c_latent,
-                 c_z,
-                 c_hidden,
-                 self_conditioning=True):
+    def __init__(self, c_s, c_z, c_hidden, dropout=0.):
         super().__init__()
         self.c_s = c_s
-        self.c_latent = c_latent
         self.c_z = c_z
         self.c_hidden = c_hidden
-        self.self_conditioning = self_conditioning
-
-        h_dim = c_s + c_latent + c_latent*self_conditioning
+        self.p_dropout = dropout
 
         self.ipmp = IPMP(
-            c_s=h_dim,
+            c_s=c_s,
             c_z=c_z,
             c_hidden=c_hidden,
-            dropout=0.,
-            edge_dropout=0.,
         )
-
-        self.latent_update = Linear(h_dim, c_latent, init='final')
-
-        self.node_update = Linear(
-            h_dim,
-            c_s,
-            init='final')
-        self.node_ln = nn.LayerNorm(c_s)
+        # self.ln = nn.LayerNorm(c_s)
+        # self.dropout = nn.Dropout(p=dropout)
+        # self.node_transition = StructureModuleTransition(
+        #     c_s,
+        #     dropout=dropout
+        # )
+        # self.edge_transition = EdgeTransition(
+        #     node_embed_size=c_s,
+        #     edge_embed_in=c_z,
+        #     edge_embed_out=c_z,
+        #     dropout=dropout
+        # )
 
     def forward(self,
-                latent_features,
                 node_features,
                 edge_features,
                 edge_index,
                 rigids,
-                node_mask,
-                self_condition=None):
-
-        input_features = [node_features, latent_features]
-        if self.self_conditioning and self_condition is not None:
-            input_features.append(self_condition['pred_latent_sidechain'])
-        elif self.self_conditioning:
-            input_features.append(torch.zeros_like(latent_features))
-
-        input_features = torch.cat(input_features, dim=-1)
-
+                node_mask):
+        # dropout_edge_index, dropout_edge_mask = dropout_edge(edge_index, p=self.p_dropout, training=self.training)
+        # dropout_edge_features = edge_features[dropout_edge_mask]
         # node_update = self.ipmp(
-        joint_features, edge_features = self.ipmp(
-            s=input_features,
+        #     s=node_features,
+        #     z=dropout_edge_features,
+        #     edge_index=dropout_edge_index,
+        #     r=rigids)
+        # node_features = self.ln(node_features + self.dropout(node_update) * node_mask[..., None])
+        # # node_features = node_features + node_update * node_mask[..., None]
+        # node_features = self.node_transition(node_features) * node_mask[..., None]
+        # edge_features = self.edge_transition(node_features, edge_features, edge_index)
+        node_features, edge_features = self.ipmp(
+            s=node_features,
             z=edge_features,
             edge_index=edge_index,
             r=rigids,
             mask=node_mask)
-        # node_features = self.node_ln(node_features + node_update * node_mask[..., None])
-        # node_features = self.node_transition(node_features) * node_mask[..., None]
-
-        latent_features = latent_features + self.latent_update(joint_features)
-        node_features = self.node_ln(node_features + self.node_update(joint_features))
-
-        return latent_features, node_features, edge_features
+        # edge_features = self.edge_transition(node_features, edge_features, edge_index)
+        return node_features, edge_features
 
 
-class IPMPDenoiser(nn.Module):
+
+class IPMPEncoder(nn.Module):
     def __init__(self,
                  c_s=256,
-                 c_latent=128,
                  c_z=128,
                  c_hidden=256,
                  c_s_in=6,
-                 c_time=64,
                  num_rbf=16,
                  num_pos_embed=16,
                  num_layers=4,
                  k=30,
                  num_aa=20,
-                 self_conditioning=True):
+                 dropout=0.1):
         super().__init__()
         self.c_s = c_s
-        self.c_latent = c_latent
         self.c_z = c_z
         self.c_hidden = c_hidden
         self.num_rbf = num_rbf
         self.num_pos_embed = num_pos_embed
-        self.c_z_in = num_rbf * (25 + 1)
-        self.self_conditioning = self_conditioning
-        self.num_aa = num_aa + 1  # + X
-
-        self.time_rbf = RBF(n_basis=c_time//2)
-
-        self.c_cond = (
+        atoms_per_res = 5
+        self.c_z_in = (
+            num_rbf * (atoms_per_res ** 2)  # bb x bb distances
+            # + atoms_per_res * 3  # src CA to dst bb direction unit vectors
+            + num_pos_embed  # rel pos embed
+        )
+        self.num_aa = num_aa + 1
+        self.c_atomic = (
             37 * 3  # rotamer
             + self.num_aa  # seq identity
-            + 1  # mask
+            + 1  # mask position
         )
 
         self.embed_node = nn.Sequential(
-            nn.Linear(c_s_in + c_time + self.c_cond, 2*c_s),
+            nn.Linear(c_s_in + self.c_atomic, 2*c_s),
             nn.ReLU(),
             nn.Linear(2*c_s, 2*c_s),
             nn.ReLU(),
@@ -130,23 +120,20 @@ class IPMPDenoiser(nn.Module):
         self.update = nn.ModuleList([
             IPMPUpdateLayer(
                 c_s=c_s,
-                c_latent=c_latent,
                 c_z=c_z,
                 c_hidden=c_hidden,
-                self_conditioning=self_conditioning
+                dropout=dropout
             )
             for _ in range(num_layers)
         ])
+        self.output_mu = nn.Linear(c_s, c_s)
+        self.output_logvar = nn.Linear(c_s, c_s)
 
         self.k = k
 
+    @torch.no_grad()
     def _prep_features(self, graph, eps=1e-8):
         res_data = graph['residue']
-
-        # time features
-        ts = res_data['t']
-        fourier_time = self.time_rbf(ts.unsqueeze(-1))  # (B x h_time,)
-        fourier_time = batchwise_to_nodewise(fourier_time, res_data.batch)
 
         # node features
         X_ca = res_data['x'].float()
@@ -162,8 +149,7 @@ class IPMPDenoiser(nn.Module):
             [
                 dihedrals,
                 mask.float()[..., None],
-                masked_seq,
-                fourier_time
+                masked_seq
             ],
         dim=-1)
         rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_0)
@@ -209,26 +195,34 @@ class IPMPDenoiser(nn.Module):
         # edge_features = torch.cat([edge_rbf, edge_dist_rel_pos, local_edge_dir_feats], dim=-1)
         edge_features = torch.cat([edge_rbf, edge_dist_rel_pos], dim=-1)
 
-        return node_features, rigids, edge_features, edge_index
+        return node_features, edge_features, edge_index
 
 
-    def forward(self, graph, intermediates, self_condition=None):
-        latent_features = intermediates['noised_latent_sidechain']
-        res_mask = graph['residue'].res_mask
-        node_features, rigids, edge_features, edge_index = self._prep_features(graph)
+    def forward(self, graph, eps=1e-8):
+        ## prep features
+        res_data = graph['residue']
+        res_mask = res_data['res_mask']
+        rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_0)
+
+        node_features, edge_features, edge_index = self._prep_features(graph, eps=eps)
+
         node_features = self.embed_node(node_features)
         edge_features = self.embed_edge(edge_features)
 
         for layer in self.update:
-            latent_features, node_features, edge_features = layer(
-                latent_features=latent_features,
-                node_features=node_features,
-                edge_features=edge_features,
-                edge_index=edge_index,
-                rigids=rigids,
-                node_mask=res_mask.float(),
-                self_condition=self_condition
+            node_features, edge_features = layer(
+                node_features,
+                edge_features,
+                edge_index,
+                rigids,
+                res_mask.float()
             )
 
-        intermediates['pred_latent_sidechain'] = latent_features
-        return intermediates
+        latent_mu = self.output_mu(node_features)
+        latent_logvar = self.output_logvar(node_features)
+
+        out_dict = {}
+        out_dict['latent_mu'] = latent_mu
+        out_dict['latent_logvar'] = latent_logvar
+
+        return out_dict

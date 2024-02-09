@@ -31,9 +31,9 @@ python predict.py --run_dir=$RUN_DIR --epoch=$EPOCH --out_prefix=$OUTPREFIX
 cd ~/software/ProteinMPNN/scripts
 conda activate proteinmpnn
 
-folder_with_pdbs=${RUN_DIR}/$OUTPREFIX
+folder_with_pdbs=${RUN_DIR}/$OUTPREFIX/samples
 
-output_dir=${folder_with_pdbs}
+output_dir=${RUN_DIR}/$OUTPREFIX
 if [ ! -d $output_dir ]
 then
     mkdir -p $output_dir
@@ -57,5 +57,5 @@ mkdir esmfold
 cd esmfold
 bash ~/projects/ligbinddiff/scripts/analysis/esmfold.sh > esmfold.log
 conda activate proteinzen
-python ~/projects/ligbinddiff/scripts/analysis/esm_analysis.py --esmlog esmfold.log --folded_folder $PWD --samples ../ | tail -n 1 > ${RUN_DIR}/num_designable.txt
+python ~/projects/ligbinddiff/scripts/analysis/esm_analysis.py --esmlog esmfold.log --folded_folder $PWD --samples ../samples | tail -n 1 > ${RUN_DIR}/num_designable.txt
 

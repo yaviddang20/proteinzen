@@ -67,7 +67,7 @@ class SE3InterpolantConfig:
 
 
 class SE3Interpolant:
-    def __init__(self, cfg, use_batch_ot=False, prealign_noise=True):
+    def __init__(self, cfg, use_batch_ot=False, prealign_noise=True, uniform_rot_noise=False):
         self._cfg = cfg
         self._rots_cfg = cfg.rots
         self._trans_cfg = cfg.trans
@@ -75,6 +75,7 @@ class SE3Interpolant:
         self._igso3 = None
         self.use_batch_ot = use_batch_ot
         self.prealign_noise = prealign_noise
+        self.uniform_rot_noise = uniform_rot_noise
         print(self.igso3)
 
     @property
@@ -142,8 +143,11 @@ class SE3Interpolant:
 
     def _corrupt_rotmats(self, rotmats_1, t, res_mask, batch):
         num_res = res_mask.shape[0]
-        noisy_rotmats = self.igso3.sample(torch.tensor([1.5]), num_res).to(self._device)
-        noisy_rotmats = noisy_rotmats.squeeze(0)
+        if self.uniform_rot_noise:
+            noisy_rotmats = _uniform_so3(num_res, self._device)
+        else:
+            noisy_rotmats = self.igso3.sample(torch.tensor([1.5]), num_res).to(self._device)
+            noisy_rotmats = noisy_rotmats.squeeze(0)
         if self.use_batch_ot:
             # this requires samples to be length batched
             sample_len = int((batch == 0).sum().item())

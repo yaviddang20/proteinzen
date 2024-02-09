@@ -3,6 +3,8 @@ from torch import nn
 
 from ligbinddiff.model.autoencoder.density import DensityEncoder
 from ligbinddiff.model.autoencoder.ipa import IPAEncoder, IPADecoder
+from ligbinddiff.model.mlm.tfn import Atom37Encoder
+from ligbinddiff.model.mlm.ipmp import IPMPEncoder as MLMIPMPEncoder
 from ligbinddiff.model.design.ipmp import IPMPEncoder as DesignIPMPEncoder, IPMPDecoder as DesignIPMPDecoder
 from ligbinddiff.model.autoencoder.ipmp import IPMPEncoder as AutoEncIPMPEncoder, IPMPDecoder as AutoEncIPMPDecoder
 from ligbinddiff.model.denoiser.sidechain.ipmp_latent import IPMPDenoiser
@@ -25,7 +27,7 @@ class IPMPLatentSidechainWrapper(nn.Module):
                  num_layers=4,
                  k=30):
         super().__init__()
-        self.encoder = DesignIPMPEncoder(
+        self.encoder = MLMIPMPEncoder(
             c_s=c_s,
             c_z=c_z,
             c_hidden=c_hidden,
@@ -34,6 +36,18 @@ class IPMPLatentSidechainWrapper(nn.Module):
             num_layers=num_layers,
             k=k
         )
+        # self.encoder = DesignIPMPEncoder(
+        #     c_s=c_s,
+        #     c_z=c_z,
+        #     c_hidden=c_hidden,
+        #     c_s_in=c_s_in,
+        #     num_rbf=num_rbf,
+        #     num_layers=num_layers,
+        #     k=k
+        # )
+        # self.encoder = Atom37Encoder(
+        #     c_out=c_s
+        # )
         self.decoder = DesignIPMPDecoder(
             c_s=c_s,
             c_z=c_z,

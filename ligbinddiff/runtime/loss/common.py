@@ -56,10 +56,13 @@ def autoencoder_losses(batch,
 
     res_mask = res_data['res_mask']
     noising_mask = res_data['noising_mask']
+    mlm_mask = res_data['mlm_mask']
     atom14_gt_mask = res_data['atom14_gt_exists']
     atom14_alt_gt_mask = res_data['atom14_alt_gt_exists']
 
-    total_res_mask = res_mask & noising_mask & seq_mask
+    minimal_mask = res_mask & seq_mask
+    ae_mask = res_mask & mlm_mask & seq_mask
+    denoiser_mask = res_mask & noising_mask & seq_mask
     decoded_all_atom14 = model_outputs['decoded_all_atom14']
     decoded_all_chis = model_outputs['decoded_all_chis']
     seq_logits = model_outputs['decoded_seq_logits']
@@ -74,18 +77,18 @@ def autoencoder_losses(batch,
         res_data.batch,
         atom14_gt_mask,
         atom14_alt_gt_mask,
-        total_res_mask,
+        minimal_mask,
         no_bb=False)
     seq_loss = seq_cce_loss(
         seq,
         seq_logits,
         res_data.batch,
-        total_res_mask)
+        denoiser_mask)
     per_seq_recov = seq_recov(
         seq,
         seq_logits,
         res_data.batch,
-        total_res_mask)
+        denoiser_mask)
     atom14_rmsd = atom14_mse.sqrt()
     # sidechain_dists_mse = distance_loss(atom91_centered, decoded_atom91, data_lens, atom91_mask.any(dim=-1), no_bb=False)
     sidechain_chi_loss = chi_loss(
@@ -98,7 +101,7 @@ def autoencoder_losses(batch,
 
     latent_mu = model_outputs['latent_mu']
     latent_logvar = model_outputs['latent_logvar']
-    kl_div = scalars_kl_div(latent_mu, latent_logvar, res_data.batch, total_res_mask)
+    kl_div = scalars_kl_div(latent_mu, latent_logvar, res_data.batch, minimal_mask)
 
     out_dict = {
         "seq_loss": seq_loss,
@@ -110,6 +113,10 @@ def autoencoder_losses(batch,
         # "bond_angle_loss": bond_angle_loss,
         "chi_loss": sidechain_chi_loss,
         "kl_div": kl_div,
+        "percent_masked": _nodewise_to_graphwise(
+            denoiser_mask.float(),
+            res_data.batch,
+            torch.ones_like(mlm_mask))
         #  "kl_div_l1": kl_div[1],
     }
 
@@ -125,7 +132,7 @@ def latent_scalar_sidechain_diffusion_loss(batch,
     res_data = batch['residue']
     x_mask = res_data['res_mask']
     noising_mask = res_data['noising_mask']
-    total_mask = x_mask & noising_mask
+    total_mask = x_mask #& noising_mask
 
     latent = latent_outputs['latent_sidechain']
     # latent = latent_outputs['latent_mu']

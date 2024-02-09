@@ -37,9 +37,14 @@ class DesignLatentSidechainNoising(Task):
         self.aux_loss_t_max = aux_loss_t_max
         self.self_conditioning = self_conditioning
         self._log = logging.getLogger(__name__)
+        self.rng = np.random.default_rng()
 
     def _gen_diffuse_mask(self, data: HeteroData):
-        return torch.ones_like(data['res_mask']).bool()
+        if self.rng.random() > 0.25:
+            return torch.ones_like(data['res_mask']).bool()
+        else:
+            percent = self.rng.random()
+            return torch.rand(data['res_mask'].shape, device=data['res_mask'].device) > percent
 
     def process_input(self, data: HeteroData):
         num_graphs = data.num_graphs
@@ -86,6 +91,7 @@ class DesignLatentSidechainNoising(Task):
         diff_feats_t['rigids_0'] = rigids_0.to_tensor_7()
         diff_feats_t['t'] = t
         diff_feats_t['noising_mask'] = diffuse_mask
+        diff_feats_t['mlm_mask'] = ~diffuse_mask
 
         diff_feats_t['atom37'] = chain_feats['all_atom_positions']
         diff_feats_t['atom37_mask'] = chain_feats['all_atom_mask']
@@ -160,11 +166,12 @@ class DesignLatentSidechainNoising(Task):
         nodewise_t = batchwise_to_nodewise(t, inputs['residue'].batch)
 
         decoder_outputs = model.decoder(inputs, latent_data)
+        mask = inputs['residue']['res_mask'] & inputs['residue']['noising_mask']
         noised_latent = self.sidechain_noiser.forward_marginal(
             latent_data[self.sidechain_x_0_key],
             # latent_data['latent_mu'],
             nodewise_t,
-            inputs['residue']['noising_mask']
+            torch.ones_like(mask).bool()
         )
         latent_outputs = model.denoiser(inputs, noised_latent, self_condition=self_conditioning)
         latent_outputs.update(noised_latent)
@@ -242,6 +249,8 @@ class DesignLatentSidechainNoising(Task):
 
         res_data['t'] = torch.ones(inputs.num_graphs, device=device)
         data = self.process_input(inputs)
+        data['residue']['noising_mask'] = torch.ones_like(data['residue']['noising_mask'])
+        data['residue']['mlm_mask'] = torch.zeros_like(data['residue']['noising_mask'])
         prior = model.sample_prior(num_nodes, device=device)
         intermediates = prior.copy()
         intermediates['t'] = torch.ones(inputs.num_graphs, device=device)
@@ -306,7 +315,7 @@ class DesignLatentSidechainNoising(Task):
             autoenc_loss_dict["atom14_mse"]
             + autoenc_loss_dict["seq_loss"]
             + autoenc_loss_dict["chi_loss"]
-            + autoenc_loss_dict["kl_div"] * 1e-6 # 1e-2
+            + autoenc_loss_dict["kl_div"] *  1e-6  # 1e-2
         )
 
         loss = (

@@ -112,7 +112,7 @@ def bucket(val, options, default=None):
 
 
 # properties
-def conformer_props(conformer, smiles, implicit_H=True):
+def conformer_props(conformer, implicit_H=True):
     # if implicit_H is enabled, we make all Hs implicit in the structure
     # to simulate PDB structures with no H info
     # and also we can save ourselves some compute
@@ -121,7 +121,7 @@ def conformer_props(conformer, smiles, implicit_H=True):
     # of explicit Hs already attached
     # we then just skip over all H atom features and any bonds with Hs
 
-    mol = Chem.MolFromSmiles(smiles)
+    mol = conformer.GetOwningMol()
     ringinfo = mol.GetRingInfo()
     # atom features
     atom_period = []
@@ -174,6 +174,16 @@ def conformer_props(conformer, smiles, implicit_H=True):
             + [bucket(ringinfo.NumAtomRings(idx), list(range(num_rings_max+1)))] # how many rings is the atom in
         )
 
+    # get 3D coords, removing Hs
+    atom_pos = conformer.GetPositions()
+    atom_idx_map = np.arange(mol.GetNumAtoms())
+    if implicit_H:
+        mol_H_mask = np.array(
+            [atom.GetSymbol() != 'H' for atom in mol.GetAtoms()]
+        )
+        atom_idx_map = atom_idx_map[mol_H_mask]
+        atom_pos = atom_pos[mol_H_mask]
+
     # bond features
     bond_edge_index = []
     bond_order = []
@@ -184,8 +194,12 @@ def conformer_props(conformer, smiles, implicit_H=True):
         src_idx = bond.GetBeginAtomIdx()
         dst_idx = bond.GetEndAtomIdx()
 
+
         if implicit_H and (src_idx in h_idx or dst_idx in h_idx):
             continue
+        elif implicit_H:
+            src_idx = np.nonzero(atom_idx_map == src_idx)[0][0]
+            dst_idx = np.nonzero(atom_idx_map == dst_idx)[0][0]
 
         # undirected graph
         bond_edge_index.append([src_idx, dst_idx])
@@ -203,14 +217,6 @@ def conformer_props(conformer, smiles, implicit_H=True):
                 )
             )
 
-    # get 3D coords, removing Hs
-    atom_pos = conformer.GetPositions()
-    if implicit_H:
-        conf_mol = conformer.GetOwningMol()
-        conf_mol_H_mask = np.array(
-            [atom.GetSymbol() != 'H' for atom in conf_mol.GetAtoms()]
-        )
-        atom_pos = atom_pos[conf_mol_H_mask]
 
     props = {
         "atom_pos": atom_pos,                       # N x 3
