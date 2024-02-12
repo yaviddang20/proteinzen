@@ -183,6 +183,8 @@ class BackboneFrameInterpolation(Task):
 
         return {
             "samples": clean_atom37_traj[-1][..., (0, 1, 2, 4, 3), :].split(num_res),
+            "clean_trajs": zip(*[clean[..., (0, 1, 2, 4, 3), :].split(num_res) for clean in clean_atom37_traj]),
+            "prot_trajs": zip(*[prot[..., (0, 1, 2, 4, 3), :].split(num_res) for prot in atom37_traj]),
             "inputs": inputs
         }
 

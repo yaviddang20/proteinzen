@@ -62,6 +62,18 @@ def atom91_to_chain(seq, atom91, chain_id, x_bb=None):
         chain.add(res)
     return chain
 
+def chains_to_model(chains, model_id=0):
+    model = Model.Model(id=model_id)
+    for chain in chains:
+        model.add(chain)
+    return model
+
+def models_to_struct(models, struct_id=0):
+    struct = Structure.Structure(struct_id)
+    for model in models:
+        struct.add(model)
+    return struct
+
 def chains_to_struct(chains, model_id=0, struct_id=0):
     model = Model.Model(id=model_id)
     for chain in chains:

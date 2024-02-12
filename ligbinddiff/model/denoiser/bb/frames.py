@@ -493,6 +493,7 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
                  num_qk_pts,
                  num_v_pts,
                  self_conditioning=False,
+                 embed_seq_edge=False,
                  last=False
                  ):
         """
@@ -534,6 +535,16 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
             nn.Linear(c_z, c_z),
             nn.LayerNorm(c_z)
         )
+        self.embed_seq_edge = embed_seq_edge
+        if embed_seq_edge:
+            self.seq_edge_embed = nn.Sequential(
+                nn.Linear(c_z, c_z),
+                nn.ReLU(),
+                nn.Linear(c_z, c_z),
+                nn.ReLU(),
+                nn.Linear(c_z, c_z),
+                nn.LayerNorm(c_z)
+            )
 
         if not last:
             self.seq_edge_transition = EdgeTransition(
@@ -561,6 +572,8 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
             res_data,
     ):
         edge_features = self.edge_embed(edge_features)
+        if self.embed_seq_edge:
+            seq_edge_features = self.seq_edge_embed(seq_edge_features)
 
         res_mask = ~(res_data['res_mask'].bool())
         noising_mask = res_data['noising_mask']
@@ -627,6 +640,8 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  graph_conditioning=False,
                  use_anchors=False,
                  interres_equilibrate=False,
+                 update_seq_edge=False,
+                 learnable_scale=False,
                  impute_oxy=False):
         super().__init__()
 
@@ -640,6 +655,8 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         self.graph_conditioning = graph_conditioning
         self.n_layers = n_layers
         self.impute_oxy = impute_oxy
+        self.update_seq_edge = update_seq_edge
+        self.learnable_scale = learnable_scale
 
         self.h_time = h_time
         self.time_rbf = RBF(n_basis=h_time//2)
@@ -685,6 +702,7 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  num_qk_pts,
                  num_v_pts,
                  self_conditioning=self_conditioning,
+                 embed_seq_edge=update_seq_edge,
                  last=True
                  # last=(i == n_layers-1)
                  # last=(i < n_layers-1)
@@ -695,6 +713,13 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         self.lrange_k = lrange_k
 
         self.torsion_angles = TorsionAngles(c_s, 1)
+
+        if self.learnable_scale:
+            self.scales = nn.ParameterList([
+                nn.Parameter(torch.ones(1,1).float())
+                for _ in range(n_layers)
+            ])
+
 
     def _gen_spatial_edge_features(self, rigids, res_mask, batch, self_condition):
         res_mask = ~res_mask
@@ -805,9 +830,14 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                 (0, self.c_s + 7)
             )
 
-        edge_features, edge_index = self._gen_spatial_edge_features(rigids_t, res_mask, batch, self_condition)
+        if self.learnable_scale:
+            scale = self.scales[0]
+        else:
+            scale = 1
+        edge_features, edge_index = self._gen_spatial_edge_features(rigids_t.scale_translation(scale), res_mask, batch, self_condition)
 
         return node_input, vn_features, edge_features, edge_index, seq_edge_features, seq_local_edge_index
+        # return node_input, vn_features, seq_edge_features, seq_local_edge_index
 
     def forward(self, data, self_condition=None):
         res_data = data['residue']
@@ -825,7 +855,8 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         # embed features
         node_features = self.embed_node(node_input)
         node_features = node_features * res_mask[..., None]
-        seq_edge_features = self.seq_edge_embed(seq_edge_features)
+        if not self.update_seq_edge:
+            seq_edge_features = self.seq_edge_embed(seq_edge_features)
 
         rigids_t = ru.Rigid.from_tensor_7(res_data['rigids_t'])
         # center the training example at the mean of the x_cas
@@ -839,12 +870,21 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         rigids_history = []
         for i, layer in enumerate(self.denoiser):
             if i > 0:
+                if self.learnable_scale:
+                    scale = self.scales[i]
+                else:
+                    scale = 1
                 # recompute graph
                 raw_edge_features, edge_index = self._gen_spatial_edge_features(
-                    rigids,
+                    rigids.scale_translation(scale),
                     res_mask,
                     res_data.batch,
                     self_condition)
+
+                if self.update_seq_edge:
+                    X_ca = rigids.get_trans()
+                    seq_edge_features, _ = gen_spatial_graph_features(X_ca, seq_local_edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=self.c_z//2)
+
             # node_features, vn_features, rigids, seq_edge_features = layer(
             #     node_features,
             #     vn_features,
@@ -890,5 +930,7 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         ret['psi'] = psi
         ret['node_features'] = node_features
         ret['edge_index'] = edge_index
+        if self.learnable_scale:
+            print([scale.data for scale in self.scales])
 
         return ret

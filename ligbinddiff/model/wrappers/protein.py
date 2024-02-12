@@ -2,7 +2,7 @@ import torch
 from torch import nn
 
 from ligbinddiff.model.design.ipmp import IPMPEncoder as DesignIPMPEncoder, IPMPDecoder as DesignIPMPDecoder
-from ligbinddiff.model.denoiser.protein.frames import GraphIpaDenoiser
+from ligbinddiff.model.denoiser.protein.frames import DynamicGraphIpaFrameDenoiser
 
 
 class IPMPLatentWrapper(nn.Module):
