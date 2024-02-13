@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch_cluster import knn_graph
 
 from ligbinddiff.model.modules.layers.node.mpnn import IPMP
+from ligbinddiff.model.modules.layers.edge.embed import PairwiseAtomicEmbedding
 from ligbinddiff.model.modules.common import RBF
 from ligbinddiff.model.modules.openfold.frames import Linear
 from ligbinddiff.data.datasets.featurize.sidechain import _dihedrals, _ideal_virtual_Cb
@@ -119,8 +120,13 @@ class IPMPDenoiser(nn.Module):
             nn.Linear(2*c_s, c_s),
             nn.LayerNorm(c_s),
         )
+        self.init_edge_embed = PairwiseAtomicEmbedding(
+            num_rbf=self.num_rbf,
+            num_pos_embed=self.num_pos_embed,
+            num_aa=num_aa
+        )
         self.embed_edge = nn.Sequential(
-            nn.Linear(self.c_z_in, 2*c_z),
+            nn.Linear(self.init_edge_embed.out_dim, 2*c_z),
             nn.ReLU(),
             nn.Linear(2*c_z, 2*c_z),
             nn.ReLU(),
@@ -142,6 +148,7 @@ class IPMPDenoiser(nn.Module):
 
     def _prep_features(self, graph, eps=1e-8):
         res_data = graph['residue']
+        res_mask = res_data['res_mask']
 
         # time features
         ts = res_data['t']
@@ -173,41 +180,34 @@ class IPMPDenoiser(nn.Module):
             [node_scalars, node_vectors.view([node_scalars.shape[0], -1])],
             dim=-1
         ).float()
+        node_features = node_features * res_mask[..., None]
 
         # edge graph
-        res_mask = res_data['res_mask']
         masked_X_ca = X_ca.clone()
         masked_X_ca[~res_mask] = torch.inf
         edge_index = knn_graph(masked_X_ca, self.k, graph['residue'].batch)
 
         # edge features
-        virtual_Cb = _ideal_virtual_Cb(bb)
-        bb = torch.cat([bb, virtual_Cb[..., None, :]], dim=-2)
+        # virtual_Cb = _ideal_virtual_Cb(bb)
+        # bb = torch.cat([bb, virtual_Cb[..., None, :]], dim=-2)
         src = edge_index[1]
         dst = edge_index[0]
 
-        ## edge distances
-        edge_bb_src = bb[src]
-        edge_bb_dst = bb[dst]
-        edge_bb_dists = torch.linalg.vector_norm(
-            edge_bb_src[..., None, :] - edge_bb_dst[..., None, :, :] + eps,
-            dim=-1)
-        edge_bb_dists = edge_bb_dists.view(edge_index.shape[1], -1, 1)
-        edge_rbf = _rbf(edge_bb_dists, D_min=2.0, D_max=22.0, D_count=self.num_rbf, device=edge_index.device)
-        edge_rbf = edge_rbf.view(edge_index.shape[1], -1)
-        ## edge rel pos embedding
-        edge_dist_rel_pos = _edge_positional_embeddings(edge_index, num_embeddings=self.num_pos_embed, device=edge_index.device)
-        # ## direction vecs from src CA to dst bb
-        # rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_0)
-        # src_rigids = rigids[src]
-        # src_X_ca = X_ca[src]
-        # edge_dist_vecs = edge_bb_dst - src_X_ca[..., None, :]
-        # edge_dir_vecs = F.normalize(edge_dist_vecs, dim=-1)
-        # local_edge_dir_vecs = src_rigids[...,  None].invert_apply(edge_dir_vecs)
-        # local_edge_dir_feats = local_edge_dir_vecs.view(edge_index.shape[1], -1)
-
-        # edge_features = torch.cat([edge_rbf, edge_dist_rel_pos, local_edge_dir_feats], dim=-1)
-        edge_features = torch.cat([edge_rbf, edge_dist_rel_pos], dim=-1)
+        # ## edge distances
+        # edge_bb_src = bb[src]
+        # edge_bb_dst = bb[dst]
+        # edge_bb_dists = torch.linalg.vector_norm(
+        #     edge_bb_src[..., None, :] - edge_bb_dst[..., None, :, :] + eps,
+        #     dim=-1)
+        # edge_bb_dists = edge_bb_dists.view(edge_index.shape[1], -1, 1)
+        # edge_rbf = _rbf(edge_bb_dists, D_min=2.0, D_max=22.0, D_count=self.num_rbf, device=edge_index.device)
+        # edge_rbf = edge_rbf.view(edge_index.shape[1], -1)
+        # ## edge rel pos embedding
+        # edge_dist_rel_pos = _edge_positional_embeddings(edge_index, num_embeddings=self.num_pos_embed, device=edge_index.device)
+        edge_features = self.init_edge_embed(graph, edge_index)
+        # technically this shouldn't be necessary but just to be safe
+        edge_mask = res_mask[src] & res_mask[dst]
+        edge_features = edge_features * edge_mask[..., None]
 
         return node_features, rigids, edge_features, edge_index
 

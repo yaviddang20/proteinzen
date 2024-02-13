@@ -11,7 +11,7 @@ from ligbinddiff.data.datasets.featurize.sidechain import _dihedrals, _ideal_vir
 from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddings, _rbf
 
 from ligbinddiff.utils.openfold import rigid_utils as ru
-from ligbinddiff.utils.framediff.all_atom import compute_all_atom14
+from ligbinddiff.utils.framediff.all_atom import compute_all_atom14, compute_atom14
 from ligbinddiff.utils.atom_reps import restype_1to3, atom91_start_end
 from ligbinddiff.data.openfold.residue_constants import restypes
 
@@ -256,8 +256,10 @@ class IPMPDecoder(nn.Module):
             )
             for _ in range(num_layers)
         ])
-        self.torsion_pred = nn.Linear(c_s, (20 * 4 + 1) * 2)
+
         self.seq_head = nn.Linear(c_s, 20)
+        self.seq_embed = nn.Embedding(21, 20)
+        self.torsion_pred = nn.Linear(c_s + 20, (4 + 1) * 2)
 
         self.k = k
 
@@ -265,15 +267,16 @@ class IPMPDecoder(nn.Module):
     @torch.no_grad()
     def _prep_features(self, graph, eps=1e-8):
         res_data = graph['residue']
+        res_mask = res_data['res_mask']
 
         # node features
         X_ca = res_data['x'].float()
         bb = res_data['bb'].float()
         dihedrals = _dihedrals(bb)
         node_features = torch.cat([dihedrals], dim=-1)
+        node_features = node_features * res_mask[..., None]
 
         # edge graph
-        res_mask = res_data['res_mask']
         masked_X_ca = X_ca.clone()
         masked_X_ca[~res_mask] = torch.inf
         edge_index = knn_graph(masked_X_ca, self.k, graph['residue'].batch)
@@ -306,10 +309,13 @@ class IPMPDecoder(nn.Module):
 
         # edge_features = torch.cat([edge_rbf, edge_dist_rel_pos, local_edge_dir_feats], dim=-1)
         edge_features = torch.cat([edge_rbf, edge_dist_rel_pos], dim=-1)
+        # technically this shouldn't be necessary but just to be safe
+        edge_mask = res_mask[src] & res_mask[dst]
+        edge_features = edge_features * edge_mask[..., None]
 
         return node_features, edge_features, edge_index
 
-    def forward(self, graph, intermediates, eps=1e-8):
+    def forward(self, graph, intermediates, eps=1e-8, use_gt_seq=True):
         res_data = graph['residue']
         num_nodes = res_data.num_nodes
         res_mask = res_data['res_mask']
@@ -333,26 +339,32 @@ class IPMPDecoder(nn.Module):
                 res_mask.float()
             )
 
-        unnorm_torsions = self.torsion_pred(node_features)
-        chi_per_aatype = unnorm_torsions.view(-1, 81, 2)
-        chi_per_aatype = F.normalize(chi_per_aatype, dim=-1)
-        psi_torsions, chi_per_aatype = chi_per_aatype.split([1, 80], dim=-2)
-
-        chi_per_aatype = chi_per_aatype.view(-1, 20, 4, 2)
-        all_atom14 = compute_all_atom14(rigids, psi_torsions, chi_per_aatype)
-        atom91 = torch.zeros((num_nodes, 91, 3), device=all_atom14.device)
-        atom91[..., :4, :] = all_atom14[..., 0, :4, :]
-        for i in range(20):
-            aa = restype_1to3[restypes[i]]
-            start, end = atom91_start_end[aa]
-            atom91[..., start:end, :] = all_atom14[..., i, 4:4+(end-start), :]
-        atom91 = atom91 - rigids.get_trans()[..., None, :]
-
         seq_logits = self.seq_head(node_features)
 
+        if use_gt_seq:
+            seq = res_data['seq']
+        else:
+            seq = seq_logits.argmax(dim=-1)
+        seq = seq.to(node_features.device)
+
+        unnorm_torsions = self.torsion_pred(
+            torch.cat([
+                node_features,
+                self.seq_embed(seq)
+            ], dim=-1)
+        )
+        chi_per_aatype = unnorm_torsions.view(-1, 5, 2)
+        chi_per_aatype = F.normalize(chi_per_aatype, dim=-1)
+        psi_torsions, chi_per_aatype = chi_per_aatype.split([1, 4], dim=-2)
+
+        # chi_per_aatype = chi_per_aatype.view(-1, 4, 2)
+        output_atom14 = compute_atom14(rigids, psi_torsions, chi_per_aatype, seq)
+
         out_dict = {}
-        out_dict['decoded_all_atom14'] = all_atom14
-        out_dict['decoded_all_chis'] = chi_per_aatype
+        # out_dict['decoded_all_atom14'] = all_atom14
+        # out_dict['decoded_all_chis'] = chi_per_aatype
+        out_dict['decoded_atom14'] = output_atom14
+        out_dict['decoded_chis'] = chi_per_aatype
         out_dict['decoded_seq_logits'] = seq_logits
 
         return out_dict

@@ -213,6 +213,19 @@ def config_hydra_store():
             ModelCheckpoint,
             dirpath="ckpt",
             every_n_epochs=1,
+            save_on_train_epoch_end=True,
+            save_last=True,
+            save_top_k=3,
+            monitor="valid/non_coil_percent",
+            mode="max"
+        ),
+        group="experiment/checkpointer",
+        name="protein")
+    exp_store(
+        pbuilds(
+            ModelCheckpoint,
+            dirpath="ckpt",
+            every_n_epochs=1,
             save_on_train_epoch_end=False,
             save_last=True,
             save_top_k=3,

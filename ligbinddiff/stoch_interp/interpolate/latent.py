@@ -42,7 +42,7 @@ class LatentInterpolant:
         self._device = device
 
     def _corrupt_x(self, x_1, t, res_mask, batch):
-        x_0 = _centered_gaussian(batch, x_1.shape[-1], self._device)
+        x_0 = torch.randn_like(x_1)
         x_t = (1 - t[..., None]) * x_0 + t[..., None] * x_1
         x_t = _diffuse_mask(x_t, x_1, res_mask)
         return x_t * res_mask[..., None]

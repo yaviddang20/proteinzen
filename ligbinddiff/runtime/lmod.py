@@ -1,5 +1,6 @@
 import logging
 import os
+from functools import partial
 
 import numpy as np
 import pandas as pd
@@ -18,6 +19,7 @@ from torchmetrics.utilities import dim_zero_cat
 from ligbinddiff.tasks import TaskList
 from ligbinddiff.utils import metrics
 from ligbinddiff.data.io.atom91 import atom91_to_pdb
+from ligbinddiff.runtime.optim import get_std_opt
 
 from .utils import gen_pbar_str
 
@@ -520,12 +522,12 @@ class MoleculeModule(L.LightningModule):
 
 
 class ProteinModule(L.LightningModule):
-    def __init__(self, model, optim_ae, optim_denoiser):
+    def __init__(self, model, optim, val_dir="validation"):
         super().__init__()
         self._log = logging.getLogger(__name__)
         self.model = model
-        self.optim_ae = optim_ae
-        self.optim_denoiser = optim_denoiser
+        self.optim = optim
+        self.val_dir = val_dir
 
         self.median_metric = MedianMetric()
 
@@ -550,39 +552,39 @@ class ProteinModule(L.LightningModule):
         self._log.info(gen_pbar_str(loss_dict))
         return loss_dict
 
-    def validation_step(self, batch, batch_idx):
-        task: TaskList = batch.task
-        outputs = task.run_evals(self.model, batch)
-        loss_dict = task.compile_task_losses(batch, outputs)
+    # def validation_step(self, batch, batch_idx):
+    #     task: TaskList = batch.task
+    #     outputs = task.run_evals(self.model, batch)
+    #     loss_dict = task.compile_task_losses(batch, outputs)
 
-        log_dict = tree.map_structure(
-            lambda x: torch.mean(x) if torch.is_tensor(x) else x,
-            loss_dict
-        )
-        log_dict = {"val_" + k: v for k,v in log_dict.items()}
+    #     log_dict = tree.map_structure(
+    #         lambda x: torch.mean(x) if torch.is_tensor(x) else x,
+    #         loss_dict
+    #     )
+    #     log_dict = {"val_" + k: v for k,v in log_dict.items()}
 
-        self.log_dict(
-            log_dict,
-            logger=True,
-            batch_size=batch.num_graphs,
-            sync_dist=True)
-        self._log.info(gen_pbar_str(loss_dict))
+    #     self.log_dict(
+    #         log_dict,
+    #         logger=True,
+    #         batch_size=batch.num_graphs,
+    #         sync_dist=True)
+    #     self._log.info(gen_pbar_str(loss_dict))
 
-        sample_outputs = task.run_predicts(self.model, batch)
-        sample_loss_dict = task.compile_task_losses(batch, sample_outputs)
-        sample_log_dict = tree.map_structure(
-            lambda x: torch.mean(x) if torch.is_tensor(x) else x,
-            sample_loss_dict
-        )
-        sample_log_dict = {"sample_" + k: v for k,v in sample_log_dict.items()}
-        self.log_dict(
-            sample_log_dict,
-            logger=True,
-            batch_size=batch.num_graphs,
-            sync_dist=True)
-        self._log.info(gen_pbar_str(sample_loss_dict))
+    #     sample_outputs = task.run_predicts(self.model, batch)
+    #     sample_loss_dict = task.compile_task_losses(batch, sample_outputs)
+    #     sample_log_dict = tree.map_structure(
+    #         lambda x: torch.mean(x) if torch.is_tensor(x) else x,
+    #         sample_loss_dict
+    #     )
+    #     sample_log_dict = {"sample_" + k: v for k,v in sample_log_dict.items()}
+    #     self.log_dict(
+    #         sample_log_dict,
+    #         logger=True,
+    #         batch_size=batch.num_graphs,
+    #         sync_dist=True)
+    #     self._log.info(gen_pbar_str(sample_loss_dict))
 
-        return loss_dict
+    #     return loss_dict
 
     def test_step(self, batch, batch_idx):
         task: TaskList = batch.task
@@ -617,11 +619,4 @@ class ProteinModule(L.LightningModule):
         return outputs
 
     def configure_optimizers(self):
-        optim_ae = self.optim_ae(
-            self.model.encoder.parameters() +
-            self.model.decoder.parameters()
-        )
-        optim_denoiser = self.optim_denoiser(
-            self.model.denoiser.parameters()
-        )
-        return optim_ae, optim_denoiser
+        return self.optim(self.model.parameters())

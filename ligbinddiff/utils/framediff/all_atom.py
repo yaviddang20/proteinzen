@@ -172,6 +172,23 @@ def compute_backbone(bb_rigids, psi_torsions, impute_O=True):
     return atom37_bb_pos, atom37_mask, aatype, atom14_pos
 
 
+def compute_atom14(bb_rigids, psi_torsions, sidechain_torsions, seq):
+    bb_torsions = psi_torsions.expand(-1, 3, -1).to(bb_rigids.device)
+    sidechain_torsions = sidechain_torsions.to(bb_rigids.device)
+    seq = seq.to('cpu')
+    torsion_angles = torch.cat([bb_torsions, sidechain_torsions], dim=-2)
+
+    all_frames = feats.torsion_angles_to_frames(
+        bb_rigids,
+        torsion_angles,
+        seq,
+        DEFAULT_FRAMES.to(bb_rigids.device))
+    atom14_pos = frames_to_atom14_pos(
+        all_frames,
+        seq)
+    return atom14_pos
+
+
 def compute_all_atom14(bb_rigids, psi_torsions, sidechain_torsions, n_aa=20):
     bb_torsion_angles = torch.tile(
         psi_torsions[..., None, :],

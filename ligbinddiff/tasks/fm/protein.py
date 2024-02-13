@@ -36,16 +36,21 @@ class ProteinInterpolation(Task):
 
     def __init__(self,
                  protein_noiser: ProteinInterpolant,
-                 aux_loss_t_min=0.75,
-                 compute_passthrough=False):
+                 aux_loss_t_min=0.25,
+                 compute_passthrough=True):
         super().__init__()
         self.se3_noiser = protein_noiser.se3_noiser
         self.sidechain_noiser = protein_noiser.sidechain_noiser
         self.aux_loss_t_min = aux_loss_t_min
         self.compute_passthrough = compute_passthrough
+        self.rng = np.random.default_rng()
 
-    def gen_diffuse_mask(self, data: HeteroData):
-        return torch.ones_like(data['res_mask']).bool()
+    def _gen_diffuse_mask(self, data: HeteroData):
+        if self.rng.random() > 0.25:
+            return torch.ones_like(data['res_mask']).bool()
+        else:
+            percent = self.rng.random()
+            return torch.rand(data['res_mask'].shape, device=data['res_mask'].device) > percent
 
     def process_input(self, data: HeteroData):
         data = copy.deepcopy(data)
@@ -67,11 +72,11 @@ class ProteinInterpolation(Task):
         rigids_1 = ru.Rigid.from_tensor_4x4(chain_feats['rigidgroups_gt_frames'])[:, 0]
 
         # compute bb frame features
-        diffuse_mask = self.gen_diffuse_mask(res_data)
+        diffuse_mask = self._gen_diffuse_mask(res_data)
         res_data['noising_mask'] = diffuse_mask
+        res_data['mlm_mask'] = ~diffuse_mask
         res_data['x'] = rigids_1.get_trans()  # for HeteroData's sake
         res_data['rigids_1'] = rigids_1.to_tensor_7()
-        res_data['noising_mask'] = diffuse_mask
         ##  noise data
         data = self.se3_noiser.corrupt_batch(data)
 
@@ -102,7 +107,7 @@ class ProteinInterpolation(Task):
         self.se3_noiser.set_device(device)
         return data
 
-    def _run_model(self, model, inputs, self_conditioning=None):
+    def _run_model(self, model, inputs, self_conditioning=None, pt_use_gt_seq=True):
         # generate latent sidechains
         latent_data = model.encoder(inputs)
         ## sample only if we're training
@@ -114,26 +119,6 @@ class ProteinInterpolation(Task):
 
         else:
             latent_data[self.sidechain_x_1_key] = latent_data['latent_mu']
-
-        ## center latent space as we can only fm/diffuse in centered Rn
-        sampled_sidechain = latent_data[self.sidechain_x_1_key]
-        sampled_center = pygu.scatter(
-            sampled_sidechain,
-            inputs['residue'].batch,
-            dim_size=inputs.num_graphs
-        )
-        sampled_count = pygu.scatter(
-            torch.ones_like(inputs['residue'].batch),
-            inputs['residue'].batch,
-            dim_size=inputs.num_graphs
-        )
-        sampled_center = sampled_center.sum(dim=-1) / (sampled_count * sampled_center.shape[-1])
-        centered_sidechain = sampled_sidechain - batchwise_to_nodewise(
-            sampled_center,
-            inputs['residue'].batch
-        )[..., None]
-        latent_data[self.sidechain_x_1_key] = centered_sidechain
-
 
         # decoder
         decoder_outputs = model.decoder(inputs, latent_data)
@@ -152,7 +137,7 @@ class ProteinInterpolation(Task):
             passthrough_latent = {
                 self.sidechain_x_1_key: latent_outputs[self.sidechain_x_1_pred_key]
             }
-            passthrough_outputs = model.decoder(passthrough_inputs, passthrough_latent)
+            passthrough_outputs = model.decoder(passthrough_inputs, passthrough_latent, use_gt_seq=pt_use_gt_seq)
             passthrough_outputs.update(noised_latent_data)
             passthrough_outputs.update(latent_data)
         else:
@@ -172,7 +157,8 @@ class ProteinInterpolation(Task):
         # TODO: should this be a separate flag?
         if model.self_conditioning and np.random.uniform() > 0.5:
             with torch.no_grad():
-                self_conditioning, _, _ = self._run_model(model, inputs)
+                self_conditioning, _, sc_pt_outputs = self._run_model(model, inputs, pt_use_gt_seq=False)
+                self_conditioning.update(sc_pt_outputs)
         else:
             self_conditioning = None
         denoiser_output, design_output, pt_outputs = self._run_model(model, inputs, self_conditioning)
@@ -183,7 +169,8 @@ class ProteinInterpolation(Task):
     def run_predict(self,
                     model,
                     inputs,
-                    device='cuda:0'):
+                    #device='cuda:0'):
+                    device='cpu'):
         self.se3_noiser.set_device(device)
         self.sidechain_noiser.set_device(device)
 
@@ -193,8 +180,10 @@ class ProteinInterpolation(Task):
         for n in num_res:
             data = HeteroData(
                 residue={
-                    "res_mask": torch.ones(n, device=device),
-                    "noising_mask": torch.ones(n, device=device),
+                    "res_mask": torch.ones(n, device=device).bool(),
+                    "noising_mask": torch.ones(n, device=device).bool(),
+                    "atom14_gt_positions": torch.zeros((n, 14, 3), device=device).float(),
+                    "seq": torch.ones(n, device=device).long() * 20,  # should be X
                     "num_nodes": n
                 }
             )
@@ -207,11 +196,11 @@ class ProteinInterpolation(Task):
             _centered_gaussian(res_data.batch, device) * du.NM_TO_ANG_SCALE
         )
         rotmats_0 = _uniform_so3(total_num_res, device)
-        sidechain_0 = _centered_rn_gaussian(
-            res_data.batch,
-            self.sidechain_noiser.dim_size,
+        latent_prior = model.sample_prior(
+            int(res_data.batch.numel()),
             device
         )
+        sidechain_0 = latent_prior['noised_latent_sidechain']
 
         # Set-up time
         ts = torch.linspace(self.se3_noiser._cfg.min_t, 1.0, self.se3_noiser._sample_cfg.num_timesteps)
@@ -243,6 +232,43 @@ class ProteinInterpolation(Task):
 
             with torch.no_grad():
                 denoiser_out = model.denoiser(batch, intermediates, self_condition=denoiser_out)
+
+                # Process model output.
+                pred_rigids = denoiser_out['final_rigids']
+                pred_trans_1 = pred_rigids.get_trans()
+                pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
+                pred_psis = denoiser_out['psi'].detach().cpu()
+                pred_latent_sidechain = denoiser_out[self.sidechain_x_1_pred_key].detach()
+                clean_traj.append(
+                    (pred_trans_1.detach().cpu(), pred_rotmats_1.detach().cpu(), pred_psis, pred_latent_sidechain.cpu())
+                )
+
+                latent_output = {
+                    self.sidechain_x_1_key: pred_latent_sidechain
+                }
+                data_list = []
+                for n in num_res:
+                    data = HeteroData(
+                        residue={
+                            "res_mask": torch.ones(n, device=device).bool(),
+                            "noising_mask": torch.ones(n, device=device).bool(),
+                            "atom14_gt_positions": torch.zeros((n, 14, 3), device=device).float(),
+                            "seq": torch.ones(n, device=device).long() * 20,  # should be X
+                            "num_nodes": n
+                        }
+                    )
+                    data_list.append(data)
+
+                decoder_inputs = Batch.from_data_list(data_list)
+                decoder_inputs['residue'].update(
+                    {
+                        "rigids_1": pred_rigids.to_tensor_7(),
+                        "x": pred_rigids.get_trans(),
+                        "bb": denoiser_out["denoised_bb"][..., :4, :]
+                    }
+                )
+                decoder_output = model.decoder(decoder_inputs, latent_output, use_gt_seq=False)
+                denoiser_out.update(decoder_output)
 
             # Process model output.
             pred_rigids = denoiser_out['final_rigids']
@@ -300,6 +326,8 @@ class ProteinInterpolation(Task):
                 residue={
                     "res_mask": torch.ones(n, device=device).bool(),
                     "noising_mask": torch.ones(n, device=device).bool(),
+                    "atom14_gt_positions": torch.zeros((n, 14, 3), device=device).float(),
+                    "seq": torch.ones(n, device=device).long() * 20,  # should be X
                     "num_nodes": n
                 }
             )
@@ -313,12 +341,13 @@ class ProteinInterpolation(Task):
                 "bb": denoiser_out["denoised_bb"][..., :4, :]
             }
         )
-        decoder_output = model.decoder(decoder_inputs, latent_output)
+        decoder_output = model.decoder(decoder_inputs, latent_output, use_gt_seq=False)
         seq_logits = decoder_output['decoded_seq_logits']
         argmax_seq = seq_logits.argmax(dim=-1)
-        all_atom14 = decoder_output['decoded_all_atom14']
+        decoded_struct = decoder_output['decoded_atom14']
+        # all_atom14 = decoder_output['decoded_all_atom14']
 
-        decoded_struct = _collect_from_seq(all_atom14, argmax_seq, torch.ones_like(argmax_seq).bool())
+        # decoded_struct = _collect_from_seq(all_atom14, argmax_seq, torch.ones_like(argmax_seq).bool())
 
         # # Convert trajectories to atom37.
         # atom37_traj = all_atom.transrotpsi_to_atom37(prot_traj, res_data.res_mask)
@@ -363,13 +392,14 @@ class ProteinInterpolation(Task):
             pt_loss_dict = autoencoder_losses(
                 inputs, pt_outputs
             )
+            norm = 1 - torch.min(inputs['t'], torch.as_tensor(t_clip_max))
             pt_aux_loss = (
-                pt_loss_dict["atom14_mse"]
+                pt_loss_dict["atom14_mse"] * 0.01 / norm
                 + pt_loss_dict["seq_loss"]
             ) * (inputs['t'] > self.aux_loss_t_min)
             pt_loss = (
-                pt_loss_dict["chi_loss"]
-            ) / torch.square(1 - torch.min(inputs['t'], torch.as_tensor(t_clip_max)))
+                pt_loss_dict["chi_loss"] / norm
+            )
             pt_loss = pt_loss + 0.25 * pt_aux_loss
 
             pt_loss_dict = {"pt_" + k: v for k,v in pt_loss_dict.items()}
@@ -385,7 +415,7 @@ class ProteinInterpolation(Task):
             + pt_loss
         ).mean()
 
-        loss_dict = {"loss": loss}
+        loss_dict = {"loss": loss, "frameflow_loss": (bb_denoising_loss + 0.25 * bb_denoising_finegrain_loss).mean()}
         loss_dict.update(bb_frame_diffusion_loss_dict)
         loss_dict.update(autoenc_loss_dict)
         loss_dict.update(latent_loss_dict)

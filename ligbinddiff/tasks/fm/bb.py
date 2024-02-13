@@ -30,12 +30,10 @@ class BackboneFrameInterpolation(Task):
     def __init__(self,
                  se3_noiser: SE3Interpolant,
                  aux_loss_t_min=0.25,
-                 rigid_traj_loss=False,
                  sep_rot_loss=False):
         super().__init__()
         self.se3_noiser = se3_noiser
         self.aux_loss_t_min = aux_loss_t_min
-        self.rigid_traj_loss = rigid_traj_loss
         self.sep_rot_loss = sep_rot_loss
 
     def gen_diffuse_mask(self, data: HeteroData):
@@ -210,17 +208,9 @@ class BackboneFrameInterpolation(Task):
             # + torch.stack(list(bb_hbond_loss_dict.values())).sum(dim=0)
         ) * (inputs['t'] > self.aux_loss_t_min)
 
-        if self.rigid_traj_loss and "intermediate_rigids" in outputs:
-            traj_loss_dict = frame_traj_loss(inputs, outputs)
-            traj_loss = traj_loss_dict["rigid_traj_loss"]
-        else:
-            traj_loss = 0
-
         loss = (
             bb_denoising_loss
             + 0.25 * bb_denoising_finegrain_loss
-            # + rg_loss_dict['rg_mse']
-            + traj_loss
         ).mean()
 
         ff_loss = (
@@ -232,7 +222,5 @@ class BackboneFrameInterpolation(Task):
         loss_dict.update(bb_frame_diffusion_loss_dict)
         # loss_dict.update(bb_frame_clash_loss_dict)
         # loss_dict.update(bb_hbond_loss_dict)
-        if self.rigid_traj_loss and "intermediate_rigids" in outputs:
-            loss_dict.update(traj_loss_dict)
         # loss_dict.update(rg_loss_dict)
         return loss_dict

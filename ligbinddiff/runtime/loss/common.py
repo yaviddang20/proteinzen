@@ -63,12 +63,14 @@ def autoencoder_losses(batch,
     minimal_mask = res_mask & seq_mask
     ae_mask = res_mask & mlm_mask & seq_mask
     denoiser_mask = res_mask & noising_mask & seq_mask
-    decoded_all_atom14 = model_outputs['decoded_all_atom14']
-    decoded_all_chis = model_outputs['decoded_all_chis']
+    # decoded_all_atom14 = model_outputs['decoded_all_atom14']
+    # decoded_all_chis = model_outputs['decoded_all_chis']
+    pred_atom14 = model_outputs['decoded_atom14']
+    pred_chis = model_outputs['decoded_chis']
     seq_logits = model_outputs['decoded_seq_logits']
 
-    pred_atom14 = _collect_from_seq(decoded_all_atom14, seq, seq_mask)
-    pred_chis = _collect_from_seq(decoded_all_chis, seq, seq_mask)
+    # pred_atom14 = _collect_from_seq(decoded_all_atom14, seq, seq_mask)
+    # pred_chis = _collect_from_seq(decoded_all_chis, seq, seq_mask)
 
     atom14_mse = atom14_mse_loss(
         gt_atom14,

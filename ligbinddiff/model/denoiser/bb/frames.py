@@ -930,7 +930,5 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         ret['psi'] = psi
         ret['node_features'] = node_features
         ret['edge_index'] = edge_index
-        if self.learnable_scale:
-            print([scale.data for scale in self.scales])
 
         return ret

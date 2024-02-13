@@ -1,7 +1,8 @@
 import torch
 from torch import nn
 
-from ligbinddiff.model.design.ipmp import IPMPEncoder as DesignIPMPEncoder, IPMPDecoder as DesignIPMPDecoder
+from ligbinddiff.model.design.ipmp import IPMPDecoder as DesignIPMPDecoder
+from ligbinddiff.model.mlm.ipmp import IPMPEncoder as MLMIPMPEncoder
 from ligbinddiff.model.denoiser.protein.frames import DynamicGraphIpaFrameDenoiser
 
 
@@ -22,12 +23,10 @@ class IPMPLatentWrapper(nn.Module):
                  knn_k=20,
                  lrange_k=40,
                  num_vn=4,
-                 vn_mode='attn',
                  self_conditioning=True,
-                 graph_conditioning=False,
                  ):
         super().__init__()
-        self.encoder = DesignIPMPEncoder(
+        self.encoder = MLMIPMPEncoder(
             c_s=c_latent,
             c_z=c_z,
             c_hidden=c_latent,
@@ -45,7 +44,7 @@ class IPMPLatentWrapper(nn.Module):
             num_layers=num_layers,
             k=sidechain_k,
         )
-        self.denoiser = GraphIpaDenoiser(
+        self.denoiser = DynamicGraphIpaFrameDenoiser(
             c_s=c_s,
             c_latent=c_latent,
             c_z=c_z,
@@ -57,9 +56,7 @@ class IPMPLatentWrapper(nn.Module):
             knn_k=knn_k,
             lrange_k=lrange_k,
             num_vn=num_vn,
-            vn_mode=vn_mode,
             self_conditioning=self_conditioning,
-            graph_conditioning=graph_conditioning,
         )
         self.c_latent = c_latent
         self.self_conditioning = self_conditioning

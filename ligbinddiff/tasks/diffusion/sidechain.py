@@ -116,36 +116,6 @@ class DesignLatentSidechainNoising(Task):
             else:
                 latent_data[self.sidechain_x_0_key] = latent_data['latent_mu']
 
-            # sampled_sidechain = latent_data[self.sidechain_x_0_key]
-            # sampled_center = scatter(
-            #     sampled_sidechain,
-            #     inputs['residue'].batch,
-            #     dim_size=inputs.num_graphs
-            # )
-            # sampled_count = scatter(
-            #     torch.ones_like(inputs['residue'].batch),
-            #     inputs['residue'].batch,
-            #     dim_size=inputs.num_graphs
-            # )
-            # sampled_center = sampled_center.sum(dim=-1) / (sampled_count * sampled_center.shape[-1])
-            # centered_sidechain = sampled_sidechain - batchwise_to_nodewise(
-            #     sampled_center,
-            #     inputs['residue'].batch
-            # )[..., None]
-
-            # var = scatter(
-            #     centered_sidechain.square(),
-            #     inputs['residue'].batch,
-            #     dim_size=inputs.num_graphs
-            # )
-            # std = torch.sqrt(var.sum(dim=-1) / (sampled_count * var.shape[-1]))
-
-            # latent_data[self.sidechain_x_0_key] = centered_sidechain / batchwise_to_nodewise(
-            #     std,
-            #     inputs['residue'].batch
-            # )[..., None]
-
-
         else:
             if model.training:
                 latent_sigma = gen_so3_unop(torch.exp)(
@@ -157,11 +127,6 @@ class DesignLatentSidechainNoising(Task):
             else:
                 latent_data[self.sidechain_x_0_key] = latent_data['latent_mu']
 
-        # # scaling the latent to stdev=1
-        # latent_sample = latent_data[self.sidechain_x_0_key]
-        # sig_hat = latent_sample.std()
-        # latent_data[self.sidechain_x_0_key] = latent_sample / sig_hat
-
         t = inputs['residue']['t']
         nodewise_t = batchwise_to_nodewise(t, inputs['residue'].batch)
 
@@ -169,7 +134,6 @@ class DesignLatentSidechainNoising(Task):
         mask = inputs['residue']['res_mask'] & inputs['residue']['noising_mask']
         noised_latent = self.sidechain_noiser.forward_marginal(
             latent_data[self.sidechain_x_0_key],
-            # latent_data['latent_mu'],
             nodewise_t,
             torch.ones_like(mask).bool()
         )

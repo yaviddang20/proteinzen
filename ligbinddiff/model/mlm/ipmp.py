@@ -5,8 +5,7 @@ from torch_cluster import knn_graph
 from torch_geometric.utils import dropout_edge
 
 from ligbinddiff.model.modules.layers.node.mpnn import IPMP
-from ligbinddiff.model.modules.openfold.frames import  StructureModuleTransition
-from ligbinddiff.model.modules.layers.edge.sitewise import EdgeTransition
+from ligbinddiff.model.modules.layers.edge.embed import PairwiseAtomicEmbedding
 from ligbinddiff.data.datasets.featurize.sidechain import _dihedrals, _ideal_virtual_Cb
 from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddings, _rbf
 
@@ -88,12 +87,12 @@ class IPMPEncoder(nn.Module):
         self.c_hidden = c_hidden
         self.num_rbf = num_rbf
         self.num_pos_embed = num_pos_embed
-        atoms_per_res = 5
-        self.c_z_in = (
-            num_rbf * (atoms_per_res ** 2)  # bb x bb distances
-            # + atoms_per_res * 3  # src CA to dst bb direction unit vectors
-            + num_pos_embed  # rel pos embed
-        )
+        # atoms_per_res = 5
+        # self.c_z_in = (
+        #     num_rbf * (atoms_per_res ** 2)  # bb x bb distances
+        #     # + atoms_per_res * 3  # src CA to dst bb direction unit vectors
+        #     + num_pos_embed  # rel pos embed
+        # )
         self.num_aa = num_aa + 1
         self.c_atomic = (
             37 * 3  # rotamer
@@ -109,8 +108,13 @@ class IPMPEncoder(nn.Module):
             nn.Linear(2*c_s, c_s),
             nn.LayerNorm(c_s),
         )
+        self.init_edge_embed = PairwiseAtomicEmbedding(
+            num_rbf=self.num_rbf,
+            num_pos_embed=self.num_pos_embed,
+            num_aa=num_aa
+        )
         self.embed_edge = nn.Sequential(
-            nn.Linear(self.c_z_in, 2*c_z),
+            nn.Linear(self.init_edge_embed.out_dim, 2*c_z),
             nn.ReLU(),
             nn.Linear(2*c_z, 2*c_z),
             nn.ReLU(),
@@ -134,6 +138,7 @@ class IPMPEncoder(nn.Module):
     @torch.no_grad()
     def _prep_features(self, graph, eps=1e-8):
         res_data = graph['residue']
+        res_mask = res_data['res_mask']
 
         # node features
         X_ca = res_data['x'].float()
@@ -152,48 +157,48 @@ class IPMPEncoder(nn.Module):
                 masked_seq
             ],
         dim=-1)
-        rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_0)
+        # TODO: fix this inconsistency
+        if "rigids_1" in res_data:
+            rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_1)
+        else:
+            rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_0)
         node_vectors = rigids[..., None].invert_apply(res_data['atom37'])
         node_vectors[..., 4:, :] = node_vectors[..., 4:, :] * mask[..., None, None]
         node_features = torch.cat(
             [node_scalars, node_vectors.view([node_scalars.shape[0], -1])],
             dim=-1
         ).float()
+        node_features = node_features * res_mask[..., None]
 
         # edge graph
-        res_mask = res_data['res_mask']
         masked_X_ca = X_ca.clone()
         masked_X_ca[~res_mask] = torch.inf
         edge_index = knn_graph(masked_X_ca, self.k, graph['residue'].batch)
 
-        # edge features
-        virtual_Cb = _ideal_virtual_Cb(bb)
-        bb = torch.cat([bb, virtual_Cb[..., None, :]], dim=-2)
+        # # edge features
+        # virtual_Cb = _ideal_virtual_Cb(bb)
+        # bb = torch.cat([bb, virtual_Cb[..., None, :]], dim=-2)
         src = edge_index[1]
         dst = edge_index[0]
 
-        ## edge distances
-        edge_bb_src = bb[src]
-        edge_bb_dst = bb[dst]
-        edge_bb_dists = torch.linalg.vector_norm(
-            edge_bb_src[..., None, :] - edge_bb_dst[..., None, :, :] + eps,
-            dim=-1)
-        edge_bb_dists = edge_bb_dists.view(edge_index.shape[1], -1, 1)
-        edge_rbf = _rbf(edge_bb_dists, D_min=2.0, D_max=22.0, D_count=self.num_rbf, device=edge_index.device)
-        edge_rbf = edge_rbf.view(edge_index.shape[1], -1)
-        ## edge rel pos embedding
-        edge_dist_rel_pos = _edge_positional_embeddings(edge_index, num_embeddings=self.num_pos_embed, device=edge_index.device)
-        # ## direction vecs from src CA to dst bb
-        # rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_0)
-        # src_rigids = rigids[src]
-        # src_X_ca = X_ca[src]
-        # edge_dist_vecs = edge_bb_dst - src_X_ca[..., None, :]
-        # edge_dir_vecs = F.normalize(edge_dist_vecs, dim=-1)
-        # local_edge_dir_vecs = src_rigids[...,  None].invert_apply(edge_dir_vecs)
-        # local_edge_dir_feats = local_edge_dir_vecs.view(edge_index.shape[1], -1)
+        # ## edge distances
+        # edge_bb_src = bb[src]
+        # edge_bb_dst = bb[dst]
+        # edge_bb_dists = torch.linalg.vector_norm(
+        #     edge_bb_src[..., None, :] - edge_bb_dst[..., None, :, :] + eps,
+        #     dim=-1)
+        # edge_bb_dists = edge_bb_dists.view(edge_index.shape[1], -1, 1)
+        # edge_rbf = _rbf(edge_bb_dists, D_min=2.0, D_max=22.0, D_count=self.num_rbf, device=edge_index.device)
+        # edge_rbf = edge_rbf.view(edge_index.shape[1], -1)
+        # ## edge rel pos embedding
+        # edge_dist_rel_pos = _edge_positional_embeddings(edge_index, num_embeddings=self.num_pos_embed, device=edge_index.device)
+        edge_features = self.init_edge_embed(graph, edge_index)
+        # technically this shouldn't be necessary but just to be safe
+        edge_mask = res_mask[src] & res_mask[dst]
+        edge_features = edge_features * edge_mask[..., None]
 
         # edge_features = torch.cat([edge_rbf, edge_dist_rel_pos, local_edge_dir_feats], dim=-1)
-        edge_features = torch.cat([edge_rbf, edge_dist_rel_pos], dim=-1)
+        # edge_features = torch.cat([edge_rbf, edge_dist_rel_pos], dim=-1)
 
         return node_features, edge_features, edge_index
 
@@ -202,7 +207,11 @@ class IPMPEncoder(nn.Module):
         ## prep features
         res_data = graph['residue']
         res_mask = res_data['res_mask']
-        rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_0)
+        # TODO: fix this inconsistency
+        if "rigids_1" in res_data:
+            rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_1)
+        else:
+            rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_0)
 
         node_features, edge_features, edge_index = self._prep_features(graph, eps=eps)
 
