@@ -3,15 +3,19 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-from ligbinddiff.model.modules.common import RBF
+from ligbinddiff.model.modules.common import GaussianRandomFourierBasis
 from ligbinddiff.model.modules.layers.edge.sitewise import EdgeTransition
 from ligbinddiff.model.modules.layers.node.attention import GraphInvariantPointAttention
 from ligbinddiff.model.modules.layers.lrange.vn import VirtualNodeAttnUpdate, VirtualNodeMPNNUpdate
+from ligbinddiff.model.modules.layers.triangle.attention import SparseTriangleAttention
+from ligbinddiff.model.modules.layers.triangle.mult import FusedSparseTriangleMultiplicativeTransition
+from ligbinddiff.model.modules.layers.node.mpnn import IPMP
 
 from ligbinddiff.utils.openfold import rigid_utils as ru
 from ligbinddiff.utils.framediff.all_atom import compute_backbone, adjust_oxygen_pos
 
 from ligbinddiff.data.datasets.featurize.common import _node_positional_embeddings
+from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddings, _rbf
 
 from ligbinddiff.model.modules.openfold.frames import BackboneUpdate, StructureModuleTransition, Linear
 
@@ -24,6 +28,10 @@ from ligbinddiff.model.modules.layers.lrange.anchor import ProjectivePoolUpdate,
 from ligbinddiff.model.modules.layers.interres import OneParamPairwiseEquilibrate
 
 from torch_geometric.utils import coalesce
+from torch_geometric.nn import knn_graph
+
+
+from torch.profiler import profile, record_function, ProfilerActivity
 
 
 class GraphIpaFrameDenoisingLayer(nn.Module):
@@ -237,7 +245,7 @@ class GraphIpaFrameDenoiser(nn.Module):
         self.n_layers = n_layers
 
         self.h_time = h_time
-        self.time_rbf = RBF(n_basis=h_time//2)
+        self.time_rbf = GaussianRandomFourierBasis(n_basis=h_time//2)
 
         self.embed_node = nn.Sequential(
             nn.Linear(
@@ -493,14 +501,43 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
                  num_qk_pts,
                  num_v_pts,
                  self_conditioning=False,
+                 triangle_attention=False,
+                 triangle_mult=False,
                  embed_seq_edge=False,
-                 last=False
+                 use_seq_edge=True,
+                 use_ipmp_seq_edge=False,
+                 last=False,
+                 num_rbf=64,
+                 knn_k=20,
+                 lrange_k=40
                  ):
         """
         Args
         ----
         """
         super().__init__()
+
+        if triangle_attention:
+            self.triangle_attention = SparseTriangleAttention(
+                c_s=c_s,
+                c_z=c_z,
+                num_heads=num_heads,
+                num_rbf=num_rbf,
+            )
+            self.edge_ln = nn.LayerNorm(c_z)
+        else:
+            self.triangle_attention = None
+
+        if triangle_mult:
+            self.triangle_mult = FusedSparseTriangleMultiplicativeTransition(
+                c_s=c_s,
+                c_z=c_z,
+                num_rbf=num_rbf,
+                use_ffn=True
+            )
+        else:
+            self.triangle_mult = None
+
 
         self.attn_spatial = GraphInvariantPointAttention(
             c_s=c_s,
@@ -510,16 +547,32 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
             no_qk_points=num_qk_pts,
             no_v_points=num_v_pts,
         )
-        self.attn_seq = GraphInvariantPointAttention(
-            c_s=c_s,
-            c_z=c_z,
-            c_hidden=c_hidden,
-            no_heads=num_heads,
-            no_qk_points=num_qk_pts,
-            no_v_points=num_v_pts,
-        )
         self.ln_s1 = nn.LayerNorm(c_s)
-        self.ln_s2 = nn.LayerNorm(c_s)
+
+        self.use_seq_edge = use_seq_edge
+        self.use_ipmp_seq_edge = use_ipmp_seq_edge
+        if self.use_seq_edge:
+            if use_ipmp_seq_edge:
+                self.attn_seq = IPMP(
+                    c_s=c_s,
+                    c_z=c_z,
+                    c_hidden=c_hidden,
+                    dropout=0.,
+                    edge_dropout=0.,
+                    final_init='final',
+                    update_edge=last
+                )
+            else:
+                self.attn_seq = GraphInvariantPointAttention(
+                    c_s=c_s,
+                    c_z=c_z,
+                    c_hidden=c_hidden,
+                    no_heads=num_heads,
+                    no_qk_points=num_qk_pts,
+                    no_v_points=num_v_pts,
+                )
+
+            self.ln_s2 = nn.LayerNorm(c_s)
 
         self.bb_update = BackboneUpdate(
             c_s
@@ -546,7 +599,7 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
                 nn.LayerNorm(c_z)
             )
 
-        if not last:
+        if not use_ipmp_seq_edge and not last:
             self.seq_edge_transition = EdgeTransition(
                 node_embed_size=c_s,
                 edge_embed_in=c_z,
@@ -575,6 +628,27 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
         if self.embed_seq_edge:
             seq_edge_features = self.seq_edge_embed(seq_edge_features)
 
+        if self.triangle_attention is not None:
+            edge_update = torch.utils.checkpoint.checkpoint(
+                self.triangle_attention,
+                node_features,
+                rigids,
+                edge_features,
+                edge_index,
+                use_reentrant=False
+            )
+            edge_features = self.edge_ln(edge_features + edge_update)
+
+        if self.triangle_mult is not None:
+            edge_features = torch.utils.checkpoint.checkpoint(
+                self.triangle_mult,
+                node_features,
+                rigids,
+                edge_features,
+                edge_index,
+                use_reentrant=False
+            )
+
         res_mask = ~(res_data['res_mask'].bool())
         noising_mask = res_data['noising_mask']
 
@@ -588,15 +662,25 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
         node_s_update = node_s_update * (~res_mask)[..., None]
         node_features = self.ln_s1(node_features + node_s_update)
 
-        node_s_update = self.attn_seq(
-            s=node_features,
-            z=seq_edge_features,
-            edge_index=seq_edge_index,
-            r=rigids,
-            mask=(~res_mask).float()
-        )
-        node_s_update = node_s_update * (~res_mask)[..., None]
-        node_features = self.ln_s1(node_features + node_s_update)
+        if self.use_seq_edge:
+            if self.use_ipmp_seq_edge:
+                node_s_update, seq_edge_features = self.attn_seq(
+                    s=node_features,
+                    z=seq_edge_features,
+                    edge_index=seq_edge_index,
+                    r=rigids,
+                    mask=(~res_mask).float()
+                )
+            else:
+                node_s_update = self.attn_seq(
+                    s=node_features,
+                    z=seq_edge_features,
+                    edge_index=seq_edge_index,
+                    r=rigids,
+                    mask=(~res_mask).float()
+                )
+                node_s_update = node_s_update * (~res_mask)[..., None]
+                node_features = self.ln_s2(node_features + node_s_update)
 
         # node_update, vn_features = self.vn_update(
         #     node_features,
@@ -621,6 +705,56 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
         return node_features, rigids, seq_edge_features
 
 
+class IPMPRefineLayer(nn.Module):
+    def __init__(self,
+                 c_s,
+                 c_z,
+                 c_hidden):
+        super().__init__()
+        self.c_s = c_s
+        self.c_z = c_z
+        self.c_hidden = c_hidden
+
+        self.ipmp = IPMP(
+            c_s=c_s,
+            c_z=c_z,
+            c_hidden=c_hidden,
+            dropout=0.,
+            edge_dropout=0.,
+            final_init="final"
+        )
+
+        self.bb_update = BackboneUpdate(
+            c_s
+        )
+
+    def forward(self,
+                node_features,
+                rigids,
+                edge_features,
+                edge_index,
+                res_data):
+        res_mask = res_data['res_mask']
+        noising_mask = res_data['noising_mask']
+
+        # node_update = self.ipmp(
+        node_features, edge_features = self.ipmp(
+            s=node_features,
+            z=edge_features,
+            edge_index=edge_index,
+            r=rigids,
+            mask=res_mask)
+
+        rigids_update = self.bb_update(
+            node_features * noising_mask[..., None])
+
+        rigids = rigids.compose_q_update_vec(
+            rigids_update * noising_mask[..., None]
+        )
+
+        return node_features, rigids, edge_features
+
+
 class DynamicGraphIpaFrameDenoiser(nn.Module):
     """ Denoising model on sidechain densities """
     def __init__(self,
@@ -640,13 +774,20 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  graph_conditioning=False,
                  use_anchors=False,
                  interres_equilibrate=False,
+                 use_triangle_attn=False,
+                 use_triangle_mult=False,
+                 use_self_edge=False,
                  update_seq_edge=False,
+                 use_ipmp_seq_edge=False,
+                 first_seq_edge_only=False,
                  learnable_scale=False,
+                 use_ipmp_refine=False,
                  impute_oxy=False):
         super().__init__()
 
         self.c_s = c_s
         self.c_z = c_z
+        self.num_rbf = c_z//2
         self.vn_mode = vn_mode
         self.num_vn = num_vn
         self.self_conditioning = self_conditioning
@@ -656,10 +797,12 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         self.n_layers = n_layers
         self.impute_oxy = impute_oxy
         self.update_seq_edge = update_seq_edge
+        self.use_self_edge = use_self_edge
         self.learnable_scale = learnable_scale
+        self.first_seq_edge_only = first_seq_edge_only
 
         self.h_time = h_time
-        self.time_rbf = RBF(n_basis=h_time//2)
+        self.time_rbf = GaussianRandomFourierBasis(n_basis=h_time//2)
 
         self.embed_node = nn.Sequential(
             nn.Linear(
@@ -703,9 +846,14 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  num_v_pts,
                  self_conditioning=self_conditioning,
                  embed_seq_edge=update_seq_edge,
-                 last=True
-                 # last=(i == n_layers-1)
-                 # last=(i < n_layers-1)
+                 use_seq_edge=(i == 0 if first_seq_edge_only else True),
+                 last=update_seq_edge,
+                 use_ipmp_seq_edge=use_ipmp_seq_edge,
+                 knn_k=knn_k,
+                 lrange_k=lrange_k,
+                 num_rbf=self.num_rbf,
+                 triangle_attention=use_triangle_attn,
+                 triangle_mult=use_triangle_mult,
             )
             for i in range(n_layers)
         ])
@@ -720,6 +868,64 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                 for _ in range(n_layers)
             ])
 
+        self.use_ipmp_refine = use_ipmp_refine
+        if self.use_ipmp_refine:
+            self.ipmp_num_rbf = 16
+            self.ipmp_num_pos_embed = 16
+            atoms_per_res = 5
+            self.c_z_in = (
+                self.ipmp_num_rbf * (atoms_per_res ** 2)  # bb x bb distances
+                # + atoms_per_res * 3  # src CA to dst bb direction unit vectors
+                + self.ipmp_num_pos_embed  # rel pos embed
+            )
+            self.embed_ipmp_edge = nn.Sequential(
+                nn.Linear(self.c_z_in, c_z),
+                nn.ReLU(),
+                nn.Linear(c_z, c_z),
+                nn.ReLU(),
+                nn.Linear(c_z, c_z),
+                nn.LayerNorm(c_z)
+            )
+
+            self.refine = nn.ModuleList([
+                IPMPRefineLayer(
+                    c_s=c_s,
+                    c_z=c_z,
+                    c_hidden=c_hidden
+                )
+                for _ in range(n_layers)
+            ])
+
+    def _gen_ipmp_edge_features(self, rigids, psis, batch, res_mask, eps=1e-8):
+        # edge graph
+        masked_X_ca = rigids.get_trans().clone()
+        masked_X_ca[~res_mask] = torch.inf
+        edge_index = knn_graph(masked_X_ca, self.knn_k, batch)
+
+        # edge features
+        bb = compute_backbone(rigids.unsqueeze(0), psis.unsqueeze(0))[-1].squeeze(0)[..., :5, :]
+        src = edge_index[1]
+        dst = edge_index[0]
+
+        # ## edge distances
+        edge_bb_src = bb[src]
+        edge_bb_dst = bb[dst]
+        edge_bb_dists = torch.linalg.vector_norm(
+            edge_bb_src[..., None, :] - edge_bb_dst[..., None, :, :] + eps,
+            dim=-1)
+        edge_bb_dists = edge_bb_dists.view(edge_index.shape[1], -1, 1)
+        edge_rbf = _rbf(edge_bb_dists, D_min=2.0, D_max=22.0, D_count=self.ipmp_num_rbf, device=edge_index.device)
+        edge_rbf = edge_rbf.view(edge_index.shape[1], -1)
+        # ## edge rel pos embedding
+        edge_dist_rel_pos = _edge_positional_embeddings(edge_index, num_embeddings=self.ipmp_num_pos_embed, device=edge_index.device)
+        # edge_features = self.init_edge_embed(graph, edge_index)
+        # technically this shouldn't be necessary but just to be safe
+        # edge_mask = res_mask[src] & res_mask[dst]
+        # edge_features = edge_features * edge_mask[..., None]
+        edge_features = torch.cat([edge_rbf, edge_dist_rel_pos], dim=-1)
+
+        return edge_features, edge_index
+
 
     def _gen_spatial_edge_features(self, rigids, res_mask, batch, self_condition):
         res_mask = ~res_mask
@@ -729,11 +935,11 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
             self_cond_X_ca = self_condition['final_rigids'].get_trans()
             masked_X_ca = self_cond_X_ca.clone()
             masked_X_ca[res_mask] = torch.inf
-            edge_index = sample_inv_cubic_edges(masked_X_ca, res_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k)
+            edge_index = sample_inv_cubic_edges(masked_X_ca, res_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k, self_edge=self.use_self_edge)
         else:
             masked_X_ca = X_ca.clone()
             masked_X_ca[res_mask] = torch.inf
-            edge_index = sample_inv_cubic_edges(masked_X_ca, res_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k)
+            edge_index = sample_inv_cubic_edges(masked_X_ca, res_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k, self_edge=self.use_self_edge)
 
         # compute edge features
         edge_features, _ = gen_spatial_graph_features(X_ca, edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=self.c_z//2)
@@ -916,6 +1122,21 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         _, psi = self.torsion_angles(node_features)
 
         rigids = rigids.scale_translation(10)
+
+        if self.use_ipmp_refine:
+            ipmp_edge_features, ipmp_edge_index = self._gen_ipmp_edge_features(
+                rigids, psi, res_data.batch, res_mask
+            )
+            ipmp_edge_features = self.embed_ipmp_edge(ipmp_edge_features)
+            for i, layer in enumerate(self.refine):
+                node_features, rigids, ipmp_edge_features = layer(
+                    node_features,
+                    rigids,
+                    ipmp_edge_features,
+                    ipmp_edge_index,
+                    res_data,
+                )
+        _, psi = self.torsion_angles(node_features)
         rigids = rigids.translate(center)
         ret = {}
         ret['denoised_frames'] = rigids

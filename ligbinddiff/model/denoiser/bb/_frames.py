@@ -5,7 +5,7 @@ from torch import nn
 from torch_cluster import knn_graph
 from torch_geometric.utils import sort_edge_index
 from ligbinddiff.data.datasets.featurize.common import _rbf
-from ligbinddiff.model.modules.common import RBF
+from ligbinddiff.model.modules.common import GaussianRandomFourierBasis
 
 from ligbinddiff.model.modules.equiformer_v2.so3 import CoefficientMappingModule, SO3_Embedding, SO3_Rotation, SO3_Grid, SO3_LinearV2
 from ligbinddiff.model.modules.equiformer_v2.layer_norm import MultiResEquivariantRMSNormArraySphericalHarmonicsV2 as NormSO3
@@ -372,7 +372,7 @@ class FrameDenoiser(nn.Module):
         self.node_SO3_grid_list = node_SO3_grid
 
         self.h_time = h_time
-        self.time_rbf = RBF(n_basis=h_time//2)
+        self.time_rbf = GaussianRandomFourierBasis(n_basis=h_time//2)
         self.time_mlp = nn.Sequential(
             nn.Linear(h_time, scalar_h_dim),
             nn.ReLU(),
@@ -649,7 +649,7 @@ class FrameDenoiser2(nn.Module):
         self.c_z = c_z
 
         self.h_time = h_time
-        self.time_rbf = RBF(n_basis=h_time//2)
+        self.time_rbf = GaussianRandomFourierBasis(n_basis=h_time//2)
         self.time_mlp = nn.Sequential(
             nn.Linear(h_time, scalar_h_dim),
             nn.ReLU(),
@@ -804,7 +804,7 @@ class FrameDenoiser2p5(nn.Module):
         self.c_z = c_z
 
         self.h_time = h_time
-        self.time_rbf = RBF(n_basis=h_time//2)
+        self.time_rbf = GaussianRandomFourierBasis(n_basis=h_time//2)
         self.time_mlp = nn.Sequential(
             nn.Linear(h_time, scalar_h_dim),
             nn.ReLU(),

@@ -67,7 +67,7 @@ class EdgeUpdate(nn.Module):
         return edge_features + self.norm(update)
 
 
-class RBF(nn.Module):
+class GaussianRandomFourierBasis(nn.Module):
     """ Damped random Fourier Feature encoding layer """
     def __init__(self, n_basis=64):
         super().__init__()

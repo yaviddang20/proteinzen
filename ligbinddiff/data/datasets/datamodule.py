@@ -92,6 +92,7 @@ class FramediffDataModule(L.LightningDataModule):
                  data_dir,
                  batch_size,
                  num_workers,
+                 min_len=30,
                  max_len=1000,
                  sample_lengths={
                     60: 5,
@@ -116,6 +117,7 @@ class FramediffDataModule(L.LightningDataModule):
         # csv = "mini_metadata.csv"
         self.train_dataset = PdbDataset(
             os.path.join(self.data_dir, csv),
+            min_num_res=min_len,
             max_num_res=max_len
         )
         self.val_dataset = LengthDataset(self.sample_lengths, batch_size=batch_size)

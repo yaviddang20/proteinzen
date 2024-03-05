@@ -1,5 +1,5 @@
 import torch
-from torch_geometric.nn import radius_graph
+from torch_geometric.nn import radius_graph, knn_graph
 from torch_geometric.utils import sort_edge_index, scatter
 
 from ligbinddiff.runtime.loss.atomic.common import atom91_to_atom14
@@ -52,40 +52,70 @@ def framediff_local_atomic_context_loss(
     return graphwise_dist_se / (graphwise_num_edges - graphwise_num_res)
 
 
-
-
-def atomic_neighborhood_dist_loss(ref_atom91,
-                                  pred_atom91,
-                                  seq,
-                                  edge_index,
-                                  num_edges,
-                                  x_mask,
+def atomic_neighborhood_dist_loss(gt_ref_atom14,
+                                  alt_ref_atom14,
+                                  pred_atom14,
+                                  gt_atom14_mask,
+                                  alt_atom14_mask,
+                                  batch,
+                                  k=30,
                                   radius_cutoff=6):
     """ Additional loss to push non-bonded atoms
         out of the van der waals radius of other atoms  """
-    pred_atom14, atom14_mask = atom91_to_atom14(pred_atom91, seq)
-    ref_atom14, _ = atom91_to_atom14(ref_atom91, seq)
-    atom14_mask = atom14_mask.any(dim=-1)
-    atom14_mask[x_mask] = True
+    res_mask = gt_atom14_mask[:, 1]
+    ref_X_ca = gt_ref_atom14[:, 1].clone()
+    ref_X_ca[~res_mask] = torch.inf
+    edge_index = knn_graph(ref_X_ca, k, batch)
+    num_edges = edge_index.shape[-1]
+    edge_batch = batch[edge_index[1]]
 
-    ref_res_src = ref_atom14[edge_index[0]].unsqueeze(-2)  # n_edge x n_atoms x 1 x 3
-    ref_res_dst = ref_atom14[edge_index[1]].unsqueeze(-3)  # n_edge x 1 x n_atoms x 3
+    gt_ref_res_src = gt_ref_atom14[edge_index[0]].unsqueeze(-2)  # n_edge x n_atoms x 1 x 3
+    gt_ref_res_dst = gt_ref_atom14[edge_index[1]].unsqueeze(-3)  # n_edge x 1 x n_atoms x 3
+
+    alt_ref_res_src = alt_ref_atom14[edge_index[0]].unsqueeze(-2)  # n_edge x n_atoms x 1 x 3
+    alt_ref_res_dst = alt_ref_atom14[edge_index[1]].unsqueeze(-3)  # n_edge x 1 x n_atoms x 3
 
     pred_res_src = pred_atom14[edge_index[0]].unsqueeze(-2)  # n_edge x n_atoms x 1 x 3
     pred_res_dst = pred_atom14[edge_index[1]].unsqueeze(-3)  # n_edge x 1 x n_atoms x 3
 
-    atom14_src_mask = atom14_mask[edge_index[0]].unsqueeze(-1)  # n_edge x n_atom x 1
-    atom14_dst_mask = atom14_mask[edge_index[1]].unsqueeze(-2)  # n_edge x 1 x n_atom
-    selection_mask = atom14_src_mask | atom14_dst_mask
+    gt_src_mask = gt_atom14_mask[edge_index[0]].unsqueeze(-1)  # n_edge x n_atom x 1
+    gt_dst_mask = gt_atom14_mask[edge_index[1]].unsqueeze(-2)  # n_edge x 1 x n_atom
 
-    ref_interres_dists = vec_norm(ref_res_src - ref_res_dst, dim=-1)  # n_edge x n_atoms x n_atoms
-    cutoff_mask = (ref_interres_dists < radius_cutoff)
-    total_mask = selection_mask | cutoff_mask
-    ref_interres_dists = ref_interres_dists[~total_mask]
+    alt_src_mask = alt_atom14_mask[edge_index[0]].unsqueeze(-1)  # n_edge x n_atom x 1
+    alt_dst_mask = alt_atom14_mask[edge_index[1]].unsqueeze(-2)  # n_edge x 1 x n_atom
+
+    ref_interres_dists = []  # n_edge x n_atoms x n_atoms
+    total_masks = []
+    for ref_res_src, ref_src_mask in zip([gt_ref_res_src, alt_ref_res_src], [gt_src_mask, alt_src_mask]):
+        for ref_res_dst, ref_dst_mask in zip([gt_ref_res_dst, alt_ref_res_dst], [gt_dst_mask, alt_dst_mask]):
+            ref_dists = vec_norm(ref_res_src - ref_res_dst, dim=-1)
+            ref_interres_dists.append(ref_dists)
+            cutoff_mask = (ref_dists < radius_cutoff)
+            total_masks.append((ref_src_mask | ref_dst_mask) | cutoff_mask)
 
     pred_interres_dists = vec_norm(pred_res_src - pred_res_dst, dim=-1)  # n_edge x n_atoms x n_atoms
-    pred_interres_dists = pred_interres_dists[~total_mask]
 
-    dist_mse = (ref_interres_dists - pred_interres_dists).square()
+    dist_ses = [
+        (ref_dists - pred_interres_dists).square() * total_mask
+        for ref_dists, total_mask in zip(ref_interres_dists, total_masks)
+    ]
 
-    return _nodewise_to_graphwise(dist_mse, num_edges, total_mask.flatten(-2, -1))
+    min_dist_ses, _ = torch.min(
+        torch.stack(dist_ses).sum(dim=(-1, -2)),
+        dim=0
+    )  # num_edges
+
+    batchwise_dist_ses = scatter(
+        min_dist_ses,
+        edge_batch,
+        dim=0,
+        dim_size=(batch.max().item()+1)
+    )
+    norm = scatter(
+        total_masks[0].sum(dim=(-1, -2)),
+        edge_batch,
+        dim=0,
+        dim_size=(batch.max().item()+1)
+    )
+
+    return batchwise_dist_ses / norm

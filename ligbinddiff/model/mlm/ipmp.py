@@ -164,6 +164,7 @@ class IPMPEncoder(nn.Module):
             rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_0)
         node_vectors = rigids[..., None].invert_apply(res_data['atom37'])
         node_vectors[..., 4:, :] = node_vectors[..., 4:, :] * mask[..., None, None]
+        # node_vectors = node_vectors * mask[..., None, None]
         node_features = torch.cat(
             [node_scalars, node_vectors.view([node_scalars.shape[0], -1])],
             dim=-1

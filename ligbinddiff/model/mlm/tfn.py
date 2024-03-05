@@ -10,7 +10,7 @@ from torch_scatter import scatter_mean
 from e3nn import o3
 from e3nn.nn import Gate, BatchNorm
 
-from ligbinddiff.model.modules.common import RBF
+from ligbinddiff.model.modules.common import GaussianRandomFourierBasis
 from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddings, _rbf
 from ligbinddiff.data.datasets.featurize.sidechain import _dihedrals, _ideal_virtual_Cb
 from ligbinddiff.utils.openfold import rigid_utils as ru

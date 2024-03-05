@@ -531,6 +531,20 @@ class ProteinModule(L.LightningModule):
 
         self.median_metric = MedianMetric()
 
+        # path = "/wynton/home/kortemme/alexjli/projects/ligbinddiff/outputs/2024-02-20/10-40-06/lightning_logs/version_0/checkpoints/epoch=85-step=69570.ckpt"
+        # ckpt = torch.load(path, map_location='cpu')
+        # self.model.encoder.load_state_dict({
+        #     key[len("model.encoder."):]: ckpt['state_dict'][key]
+        #     for key in ckpt['state_dict'].keys()
+        #     if key.startswith("model.encoder")
+        # })
+        # self.model.decoder.load_state_dict({
+        #     key[len("model.decoder."):]: ckpt['state_dict'][key]
+        #     for key in ckpt['state_dict'].keys()
+        #     if key.startswith("model.decoder")
+        # })
+
+
     def training_step(self, batch):
         task: TaskList = batch.task
         outputs = task.run_evals(self.model, batch)
@@ -604,6 +618,7 @@ class ProteinModule(L.LightningModule):
 
         self.median_metric.update(sample_loss_dict['autoenc_per_seq_recov'])
         self.log("median_seq_recov", self.median_metric, on_step=False, on_epoch=True)
+        print(gen_pbar_str(sample_loss_dict))
         self._log.info(gen_pbar_str(sample_loss_dict))
         return sample_loss_dict
 
@@ -619,4 +634,10 @@ class ProteinModule(L.LightningModule):
         return outputs
 
     def configure_optimizers(self):
-        return self.optim(self.model.parameters())
+        # return self.optim(self.model.denoiser.parameters())
+        return self.optim(
+            list(self.model.denoiser.parameters())
+            + list(self.model.encoder.parameters())
+            + list(self.model.decoder.parameters())
+        )
+

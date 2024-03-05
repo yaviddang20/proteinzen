@@ -11,7 +11,7 @@ from e3nn import o3
 from e3nn.nn import BatchNorm, FullyConnectedNet
 
 
-from ligbinddiff.model.modules.common import RBF
+from ligbinddiff.model.modules.common import GaussianRandomFourierBasis
 from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddings, _rbf
 from ligbinddiff.model.modules.openfold.frames import Linear
 
@@ -177,7 +177,7 @@ class MoleculeDenoiser(nn.Module):
         self.n_rbf = n_rbf
         self.k = k
 
-        self.time_rbf = RBF(n_basis=h_time//2)
+        self.time_rbf = GaussianRandomFourierBasis(n_basis=h_time//2)
 
         self.embed_atoms = nn.Sequential(
             nn.Linear(n_atom_in + h_time, c_s),

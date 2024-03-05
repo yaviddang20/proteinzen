@@ -1,5 +1,7 @@
 import numpy as np
 import torch
+import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 from torch_geometric.utils import sort_edge_index, scatter
 from ligbinddiff.data.datasets.featurize.common import _rbf
 
@@ -17,14 +19,18 @@ def sample_inv_cubic_edges(batched_X_ca, batched_x_mask, batch, knn_k=30, inv_cu
         rel_pos_CA = X_ca.unsqueeze(1) - X_ca.unsqueeze(0)  # N x N x 3
         dist_CA = torch.linalg.vector_norm(rel_pos_CA, dim=-1)  # N x N
         sorted_dist, sorted_edges = torch.sort(dist_CA, dim=-1)  # N x N
-        knn_edges = sorted_edges[..., 1:knn_k+1]  # first edge will always be self
-        # knn_edges = sorted_edges[..., 0:knn_k]  # first edge will always be self
+        if self_edge:
+            knn_edges = sorted_edges[..., :knn_k]  # first edge will always be self
+            # remove knn edges
+            remaining_dist = sorted_dist[..., knn_k:]  # N x (N - knn_k - 1)
+            remaining_edges = sorted_edges[..., knn_k:]  # N x (N - knn_k - 1)
 
-        # remove knn edges
-        remaining_dist = sorted_dist[..., knn_k+1:]  # N x (N - knn_k - 1)
-        remaining_edges = sorted_edges[..., knn_k+1:]  # N x (N - knn_k - 1)
-        # remaining_dist = sorted_dist[..., knn_k:]  # N x (N - knn_k - 1)
-        # remaining_edges = sorted_edges[..., knn_k:]  # N x (N - knn_k - 1)
+        else:
+            # remove self edge
+            knn_edges = sorted_edges[..., 1:knn_k+1]  # first edge will always be self
+            # remove knn edges
+            remaining_dist = sorted_dist[..., knn_k+1:]  # N x (N - knn_k - 1)
+            remaining_edges = sorted_edges[..., knn_k+1:]  # N x (N - knn_k - 1)
 
         ## inv cube
         uniform = torch.distributions.Uniform(0,1)
@@ -40,6 +46,7 @@ def sample_inv_cubic_edges(batched_X_ca, batched_x_mask, batch, knn_k=30, inv_cu
         num_bad_edges = (~good_edges).sum(dim=-1)
         max_num_bad_edges = int(num_bad_edges.max())
         if inv_cube_k > perturbed_logprobs.shape[-1] - max_num_bad_edges:
+            print(f"trimming down num edges from {inv_cube_k} to {perturbed_logprobs.shape[-1] - max_num_bad_edges}, {max_num_bad_edges} bad edges")
             inv_cube_k = perturbed_logprobs.shape[-1] - max_num_bad_edges
 
         _, sampled_edges_relative_idx = torch.topk(perturbed_logprobs, k=inv_cube_k, dim=-1)
@@ -56,6 +63,49 @@ def sample_inv_cubic_edges(batched_X_ca, batched_x_mask, batch, knn_k=30, inv_cu
     edge_index = torch.cat(edge_indicies, dim=-1)
     edge_mask = batched_x_mask[edge_index].any(dim=0)
     return edge_index[:, ~edge_mask]
+
+
+def sparse_to_knn_graph(edge_features, edge_index):
+    src = edge_index[1]
+    assert (torch.sort(src)[0] == src).all(), "edge index must have monotonic increasing node index"
+
+    num_nodes = int(edge_index.max() + 1)
+    num_edges_per_node = scatter(
+        torch.ones_like(edge_index[1]),
+        edge_index[1],
+        dim_size=num_nodes,
+    )
+    # max_k = int(num_edges_per_node.max())
+
+    edges_per_node = edge_features.split(num_edges_per_node.tolist(), dim=0)
+    knn_edge_features = pad_sequence(
+        edges_per_node,
+        batch_first=True,
+        padding_value=0.
+    )
+    edge_index_per_node = edge_index[0].split(num_edges_per_node.tolist(), dim=0)
+    knn_edge_index = pad_sequence(
+        edge_index_per_node,
+        batch_first=True,
+        padding_value=-1
+    )
+
+    edge_mask = (knn_edge_index != -1)
+    knn_edge_index[~edge_mask] = 0
+
+    return knn_edge_features, knn_edge_index, edge_mask
+
+
+def knn_to_sparse_graph(edge_features, edge_index, edge_mask):
+    sparse_edge_features = edge_features[edge_mask]
+    dst_edge_index = edge_index[edge_mask]
+    num_nodes = edge_features.shape[0]
+    knn_src_edge_index = torch.arange(
+        num_nodes, device=edge_index.device
+    )[..., None].expand(-1, edge_index.shape[-1])
+    src_edge_index = knn_src_edge_index[edge_mask]
+    return sparse_edge_features, torch.stack([dst_edge_index, src_edge_index])
+
 
 
 def dense_to_sparse_graph(node_features, edge_features, edge_index, node_index=None):

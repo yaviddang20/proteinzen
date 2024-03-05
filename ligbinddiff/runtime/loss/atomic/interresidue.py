@@ -4,7 +4,7 @@ from ligbinddiff.utils.atom_reps import atom14_clash_radius, atom14_interact_mas
 
 
 import torch
-from torch_geometric.nn import radius_graph
+from torch_geometric.nn import radius_graph, knn_graph
 import torch_geometric.utils as pygu
 
 from ligbinddiff.runtime.loss.utils import _nodewise_to_graphwise, vec_norm
@@ -128,11 +128,23 @@ def bb_clash_loss(pred_bb,
 def intersidechain_clash_loss(pred_atom14,
                               atom14_mask,
                               seq,
-                              edge_index,
-                              edge_batch):
+                              batch,
+                              k=30):
     """ Additional loss to push non-bonded atoms
         out of the van der waals radius of other atoms  """
-    atom14_clash_radius = torch.as_tensor(atom14_clash_radius, device=pred_atom14.device)
+    atom14_clash_radius_torch = torch.as_tensor(atom14_clash_radius, device=pred_atom14.device)
+
+    pred_X_ca = pred_atom14[:, 1].clone()
+    res_mask = atom14_mask.any(dim=-1)
+    pred_X_ca[~res_mask] = torch.inf
+    edge_index = knn_graph(pred_X_ca, k, batch)
+
+    # we need to treat adjacent residues differently
+    # we'll just zero out the backbone loss components, since this is generally handled by other losses
+    chain_edge = (torch.abs(edge_index[0] - edge_index[1]) < 2)
+
+
+    edge_batch = batch[edge_index[1]]
 
     src = edge_index[1]
     dst = edge_index[0]
@@ -142,13 +154,23 @@ def intersidechain_clash_loss(pred_atom14,
 
     atom14_src_mask = atom14_mask[src].unsqueeze(-1)  # n_edge x n_atom x 1
     atom14_dst_mask = atom14_mask[dst].unsqueeze(-2)  # n_edge x 1 x n_atom
-    total_mask = atom14_src_mask | atom14_dst_mask
+    total_mask = atom14_src_mask & atom14_dst_mask
+    total_mask[chain_edge][:, :4, :4] = False
 
     interres_dists = vec_norm(res_src - res_dst, dim=-1)  # n_edge x n_atoms x n_atoms
     seq_src = seq[src]
     seq_dst = seq[dst]
-    clash_dists = atom14_clash_radius[(seq_src, seq_dst)]
+    clash_dists = atom14_clash_radius_torch[(seq_src, seq_dst)]
+    # TODO: allow for di-sulfide bonds?
 
     clash_loss = torch.where(interres_dists < clash_dists, clash_dists - interres_dists, 0)
+    clash_loss = clash_loss * total_mask
+    # print(pred_atom14)
+    # print(edge_index)
+    # print(interres_dists)
+    # print(clash_dists)
+    # print(clash_loss)
+    # torch.set_printoptions(threshold=100000000)
+    # print(clash_loss[torch.nonzero(clash_loss, as_tuple=True)])
 
     return _nodewise_to_graphwise(clash_loss, edge_batch, total_mask, reduction='sum')

@@ -16,7 +16,7 @@ from ligbinddiff.tasks import Task
 from ligbinddiff.model.utils.graph import batchwise_to_nodewise
 
 from ligbinddiff.runtime.loss.frames import bb_frame_fm_loss
-from ligbinddiff.runtime.loss.common import autoencoder_losses, latent_scalar_sidechain_fm_loss, _collect_from_seq
+from ligbinddiff.runtime.loss.common import autoencoder_losses, latent_scalar_sidechain_fm_loss, _collect_from_seq, pt_autoencoder_losses
 from ligbinddiff.stoch_interp.interpolate.se3 import _centered_gaussian, _uniform_so3
 from ligbinddiff.stoch_interp.interpolate.latent import _centered_gaussian as _centered_rn_gaussian
 from ligbinddiff.stoch_interp.interpolate.protein import ProteinInterpolant
@@ -37,20 +37,23 @@ class ProteinInterpolation(Task):
     def __init__(self,
                  protein_noiser: ProteinInterpolant,
                  aux_loss_t_min=0.25,
-                 compute_passthrough=True):
+                 compute_passthrough=True,
+                 pt_clash_loss_t=1.1):
         super().__init__()
         self.se3_noiser = protein_noiser.se3_noiser
         self.sidechain_noiser = protein_noiser.sidechain_noiser
         self.aux_loss_t_min = aux_loss_t_min
         self.compute_passthrough = compute_passthrough
+        self.pt_clash_loss_t = pt_clash_loss_t
         self.rng = np.random.default_rng()
 
     def _gen_diffuse_mask(self, data: HeteroData):
-        if self.rng.random() > 0.25:
-            return torch.ones_like(data['res_mask']).bool()
-        else:
-            percent = self.rng.random()
-            return torch.rand(data['res_mask'].shape, device=data['res_mask'].device) > percent
+        return torch.ones_like(data['res_mask']).bool()
+        # if self.rng.random() > 0.25:
+        #     return torch.ones_like(data['res_mask']).bool()
+        # else:
+        #     percent = self.rng.random()
+        #     return torch.rand(data['res_mask'].shape, device=data['res_mask'].device) > percent
 
     def process_input(self, data: HeteroData):
         data = copy.deepcopy(data)
@@ -134,10 +137,16 @@ class ProteinInterpolation(Task):
             # compute passthrough outputs
             passthrough_inputs = copy.copy(inputs)
             passthrough_inputs['residue']['rigids_1'] = latent_outputs['final_rigids'].to_tensor_7()
+            passthrough_inputs['residue']['x'] = latent_outputs['final_rigids'].get_trans()
+            passthrough_inputs['residue']['bb'] = latent_outputs['denoised_bb'][:, :4]
             passthrough_latent = {
                 self.sidechain_x_1_key: latent_outputs[self.sidechain_x_1_pred_key]
             }
-            passthrough_outputs = model.decoder(passthrough_inputs, passthrough_latent, use_gt_seq=pt_use_gt_seq)
+            passthrough_outputs = model.decoder(
+                passthrough_inputs,
+                passthrough_latent,
+                t=inputs['t'],
+                use_gt_seq=pt_use_gt_seq)
             passthrough_outputs.update(noised_latent_data)
             passthrough_outputs.update(latent_data)
         else:
@@ -169,8 +178,8 @@ class ProteinInterpolation(Task):
     def run_predict(self,
                     model,
                     inputs,
-                    #device='cuda:0'):
-                    device='cpu'):
+                    device='cuda:0'):
+                    # device='cpu'):
         self.se3_noiser.set_device(device)
         self.sidechain_noiser.set_device(device)
 
@@ -206,17 +215,30 @@ class ProteinInterpolation(Task):
         ts = torch.linspace(self.se3_noiser._cfg.min_t, 1.0, self.se3_noiser._sample_cfg.num_timesteps)
         t_1 = ts[0]
 
+        init_bb_psi = torch.zeros((total_num_res, 2), device=device)  # bb psi
+        init_bb_psi[:, 0] = 1
+        init_atom14 = all_atom.compute_backbone(
+            ru.Rigid(
+                rots=ru.Rotation(rot_mats=rotmats_0),
+                trans=trans_0
+            ),
+            init_bb_psi,
+            impute_O=False,
+        )[-1]
+
         prot_traj = [(
-            trans_0,
-            rotmats_0,
-            torch.zeros((total_num_res, 2), device=device),
-            sidechain_0
+            trans_0,  # trans
+            rotmats_0,  # rot
+            init_bb_psi,
+            sidechain_0,  # latent sidechain,
+            torch.ones((total_num_res, 21), device=device).float(),  # seq logits
+            init_atom14  # atom14 struct
         )]
         clean_traj = []
         denoiser_out = None
         for t_2 in tqdm.tqdm(ts[1:]):
             # Run model.
-            trans_t_1, rotmats_t_1, _, sidechain_t_1 = prot_traj[-1]
+            trans_t_1, rotmats_t_1, _, sidechain_t_1, _, _ = prot_traj[-1]
             res_data["trans_t"] = trans_t_1
             res_data["rotmats_t"] = rotmats_t_1
             res_data['rigids_t'] = ru.Rigid(
@@ -239,9 +261,6 @@ class ProteinInterpolation(Task):
                 pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
                 pred_psis = denoiser_out['psi'].detach().cpu()
                 pred_latent_sidechain = denoiser_out[self.sidechain_x_1_pred_key].detach()
-                clean_traj.append(
-                    (pred_trans_1.detach().cpu(), pred_rotmats_1.detach().cpu(), pred_psis, pred_latent_sidechain.cpu())
-                )
 
                 latent_output = {
                     self.sidechain_x_1_key: pred_latent_sidechain
@@ -267,30 +286,66 @@ class ProteinInterpolation(Task):
                         "bb": denoiser_out["denoised_bb"][..., :4, :]
                     }
                 )
-                decoder_output = model.decoder(decoder_inputs, latent_output, use_gt_seq=False)
+                decoder_output = model.decoder(
+                    decoder_inputs,
+                    latent_output,
+                    t=t,
+                    use_gt_seq=False
+                )
                 denoiser_out.update(decoder_output)
 
-            # Process model output.
-            pred_rigids = denoiser_out['final_rigids']
-            pred_trans_1 = pred_rigids.get_trans()
-            pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
-            pred_psis = denoiser_out['psi'].detach().cpu()
-            pred_latent_sidechain = denoiser_out[self.sidechain_x_1_pred_key]
-            clean_traj.append(
-                (pred_trans_1.detach().cpu(), pred_rotmats_1.detach().cpu(), pred_psis, pred_latent_sidechain.detach().cpu())
-            )
+                clean_traj.append(
+                    (
+                        pred_trans_1.detach().cpu(),
+                        pred_rotmats_1.detach().cpu(),
+                        pred_psis,
+                        pred_latent_sidechain.cpu(),
+                        decoder_output['decoded_seq_logits'].detach().cpu().argmax(dim=-1),
+                        decoder_output['decoded_atom14'].detach().cpu()
+                    )
+                )
+
+            # # Process model output.
+            # pred_rigids = denoiser_out['final_rigids']
+            # pred_trans_1 = pred_rigids.get_trans()
+            # pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
+            # pred_psis = denoiser_out['psi'].detach().cpu()
+            # pred_latent_sidechain = denoiser_out[self.sidechain_x_1_pred_key]
+            # clean_traj.append(
+            #     (pred_trans_1.detach().cpu(), pred_rotmats_1.detach().cpu(), pred_psis, pred_latent_sidechain.detach().cpu())
+            # )
 
             # Take reverse step
             d_t = t_2 - t_1
             trans_t_2 = self.se3_noiser._trans_euler_step(d_t, t_1, pred_trans_1, trans_t_1)
             rotmats_t_2 = self.se3_noiser._rots_euler_step(d_t, t_1, pred_rotmats_1, rotmats_t_1)
             sidechain_t_2 = self.sidechain_noiser._euler_step(d_t, t_1, pred_latent_sidechain, sidechain_t_1)
-            prot_traj.append((trans_t_2, rotmats_t_2, pred_psis, sidechain_t_2))
+
+            atom14_t_2 = all_atom.compute_backbone(
+                ru.Rigid(
+                    rots=ru.Rotation(rot_mats=rotmats_t_2),
+                    trans=trans_t_2
+                ),
+                init_bb_psi,
+                impute_O=False,
+            )[-1]
+
+            prot_traj.append(
+                (trans_t_2,
+                 rotmats_t_2,
+                 pred_psis,
+                 sidechain_t_2,
+                 decoder_output["decoded_seq_logits"].argmax(dim=-1).detach().cpu(),
+                 atom14_t_2.detach().cpu()
+                ))
             t_1 = t_2
+
+            if not model.self_conditioning:
+                denoiser_out = None
 
         # We only integrated to min_t, so need to make a final step
         t_1 = ts[-1]
-        trans_t_1, rotmats_t_1, _, sidechain_t_1 = prot_traj[-1]
+        trans_t_1, rotmats_t_1, _, sidechain_t_1, _, _ = prot_traj[-1]
         res_data["trans_t"] = trans_t_1
         res_data["rotmats_t"] = rotmats_t_1
         res_data['rigids_t'] = ru.Rigid(
@@ -313,9 +368,6 @@ class ProteinInterpolation(Task):
         pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
         pred_psis = denoiser_out['psi'].detach().cpu()
         pred_latent_sidechain = denoiser_out[self.sidechain_x_1_pred_key].detach()
-        clean_traj.append(
-            (pred_trans_1.detach().cpu(), pred_rotmats_1.detach().cpu(), pred_psis, pred_latent_sidechain.cpu())
-        )
 
         latent_output = {
             self.sidechain_x_1_key: pred_latent_sidechain
@@ -345,6 +397,18 @@ class ProteinInterpolation(Task):
         seq_logits = decoder_output['decoded_seq_logits']
         argmax_seq = seq_logits.argmax(dim=-1)
         decoded_struct = decoder_output['decoded_atom14']
+
+        clean_traj.append(
+            (
+                pred_trans_1.detach().cpu(),
+                pred_rotmats_1.detach().cpu(),
+                pred_psis,
+                pred_latent_sidechain.cpu(),
+                decoder_output['decoded_seq_logits'].detach().cpu().argmax(dim=-1),
+                decoder_output['decoded_atom14'].detach().cpu()
+            )
+        )
+
         # all_atom14 = decoder_output['decoded_all_atom14']
 
         # decoded_struct = _collect_from_seq(all_atom14, argmax_seq, torch.ones_like(argmax_seq).bool())
@@ -352,10 +416,16 @@ class ProteinInterpolation(Task):
         # # Convert trajectories to atom37.
         # atom37_traj = all_atom.transrotpsi_to_atom37(prot_traj, res_data.res_mask)
         # clean_atom37_traj = all_atom.transrotpsi_to_atom37(clean_traj, res_data.res_mask)
+        clean_trajs = zip(*[traj[-1].split(num_res) for traj in clean_traj])
+        clean_traj_seqs = zip(*[traj[-2].split(num_res) for traj in clean_traj])
+        prot_trajs = zip(*[traj[-1].split(num_res) for traj in prot_traj])
 
         return {
             "samples": decoded_struct.split(num_res),
             "seqs": argmax_seq.split(num_res),
+            "clean_trajs": clean_trajs,
+            "clean_traj_seqs": clean_traj_seqs,
+            "prot_trajs": prot_trajs,
             "inputs": inputs
         }
 
@@ -369,6 +439,13 @@ class ProteinInterpolation(Task):
         )
         latent_loss_dict = latent_scalar_sidechain_fm_loss(inputs, outputs)
 
+        # outputs["decoded_atom14_gt_seq"] = inputs["residue"]["atom14_gt_positions"]
+        # autoenc_loss_dict = autoencoder_losses(
+        #     inputs, outputs
+        # )
+        # print(autoenc_loss_dict)
+        # exit()
+
         bb_denoising_loss = (
             bb_frame_diffusion_loss_dict["trans_vf_loss"] * 2 +
             bb_frame_diffusion_loss_dict["rot_vf_loss"]
@@ -380,11 +457,14 @@ class ProteinInterpolation(Task):
 
         vae_loss = (
             autoenc_loss_dict["atom14_mse"]
+            + autoenc_loss_dict["sidechain_dists_mse"]
+            # + autoenc_loss_dict["pred_sidechain_clash_loss"]
             + autoenc_loss_dict["seq_loss"]
             + autoenc_loss_dict["chi_loss"]
             + autoenc_loss_dict["kl_div"] * 1e-6
         )
         latent_denoising_loss = latent_loss_dict["latent_fm_loss"]
+        # latent_denoising_loss = latent_loss_dict["latent_denoising_loss"] * 0.01
 
         if self.compute_passthrough:
             pt_outputs = outputs["pt_outputs"]
@@ -393,14 +473,23 @@ class ProteinInterpolation(Task):
                 inputs, pt_outputs
             )
             norm = 1 - torch.min(inputs['t'], torch.as_tensor(t_clip_max))
-            pt_aux_loss = (
-                pt_loss_dict["atom14_mse"] * 0.01 / norm
+            pt_abs_pos_loss = (
+                pt_loss_dict["atom14_mse"]
+                + pt_loss_dict["sidechain_dists_mse"]
+                # + pt_loss_dict["chi_loss"]
+                # + pt_loss_dict["seq_loss"]
+            ) * (inputs['t'] > self.aux_loss_t_min)
+            pt_rel_pos_loss = (
+                # pt_loss_dict["atom14_mse"]
+                # + pt_loss_dict["sidechain_dists_mse"]
+                + pt_loss_dict["chi_loss"]
                 + pt_loss_dict["seq_loss"]
             ) * (inputs['t'] > self.aux_loss_t_min)
             pt_loss = (
-                pt_loss_dict["chi_loss"] / norm
+                pt_abs_pos_loss * 0.01 / (norm ** 2)
+                + pt_rel_pos_loss
+                + (inputs['t'] > self.pt_clash_loss_t) * pt_loss_dict['pred_sidechain_clash_loss']
             )
-            pt_loss = pt_loss + 0.25 * pt_aux_loss
 
             pt_loss_dict = {"pt_" + k: v for k,v in pt_loss_dict.items()}
         else:

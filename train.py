@@ -83,7 +83,7 @@ class Experiment:
         trainer.fit(
             model=self._model,
             datamodule=self._datamodule,
-            ckpt_path=self._exp_cfg.warm_start
+            ckpt_path=self._exp_cfg.warm_start,
         )
 
 

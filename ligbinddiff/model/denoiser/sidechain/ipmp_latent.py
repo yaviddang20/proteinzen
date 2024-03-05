@@ -5,7 +5,7 @@ from torch_cluster import knn_graph
 
 from ligbinddiff.model.modules.layers.node.mpnn import IPMP
 from ligbinddiff.model.modules.layers.edge.embed import PairwiseAtomicEmbedding
-from ligbinddiff.model.modules.common import RBF
+from ligbinddiff.model.modules.common import GaussianRandomFourierBasis
 from ligbinddiff.model.modules.openfold.frames import Linear
 from ligbinddiff.data.datasets.featurize.sidechain import _dihedrals, _ideal_virtual_Cb
 from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddings, _rbf
@@ -104,7 +104,7 @@ class IPMPDenoiser(nn.Module):
         self.self_conditioning = self_conditioning
         self.num_aa = num_aa + 1  # + X
 
-        self.time_rbf = RBF(n_basis=c_time//2)
+        self.time_rbf = GaussianRandomFourierBasis(n_basis=c_time//2)
 
         self.c_cond = (
             37 * 3  # rotamer
@@ -164,6 +164,7 @@ class IPMPDenoiser(nn.Module):
 
         seq = F.one_hot(res_data['seq'], num_classes=self.num_aa).to(mask.device)
         masked_seq = seq * mask[..., None]
+        # print((masked_seq == 0).all())
 
         node_scalars = torch.cat(
             [
@@ -176,6 +177,7 @@ class IPMPDenoiser(nn.Module):
         rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_0)
         node_vectors = rigids[..., None].invert_apply(res_data['atom37'])
         node_vectors[..., 4:, :] = node_vectors[..., 4:, :] * mask[..., None, None]
+        # print((node_vectors[..., 4:, :] == 0).all())
         node_features = torch.cat(
             [node_scalars, node_vectors.view([node_scalars.shape[0], -1])],
             dim=-1

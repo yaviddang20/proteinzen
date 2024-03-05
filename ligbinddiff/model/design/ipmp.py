@@ -5,6 +5,7 @@ from torch_cluster import knn_graph
 from torch_geometric.utils import dropout_edge
 
 from ligbinddiff.model.modules.layers.node.mpnn import IPMP
+from ligbinddiff.model.modules.common import GaussianRandomFourierBasis
 from ligbinddiff.model.modules.openfold.frames import  StructureModuleTransition
 from ligbinddiff.model.modules.layers.edge.sitewise import EdgeTransition
 from ligbinddiff.data.datasets.featurize.sidechain import _dihedrals, _ideal_virtual_Cb
@@ -14,6 +15,7 @@ from ligbinddiff.utils.openfold import rigid_utils as ru
 from ligbinddiff.utils.framediff.all_atom import compute_all_atom14, compute_atom14
 from ligbinddiff.utils.atom_reps import restype_1to3, atom91_start_end
 from ligbinddiff.data.openfold.residue_constants import restypes
+from ligbinddiff.data.openfold.data_transforms import make_atom14_masks
 
 
 class IPMPUpdateLayer(nn.Module):
@@ -216,6 +218,7 @@ class IPMPDecoder(nn.Module):
                  num_rbf=16,
                  num_pos_embed=16,
                  num_layers=4,
+                 h_time=64,
                  k=30,
                  dropout=0.1):
         super().__init__()
@@ -231,14 +234,15 @@ class IPMPDecoder(nn.Module):
             + num_pos_embed  # rel pos embed
         )
 
+        self.embed_time = GaussianRandomFourierBasis(h_time)
+
         self.embed_node = nn.Sequential(
-            nn.Linear(c_s_in, 2*c_s),
-            nn.ReLU(),
-            nn.Linear(2*c_s, 2*c_s),
+            nn.Linear(c_s + h_time*2, 2*c_s),
             nn.ReLU(),
             nn.Linear(2*c_s, c_s),
-            nn.LayerNorm(c_s),
         )
+        self.node_ln = nn.LayerNorm(c_s)
+
         self.embed_edge = nn.Sequential(
             nn.Linear(self.c_z_in, 2*c_z),
             nn.ReLU(),
@@ -264,7 +268,7 @@ class IPMPDecoder(nn.Module):
         self.k = k
 
 
-    @torch.no_grad()
+    # @torch.no_grad()
     def _prep_features(self, graph, eps=1e-8):
         res_data = graph['residue']
         res_mask = res_data['res_mask']
@@ -315,7 +319,12 @@ class IPMPDecoder(nn.Module):
 
         return node_features, edge_features, edge_index
 
-    def forward(self, graph, intermediates, eps=1e-8, use_gt_seq=True):
+    def forward(self,
+                graph,
+                intermediates,
+                t=None,
+                eps=1e-8,
+                use_gt_seq=True):
         res_data = graph['residue']
         num_nodes = res_data.num_nodes
         res_mask = res_data['res_mask']
@@ -327,7 +336,16 @@ class IPMPDecoder(nn.Module):
 
         _, edge_features, edge_index = self._prep_features(graph, eps=eps)
 
+        if t is None:
+            t = torch.zeros(graph.num_graphs, device=edge_features.device)
+        timestep_embed = self.embed_time(t[..., None])
+        timestep_embed = timestep_embed[res_data.batch]
+
         node_features = intermediates['latent_sidechain']
+        node_update = self.embed_node(
+            torch.cat([timestep_embed, node_features], dim=-1)
+        )
+        node_features = self.node_ln(node_features + node_update * res_mask[..., None])
         edge_features = self.embed_edge(edge_features)
 
         for layer in self.update:
@@ -341,11 +359,9 @@ class IPMPDecoder(nn.Module):
 
         seq_logits = self.seq_head(node_features)
 
-        if use_gt_seq:
-            seq = res_data['seq']
-        else:
-            seq = seq_logits.argmax(dim=-1)
+        seq = seq_logits.argmax(dim=-1)
         seq = seq.to(node_features.device)
+        atom14_mask_dict = make_atom14_masks({"aatype": seq})
 
         unnorm_torsions = self.torsion_pred(
             torch.cat([
@@ -360,11 +376,30 @@ class IPMPDecoder(nn.Module):
         # chi_per_aatype = chi_per_aatype.view(-1, 4, 2)
         output_atom14 = compute_atom14(rigids, psi_torsions, chi_per_aatype, seq)
 
+
         out_dict = {}
         # out_dict['decoded_all_atom14'] = all_atom14
         # out_dict['decoded_all_chis'] = chi_per_aatype
         out_dict['decoded_atom14'] = output_atom14
+        out_dict['decoded_atom14_mask'] = atom14_mask_dict['atom14_atom_exists']
         out_dict['decoded_chis'] = chi_per_aatype
         out_dict['decoded_seq_logits'] = seq_logits
+
+        if use_gt_seq:
+            gt_seq = res_data['seq']
+            unnorm_torsions = self.torsion_pred(
+                torch.cat([
+                    node_features,
+                    self.seq_embed(gt_seq)
+                ], dim=-1)
+            )
+            chi_per_aatype = unnorm_torsions.view(-1, 5, 2)
+            chi_per_aatype = F.normalize(chi_per_aatype, dim=-1)
+            psi_torsions, chi_per_aatype = chi_per_aatype.split([1, 4], dim=-2)
+
+            # chi_per_aatype = chi_per_aatype.view(-1, 4, 2)
+            output_atom14 = compute_atom14(rigids, psi_torsions, chi_per_aatype, gt_seq)
+            out_dict['decoded_atom14_gt_seq'] = output_atom14
+            out_dict['decoded_chis_gt_seq'] = chi_per_aatype
 
         return out_dict

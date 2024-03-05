@@ -124,6 +124,7 @@ def angle_axis_rot_vf_loss(
         ref_rot_vf,
         batch,
         res_mask,
+        angle_loss_weight=0.5,
         eps=1e-8):
     pred_rot_vf = pred_rot_vf
 
@@ -142,7 +143,7 @@ def angle_axis_rot_vf_loss(
         angle_loss,
         dim=-1
     )
-    rot_loss = angle_loss + axis_loss
+    rot_loss = angle_loss * angle_loss_weight + axis_loss
     return _nodewise_to_graphwise(rot_loss, batch, res_mask)
 
 
@@ -276,7 +277,8 @@ def bb_frame_diffusion_loss(batch,
 def bb_frame_fm_loss(batch,
                      denoiser_outputs,
                      t_norm_clip=0.9,
-                     sep_rot_loss=False):
+                     sep_rot_loss=False,
+                     local_atomic_dist_r=6):
     res_data = batch['residue']
     res_mask = res_data['res_mask']
     noising_mask = res_data['noising_mask']
@@ -310,7 +312,7 @@ def bb_frame_fm_loss(batch,
     bb_mask = res_data['atom37_mask'][:, (0, 1, 2, 4, 3)].bool()
     denoised_bb = denoiser_outputs['denoised_bb']
     backbone_mse = torch.square(denoised_bb - bb).sum(dim=-1)
-    backbone_mse = _nodewise_to_graphwise(backbone_mse, res_batch, bb_mask)
+    backbone_mse = _nodewise_to_graphwise(backbone_mse, res_batch, bb_mask & mask[..., None])
 
     t = batch['t']
     norm_scale = 1 - torch.min(
@@ -342,7 +344,8 @@ def bb_frame_fm_loss(batch,
         denoised_bb,
         bb,
         res_batch,
-        res_mask
+        res_mask,
+        r=local_atomic_dist_r
     )
 
     # this seems to work well

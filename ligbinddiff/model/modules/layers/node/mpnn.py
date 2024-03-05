@@ -12,10 +12,10 @@ from typing import Optional, Sequence, Tuple
 
 
 class PositionWiseFeedForward(nn.Module):
-    def __init__(self, num_hidden, num_ff):
+    def __init__(self, num_hidden, num_ff, final_init="default"):
         super().__init__()
         self.W_in = nn.Linear(num_hidden, num_ff, bias=True)
-        self.W_out = nn.Linear(num_ff, num_hidden, bias=True)
+        self.W_out = Linear(num_ff, num_hidden, bias=True, init=final_init)
         self.act = torch.nn.GELU()
     def forward(self, h_V):
         h = self.act(self.W_in(h_V))
@@ -37,6 +37,8 @@ class IPMP(nn.Module):
         edge_dropout=0.2,
         inf: float = 1e5,
         eps: float = 1e-8,
+        final_init="default",
+        update_edge=True,
     ):
         """
         Args:
@@ -84,21 +86,24 @@ class IPMP(nn.Module):
             Linear(c_hidden, c_s, init='final'),
         )
         self.node_ln1 = nn.LayerNorm(c_s)
-        self.node_ffn = PositionWiseFeedForward(c_s, c_s*4)
+        self.node_ffn = PositionWiseFeedForward(c_s, c_s*4, final_init=final_init)
         self.node_ln2 = nn.LayerNorm(c_s)
 
-        self.edge_pts = Linear(self.c_s, self.no_points * 3)
-        self.edge_msg_mlp = nn.Sequential(
-            Linear(
-                premsg_dim,
-                c_hidden
-            ),
-            nn.ReLU(),
-            Linear(c_hidden, c_hidden),
-            nn.ReLU(),
-            Linear(c_hidden, c_z, init='final'),
-        )
-        self.edge_ln = nn.LayerNorm(c_z)
+        self.update_edge = update_edge
+
+        if update_edge:
+            self.edge_pts = Linear(self.c_s, self.no_points * 3)
+            self.edge_msg_mlp = nn.Sequential(
+                Linear(
+                    premsg_dim,
+                    c_hidden
+                ),
+                nn.ReLU(),
+                Linear(c_hidden, c_hidden),
+                nn.ReLU(),
+                Linear(c_hidden, c_z, init='final'),
+            )
+            self.edge_ln = nn.LayerNorm(c_z)
 
     def _gen_premessage(
         self,
@@ -204,9 +209,10 @@ class IPMP(nn.Module):
         s = self.node_ln1(s + self.dropout(node_update) * mask[..., None])
         s = self.node_ln2(s + self.node_ffn(s) * mask[..., None])
 
-        edge_premessage = self._gen_premessage(s, z, edge_index, r, edge=True)
-        edge_message = self.edge_msg_mlp(edge_premessage)
-        z = self.edge_ln(z + self.dropout(edge_message))
+        if self.update_edge:
+            edge_premessage = self._gen_premessage(s, z, edge_index, r, edge=True)
+            edge_message = self.edge_msg_mlp(edge_premessage)
+            z = self.edge_ln(z + self.dropout(edge_message))
 
         return s, z
 

@@ -40,11 +40,12 @@ class DesignLatentSidechainNoising(Task):
         self.rng = np.random.default_rng()
 
     def _gen_diffuse_mask(self, data: HeteroData):
-        if self.rng.random() > 0.25:
-            return torch.ones_like(data['res_mask']).bool()
-        else:
-            percent = self.rng.random()
-            return torch.rand(data['res_mask'].shape, device=data['res_mask'].device) > percent
+        return torch.ones_like(data['res_mask']).bool()
+        # if self.rng.random() > 0.25:
+        #     return torch.ones_like(data['res_mask']).bool()
+        # else:
+        #     percent = self.rng.random()
+        #     return torch.rand(data['res_mask'].shape, device=data['res_mask'].device) > percent
 
     def process_input(self, data: HeteroData):
         num_graphs = data.num_graphs

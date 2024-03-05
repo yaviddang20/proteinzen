@@ -100,7 +100,7 @@ class PairwiseAtomicEmbedding(nn.Module):
             dim=-1
         )
         edge_features.append(
-            atom14_pairwise_dist.view(num_edges, -1) * unnoised_edges[..., -1]
+            atom14_pairwise_dist.view(num_edges, -1) * unnoised_edges[..., None]
         )  # 196
 
         # total 596

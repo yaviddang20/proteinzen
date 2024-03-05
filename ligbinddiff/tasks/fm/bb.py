@@ -30,11 +30,15 @@ class BackboneFrameInterpolation(Task):
     def __init__(self,
                  se3_noiser: SE3Interpolant,
                  aux_loss_t_min=0.25,
-                 sep_rot_loss=False):
+                 rigid_traj_loss=False,
+                 sep_rot_loss=False,
+                 local_atomic_dist_r=6):
         super().__init__()
         self.se3_noiser = se3_noiser
         self.aux_loss_t_min = aux_loss_t_min
+        self.rigid_traj_loss = rigid_traj_loss
         self.sep_rot_loss = sep_rot_loss
+        self.local_atomic_dist_r = local_atomic_dist_r
 
     def gen_diffuse_mask(self, data: HeteroData):
         return torch.ones_like(data['res_mask']).bool()
@@ -92,6 +96,7 @@ class BackboneFrameInterpolation(Task):
                     model,
                     inputs,
                     device='cuda:0'):
+                    # device='cpu'):
         self.se3_noiser.set_device(device)
 
         num_res = inputs['num_res']
@@ -188,7 +193,9 @@ class BackboneFrameInterpolation(Task):
 
     def compute_loss(self, inputs, outputs: Dict):
         bb_frame_diffusion_loss_dict = bb_frame_fm_loss(
-            inputs, outputs, sep_rot_loss=self.sep_rot_loss)
+            inputs, outputs,
+            sep_rot_loss=self.sep_rot_loss,
+            local_atomic_dist_r=self.local_atomic_dist_r)
         # bb_frame_clash_loss_dict = bb_frame_clash_loss(
         #     inputs, outputs
         # )

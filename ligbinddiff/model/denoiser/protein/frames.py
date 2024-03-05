@@ -3,7 +3,10 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-from ligbinddiff.model.modules.common import RBF
+
+from torch_geometric.nn import knn_graph
+
+from ligbinddiff.model.modules.common import GaussianRandomFourierBasis
 from ligbinddiff.model.modules.layers.edge.sitewise import EdgeTransition
 from ligbinddiff.model.modules.layers.node.attention import GraphInvariantPointAttention
 from ligbinddiff.model.modules.layers.node.mpnn import IPMP
@@ -12,6 +15,8 @@ from ligbinddiff.utils.openfold import rigid_utils as ru
 from ligbinddiff.utils.framediff.all_atom import compute_backbone
 
 from ligbinddiff.data.datasets.featurize.common import _node_positional_embeddings
+from ligbinddiff.data.datasets.featurize.sidechain import _dihedrals, _ideal_virtual_Cb
+from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddings, _rbf
 
 from ligbinddiff.model.modules.openfold.frames import BackboneUpdate, StructureModuleTransition
 from ligbinddiff.model.modules.layers.edge.embed import MLMPairwiseAtomicEmbedding, SelfConditionPairwiseAtomicEmbedding
@@ -52,7 +57,8 @@ class BackboneDenoisingLayer(nn.Module):
             nn.LayerNorm(c_z)
         )
 
-        self.node_update = nn.Linear(c_s+c_latent, c_s)
+        self.node_update = Linear(c_latent, c_s, init='final')
+        self.ln_s0 = nn.LayerNorm(c_s)
 
         self.attn_spatial = GraphInvariantPointAttention(
             c_s=c_s,
@@ -96,9 +102,7 @@ class BackboneDenoisingLayer(nn.Module):
         noising_mask = res_data['noising_mask']
 
         edge_features = self.edge_embed(edge_features)
-        node_features = self.node_update(
-            torch.cat([node_features, latent_features], dim=-1)
-        )
+        node_features = self.ln_s0(node_features + self.node_update(latent_features))
 
         node_s_update = self.attn_spatial(
             s=node_features,
@@ -133,6 +137,75 @@ class BackboneDenoisingLayer(nn.Module):
         return node_features, rigids, latent_features
 
 
+class IPMPUpdateLayer(nn.Module):
+    def __init__(self,
+                 c_s,
+                 c_latent,
+                 c_z,
+                 c_hidden):
+        super().__init__()
+        self.c_s = c_s
+        self.c_latent = c_latent
+        self.c_z = c_z
+        self.c_hidden = c_hidden
+
+        h_dim = c_s + c_latent
+
+        self.ipmp = IPMP(
+            c_s=h_dim,
+            c_z=c_z,
+            c_hidden=c_hidden,
+            dropout=0.,
+            edge_dropout=0.,
+        )
+
+        self.latent_update = Linear(h_dim, c_latent, init='final')
+
+        self.node_update = Linear(
+            h_dim,
+            c_s,
+            init='final')
+        self.node_ln = nn.LayerNorm(c_s)
+
+        self.bb_update = BackboneUpdate(
+            c_s
+        )
+
+    def forward(self,
+                node_features,
+                rigids,
+                latent_features,
+                edge_features,
+                edge_index,
+                res_data):
+        res_mask = res_data['res_mask']
+        noising_mask = res_data['noising_mask']
+        input_features = [node_features, latent_features]
+        input_features = torch.cat(input_features, dim=-1)
+
+        # node_update = self.ipmp(
+        joint_features, edge_features = self.ipmp(
+            s=input_features,
+            z=edge_features,
+            edge_index=edge_index,
+            r=rigids,
+            mask=res_mask)
+        # node_features = self.node_ln(node_features + node_update * node_mask[..., None])
+        # node_features = self.node_transition(node_features) * node_mask[..., None]
+
+        latent_features = latent_features + self.latent_update(joint_features)
+        node_features = self.node_ln(node_features + self.node_update(joint_features))
+
+        rigids_update = self.bb_update(
+            node_features * noising_mask[..., None])
+
+        rigids = rigids.compose_q_update_vec(
+            rigids_update * noising_mask[..., None]
+        )
+
+        return node_features, rigids, latent_features, edge_features
+
+
 class DynamicGraphIpaFrameDenoiser(nn.Module):
     """ Denoising model on sidechain densities """
     def __init__(self,
@@ -149,7 +222,7 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  lrange_k=40,
                  num_vn=4,
                  num_aa=20,
-                 self_conditioning=False,
+                 self_conditioning=True,
                  impute_oxy=False):
         super().__init__()
 
@@ -165,7 +238,7 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         self.lrange_k = lrange_k
         self.h_time = h_time
 
-        self.time_rbf = RBF(n_basis=h_time//2)
+        self.time_rbf = GaussianRandomFourierBasis(n_basis=h_time//2)
 
         # node_embedding + time_embedding + fixed_mask + noised_latent + self_conditioning
         self.node_in = (c_s + h_time + 1 + c_latent) + self_conditioning * (
@@ -204,7 +277,8 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
             num_pos_embed=self.c_z//2,
         )
 
-        self.edge_in = self.gen_mlm_features.out_dim + self_conditioning * self.gen_sc_edge_features.out_dim
+        # self.edge_in = self.gen_mlm_features.out_dim + self_conditioning * self.gen_sc_edge_features.out_dim
+        self.edge_in = c_z + self_conditioning * (c_z//2)
 
         self.denoiser = nn.ModuleList([
             BackboneDenoisingLayer(
@@ -221,29 +295,84 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         ])
         self.torsion_angles = TorsionAngles(c_s, 1)
 
+        self.ipmp_num_rbf = 16
+        self.ipmp_num_pos_embed = 16
+        atoms_per_res = 5
+        self.c_z_in = (
+            self.ipmp_num_rbf * (atoms_per_res ** 2)  # bb x bb distances
+            # + atoms_per_res * 3  # src CA to dst bb direction unit vectors
+            + self.ipmp_num_pos_embed  # rel pos embed
+        )
+        self.embed_ipmp_edge = nn.Sequential(
+            nn.Linear(self.c_z_in, c_z),
+            nn.ReLU(),
+            nn.Linear(c_z, c_z),
+            nn.ReLU(),
+            nn.Linear(c_z, c_z),
+            nn.LayerNorm(c_z)
+        )
+
+        self.refine = nn.ModuleList([
+            IPMPUpdateLayer(
+                c_s=c_s,
+                c_latent=c_latent,
+                c_z=c_z,
+                c_hidden=c_hidden
+            )
+            for _ in range(n_layers)
+        ])
+
+
     def _gen_spatial_edge_features(self, data, rigids, res_mask, batch, self_condition):
+        # # generate spatial edges
+        # X_ca = rigids.get_trans()
+        # masked_X_ca = X_ca.clone()
+        # masked_X_ca[~res_mask] = torch.inf
+        # edge_index = sample_inv_cubic_edges(masked_X_ca, ~res_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k)
+
+        # edge_features = []
+        # edge_features.append(
+        #     self.gen_mlm_features(data, rigids, edge_index)
+        # )
+
+        # if self.self_conditioning and self_condition is not None:
+        #     self_cond_edge_features = self.gen_sc_edge_features(self_condition, edge_index)
+        #     edge_features.append(self_cond_edge_features)
+        # elif self.self_conditioning:
+        #     edge_features.append(
+        #         torch.zeros((
+        #             edge_index.shape[1],
+        #             self.gen_sc_edge_features.out_dim
+        #         ), device=edge_index.device))
+
+        # return torch.cat(edge_features, dim=-1), edge_index
+
+        res_mask = ~res_mask
         # generate spatial edges
         X_ca = rigids.get_trans()
         masked_X_ca = X_ca.clone()
-        masked_X_ca[~res_mask] = torch.inf
-        edge_index = sample_inv_cubic_edges(masked_X_ca, ~res_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k)
+        masked_X_ca[res_mask] = torch.inf
+        edge_index = sample_inv_cubic_edges(masked_X_ca, res_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k)
 
-        edge_features = []
-        edge_features.append(
-            self.gen_mlm_features(data, rigids, edge_index)
-        )
+        # compute edge features
+        edge_features, _ = gen_spatial_graph_features(X_ca, edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=self.c_z//2)
 
         if self.self_conditioning and self_condition is not None:
-            self_cond_edge_features = self.gen_sc_edge_features(self_condition, edge_index)
-            edge_features.append(self_cond_edge_features)
+            self_cond_rigids = self_condition['final_rigids']
+            self_cond_X_ca = self_cond_rigids.get_trans()
+            self_cond_edge_features, _ = gen_spatial_graph_features(self_cond_X_ca, edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=0)
+            edge_features = torch.cat(
+                [edge_features, self_cond_edge_features],
+                dim=-1
+            )
         elif self.self_conditioning:
-            edge_features.append(
-                torch.zeros((
-                    edge_index.shape[1],
-                    self.gen_sc_edge_features.out_dim
-                ), device=edge_index.device))
+            edge_features = F.pad(
+                edge_features,
+                (0, self.c_z//2)
+            )
 
-        return torch.cat(edge_features, dim=-1), edge_index
+        return edge_features, edge_index
+
 
     def _gen_inital_features(self, data, intermediates, self_condition):
         res_data = data['residue']
@@ -319,8 +448,8 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                     self_cond_nodes,
                     self_cond_latent,
                     t7_rel,
-                    F.one_hot(sc_seq, num_classes=self.num_aa),
-                    atom14_local.view(res_data.num_nodes, -1)
+                    torch.zeros_like(F.one_hot(sc_seq, num_classes=self.num_aa)),
+                    torch.zeros_like(atom14_local.view(res_data.num_nodes, -1))
                 ],
                 dim=-1
             )
@@ -333,6 +462,36 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
 
 
         return node_input, seq_edge_features, seq_local_edge_index
+
+    def _gen_ipmp_edge_features(self, rigids, psis, batch, res_mask, eps=1e-8):
+        # edge graph
+        masked_X_ca = rigids.get_trans().clone()
+        masked_X_ca[~res_mask] = torch.inf
+        edge_index = knn_graph(masked_X_ca, self.knn_k, batch)
+
+        # edge features
+        bb = compute_backbone(rigids.unsqueeze(0), psis.unsqueeze(0))[-1].squeeze(0)[..., :5, :]
+        src = edge_index[1]
+        dst = edge_index[0]
+
+        # ## edge distances
+        edge_bb_src = bb[src]
+        edge_bb_dst = bb[dst]
+        edge_bb_dists = torch.linalg.vector_norm(
+            edge_bb_src[..., None, :] - edge_bb_dst[..., None, :, :] + eps,
+            dim=-1)
+        edge_bb_dists = edge_bb_dists.view(edge_index.shape[1], -1, 1)
+        edge_rbf = _rbf(edge_bb_dists, D_min=2.0, D_max=22.0, D_count=self.ipmp_num_rbf, device=edge_index.device)
+        edge_rbf = edge_rbf.view(edge_index.shape[1], -1)
+        # ## edge rel pos embedding
+        edge_dist_rel_pos = _edge_positional_embeddings(edge_index, num_embeddings=self.ipmp_num_pos_embed, device=edge_index.device)
+        # edge_features = self.init_edge_embed(graph, edge_index)
+        # technically this shouldn't be necessary but just to be safe
+        # edge_mask = res_mask[src] & res_mask[dst]
+        # edge_features = edge_features * edge_mask[..., None]
+        edge_features = torch.cat([edge_rbf, edge_dist_rel_pos], dim=-1)
+
+        return edge_features, edge_index
 
 
     def forward(self, data, intermediates, self_condition=None):
@@ -381,8 +540,23 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
             )
 
         _, psi = self.torsion_angles(node_features)
-
         rigids = rigids.scale_translation(10)
+
+        ipmp_edge_features, ipmp_edge_index = self._gen_ipmp_edge_features(
+            rigids, psi, res_data.batch, res_mask
+        )
+        ipmp_edge_features = self.embed_ipmp_edge(ipmp_edge_features)
+        for i, layer in enumerate(self.refine):
+            node_features, rigids, latent_features, ipmp_edge_features = layer(
+                node_features,
+                rigids,
+                latent_features,
+                ipmp_edge_features,
+                ipmp_edge_index,
+                res_data,
+            )
+        _, psi = self.torsion_angles(node_features)
+
         rigids = rigids.translate(center)
         ret = {}
         ret['denoised_frames'] = rigids

@@ -11,7 +11,7 @@ import functools as fn
 from torch_geometric.utils import sort_edge_index
 
 from ligbinddiff.data.datasets.featurize.common import _node_positional_embeddings, _edge_positional_embeddings, _rbf
-from ligbinddiff.model.modules.common import RBF
+from ligbinddiff.model.modules.common import GaussianRandomFourierBasis
 from ligbinddiff.model.modules.openfold.frames import Linear, flatten_final_dims, ipa_point_weights_init_
 from ligbinddiff.model.utils.graph import get_data_lens, batchwise_to_nodewise, gen_spatial_graph_features, sample_inv_cubic_edges, sequence_local_graph
 from ligbinddiff.utils.openfold.rigid_utils import Rigid, batchwise_center
@@ -1371,7 +1371,7 @@ class KnnIpaScoreWrapper(nn.Module):
         self.c_z = c_z
 
         self.h_time = h_time
-        self.time_rbf = RBF(n_basis=h_time//2)
+        self.time_rbf = GaussianRandomFourierBasis(n_basis=h_time//2)
         self.time_mlp = nn.Sequential(
             nn.Linear(h_time, scalar_h_dim),
             nn.ReLU(),
