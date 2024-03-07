@@ -246,3 +246,204 @@ class SparseSubsampledTriangleAttention(nn.Module):
             )
 
         return edge_update
+
+
+class TriangleCrossAttention(nn.Module):
+    def __init__(self,
+                 c_s,
+                 c_z,
+                 num_heads=4,
+                 num_rbf=64,
+                 inf=1e4,
+                 assume_sorted=False):
+        super().__init__()
+        self.c_s = c_s
+        self.c_z = c_z
+        self.num_rbf = num_rbf
+        self.num_heads = num_heads
+
+        self.dist_bias_gate = nn.Sequential(
+            nn.Linear(2*c_s, num_heads),
+            nn.Sigmoid()
+        )
+        self.dist_bias = nn.Linear(self.num_rbf, num_heads)
+
+        self.lin_q = nn.Linear(c_z, c_z)
+        self.lin_k = nn.Linear(c_z, c_z)
+        self.lin_v = nn.Linear(c_z, c_z)
+        self.lin_out = Linear(c_z, c_z, init='final')
+        self.assume_sorted = assume_sorted
+
+        self.inf = inf
+
+    def forward(self,
+                node_features,
+                rigids,
+                src_edge_features,
+                src_edge_index,
+                dst_edge_features,
+                dst_edge_index,
+                eps=1e-8):
+        num_nodes = node_features.shape[0]
+
+        knn_src_edge_features, knn_src_edge_index, knn_src_edge_mask = sparse_to_knn_graph(src_edge_features, src_edge_index)
+        knn_dst_edge_features, knn_dst_edge_index, knn_dst_edge_mask = sparse_to_knn_graph(dst_edge_features, dst_edge_index)
+        k_src = knn_src_edge_index.shape[-1]
+        k_dst = knn_dst_edge_index.shape[-1]
+
+        edge1 = knn_dst_edge_index[..., None].expand(-1, -1, k_src)
+        edge2 = knn_src_edge_index[..., None, :].expand(-1, k_dst, -1),
+
+        edge3_node1 = node_features[edge1]
+        edge3_node2 = node_features[edge2]
+        edge3_gate = self.dist_bias_gate(
+            torch.cat([edge3_node1, edge3_node2], dim=-1)
+        )
+
+        node_trans = rigids.get_trans()
+        edge3_node1_trans = node_trans[edge1]
+        edge3_node2_trans = node_trans[edge2]
+        edge3_dist = torch.linalg.vector_norm(
+            edge3_node1_trans - edge3_node2_trans + eps,
+            dim=-1
+        )
+
+        edge3_dist_features = _rbf(edge3_dist, D_count=self.num_rbf, device=edge3_dist.device)
+        edge3_dist_bias = edge3_gate * self.dist_bias(edge3_dist_features)  # n x k_dst x k_src x h
+
+        edge_q = self.lin_q(knn_dst_edge_features)
+        edge_k = self.lin_k(knn_src_edge_features)
+        edge_q = edge_q.view(num_nodes, k_dst, self.num_heads, -1)  # n x k_dst x h x c_z//h
+        edge_k = edge_k.view(num_nodes, k_src, -1, self.num_heads)  # n x k_src x c_z//h x h
+
+        edge_attn = edge_q.transpose(-2, -3) @ edge_k.transpose(-1, -3)  # n x h x k_dst x k_src
+        edge_attn = edge_attn.transpose(-2, -3).transpose(-1, -2)  # n x k_dst x k_src x h
+        edge_attn = 1 / np.sqrt(self.c_z) * edge_attn
+        edge_attn = edge_attn + edge3_dist_bias
+
+        edge_edge_mask = knn_src_edge_mask[..., None, :] & knn_dst_edge_mask[..., None]  # n x k_dst x k_src
+        edge_attn = edge_attn - self.inf * (~edge_edge_mask[..., None]).float()
+        edge_attn = torch.softmax(edge_attn, dim=-2) # n x k_dst x k_src x h
+
+        edge_v = self.lin_v(knn_src_edge_features).view(num_nodes, k_src, self.num_heads, -1)  # n x k_src x h x c_z//h
+        edge_update = torch.sum(
+            edge_v[..., None, :, :, :]  # n x 1 x k_src x h x c_z//h
+            * edge_attn[..., None]
+            * edge_edge_mask[..., None, None],  # n x k_dst x k_src x h x 1
+        dim=-3)  # n x k x h x c_z//h
+        edge_update = self.lin_out(edge_update.view(-1, k_dst, self.c_z))
+        edge_update, _ = knn_to_sparse_graph(edge_update, knn_dst_edge_index, knn_dst_edge_mask)
+
+        return edge_update
+
+
+class TwoScaleTriangleCrossAttention(nn.Module):
+    def __init__(self,
+                 c_s,
+                 c_z,
+                 num_heads=4,
+                 num_rbf=64):
+        super().__init__()
+
+        self.self_attn = TriangleCrossAttention(
+            c_s=c_s,
+            c_z=c_z,
+            num_heads=num_heads,
+            num_rbf=num_rbf
+        )
+        self.self_ln = nn.LayerNorm(c_z)
+
+        self.cross_attn = TriangleCrossAttention(
+            c_s=c_s,
+            c_z=c_z,
+            num_heads=num_heads,
+            num_rbf=num_rbf
+        )
+        self.cross_ln = nn.LayerNorm(c_z)
+
+    def forward(self,
+                node_features,
+                rigids,
+                self_edge_features,
+                self_edge_index,
+                cross_edge_features,
+                cross_edge_index):
+
+        self_edge_update = self.self_attn(
+            node_features,
+            rigids,
+            self_edge_features,
+            self_edge_index,
+            self_edge_features,
+            self_edge_index,
+        )
+        self_edge_features = self.self_ln(self_edge_update + self_edge_features)
+
+        cross_edge_update = self.cross_attn(
+            node_features,
+            rigids,
+            self_edge_features,
+            self_edge_index,
+            cross_edge_features,
+            cross_edge_index,
+        )
+        cross_edge_features = self.cross_ln(cross_edge_update + cross_edge_features)
+
+        return self_edge_features, cross_edge_features
+
+
+class ThreeScaleTriangleCrossAttention(nn.Module):
+    def __init__(self,
+                 c_s,
+                 c_z,
+                 num_heads=4,
+                 num_rbf=64):
+        super().__init__()
+
+        self.self_attn = TriangleCrossAttention(
+            c_s=c_s,
+            c_z=c_z,
+            num_heads=num_heads,
+            num_rbf=num_rbf
+        )
+        self.self_ln = nn.LayerNorm(c_z)
+
+        self.cross_attn = TriangleCrossAttention(
+            c_s=c_s,
+            c_z=c_z,
+            num_heads=num_heads,
+            num_rbf=num_rbf
+        )
+        self.cross_ln = nn.LayerNorm(c_z)
+
+    def forward(self,
+                node_features,
+                rigids,
+                src_edge_features,
+                src_edge_index,
+                self_edge_features,
+                self_edge_index,
+                cross_edge_features,
+                cross_edge_index):
+
+        self_edge_update = self.self_attn(
+            node_features,
+            rigids,
+            src_edge_features,
+            src_edge_index,
+            self_edge_features,
+            self_edge_index,
+        )
+        self_edge_features = self.self_ln(self_edge_update + self_edge_features)
+
+        cross_edge_update = self.cross_attn(
+            node_features,
+            rigids,
+            self_edge_features,
+            self_edge_index,
+            cross_edge_features,
+            cross_edge_index,
+        )
+        cross_edge_features = self.cross_ln(cross_edge_update + cross_edge_features)
+
+        return self_edge_features, cross_edge_features

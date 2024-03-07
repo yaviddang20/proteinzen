@@ -6,10 +6,13 @@ from torch_geometric.utils import sort_edge_index, scatter
 from ligbinddiff.data.datasets.featurize.common import _rbf
 
 from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddings
+import ligbinddiff.utils.openfold.rigid_utils as ru
 
 
 def sample_inv_cubic_edges(batched_X_ca, batched_x_mask, batch, knn_k=30, inv_cube_k=10, self_edge=False):
     edge_indicies = []
+    knn_edge_select = []
+    lrange_edge_select = []
     offset = 0
     for i in range(batch.max().item() + 1):
         X_ca = batched_X_ca[batch == i]
@@ -59,10 +62,19 @@ def sample_inv_cubic_edges(batched_X_ca, batched_x_mask, batch, knn_k=30, inv_cu
         # edge_indicies.append(sort_edge_index(edge_index, sort_by_row=False) + offset)
         edge_indicies.append(edge_index + offset)
         offset = offset + (batch == i).long().sum()
+        num_nodes = X_ca.shape[0]
+        knn_edge_select.append(torch.cat(
+            [torch.ones(knn_k), torch.zeros(inv_cube_k)]
+        ).repeat(num_nodes).bool().to(X_ca.device))
+        lrange_edge_select.append(torch.cat(
+            [torch.zeros(knn_k), torch.ones(inv_cube_k)]
+        ).repeat(num_nodes).bool().to(X_ca.device))
 
     edge_index = torch.cat(edge_indicies, dim=-1)
+    knn_edge_select = torch.cat(knn_edge_select, dim=0)
+    lrange_edge_select = torch.cat(lrange_edge_select, dim=0)
     edge_mask = batched_x_mask[edge_index].any(dim=0)
-    return edge_index[:, ~edge_mask]
+    return edge_index[:, ~edge_mask], knn_edge_select[~edge_mask], lrange_edge_select[~edge_mask]
 
 
 def sparse_to_knn_graph(edge_features, edge_index):
@@ -203,17 +215,28 @@ def batchwise_to_nodewise(t_per_graph, batch):
     return t_per_graph[batch]
 
 
-def gen_spatial_graph_features(X_ca, edge_index, num_rbf_embed, num_pos_embed):
+def gen_spatial_graph_features(rigids: ru.Rigid, edge_index, num_rbf_embed, num_pos_embed):
+    X_ca = rigids.get_trans()
+    quats = rigids.get_rots().get_quats()
+    src_quat = quats[edge_index[1]]
+    dst_quat = quats[edge_index[0]]
+    quat_rel = ru.quat_multiply(
+        ru.invert_quat(src_quat),
+        dst_quat
+    )
+    edge_features = [quat_rel]
+
     edge_dist_vec = X_ca[edge_index[0]] - X_ca[edge_index[1]]
     edge_dist = torch.linalg.vector_norm(edge_dist_vec, dim=-1)
-    edge_dist_rbf = _rbf(edge_dist, device=edge_dist.device, D_count=num_rbf_embed)  # edge_channels_list
-    if num_pos_embed > 0:
-        edge_dist_rel_pos = _edge_positional_embeddings(edge_index, num_embeddings=num_pos_embed, device=edge_dist.device)  # edge_channels_list
+    if num_rbf_embed > 0:
+        edge_dist_rbf = _rbf(edge_dist, device=edge_dist.device, D_count=num_rbf_embed)  # edge_channels_list
+        edge_features.append(edge_dist_rbf)
 
     if num_pos_embed > 0:
-        edge_features = torch.cat([edge_dist_rbf, edge_dist_rel_pos], dim=-1)
-    else:
-        edge_features = edge_dist_rbf
+        edge_features.append(
+            _edge_positional_embeddings(edge_index, num_embeddings=num_pos_embed, device=edge_dist.device)  # edge_channels_list
+        )
+    edge_features = torch.cat(edge_features, dim=-1)
 
     return edge_features, edge_dist_vec
 
