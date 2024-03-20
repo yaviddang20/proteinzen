@@ -57,7 +57,7 @@ def atom14_to_atom37(atom14, batch):
 
     atom37_data = atom37_data * batch["atom37_atom_exists"][..., None]
 
-    return atom37_data
+    return atom37_data, batch["atom37_atom_exists"]
 
 
 def build_template_angle_feat(template_feats):

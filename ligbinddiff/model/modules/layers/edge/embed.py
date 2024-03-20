@@ -15,26 +15,33 @@ class PairwiseAtomicEmbedding(nn.Module):
                  scale=1,
                  D_min=2.0,
                  D_max=22.0,
-                 num_aa=20):
+                 num_aa=20,
+                 classic_mode=False):
         super().__init__()
         self.dist_clip = dist_clip
         self.num_aa = num_aa + 1
         self.num_rbf = num_rbf
         self.num_pos_embed = num_pos_embed
+        self.classic_mode = classic_mode
 
         self.scale = scale
         self.D_min = D_min
         self.D_max = D_max
 
-        # TODO: compute this based on input params
-        self.out_dim = (
-            2                       # mask bits
-            + self.num_aa * 2       # src/dst seq
-            + (4 * 4) * num_rbf     # bb x bb dist
-            + num_pos_embed         # rel pos embed
-            + (14 * 3) * 2          # src/dst atom14
-            + 14 * 14               # src/dst atom14 pairwise dist
-        )
+        if classic_mode:
+            self.out_dim = (
+                + (5 * 5) * num_rbf     # bb x bb dist
+                + num_pos_embed         # rel pos embed
+            )
+        else:
+            self.out_dim = (
+                2                       # mask bits
+                + self.num_aa * 2       # src/dst seq
+                + (5 * 5) * num_rbf     # bb x bb dist
+                + num_pos_embed         # rel pos embed
+                + (14 * 3) * 2          # src/dst atom14
+                + 14 * 14               # src/dst atom14 pairwise dist
+            )
 
     def forward(self, data, edge_index, eps=1e-8):
         res_data = data['residue']
@@ -54,18 +61,21 @@ class PairwiseAtomicEmbedding(nn.Module):
         else:
             rigids = ru.Rigid.from_tensor_7(data['residue'].rigids_0)
 
-        edge_features = [
-            noised_dst.float()[..., None],
-            noised_src.float()[..., None]
-        ]  # 2
+        if self.classic_mode:
+            edge_features = []
+        else:
+            edge_features = [
+                noised_dst.float()[..., None],
+                noised_src.float()[..., None]
+            ]  # 2
 
-        seq = res_data['seq']
-        src_seq = F.one_hot(seq[src], num_classes=self.num_aa)
-        dst_seq = F.one_hot(seq[dst], num_classes=self.num_aa)
-        edge_features.append(src_seq * ~noised_src[..., None])  # 21
-        edge_features.append(dst_seq * ~noised_dst[..., None])  # 21
+            seq = res_data['seq']
+            src_seq = F.one_hot(seq[src], num_classes=self.num_aa)
+            dst_seq = F.one_hot(seq[dst], num_classes=self.num_aa)
+            edge_features.append(src_seq * ~noised_src[..., None])  # 21
+            edge_features.append(dst_seq * ~noised_dst[..., None])  # 21
 
-        bb = atom14[..., :3, :]
+        bb = atom14[..., :4, :]
         virtual_Cb = _ideal_virtual_Cb(bb)
         bb = torch.cat([bb, virtual_Cb[..., None, :]], dim=-2)
 
@@ -84,24 +94,29 @@ class PairwiseAtomicEmbedding(nn.Module):
         edge_dist_rel_pos = _edge_positional_embeddings(edge_index, num_embeddings=self.num_pos_embed, device=edge_index.device)
         edge_features.append(edge_dist_rel_pos)  # 16
 
-        ## pairwise sidechain atom distances
-        src_atom14_local = rigids[..., None].invert_apply(atom14)[src]
-        dst_atom14_in_src_local = rigids[src, None].invert_apply(atom14[dst])
-        edge_features.append(
-            src_atom14_local.view(num_edges, -1) *  ~noised_src[..., None]
-        )  # 42
-        edge_features.append(
-            dst_atom14_in_src_local.view(num_edges, -1) *  ~noised_dst[..., None]
-        )  # 42
+        if not self.classic_mode:
+            ## pairwise sidechain atom distances
+            src_atom14_local = rigids[..., None].invert_apply(atom14)[src]
+            dst_atom14_in_src_local = rigids[src, None].invert_apply(atom14[dst])
 
-        # TODO: clip by some upper bound e.g. 10 A?
-        atom14_pairwise_dist = torch.linalg.vector_norm(
-            src_atom14_local[..., None, :] - dst_atom14_in_src_local[..., None, :, :] + eps,
-            dim=-1
-        )
-        edge_features.append(
-            atom14_pairwise_dist.view(num_edges, -1) * unnoised_edges[..., None]
-        )  # 196
+            src_atom14_local[..., 4:, :] = src_atom14_local[..., 4:, :] * ~noised_src[..., None, None]
+            dst_atom14_in_src_local[..., 4:, :] = dst_atom14_in_src_local[..., 4:, :] * ~noised_dst[..., None, None]
+
+            edge_features.append(
+                src_atom14_local.view(num_edges, -1)
+            )  # 42
+            edge_features.append(
+                dst_atom14_in_src_local.view(num_edges, -1)
+            )  # 42
+
+            # TODO: clip by some upper bound e.g. 10 A?
+            atom14_pairwise_dist = torch.linalg.vector_norm(
+                src_atom14_local[..., None, :] - dst_atom14_in_src_local[..., None, :, :] + eps,
+                dim=-1
+            )
+            edge_features.append(
+                atom14_pairwise_dist.view(num_edges, -1) * unnoised_edges[..., None]
+            )  # 196
 
         # total 596
         return torch.cat(edge_features, dim=-1).float()

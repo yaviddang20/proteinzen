@@ -10,6 +10,7 @@ import ligbinddiff.utils.openfold.rigid_utils as ru
 
 
 def sample_inv_cubic_edges(batched_X_ca, batched_x_mask, batch, knn_k=30, inv_cube_k=10, self_edge=False):
+    # TODO: change x_mask to be True for retained positions
     edge_indicies = []
     knn_edge_select = []
     lrange_edge_select = []
@@ -47,9 +48,13 @@ def sample_inv_cubic_edges(batched_X_ca, batched_x_mask, batch, knn_k=30, inv_cu
 
         # if we don't have inv_cube_k nodes to sample, sample the max we can
         num_bad_edges = (~good_edges).sum(dim=-1)
+        # we set "num bad edges" for masked residues to 0, otherwise that would skew our count
+        num_bad_edges[x_mask] = 0
         max_num_bad_edges = int(num_bad_edges.max())
         if inv_cube_k > perturbed_logprobs.shape[-1] - max_num_bad_edges:
             print(f"trimming down num edges from {inv_cube_k} to {perturbed_logprobs.shape[-1] - max_num_bad_edges}, {max_num_bad_edges} bad edges")
+            if perturbed_logprobs.shape[-1] - max_num_bad_edges == 0:
+                print(f"we shouldn't get rid of all edges... right now we see num_bad_edges as ", num_bad_edges)
             inv_cube_k = perturbed_logprobs.shape[-1] - max_num_bad_edges
 
         _, sampled_edges_relative_idx = torch.topk(perturbed_logprobs, k=inv_cube_k, dim=-1)

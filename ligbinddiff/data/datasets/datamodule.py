@@ -10,7 +10,7 @@ import pandas as pd
 from ligbinddiff.tasks import TaskSampler
 
 from .dataset import PdbDataset, LengthDataset, GEOMDataset
-from .sampler import BatchSampler, LengthBatchSampler, AtomicBatchSampler
+from .sampler import BatchSampler, LengthBatchSampler, AtomicBatchSampler, ClusteredBatchSampler
 
 
 def gen_collate_fn(task_sampler: TaskSampler):
@@ -103,7 +103,8 @@ class FramediffDataModule(L.LightningDataModule):
                     110: 5,
                     120: 5
                  },
-                 length_batch=False
+                 length_batch=False,
+                 sample_from_clusters=False
                  ):
         super().__init__()
         self.data_dir = data_dir
@@ -111,6 +112,7 @@ class FramediffDataModule(L.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.length_batch = length_batch
+        self.sample_from_clusters = sample_from_clusters
 
         self.sample_lengths = sample_lengths
         csv = "filtered_metadata.csv"
@@ -118,7 +120,7 @@ class FramediffDataModule(L.LightningDataModule):
         self.train_dataset = PdbDataset(
             os.path.join(self.data_dir, csv),
             min_num_res=min_len,
-            max_num_res=max_len
+            max_num_res=max_len,
         )
         self.val_dataset = LengthDataset(self.sample_lengths, batch_size=batch_size)
 
@@ -130,6 +132,14 @@ class FramediffDataModule(L.LightningDataModule):
                 x,
                 num_workers=self.num_workers,
                 batch_sampler=LengthBatchSampler(x, batch_size=self.batch_size),
+                collate_fn=collate_fn,
+                shuffle=False
+            )
+        elif self.sample_from_clusters:
+            dataloader = DataLoader(
+                x,
+                num_workers=self.num_workers,
+                batch_sampler=ClusteredBatchSampler(x, batch_size=self.batch_size),
                 collate_fn=collate_fn,
                 shuffle=False
             )

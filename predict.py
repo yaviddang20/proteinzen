@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import io
 import os
 import glob
 
@@ -19,9 +20,10 @@ import wandb
 
 from ligbinddiff.runtime.config import config_hydra_store, remove_zen_keys
 from ligbinddiff.tasks.task import single_task_sampler
-from ligbinddiff.data.io.atom91 import atom91_to_pdb
+from ligbinddiff.data.io.atom91 import atom91_to_pdb, atom91_to_chain, chains_to_model, models_to_struct, save_struct
 from ligbinddiff.utils.atom_reps import atom14_to_atom91
 from ligbinddiff.data.openfold.residue_constants import restypes
+from ligbinddiff.runtime.lmod import BackboneModule
 
 
 # A logger for this file
@@ -82,6 +84,34 @@ class Experiment:
                     for sample, sample_id in zip(samples, sample_ids):
                         sample_len = sample.shape[0]
                         atom91_to_pdb("".join(["A" for _ in range(sample_len)]), sample.numpy(force=True), f"len_{sample_len}_bb_{sample_id}")
+                    # clean_trajs = batch['clean_trajs']
+                    # prot_trajs = batch['prot_trajs']
+                    # for clean_traj, prot_traj, sample_id in zip(clean_trajs, prot_trajs, sample_ids):
+                    #     clean_traj_name = f"len_{sample_len}_bb_{sample_id}_clean_traj.pdb"
+                    #     prot_traj_name = f"len_{sample_len}_bb_{sample_id}_prot_traj.pdb"
+                    #     clean_models = []
+                    #     prot_models = []
+                    #     for i in range(len(clean_traj)):
+                    #         clean = clean_traj[i]
+                    #         prot = prot_traj[i]
+                    #         sample_len = clean.shape[0]
+                    #         clean_chain = atom91_to_chain(
+                    #             "".join(["A" for _ in range(sample_len)]),
+                    #             clean.numpy(force=True),
+                    #             "A"
+                    #         )
+                    #         prot_chain = atom91_to_chain(
+                    #             "".join(["A" for _ in range(sample_len)]),
+                    #             prot.numpy(force=True),
+                    #             "A"
+                    #         )
+                    #         clean_model = chains_to_model([clean_chain], model_id=i)
+                    #         prot_model = chains_to_model([prot_chain], model_id=i)
+                    #         clean_models.append(clean_model)
+                    #         prot_models.append(prot_model)
+                    #     save_struct(models_to_struct(clean_models), clean_traj_name)
+                    #     save_struct(models_to_struct(prot_models), prot_traj_name)
+
                 elif self._cfg.domain.domain == 'protein':
                     seqs = batch['seqs']
                     for sample, sample_id, seq in zip(samples, sample_ids, seqs):
@@ -91,12 +121,47 @@ class Experiment:
                         atom91, atom91_mask = atom14_to_atom91(seq, atom14)
                         atom91_to_pdb(seq, atom91, f"len_{sample_len}_protein_{sample_id}")
 
+                    # clean_trajs = batch['clean_trajs']
+                    # clean_traj_seqs = batch['clean_traj_seqs']
+                    # prot_trajs = batch['prot_trajs']
+                    # for clean_traj, clean_seq, prot_traj, sample_id in zip(clean_trajs, clean_traj_seqs, prot_trajs, sample_ids):
+                    #     clean_traj_name = f"len_{sample_len}_protein_{sample_id}_clean_traj.pdb"
+                    #     prot_traj_name = f"len_{sample_len}_protein_{sample_id}_prot_traj.pdb"
+                    #     clean_models = []
+                    #     prot_models = []
+                    #     for i, _ in enumerate(clean_traj):
+                    #         clean = clean_traj[i]
+                    #         seq = "".join([restypes[j] for j in clean_seq[i].tolist()])
+                    #         print(seq)
+                    #         prot = prot_traj[i]
+                    #         sample_len = clean.shape[0]
+                    #         clean_atom91, _ = atom14_to_atom91(seq, clean.numpy(force=True))
+                    #         clean_chain = atom91_to_chain(
+                    #             seq,
+                    #             clean_atom91,
+                    #             "A"
+                    #         )
+                    #         all_ala = "".join(["A" for _ in range(sample_len)])
+                    #         prot_atom91, _ = atom14_to_atom91(all_ala, prot.numpy(force=True))
+                    #         prot_chain = atom91_to_chain(
+                    #             all_ala,
+                    #             prot_atom91,
+                    #             "A"
+                    #         )
+                    #         clean_model = chains_to_model([clean_chain], model_id=i)
+                    #         prot_model = chains_to_model([prot_chain], model_id=i)
+                    #         clean_models.append(clean_model)
+                    #         prot_models.append(prot_model)
+                    #     save_struct(models_to_struct(clean_models), clean_traj_name)
+                    #     save_struct(models_to_struct(prot_models), prot_traj_name)
+
+
 
 
 def main(model,
          corrupter,
          datamodule,
-         lmodule,
+         # lmodule,
          experiment,
          tasks,
          zen_cfg):
@@ -106,7 +171,8 @@ def main(model,
 
     # datamodule and optim are all partial'd __init__s
     # so we instantiate instances of each
-    model = lmodule(model, experiment['optim'])
+    # model = lmodule(model, experiment['optim'])
+    model = BackboneModule(model, experiment['optim'])
     task_sampler = single_task_sampler(tasks(corrupter))
     datamodule_inst = datamodule(task_sampler=task_sampler)
     exp = Experiment(
@@ -119,9 +185,10 @@ def main(model,
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_dir")
-    parser.add_argument("--epoch", type=int, default=-1)
+    # parser.add_argument("--epoch", type=int, default=-1)
     parser.add_argument("--out_prefix", default="samples_24hr")
     parser.add_argument("--debug", action="store_true", default=False)
+    parser.add_argument("--save_traj", action="store_true", default=False)
     args = parser.parse_args()
 
     config_path = os.path.join(
@@ -129,18 +196,25 @@ if __name__ == '__main__':
         ".hydra",
         "config.yaml"
     )
-    if args.epoch == -1:
-        ckpt_path = os.path.join(
+    # if args.epoch == -1:
+    #     ckpt_path = os.path.join(
+    #         args.run_dir,
+    #         "ckpt/last.ckpt",
+    #     )
+    # else:
+    #     ckpt_path = list(glob.glob(
+    #         os.path.join(
+    #             args.run_dir,
+    #             f"ckpt/epoch={args.epoch}*.ckpt",
+    #         )
+    #     ))[0]
+
+    ckpt_path = list(glob.glob(
+        os.path.join(
             args.run_dir,
-            "ckpt/last.ckpt",
+            "lightning_logs/version_0/checkpoints/*.ckpt",
         )
-    else:
-        ckpt_path = list(glob.glob(
-            os.path.join(
-                args.run_dir,
-                f"ckpt/epoch={args.epoch}*.ckpt",
-            )
-        ))[0]
+    ))[0]
 
 
     cfg = load_from_yaml(config_path)
@@ -149,19 +223,49 @@ if __name__ == '__main__':
 
     if cfg['domain']['domain'] == "backbone":
         if args.debug:
+            print("debug")
             cfg['datamodule']['sample_lengths'] = {
-                60: 5,
-                70: 5,
-                80: 5,
-                90: 5,
-                100: 5,
-                110: 5,
-                120: 5
+                # 60: 1
+                # 60: 5,
+                # 70: 5,
+                # 80: 5,
+                # 90: 5,
+                # 100: 5,
+                # 110: 5,
+                # 120: 5
             }
         else:
             cfg['datamodule']['sample_lengths'] = {
                 i: 10
                 for i in range(60, 128+1)
+            }
+            # cfg['datamodule']['sample_lengths'] = {
+            #     i: 50
+            #     for i in range(100, 300+1, 50)
+            # }
+
+    if cfg['domain']['domain'] == "protein":
+        if args.debug:
+            print("debug")
+            cfg['datamodule']['sample_lengths'] = {
+                # 60: 1
+                # 60: 5,
+                # 70: 5,
+                # 80: 5,
+                # 90: 5,
+                # 100: 1,
+                # 110: 5,
+                # 120: 5
+                230: 1
+            }
+        else:
+            # cfg['datamodule']['sample_lengths'] = {
+            #     i: 10
+            #     for i in range(60, 128+1)
+            # }
+            cfg['datamodule']['sample_lengths'] = {
+                i: 50
+                for i in range(100, 300+1, 50)
             }
 
     samples_dir = os.path.join(args.run_dir, args.out_prefix)
@@ -169,8 +273,13 @@ if __name__ == '__main__':
         samples_dir,
         exist_ok=True
     )
+    samples_dir = os.path.join(samples_dir, "samples")
+    os.makedirs(
+        samples_dir,
+        exist_ok=True
+    )
     cfg['experiment']['samples_dir'] = samples_dir
-    if cfg['domain']['domain'] == "molecule":
-        cfg['lmodule']['val_dir'] = samples_dir
+    # if cfg['domain']['domain'] == "molecule":
+    #     cfg['lmodule']['val_dir'] = samples_dir
 
     zen(main, unpack_kwargs=True)(cfg)

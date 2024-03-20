@@ -19,13 +19,14 @@ cd $1
 RUN_DIR=$PWD
 cd $ROOT_DIR
 
-EPOCH=$2
-OUTPREFIX=$3
+# EPOCH=$2
+# OUTPREFIX=$3
+OUTPREFIX=$2
 
 ## generate samples
 conda activate proteinzen
 
-python predict.py --run_dir=$RUN_DIR --epoch=$EPOCH --out_prefix=$OUTPREFIX
+python predict.py --run_dir=$RUN_DIR --out_prefix=$OUTPREFIX
 
 ## sample with ProteinMPNN
 cd ~/software/ProteinMPNN/scripts
@@ -57,5 +58,5 @@ mkdir esmfold
 cd esmfold
 bash ~/projects/ligbinddiff/scripts/analysis/esmfold.sh > esmfold.log
 conda activate proteinzen
-python ~/projects/ligbinddiff/scripts/analysis/esm_analysis.py --esmlog esmfold.log --folded_folder $PWD --samples ../samples | tail -n 1 > ${RUN_DIR}/num_designable.txt
+python ~/projects/ligbinddiff/scripts/analysis/esm_analysis.py --esmlog esmfold.log --folded_folder $PWD --samples ../samples | tail -n 2 > ${RUN_DIR}/$OUTPREFIX/num_designable.txt
 

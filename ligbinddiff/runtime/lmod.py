@@ -1,6 +1,7 @@
 import logging
 import os
 from functools import partial
+import copy
 
 import numpy as np
 import pandas as pd
@@ -185,6 +186,15 @@ class SidechainModule(L.LightningModule):
         self._log.info(gen_pbar_str(loss_dict))
         return loss_dict
 
+    # def on_after_backward(self):
+    #     if self.trainer.global_step % 1 == 0:
+    #         for name, p in self.named_parameters():
+    #             if hasattr(p.grad, "data"):
+    #                 grad = p.grad.data
+    #                 print(name, p.shape, torch.mean(grad ** 2))
+    #     exit()
+
+
     def validation_step(self, batch, batch_idx):
         task: TaskList = batch['task']
 
@@ -204,19 +214,38 @@ class SidechainModule(L.LightningModule):
             sync_dist=True)
         self._log.info(gen_pbar_str(loss_dict))
 
-        sample_outputs = task.run_predicts(self.model, batch)
-        sample_loss_dict = task.compile_task_losses(batch, sample_outputs)
-        sample_log_dict = tree.map_structure(
+        batch = copy.copy(batch)
+        batch['residue']['noising_mask'] = torch.ones_like(batch['residue']['noising_mask'])
+        batch['residue']['mlm_mask'] = torch.zeros_like(batch['residue']['mlm_mask'])
+        outputs = task.run_evals(self.model, batch)
+        loss_dict = task.compile_task_losses(batch, outputs)
+
+        log_dict = tree.map_structure(
             lambda x: torch.mean(x) if torch.is_tensor(x) else x,
-            sample_loss_dict
+            loss_dict
         )
-        sample_log_dict = {"sample_" + k: v for k,v in sample_log_dict.items()}
+        log_dict = {"val_all_mask_" + k: v for k,v in log_dict.items()}
+
         self.log_dict(
-            sample_log_dict,
+            log_dict,
             logger=True,
             batch_size=batch.num_graphs,
             sync_dist=True)
-        self._log.info(gen_pbar_str(sample_loss_dict))
+        self._log.info(gen_pbar_str(loss_dict))
+
+        # sample_outputs = task.run_predicts(self.model, batch)
+        # sample_loss_dict = task.compile_task_losses(batch, sample_outputs)
+        # sample_log_dict = tree.map_structure(
+        #     lambda x: torch.mean(x) if torch.is_tensor(x) else x,
+        #     sample_loss_dict
+        # )
+        # sample_log_dict = {"sample_" + k: v for k,v in sample_log_dict.items()}
+        # self.log_dict(
+        #     sample_log_dict,
+        #     logger=True,
+        #     batch_size=batch.num_graphs,
+        #     sync_dist=True)
+        # self._log.info(gen_pbar_str(sample_loss_dict))
         return loss_dict
 
 

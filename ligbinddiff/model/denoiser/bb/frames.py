@@ -928,7 +928,7 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  sc_learned_features=True,
                  rbf_encode_sc_trans=False,
                  use_transformer=False,
-                 add_nodes_to_edge=False,
+                 add_nodes_to_edge=True,
                  use_triangle_transfer=False,
                  use_edge_transition=False,
                  impute_oxy=False):
@@ -1203,8 +1203,8 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
             if self.rbf_encode_sc_trans:
                 eps = 1e-8
                 trans_unit_vec = F.normalize(trans_rel + eps)
-                trans_dist = torch.linalg.vector_norm(trans_rel + eps)
-                trans_rbf = _rbf(trans_dist, D_count=self.num_rbf)
+                trans_dist = torch.linalg.vector_norm(trans_rel + eps, dim=-1)
+                trans_rbf = _rbf(trans_dist, D_count=self.num_rbf, device=trans_dist.device)
 
                 node_input = torch.cat(
                     [node_input, self_cond_nodes, quat_rel, trans_unit_vec, trans_rbf],

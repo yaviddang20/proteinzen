@@ -20,7 +20,7 @@ from ligbinddiff.stoch_interp.flow_matchers.frames import GraphFrameFlow
 
 from ligbinddiff.model.design.ipmp import IPMPEncoder, IPMPDecoder
 from ligbinddiff.model.autoencoder.ipa import IPAEncoder, IPADecoder
-from ligbinddiff.model.wrappers.sidechain import IPMPLatentSidechainWrapper, IPALatentSidechainWrapper, DensityLatentSidechainWrapper
+from ligbinddiff.model.wrappers.sidechain import IPMPLatentSidechainWrapper, IPALatentSidechainWrapper, DensityLatentSidechainWrapper, BilevelIPMPLatentSidechainWrapper
 from ligbinddiff.model.wrappers.protein import IPMPLatentWrapper
 
 from ligbinddiff.tasks.diffusion.bb import BackboneFrameNoising
@@ -101,7 +101,7 @@ def config_hydra_store():
     datamodule_store(
         pbuilds(
             FramediffDataModule,
-            data_dir="/wynton/home/kortemme/alexjli/projects/ligbinddiff/data/framediff",
+            data_dir="/wynton/home/kortemme/alexjli/projects/ligbinddiff/data/framediff_clustered",
             batch_size=3000,
             num_workers=4
         ),
@@ -153,6 +153,9 @@ def config_hydra_store():
     model_store(
         IPMPLatentSidechainWrapper,
         name="diffusion_sidechain")
+    # model_store(
+    #     BilevelIPMPLatentSidechainWrapper,
+    #     name="diffusion_sidechain")
     # model_store(
     #     IPALatentSidechainWrapper,
     #     name="diffusion_sidechain")

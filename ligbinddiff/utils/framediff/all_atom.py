@@ -92,6 +92,73 @@ def torsion_angles_to_frames(
     return all_frames_to_global
 
 
+def rotate_torsion_angles_on_frames(
+        r: Rigid,
+        alpha: torch.Tensor,
+    ):
+    """Conversion method of torsion angles to frames provided the backbone.
+
+    Args:
+        r: Rigid groups.
+        alpha: Torsion angles.
+
+    Returns:
+        All frames rotated based on their torsion frame.
+
+    """
+    bb_rot = alpha.new_zeros((*((1,) * len(alpha.shape[:-1])), 2))
+    bb_rot[..., 1] = 1
+
+    # [*, N, 5, 2]
+    alpha = torch.cat(
+        [bb_rot.expand(*alpha.shape[:-2], -1, -1), alpha], dim=-2
+    )
+
+    # [*, N, 5, 3, 3]
+    # Produces rotation matrices of the form:
+    # [
+    #   [1, 0  , 0  ],
+    #   [0, a_2,-a_1],
+    #   [0, a_1, a_2]
+    # ]
+    # This follows the original code rather than the supplement, which uses
+    # different indices.
+
+    all_rots = alpha.new_zeros(r.get_rots().get_rot_mats().shape)
+    all_rots[..., 0, 0] = 1
+    all_rots[..., 1, 1] = alpha[..., 1]
+    all_rots[..., 1, 2] = -alpha[..., 0]
+    all_rots[..., 2, 1:] = alpha
+
+    all_rots = Rigid(Rotation(rot_mats=all_rots), None)
+
+    all_frames = r.compose(all_rots)
+
+    chi2_frame_to_frame = all_frames[..., 2]
+    chi3_frame_to_frame = all_frames[..., 3]
+    chi4_frame_to_frame = all_frames[..., 4]
+
+    chi1_frame_to_bb = all_frames[..., 1]
+    chi2_frame_to_bb = chi1_frame_to_bb.compose(chi2_frame_to_frame)
+    chi3_frame_to_bb = chi2_frame_to_bb.compose(chi3_frame_to_frame)
+    chi4_frame_to_bb = chi3_frame_to_bb.compose(chi4_frame_to_frame)
+
+    all_frames_to_bb = Rigid.cat(
+        [
+            all_frames[..., :2],
+            chi2_frame_to_bb.unsqueeze(-1),
+            chi3_frame_to_bb.unsqueeze(-1),
+            chi4_frame_to_bb.unsqueeze(-1),
+        ],
+        dim=-1,
+    )
+
+    all_frames_to_global = r.compose(all_frames_to_bb)
+
+    return all_frames_to_global
+
+
+
 def prot_to_torsion_angles(aatype, atom37, atom37_mask):
     """Calculate torsion angle features from protein features."""
     prot_feats = {

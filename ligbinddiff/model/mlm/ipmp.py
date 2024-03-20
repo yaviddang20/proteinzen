@@ -80,13 +80,15 @@ class IPMPEncoder(nn.Module):
                  num_layers=4,
                  k=30,
                  num_aa=20,
-                 dropout=0.1):
+                 dropout=0.1,
+                 classic_mode=False):
         super().__init__()
         self.c_s = c_s
         self.c_z = c_z
         self.c_hidden = c_hidden
         self.num_rbf = num_rbf
         self.num_pos_embed = num_pos_embed
+        self.classic_mode = classic_mode
         # atoms_per_res = 5
         # self.c_z_in = (
         #     num_rbf * (atoms_per_res ** 2)  # bb x bb distances
@@ -94,11 +96,14 @@ class IPMPEncoder(nn.Module):
         #     + num_pos_embed  # rel pos embed
         # )
         self.num_aa = num_aa + 1
-        self.c_atomic = (
-            37 * 3  # rotamer
-            + self.num_aa  # seq identity
-            + 1  # mask position
-        )
+        if classic_mode:
+            self.c_atomic = 0
+        else:
+            self.c_atomic = (
+                37 * 3  # rotamer
+                + self.num_aa  # seq identity
+                + 1  # mask position
+            )
 
         self.embed_node = nn.Sequential(
             nn.Linear(c_s_in + self.c_atomic, 2*c_s),
@@ -111,7 +116,8 @@ class IPMPEncoder(nn.Module):
         self.init_edge_embed = PairwiseAtomicEmbedding(
             num_rbf=self.num_rbf,
             num_pos_embed=self.num_pos_embed,
-            num_aa=num_aa
+            num_aa=num_aa,
+            classic_mode=classic_mode
         )
         self.embed_edge = nn.Sequential(
             nn.Linear(self.init_edge_embed.out_dim, 2*c_z),
@@ -147,29 +153,34 @@ class IPMPEncoder(nn.Module):
 
         mask = res_data['mlm_mask']
 
-        seq = F.one_hot(res_data['seq'], num_classes=self.num_aa).to(mask.device)
-        masked_seq = seq * mask[..., None]
 
-        node_scalars = torch.cat(
-            [
-                dihedrals,
-                mask.float()[..., None],
-                masked_seq
-            ],
-        dim=-1)
         # TODO: fix this inconsistency
         if "rigids_1" in res_data:
             rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_1)
         else:
             rigids = ru.Rigid.from_tensor_7(graph['residue'].rigids_0)
-        node_vectors = rigids[..., None].invert_apply(res_data['atom37'])
-        node_vectors[..., 4:, :] = node_vectors[..., 4:, :] * mask[..., None, None]
-        # node_vectors = node_vectors * mask[..., None, None]
-        node_features = torch.cat(
-            [node_scalars, node_vectors.view([node_scalars.shape[0], -1])],
-            dim=-1
-        ).float()
-        node_features = node_features * res_mask[..., None]
+
+        if self.classic_mode:
+            node_features = dihedrals
+        else:
+            seq = F.one_hot(res_data['seq'], num_classes=self.num_aa).to(mask.device)
+            masked_seq = seq * mask[..., None]
+            node_scalars = torch.cat(
+                [
+                    dihedrals,
+                    mask.float()[..., None],
+                    masked_seq
+                ],
+            dim=-1)
+            node_vectors = rigids[..., None].invert_apply(res_data['atom37'])
+            node_vectors[..., 5:, :] = node_vectors[..., 5:, :] * mask[..., None, None]
+            node_vectors[..., 3, :] = node_vectors[..., 3, :] * mask[..., None]
+            # node_vectors = node_vectors * mask[..., None, None]
+            node_features = torch.cat(
+                [node_scalars, node_vectors.view([node_scalars.shape[0], -1])],
+                dim=-1
+            ).float()
+            node_features = node_features * res_mask[..., None]
 
         # edge graph
         masked_X_ca = X_ca.clone()

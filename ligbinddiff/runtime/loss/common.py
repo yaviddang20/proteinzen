@@ -110,12 +110,12 @@ def autoencoder_losses(batch,
         res_data.batch,
         torsions_mask[..., 3:]
     )
-    pred_atom14_clash_loss = intersidechain_clash_loss(
-        pred_atom14=pred_atom14,
-        atom14_mask=model_outputs['decoded_atom14_mask'].bool(),
-        seq=seq_logits.argmax(dim=-1),
-        batch=res_data.batch
-    )
+    # pred_atom14_clash_loss = intersidechain_clash_loss(
+    #     pred_atom14=pred_atom14,
+    #     atom14_mask=model_outputs['decoded_atom14_mask'].bool(),
+    #     seq=seq_logits.argmax(dim=-1),
+    #     batch=res_data.batch
+    # )
 
 
     latent_mu = model_outputs['latent_mu']
@@ -128,7 +128,7 @@ def autoencoder_losses(batch,
         "atom14_mse": atom14_mse,
         "atom14_rmsd": atom14_rmsd,
         "sidechain_dists_mse": sidechain_dists_mse,
-        "pred_sidechain_clash_loss": pred_atom14_clash_loss,
+        # "pred_sidechain_clash_loss": pred_atom14_clash_loss,
         # "bond_length_mse": bond_length_mse,
         # "bond_angle_loss": bond_angle_loss,
         "chi_loss": sidechain_chi_loss,

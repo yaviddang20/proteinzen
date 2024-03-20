@@ -226,7 +226,7 @@ class MoleculeDenoiser(nn.Module):
         )
         self.pos_update = nn.ModuleList(
             [
-                o3.Linear(self.feat_irreps, "1x1e")
+                o3.Linear(self.feat_irreps, "1x1o")
                 for _ in range(n_layers)
             ]
         )
