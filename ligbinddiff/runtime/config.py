@@ -12,6 +12,7 @@ from ligbinddiff.diffusion.noisers.latent import SidechainDiffuser
 from ligbinddiff.stoch_interp.interpolate.se3 import SE3Interpolant, SE3InterpolantConfig
 from ligbinddiff.stoch_interp.interpolate.protein import ProteinInterpolant
 from ligbinddiff.stoch_interp.interpolate.molecule import HarmonicPriorInterpolant
+from ligbinddiff.stoch_interp.interpolate.dirichlet import DirichletConditionalFlow
 
 from ligbinddiff.model.denoiser.bb.frames import GraphIpaFrameDenoiser, DynamicGraphIpaFrameDenoiser
 from ligbinddiff.model.denoiser.sidechain.ipmp_latent import IPMPDenoiser
@@ -19,6 +20,7 @@ from ligbinddiff.model.denoiser.molecule.tfn import MoleculeDenoiser
 from ligbinddiff.stoch_interp.flow_matchers.frames import GraphFrameFlow
 
 from ligbinddiff.model.design.ipmp import IPMPEncoder, IPMPDecoder
+from ligbinddiff.model.design.ipmp_seq_only import IPMPDenoiser as DirichletIPMPDenoiser
 from ligbinddiff.model.autoencoder.ipa import IPAEncoder, IPADecoder
 from ligbinddiff.model.wrappers.sidechain import IPMPLatentSidechainWrapper, IPALatentSidechainWrapper, DensityLatentSidechainWrapper, BilevelIPMPLatentSidechainWrapper
 from ligbinddiff.model.wrappers.protein import IPMPLatentWrapper
@@ -28,6 +30,7 @@ from ligbinddiff.tasks.diffusion.sidechain import DesignLatentSidechainNoising
 from ligbinddiff.tasks.fm.bb import BackboneFrameInterpolation
 from ligbinddiff.tasks.fm.protein import ProteinInterpolation
 from ligbinddiff.tasks.fm.molecule import HarmonicFlowMatching
+from ligbinddiff.tasks.fm.sidechain import DirichletFlowMatching
 
 from ligbinddiff.runtime.lmod import BackboneModule, SidechainModule, ProteinModule, MoleculeModule
 
@@ -62,6 +65,7 @@ def config_hydra_store():
     paradigm_store = store(group="paradigm")
     paradigm_store({"paradigm": "diffusion"}, name="diffusion")
     paradigm_store({"paradigm": "fm"}, name="fm")
+    paradigm_store({"paradigm": "dirichlet"}, name="dirichlet")
 
     domain_store = store(group="domain")
     domain_store({"domain": "backbone"}, name="bb")
@@ -88,6 +92,9 @@ def config_hydra_store():
     corruption_store(
         HarmonicPriorInterpolant,
         name="fm_molecule")
+    corruption_store(
+        DirichletConditionalFlow,
+        name="dirichlet_sidechain")
 
     datamodule_store = store(group="datamodule")
     datamodule_store(
@@ -159,10 +166,14 @@ def config_hydra_store():
     # model_store(
     #     IPALatentSidechainWrapper,
     #     name="diffusion_sidechain")
+    model_store(
+        DirichletIPMPDenoiser,
+        name="dirichlet_sidechain")
 
     task_store = store(group="tasks")
     task_store(pbuilds(BackboneFrameNoising), name="diffusion_bb")
     task_store(pbuilds(DesignLatentSidechainNoising), name="diffusion_sidechain")
+    task_store(pbuilds(DirichletFlowMatching), name="dirichlet_sidechain")
     task_store(pbuilds(BackboneFrameInterpolation), name="fm_bb")
     task_store(pbuilds(ProteinInterpolation), name="fm_protein")
     task_store(pbuilds(HarmonicFlowMatching), name="fm_molecule")

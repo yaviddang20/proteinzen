@@ -158,7 +158,8 @@ class SidechainModule(L.LightningModule):
         self.val_dir = val_dir
         self.validation_epoch_metrics = []
 
-        self.median_metric = MedianMetric()
+        self.one_shot_median_metric = MedianMetric()
+        self.sample_median_metric = MedianMetric()
 
     def training_step(self, batch):
         task: TaskList = batch.task
@@ -233,24 +234,38 @@ class SidechainModule(L.LightningModule):
             sync_dist=True)
         self._log.info(gen_pbar_str(loss_dict))
 
-        # sample_outputs = task.run_predicts(self.model, batch)
-        # sample_loss_dict = task.compile_task_losses(batch, sample_outputs)
-        # sample_log_dict = tree.map_structure(
-        #     lambda x: torch.mean(x) if torch.is_tensor(x) else x,
-        #     sample_loss_dict
-        # )
-        # sample_log_dict = {"sample_" + k: v for k,v in sample_log_dict.items()}
-        # self.log_dict(
-        #     sample_log_dict,
-        #     logger=True,
-        #     batch_size=batch.num_graphs,
-        #     sync_dist=True)
-        # self._log.info(gen_pbar_str(sample_loss_dict))
+        sample_outputs = task.run_predicts(self.model, batch)
+        sample_loss_dict = task.compile_task_losses(batch, sample_outputs)
+        sample_log_dict = tree.map_structure(
+            lambda x: torch.mean(x) if torch.is_tensor(x) else x,
+            sample_loss_dict
+        )
+        sample_log_dict = {"sample_" + k: v for k,v in sample_log_dict.items()}
+        self.log_dict(
+            sample_log_dict,
+            logger=True,
+            batch_size=batch.num_graphs,
+            sync_dist=True)
+        sample_loss_dict = {"sample_" + k: v for k,v in sample_loss_dict.items()}
+        self._log.info(gen_pbar_str(sample_loss_dict))
         return loss_dict
 
 
     def test_step(self, batch, batch_idx):
-        task: TaskList = batch.task
+        task: TaskList = batch['task']
+        assert not self.model.training
+        outputs = task.run_evals(self.model, batch)
+        loss_dict = task.compile_task_losses(batch, outputs)
+
+        log_dict = tree.map_structure(
+            lambda x: torch.mean(x) if torch.is_tensor(x) else x,
+            loss_dict
+        )
+        log_dict = {"val_" + k: v for k,v in log_dict.items()}
+        self.one_shot_median_metric.update(loss_dict['per_seq_recov'])
+        self.log("median_seq_recov", self.one_shot_median_metric, on_step=False, on_epoch=True)
+        self._log.info(gen_pbar_str(loss_dict))
+
         sample_outputs = task.run_predicts(self.model, batch)
         sample_loss_dict = task.compile_task_losses(batch, sample_outputs)
         sample_log_dict = tree.map_structure(
@@ -266,8 +281,8 @@ class SidechainModule(L.LightningModule):
             batch_size=batch.num_graphs,
             sync_dist=True)
 
-        self.median_metric.update(sample_loss_dict['autoenc_per_seq_recov'])
-        self.log("median_seq_recov", self.median_metric, on_step=False, on_epoch=True)
+        self.sample_median_metric.update(sample_loss_dict['per_seq_recov'])
+        self.log("sample_median_seq_recov", self.sample_median_metric, on_step=False, on_epoch=True)
         self._log.info(gen_pbar_str(sample_loss_dict))
         return sample_loss_dict
 

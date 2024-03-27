@@ -235,14 +235,14 @@ if __name__ == '__main__':
                 # 120: 5
             }
         else:
-            cfg['datamodule']['sample_lengths'] = {
-                i: 10
-                for i in range(60, 128+1)
-            }
             # cfg['datamodule']['sample_lengths'] = {
-            #     i: 50
-            #     for i in range(100, 300+1, 50)
+            #     i: 10
+            #     for i in range(60, 128+1)
             # }
+            cfg['datamodule']['sample_lengths'] = {
+                i: 50
+                for i in range(100, 300+1, 50)
+            }
 
     if cfg['domain']['domain'] == "protein":
         if args.debug:

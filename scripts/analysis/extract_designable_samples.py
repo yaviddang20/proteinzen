@@ -16,7 +16,7 @@ if __name__ == '__main__':
     df = pd.read_csv(args.csv)
     designable_samples = df[df.sc_rmsd < 2]
 
-    out_dir = os.path.join(args.samples, "designable_samples")
+    out_dir = os.path.join(args.samples, "../designable_samples")
     if not os.path.isdir(out_dir):
         os.mkdir(out_dir)
 
