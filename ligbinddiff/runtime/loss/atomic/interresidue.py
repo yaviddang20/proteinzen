@@ -129,6 +129,7 @@ def intersidechain_clash_loss(pred_atom14,
                               atom14_mask,
                               seq,
                               batch,
+                              clash_tolerance=1.5,
                               k=30):
     """ Additional loss to push non-bonded atoms
         out of the van der waals radius of other atoms  """
@@ -142,8 +143,6 @@ def intersidechain_clash_loss(pred_atom14,
     # we need to treat adjacent residues differently
     # we'll just zero out the backbone loss components, since this is generally handled by other losses
     chain_edge = (torch.abs(edge_index[0] - edge_index[1]) < 2)
-
-
     edge_batch = batch[edge_index[1]]
 
     src = edge_index[1]
@@ -155,7 +154,8 @@ def intersidechain_clash_loss(pred_atom14,
     atom14_src_mask = atom14_mask[src].unsqueeze(-1)  # n_edge x n_atom x 1
     atom14_dst_mask = atom14_mask[dst].unsqueeze(-2)  # n_edge x 1 x n_atom
     total_mask = atom14_src_mask & atom14_dst_mask
-    total_mask[chain_edge][:, :4, :4] = False
+    # total_mask[chain_edge, :4, :4] = False
+    total_mask[:, :4, :4] = False
 
     interres_dists = vec_norm(res_src - res_dst, dim=-1)  # n_edge x n_atoms x n_atoms
     seq_src = seq[src]
@@ -163,8 +163,26 @@ def intersidechain_clash_loss(pred_atom14,
     clash_dists = atom14_clash_radius_torch[(seq_src, seq_dst)]
     # TODO: allow for di-sulfide bonds?
 
-    clash_loss = torch.where(interres_dists < clash_dists, clash_dists - interres_dists, 0)
+    # clash_loss_no_tol = torch.where(
+    #     interres_dists < clash_dists,
+    #     clash_dists - interres_dists,
+    #     0
+    # )
+    # print(clash_loss_no_tol.max())
+
+    clash_loss = torch.where(
+        interres_dists < clash_dists - clash_tolerance,
+        clash_dists - clash_tolerance - interres_dists,
+        0
+    )
     clash_loss = clash_loss * total_mask
+
+    # clash = clash_loss.sum(dim=(-1, -2)) > 0
+    # print(clash_loss.max())
+    # print(clash_loss[clash][:2])
+    # print(edge_index[:, clash][:, :2])
+    # print(clash_loss.sum(dim=(-1, -2))[clash])
+
     # print(pred_atom14)
     # print(edge_index)
     # print(interres_dists)

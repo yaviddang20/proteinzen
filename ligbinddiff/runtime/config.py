@@ -10,11 +10,14 @@ from ligbinddiff.data.datasets.datamodule import ProteinDataModule, FramediffDat
 from ligbinddiff.diffusion.noisers.se3_diffuser import SE3Diffuser
 from ligbinddiff.diffusion.noisers.latent import SidechainDiffuser
 from ligbinddiff.stoch_interp.interpolate.se3 import SE3Interpolant, SE3InterpolantConfig
-from ligbinddiff.stoch_interp.interpolate.protein import ProteinInterpolant
+from ligbinddiff.stoch_interp.interpolate.protein import ProteinInterpolant, ProteinDirichletInterpolant, ProteinDirichletChiInterpolant, ProteinDirichletMultiChiInterpolant
 from ligbinddiff.stoch_interp.interpolate.molecule import HarmonicPriorInterpolant
 from ligbinddiff.stoch_interp.interpolate.dirichlet import DirichletConditionalFlow
 
 from ligbinddiff.model.denoiser.bb.frames import GraphIpaFrameDenoiser, DynamicGraphIpaFrameDenoiser
+from ligbinddiff.model.denoiser.protein.frames_dirichlet import DynamicGraphIpaFrameDirichletDenoiser
+from ligbinddiff.model.denoiser.protein.frames_dirichlet_chi import DynamicGraphIpaFrameDirichletChiDenoiser
+from ligbinddiff.model.denoiser.protein.frames_dirichlet_multichi import DynamicGraphIpaFrameDirichletMultiChiDenoiser
 from ligbinddiff.model.denoiser.sidechain.ipmp_latent import IPMPDenoiser
 from ligbinddiff.model.denoiser.molecule.tfn import MoleculeDenoiser
 from ligbinddiff.stoch_interp.flow_matchers.frames import GraphFrameFlow
@@ -28,7 +31,7 @@ from ligbinddiff.model.wrappers.protein import IPMPLatentWrapper
 from ligbinddiff.tasks.diffusion.bb import BackboneFrameNoising
 from ligbinddiff.tasks.diffusion.sidechain import DesignLatentSidechainNoising
 from ligbinddiff.tasks.fm.bb import BackboneFrameInterpolation
-from ligbinddiff.tasks.fm.protein import ProteinInterpolation
+from ligbinddiff.tasks.fm.protein import ProteinInterpolation, ProteinDirichletInterpolation, ProteinDirichletChiInterpolation, ProteinDirichletMultiChiInterpolation
 from ligbinddiff.tasks.fm.molecule import HarmonicFlowMatching
 from ligbinddiff.tasks.fm.sidechain import DirichletFlowMatching
 
@@ -89,6 +92,18 @@ def config_hydra_store():
         ProteinInterpolant,
         se3_cfg=builds(SE3InterpolantConfig),
         name="fm_protein")
+    # corruption_store(
+    #     ProteinDirichletInterpolant,
+    #     se3_cfg=builds(SE3InterpolantConfig),
+    #     name="dirichlet_protein")
+    # corruption_store(
+    #     ProteinDirichletChiInterpolant,
+    #     se3_cfg=builds(SE3InterpolantConfig),
+    #     name="dirichlet_protein")
+    corruption_store(
+        ProteinDirichletMultiChiInterpolant,
+        se3_cfg=builds(SE3InterpolantConfig),
+        name="dirichlet_protein")
     corruption_store(
         HarmonicPriorInterpolant,
         name="fm_molecule")
@@ -153,6 +168,9 @@ def config_hydra_store():
     # model_store(GraphIpaFrameDenoiser, name="fm_bb")
     model_store(DynamicGraphIpaFrameDenoiser, name="fm_bb")
     model_store(IPMPLatentWrapper, name="fm_protein")
+    # model_store(DynamicGraphIpaFrameDirichletDenoiser, name="dirichlet_protein")
+    # model_store(DynamicGraphIpaFrameDirichletChiDenoiser, name="dirichlet_protein")
+    model_store(DynamicGraphIpaFrameDirichletMultiChiDenoiser, name="dirichlet_protein")
     model_store(MoleculeDenoiser, name="fm_molecule")
     # model_store(
     #     DensityLatentSidechainWrapper,
@@ -176,6 +194,9 @@ def config_hydra_store():
     task_store(pbuilds(DirichletFlowMatching), name="dirichlet_sidechain")
     task_store(pbuilds(BackboneFrameInterpolation), name="fm_bb")
     task_store(pbuilds(ProteinInterpolation), name="fm_protein")
+    # task_store(pbuilds(ProteinDirichletInterpolation), name="dirichlet_protein")
+    # task_store(pbuilds(ProteinDirichletChiInterpolation), name="dirichlet_protein")
+    task_store(pbuilds(ProteinDirichletMultiChiInterpolation), name="dirichlet_protein")
     task_store(pbuilds(HarmonicFlowMatching), name="fm_molecule")
 
     exp_store = store(group="experiment")

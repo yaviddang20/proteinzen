@@ -24,10 +24,12 @@ class DirichletConditionalFlow:
         self.K = K
 
     def c_factor(self, probs, t, batch, use_torch=False):
+        # we need double precision for this, floats will have overflow
         if use_torch:
             device = probs.device
-            probs = probs.numpy(force=True)
-            t = t.numpy(force=True)
+            dtype = probs.dtype
+            probs = probs.double().numpy(force=True)
+            t = t.double().numpy(force=True)
         alpha = t + 1
         alpha_expand = np.tile(alpha[:, None], (1, self.K))
         out1 = scipy.special.beta(alpha_expand, self.K - 1)
@@ -43,7 +45,7 @@ class DirichletConditionalFlow:
         interp = np.concatenate(interp, axis=0)
         final = interp * out
         if use_torch:
-            final = torch.as_tensor(final, device=device)
+            final = torch.as_tensor(final, device=device, dtype=dtype)
         return final
 
     def sample_cond_prob_path(self, seq, t, noising_mask, seq_mask):
@@ -64,7 +66,7 @@ class DirichletConditionalFlow:
 
     def corrupt_batch(self, batch):
         res_data = batch["residue"]
-        t = batch['t']
+        t = batch['t'] * self.t_max
         nodewise_t = t[res_data.batch]
 
         # [N]

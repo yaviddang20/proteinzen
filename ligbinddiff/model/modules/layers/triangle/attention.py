@@ -337,6 +337,93 @@ class TriangleCrossAttention(nn.Module):
         return edge_update
 
 
+class TriangleCrossAttention2(nn.Module):
+    def __init__(self,
+                 c_s,
+                 c_z,
+                 num_heads=4,
+                 num_rbf=64,
+                 inf=1e4,
+                 assume_sorted=False):
+        super().__init__()
+        self.c_s = c_s
+        self.c_z = c_z
+        self.num_rbf = num_rbf
+        self.num_heads = num_heads
+
+        self.dist_bias_gate = nn.Sequential(
+            nn.Linear(2*c_s, num_heads),
+            nn.Sigmoid()
+        )
+        self.dist_bias = nn.Sequential(
+            nn.Linear(self.num_rbf, self.num_rbf),
+            nn.ReLU(),
+            nn.Linear(self.num_rbf, num_heads),
+        )
+
+        self.lin_q = nn.Linear(c_z, c_z)
+        self.lin_k = nn.Linear(c_z, c_z)
+        self.lin_v = nn.Linear(c_z, c_z)
+        self.lin_out = Linear(c_z, c_z)
+        self.assume_sorted = assume_sorted
+
+        self.inf = inf
+
+    def forward(self,
+                node_features,
+                rigids,
+                knn_src_edge_features,
+                knn_src_edge_index,
+                dst_edge_features,
+                dst_edge_index,
+                eps=1e-8):
+        num_nodes = node_features.shape[0]
+        num_edges = dst_edge_features.shape[0]
+
+        k = knn_src_edge_index.shape[-1]
+
+        edge1 = dst_edge_index[..., None]
+        edge2 = knn_src_edge_index
+
+        # edge3_node1 = node_features[edge1[0]]
+        # edge3_node2 = node_features[edge2[0]]
+        # edge3_gate = self.dist_bias_gate(
+        #     torch.cat([edge3_node1, edge3_node2], dim=-1)
+        # )
+
+        node_trans = rigids.get_trans()
+        edge3_node1_trans = node_trans[edge1[0]]
+        edge3_node2_trans = node_trans[edge2[0]]
+        edge3_dist = torch.linalg.vector_norm(
+            edge3_node1_trans - edge3_node2_trans + eps,
+            dim=-1
+        )
+
+        edge3_dist_features = _rbf(edge3_dist, D_count=self.num_rbf, device=edge3_dist.device)
+        # edge3_dist_bias = edge3_gate * self.dist_bias(edge3_dist_features)  # n_edge x k x h
+        edge3_dist_bias = self.dist_bias(edge3_dist_features)  # n_edge x k x h
+
+        edge_q = self.lin_q(dst_edge_features)
+        edge_k = self.lin_k(knn_src_edge_features)
+        edge_q = edge_q.view(num_edges, 1, self.num_heads, -1)  # n_edge x 1 x h x c_z//h
+        edge_k = edge_k.view(num_edges, k, -1, self.num_heads)  # n_edge x k x c_z//h x h
+
+        edge_attn = edge_q.transpose(-2, -3) @ edge_k.transpose(-1, -3)  # n_edge x h x 1 x k
+        edge_attn = edge_attn.squeeze(-2).transpose(-1, -2)  # n_edge x k x h
+        edge_attn = 1 / np.sqrt(self.c_z) * edge_attn
+        edge_attn = edge_attn + edge3_dist_bias
+        edge_attn = torch.softmax(edge_attn, dim=-2) # n_edge x k x h
+
+        edge_v = self.lin_v(knn_src_edge_features).view(num_edges, k, self.num_heads, -1)  # n_edge x k x h x c_z//h
+        edge_update = torch.sum(
+            edge_v * edge_attn[..., None],
+            dim=-3
+        )  # n_edge x h x c_z//h
+        edge_update = self.lin_out(edge_update.view(num_edges, self.c_z))
+
+        return edge_update
+
+
 class TwoScaleTriangleCrossAttention(nn.Module):
     def __init__(self,
                  c_s,

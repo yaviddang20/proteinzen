@@ -9,7 +9,14 @@ from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddin
 import ligbinddiff.utils.openfold.rigid_utils as ru
 
 
-def sample_inv_cubic_edges(batched_X_ca, batched_x_mask, batch, knn_k=30, inv_cube_k=10, self_edge=False):
+def sample_inv_cubic_edges(
+    batched_X_ca,
+    batched_x_mask,
+    batch,
+    knn_k=30,
+    inv_cube_k=10,
+    self_edge=False
+):
     # TODO: change x_mask to be True for retained positions
     edge_indicies = []
     knn_edge_select = []
@@ -80,6 +87,94 @@ def sample_inv_cubic_edges(batched_X_ca, batched_x_mask, batch, knn_k=30, inv_cu
     lrange_edge_select = torch.cat(lrange_edge_select, dim=0)
     edge_mask = batched_x_mask[edge_index].any(dim=0)
     return edge_index[:, ~edge_mask], knn_edge_select[~edge_mask], lrange_edge_select[~edge_mask]
+
+
+def sample_logn_inv_cubic_edges(
+    batched_X_ca,
+    batched_x_mask,
+    batch,
+    knn_k=20,
+    min_inv_cube_edges=40,
+    logn_scale=8,
+    logn_offset=-12,
+    self_edge=False
+):
+    # TODO: change x_mask to be True for retained positions
+    edge_indicies = []
+    knn_edge_select = []
+    lrange_edge_select = []
+    offset = 0
+    for i in range(batch.max().item() + 1):
+        X_ca = batched_X_ca[batch == i]
+        x_mask = batched_x_mask[batch == i]
+
+        X_ca[x_mask] = torch.inf
+        rel_pos_CA = X_ca.unsqueeze(1) - X_ca.unsqueeze(0)  # N x N x 3
+        dist_CA = torch.linalg.vector_norm(rel_pos_CA, dim=-1)  # N x N
+        sorted_dist, sorted_edges = torch.sort(dist_CA, dim=-1)  # N x N
+        if self_edge:
+            knn_edges = sorted_edges[..., :knn_k]  # first edge will always be self
+            # remove knn edges
+            remaining_dist = sorted_dist[..., knn_k:]  # N x (N - knn_k - 1)
+            remaining_edges = sorted_edges[..., knn_k:]  # N x (N - knn_k - 1)
+
+        else:
+            # remove self edge
+            knn_edges = sorted_edges[..., 1:knn_k+1]  # first edge will always be self
+            # remove knn edges
+            remaining_dist = sorted_dist[..., knn_k+1:]  # N x (N - knn_k - 1)
+            remaining_edges = sorted_edges[..., knn_k+1:]  # N x (N - knn_k - 1)
+
+        ## inv cube
+        uniform = torch.distributions.Uniform(0,1)
+        dist_noise = uniform.sample(remaining_dist.shape).to(batched_X_ca.device)  # N x (N - knn_k - 1)
+
+        logprobs = -3 * torch.log(remaining_dist)  # N x (N - knn_k)
+        perturbed_logprobs = logprobs - torch.log(-torch.log(dist_noise))  # N x (N - knn_k - 1)
+
+        good_edges = torch.isfinite(perturbed_logprobs)
+        perturbed_logprobs[~good_edges] = -torch.inf
+
+        # if we don't have inv_cube_k nodes to sample, sample the max we can
+        num_bad_edges = (~good_edges).sum(dim=-1)
+        # we set "num bad edges" for masked residues to 0, otherwise that would skew our count
+        num_bad_edges[x_mask] = 0
+        max_num_bad_edges = int(num_bad_edges.max())
+        num_nodes = (~x_mask).sum().item()
+        # TODO: which log should this be...
+        inv_cube_k = round(
+            max(min_inv_cube_edges, logn_scale * np.log2(num_nodes) + logn_offset)
+        )
+        if inv_cube_k > perturbed_logprobs.shape[-1] - max_num_bad_edges:
+            print(f"trimming down num edges from {inv_cube_k} to {perturbed_logprobs.shape[-1] - max_num_bad_edges}, {max_num_bad_edges} bad edges")
+            if perturbed_logprobs.shape[-1] - max_num_bad_edges == 0:
+                print(f"we shouldn't get rid of all edges... right now we see num_bad_edges as ", num_bad_edges)
+            inv_cube_k = perturbed_logprobs.shape[-1] - max_num_bad_edges
+
+        _, sampled_edges_relative_idx = torch.topk(perturbed_logprobs, k=inv_cube_k, dim=-1)
+        sampled_edges = torch.gather(remaining_edges, -1, sampled_edges_relative_idx)  # N x inv_cube_k
+
+        edge_sinks = torch.cat([knn_edges, sampled_edges], dim=-1)  # B x N x (knn_k + inv_cube_k)
+        edge_sources = torch.arange(X_ca.shape[0]).repeat_interleave(knn_k + inv_cube_k).to(edge_sinks.device)
+        edge_index = torch.stack([edge_sinks.flatten(), edge_sources], dim=0)
+        # sorting not strictly necessarily but it help if we ever hack things to dense knn graphs
+        # edge_indicies.append(sort_edge_index(edge_index, sort_by_row=False) + offset)
+        edge_indicies.append(edge_index + offset)
+        offset = offset + (batch == i).long().sum()
+        num_nodes = X_ca.shape[0]
+        knn_edge_select.append(torch.cat(
+            [torch.ones(knn_k), torch.zeros(inv_cube_k)]
+        ).repeat(num_nodes).bool().to(X_ca.device))
+        lrange_edge_select.append(torch.cat(
+            [torch.zeros(knn_k), torch.ones(inv_cube_k)]
+        ).repeat(num_nodes).bool().to(X_ca.device))
+
+    edge_index = torch.cat(edge_indicies, dim=-1)
+    knn_edge_select = torch.cat(knn_edge_select, dim=0)
+    lrange_edge_select = torch.cat(lrange_edge_select, dim=0)
+    edge_mask = batched_x_mask[edge_index].any(dim=0)
+    return edge_index[:, ~edge_mask], knn_edge_select[~edge_mask], lrange_edge_select[~edge_mask]
+
 
 
 def sparse_to_knn_graph(edge_features, edge_index):

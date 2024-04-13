@@ -104,7 +104,8 @@ class FramediffDataModule(L.LightningDataModule):
                     120: 5
                  },
                  length_batch=False,
-                 sample_from_clusters=False
+                 sample_from_clusters=False,
+                 batch_by_edge_fn=None
                  ):
         super().__init__()
         self.data_dir = data_dir
@@ -113,6 +114,7 @@ class FramediffDataModule(L.LightningDataModule):
         self.num_workers = num_workers
         self.length_batch = length_batch
         self.sample_from_clusters = sample_from_clusters
+        self.batch_by_edge_fn = batch_by_edge_fn
 
         self.sample_lengths = sample_lengths
         csv = "filtered_metadata.csv"
@@ -139,7 +141,7 @@ class FramediffDataModule(L.LightningDataModule):
             dataloader = DataLoader(
                 x,
                 num_workers=self.num_workers,
-                batch_sampler=ClusteredBatchSampler(x, batch_size=self.batch_size),
+                batch_sampler=ClusteredBatchSampler(x, batch_size=self.batch_size, batch_by_edge_fn=self.batch_by_edge_fn),
                 collate_fn=collate_fn,
                 shuffle=False
             )
@@ -147,7 +149,7 @@ class FramediffDataModule(L.LightningDataModule):
             dataloader = DataLoader(
                 x,
                 num_workers=self.num_workers,
-                batch_sampler=BatchSampler(x, batch_size=self.batch_size),
+                batch_sampler=BatchSampler(x, batch_size=self.batch_size, batch_by_edge_fn=self.batch_by_edge_fn),
                 collate_fn=collate_fn,
                 shuffle=False
             )

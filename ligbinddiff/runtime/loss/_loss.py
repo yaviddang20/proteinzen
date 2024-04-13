@@ -11,7 +11,7 @@ from ligbinddiff.runtime.loss.atomic.intraresidue import (angle_loss, atom91_mse
 from ligbinddiff.runtime.loss.atomic.interresidue import (chain_constraints_loss,
                                              backbone_dihedrals_loss,
                                              intersidechain_clash_loss)
-from ligbinddiff.runtime.loss.atomic.atomic import atomic_neighborhood_dist_loss, framediff_local_atomic_context_loss
+from ligbinddiff.runtime.loss.atomic.atomic import residue_knn_neighborhood_atomic_dist_loss, framediff_local_atomic_context_loss
 from ligbinddiff.runtime.loss.atomic.hbond import bb_hbond_loss
 from ligbinddiff.runtime.loss.density import zernike_coeff_loss
 from ligbinddiff.runtime.loss.latent import so3_embedding_kl, so3_embedding_mse
@@ -78,7 +78,7 @@ def cath_latent_loss_fn(batch, latent_outputs, decoder_outputs, passthrough_outp
         num_edges,
         x_mask
     )
-    local_atomic_dist_loss = atomic_neighborhood_dist_loss(
+    local_atomic_dist_loss = residue_knn_neighborhood_atomic_dist_loss(
         atom91_centered + X_ca.unsqueeze(-2),
         decoded_atom91 + X_ca.unsqueeze(-2),
         seq,
@@ -107,7 +107,7 @@ def cath_latent_loss_fn(batch, latent_outputs, decoder_outputs, passthrough_outp
             num_edges,
             x_mask | (~same)
         )
-        cl_local_atomic_dist_loss = atomic_neighborhood_dist_loss(
+        cl_local_atomic_dist_loss = residue_knn_neighborhood_atomic_dist_loss(
             atom91_centered + X_ca.unsqueeze(-2),
             decoded_atom91 + X_ca.unsqueeze(-2),
             seq,
@@ -763,7 +763,7 @@ def inpaint_latent_loss_fn(batch,
         num_edges,
         x_mask
     )
-    local_atomic_dist_loss = atomic_neighborhood_dist_loss(
+    local_atomic_dist_loss = residue_knn_neighborhood_atomic_dist_loss(
         atom91,
         decoded_atom91,
         seq,
@@ -792,7 +792,7 @@ def inpaint_latent_loss_fn(batch,
             num_edges,
             x_mask | (~same)
         )
-        cl_local_atomic_dist_loss = atomic_neighborhood_dist_loss(
+        cl_local_atomic_dist_loss = residue_knn_neighborhood_atomic_dist_loss(
             atom91,
             decoded_atom91,
             seq,
@@ -1035,7 +1035,7 @@ def clash_losses(batch,
         num_edges,
         x_mask
     )
-    local_atomic_dist_loss = atomic_neighborhood_dist_loss(
+    local_atomic_dist_loss = residue_knn_neighborhood_atomic_dist_loss(
         atom91,
         decoded_atom91,
         seq,

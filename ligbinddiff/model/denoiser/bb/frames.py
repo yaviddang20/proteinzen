@@ -7,7 +7,7 @@ from ligbinddiff.model.modules.common import GaussianRandomFourierBasis
 from ligbinddiff.model.modules.layers.edge.sitewise import EdgeTransition
 from ligbinddiff.model.modules.layers.node.attention import GraphInvariantPointAttention
 from ligbinddiff.model.modules.layers.lrange.vn import VirtualNodeAttnUpdate, VirtualNodeMPNNUpdate
-from ligbinddiff.model.modules.layers.triangle.attention import SparseTriangleAttention, TriangleCrossAttention, TwoScaleTriangleCrossAttention, ThreeScaleTriangleCrossAttention
+from ligbinddiff.model.modules.layers.triangle.attention import SparseTriangleAttention, TriangleCrossAttention, TriangleCrossAttention2, TwoScaleTriangleCrossAttention, ThreeScaleTriangleCrossAttention
 from ligbinddiff.model.modules.layers.triangle.mult import FusedSparseTriangleMultiplicativeTransition
 from ligbinddiff.model.modules.layers.node.mpnn import IPMP
 
@@ -19,7 +19,8 @@ from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddin
 
 from ligbinddiff.model.modules.openfold.frames import BackboneUpdate, StructureModuleTransition, Linear
 
-from ligbinddiff.model.utils.graph import sample_inv_cubic_edges, sequence_local_graph, gen_spatial_graph_features, batchwise_to_nodewise, get_data_lens
+from ligbinddiff.model.utils.graph import sample_inv_cubic_edges, sample_logn_inv_cubic_edges, sequence_local_graph, gen_spatial_graph_features, batchwise_to_nodewise, get_data_lens
+from ligbinddiff.model.utils.graph import sparse_to_knn_graph, knn_to_sparse_graph
 
 from .framediff import TorsionAngles
 
@@ -28,8 +29,7 @@ from ligbinddiff.model.modules.layers.lrange.anchor import ProjectivePoolUpdate,
 from ligbinddiff.model.modules.layers.interres import OneParamPairwiseEquilibrate
 
 from torch_geometric.utils import coalesce
-from torch_geometric.nn import knn_graph
-
+from torch_cluster import knn, knn_graph
 
 from torch.profiler import profile, record_function, ProfilerActivity
 
@@ -497,13 +497,14 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
                  c_s,
                  c_z,
                  c_hidden,
-                 num_heads,
+                 ipa_num_heads,
                  num_qk_pts,
                  num_v_pts,
                  self_conditioning=False,
                  triangle_attention=False,
                  triangle_mult=False,
                  triangle_transfer=False,
+                 triangle_num_heads=4,
                  vn_mode=None,
                  embed_seq_edge=False,
                  use_seq_edge=True,
@@ -533,10 +534,10 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
             #     num_heads=num_heads,
             #     num_rbf=num_rbf,
             # )
-            self.triangle_attention = TwoScaleTriangleCrossAttention(
+            self.triangle_attention = TriangleCrossAttention2(
                 c_s,
                 c_z,
-                num_heads,
+                triangle_num_heads,
                 num_rbf
             )
             self.edge_ln = nn.LayerNorm(c_z)
@@ -554,10 +555,15 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
             self.triangle_mult = None
 
         if triangle_transfer:
-            self.triangle_transfer = ThreeScaleTriangleCrossAttention(
+            # self.triangle_transfer = ThreeScaleTriangleCrossAttention(
+            #     c_s,
+            #     c_z,
+            #     num_heads
+            # )
+            self.triangle_transfer = TriangleCrossAttention2(
                 c_s,
                 c_z,
-                num_heads
+                triangle_num_heads
             )
             self.transfer_edge_ln = nn.LayerNorm(c_z)
         else:
@@ -568,7 +574,7 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
             c_s=c_s,
             c_z=c_z,
             c_hidden=c_hidden,
-            no_heads=num_heads,
+            no_heads=ipa_num_heads,
             no_qk_points=num_qk_pts,
             no_v_points=num_v_pts,
         )
@@ -603,7 +609,7 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
                 c_s=c_s,
                 c_z=c_z,
                 c_hidden=c_hidden,
-                no_heads=num_heads,
+                no_heads=ipa_num_heads,
                 no_qk_points=num_qk_pts,
                 no_v_points=num_v_pts,
             )
@@ -629,13 +635,13 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
         if vn_mode == 'attn':
             self.vn_update = VirtualNodeAttnUpdate(
                 c_s,
-                c_s // num_heads,
-                num_heads=num_heads
+                c_s // ipa_num_heads,
+                num_heads=ipa_num_heads
             )
         elif vn_mode == 'mpnn':
             self.vn_update = VirtualNodeMPNNUpdate(
                 c_s,
-                num_heads=num_heads
+                num_heads=ipa_num_heads
             )
 
         self.bb_update = BackboneUpdate(
@@ -678,8 +684,8 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
             node_features,
             rigids,
             vn_features,
-            old_knn_edge_features,
-            old_knn_edge_index,
+            old_edge_features,
+            old_edge_index,
             edge_features,
             edge_index,
             knn_edge_select,
@@ -718,46 +724,68 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
 
         if self.triangle_transfer is not None:
             if self.first:
-                old_knn_edge_features = edge_features.clone()#[lrange_edge_select]
-                old_knn_edge_index = edge_index.clone()#[:, lrange_edge_select]
+                old_edge_features = edge_features
+                old_edge_index = edge_index
 
-            knn_edge_update, lrange_edge_update = self.triangle_transfer(
+            old_dst = old_edge_index[0]
+            old_src = old_edge_index[1]
+            rigid_trans = rigids.get_trans()
+            old_X_dst = rigid_trans[old_dst]
+            new_dst = edge_index[0]
+            new_src = edge_index[1]
+            new_X_dst = rigid_trans[new_dst]
+            transfer_index = knn(old_X_dst, new_X_dst, k=10, batch_x=old_src, batch_y=new_src)
+            transfer_index = torch.stack([transfer_index[1], transfer_index[0]], dim=0)  # "source_to_target"
+            transfer_edge_features = old_edge_features[transfer_index[0]]
+            transfer_edge_index = old_edge_index[:, transfer_index[0]]
+
+            # this isn't resistant to bugs but it should be much faster
+            num_edges = edge_features.shape[0]
+            knn_transfer_edge_features = transfer_edge_features.view(num_edges, 10, -1)
+            knn_transfer_edge_index = transfer_edge_index.view(2, num_edges, 10)
+            # knn_transfer_edge_features, _, _ = sparse_to_knn_graph(transfer_edge_features, transfer_index)
+            # knn_transfer_edge_index, _, _ = sparse_to_knn_graph(transfer_edge_index.transpose(-1, -2), transfer_index)
+            # knn_transfer_edge_index = knn_transfer_edge_index.permute(2, 0, 1)
+
+            edge_update = self.triangle_transfer(
                 node_features,
                 rigids,
-                old_knn_edge_features,
-                old_knn_edge_index,
-                edge_features[knn_edge_select],
-                edge_index[:, knn_edge_select],
-                edge_features[lrange_edge_select],
-                edge_index[:, lrange_edge_select])
-            # knn_edge_update, lrange_edge_update = torch.utils.checkpoint.checkpoint(
+                knn_transfer_edge_features,
+                knn_transfer_edge_index,
+                edge_features,
+                edge_index)
+            # edge_update = torch.utils.checkpoint.checkpoint(
             #     self.triangle_transfer,
             #     node_features,
             #     rigids,
-            #     old_knn_edge_features,
-            #     old_knn_edge_index,
-            #     edge_features[knn_edge_select],
-            #     edge_index[:, knn_edge_select],
-            #     edge_features[lrange_edge_select],
-            #     edge_index[:, lrange_edge_select],
-            #     use_reentrant=False)
-            edge_features[knn_edge_select] = edge_features[knn_edge_select] + knn_edge_update
-            edge_features[lrange_edge_select] = edge_features[lrange_edge_select] + lrange_edge_update
-            edge_features = self.transfer_edge_ln(edge_features)
+            #     knn_transfer_edge_features,
+            #     knn_transfer_edge_index,
+            #     edge_features,
+            #     edge_index,
+            #     use_reentrant=True)
+            edge_features = self.transfer_edge_ln(edge_features + edge_update)
 
         if self.triangle_attention is not None:
-            knn_edge_update, lrange_edge_update = torch.utils.checkpoint.checkpoint(
-                self.triangle_attention,
+            dst = edge_index[0]
+            src = edge_index[1]
+            rigid_trans = rigids.get_trans()
+            X_dst = rigid_trans[dst]
+            transfer_index = knn_graph(X_dst, k=10, batch=src)
+            transfer_edge_features = edge_features[transfer_index[0]]
+            transfer_edge_index = edge_index[:, transfer_index[0]]
+            # this isn't resistant to bugs but it should be much faster
+            num_edges = edge_features.shape[0]
+            knn_transfer_edge_features = transfer_edge_features.view(num_edges, 10, -1)
+            knn_transfer_edge_index = transfer_edge_index.view(2, num_edges, 10)
+
+            edge_update = self.triangle_attention(
                 node_features,
                 rigids,
-                edge_features[knn_edge_select],
-                edge_index[:, knn_edge_select],
-                edge_features[lrange_edge_select],
-                edge_index[:, lrange_edge_select],
-                use_reentrant=False)
-            edge_features[knn_edge_select] = edge_features[knn_edge_select] + knn_edge_update
-            edge_features[lrange_edge_select] = edge_features[lrange_edge_select] + lrange_edge_update
-            edge_features = self.edge_ln(edge_features)
+                knn_transfer_edge_features,
+                knn_transfer_edge_index,
+                edge_features,
+                edge_index)
+            edge_features = self.edge_ln(edge_features + edge_update)
 
         if self.triangle_mult is not None:
             edge_features = torch.utils.checkpoint.checkpoint(
@@ -904,12 +932,15 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  c_z=128,
                  c_hidden=256,
                  num_heads=8,
+                 triangle_num_heads=8,
                  num_qk_pts=8,
                  num_v_pts=12,
                  h_time=64,
                  n_layers=4,
                  knn_k=20,
                  lrange_k=40,
+                 lrange_logn_scale=0,
+                 lrange_logn_offset=0,
                  num_vn=4,
                  vn_mode=None,
                  self_conditioning=False,
@@ -1009,6 +1040,7 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  num_rbf=self.num_rbf,
                  triangle_attention=use_triangle_attn,
                  triangle_mult=use_triangle_mult,
+                 triangle_num_heads=triangle_num_heads,
                  vn_mode=vn_mode,
                  use_transformer=use_transformer,
                  add_nodes_to_edge=add_nodes_to_edge,
@@ -1020,6 +1052,8 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         ])
         self.knn_k = knn_k
         self.lrange_k = lrange_k
+        self.lrange_logn_scale = lrange_logn_scale
+        self.lrange_logn_offset = lrange_logn_offset
 
         self.torsion_angles = TorsionAngles(c_s, 1)
 
@@ -1090,13 +1124,28 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
             self_cond_X_ca = self_condition['final_rigids'].get_trans()
             masked_X_ca = self_cond_X_ca.clone()
             masked_X_ca[res_mask] = torch.inf
-            edge_index, knn_edge_select, lrange_edge_select = sample_inv_cubic_edges(
-                masked_X_ca, res_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k, self_edge=self.use_self_edge)
+            edge_index, knn_edge_select, lrange_edge_select = sample_logn_inv_cubic_edges(
+                masked_X_ca,
+                res_mask,
+                batch,
+                knn_k=self.knn_k,
+                min_inv_cube_edges=self.lrange_k,
+                logn_scale=self.lrange_logn_scale,
+                logn_offset=self.lrange_logn_offset,
+                self_edge=self.use_self_edge)
         else:
             masked_X_ca = X_ca.clone()
             masked_X_ca[res_mask] = torch.inf
-            edge_index, knn_edge_select, lrange_edge_select = sample_inv_cubic_edges(
-                masked_X_ca, res_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k, self_edge=self.use_self_edge)
+            edge_index, knn_edge_select, lrange_edge_select = sample_logn_inv_cubic_edges(
+                masked_X_ca,
+                res_mask,
+                batch,
+                knn_k=self.knn_k,
+                min_inv_cube_edges=self.lrange_k,
+                logn_scale=self.lrange_logn_scale,
+                logn_offset=self.lrange_logn_offset,
+                self_edge=self.use_self_edge)
+
 
         # compute edge features
         edge_features, _ = gen_spatial_graph_features(rigids, edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=self.c_z//2)

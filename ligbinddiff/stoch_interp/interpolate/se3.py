@@ -13,6 +13,28 @@ from ligbinddiff.model.utils.graph import batchwise_to_nodewise
 from torch_geometric.data import HeteroData, Batch
 from torch_geometric.utils import scatter
 import dataclasses
+import numpy as np
+
+# from eigenfold
+class HarmonicPrior:
+    def __init__(self, N = 256, a=3/(3.8**2)):
+        J = torch.zeros(N, N)
+        for i, j in zip(np.arange(N-1), np.arange(1, N)):
+            J[i,i] += a
+            J[j,j] += a
+            J[i,j] = J[j,i] = -a
+        D, P = torch.linalg.eigh(J)
+        D_inv = 1/D
+        D_inv[0] = 0
+        self.P, self.D_inv = P, D_inv
+        self.N = N
+
+    def to(self, device):
+        self.P = self.P.to(device)
+        self.D_inv = self.D_inv.to(device)
+
+    def sample(self, batch_dims=()):
+        return self.P @ (torch.sqrt(self.D_inv)[:,None] * torch.randn(*batch_dims, self.N, 3, device=self.P.device))
 
 
 def _centered_gaussian(batch, device):
@@ -67,7 +89,12 @@ class SE3InterpolantConfig:
 
 
 class SE3Interpolant:
-    def __init__(self, cfg, use_batch_ot=False, prealign_noise=True, uniform_rot_noise=False):
+    def __init__(self,
+                 cfg,
+                 use_batch_ot=False,
+                 prealign_noise=True,
+                 uniform_rot_noise=False,
+                 harmonic_trans_noise=False):
         self._cfg = cfg
         self._rots_cfg = cfg.rots
         self._trans_cfg = cfg.trans
@@ -76,6 +103,7 @@ class SE3Interpolant:
         self.use_batch_ot = use_batch_ot
         self.prealign_noise = prealign_noise
         self.uniform_rot_noise = uniform_rot_noise
+        self.harmonic_trans_noise = harmonic_trans_noise
         print(self.igso3)
 
     @property
@@ -93,8 +121,26 @@ class SE3Interpolant:
         return t * (1 - 2 * self._cfg.min_t) + self._cfg.min_t
 
     def _corrupt_trans(self, trans_1, t, res_mask, batch):
-        trans_nm_0 = _centered_gaussian(batch, self._device)
-        trans_0 = trans_nm_0 * du.NM_TO_ANG_SCALE
+        if self.harmonic_trans_noise:
+            sample_lens = scatter(
+                torch.ones_like(batch),
+                batch
+            )
+            noise = []
+            for l in sample_lens.tolist():
+                prior = HarmonicPrior(l)
+                noise.append(prior.sample().to(self._device))
+            noise = torch.cat(noise, dim=0)
+            center = scatter(
+                noise,
+                index=batch,
+                dim=0,
+                reduce='mean'
+            )
+            trans_0 = noise - center[batch]
+        else:
+            trans_nm_0 = _centered_gaussian(batch, self._device)
+            trans_0 = trans_nm_0 * du.NM_TO_ANG_SCALE
         if self.use_batch_ot:
             # this requires samples to be length batched
             sample_len = int((batch == 0).sum().item())
@@ -258,9 +304,23 @@ class SE3Interpolant:
         batch = Batch.from_data_list(data_list)
         res_data = batch['residue']
         # Set-up initial prior samples
-        trans_0 = (
-            _centered_gaussian(res_data.batch, self._device) * du.NM_TO_ANG_SCALE
-        )
+        if self.harmonic_trans_noise:
+            noise = []
+            for l in num_res:
+                prior = HarmonicPrior(l)
+                noise.append(prior.sample().to(self._device))
+            noise = torch.cat(noise, dim=0)
+            center = scatter(
+                noise,
+                index=res_data.batch,
+                dim=0,
+                reduce='mean'
+            )
+            trans_0 = noise - center[res_data.batch]
+        else:
+            trans_0 = (
+                _centered_gaussian(res_data.batch, self._device) * du.NM_TO_ANG_SCALE
+            )
         rotmats_0 = _uniform_so3(total_num_res, self._device)
 
         # Set-up time

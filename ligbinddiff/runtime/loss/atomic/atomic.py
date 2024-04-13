@@ -52,7 +52,69 @@ def framediff_local_atomic_context_loss(
     return graphwise_dist_se / (graphwise_num_edges - graphwise_num_res)
 
 
-def atomic_neighborhood_dist_loss(gt_ref_atom14,
+def local_atomic_context_loss(
+    pred_atom14,
+    gt_atom14,
+    alt_atom14,
+    batch,
+    atom14_mask,
+    r=6,
+    eps=1e-6,
+    max_num_neighbors=100,
+):
+    res_mask = atom14_mask[:, 1]
+    # re: ambiguous atom14 naming
+    # im gonna use a heuristic for the ref atom14
+    # where we'll just take the ref residue atom ordering
+    # as the one which is lowest in rmsd to the predicted structure
+    # in a lot of cases this probably won't hold but it will at least work
+    # in low rmsd regimes i think
+    with torch.no_grad():
+        pred_gt_diff = torch.square(pred_atom14 - gt_atom14).sum(dim=-1)
+        pred_alt_diff = torch.square(pred_atom14 - alt_atom14).sum(dim=-1)
+        pred_gt_mse = torch.sum(pred_gt_diff * atom14_mask, dim=-1)
+        pred_alt_mse = torch.sum(pred_alt_diff * atom14_mask, dim=-1)
+
+        gt_over_alt = pred_gt_mse < pred_alt_mse
+        ref_atom14 = gt_atom14 * gt_over_alt[..., None, None] + alt_atom14 * ~gt_over_alt[..., None, None]
+
+    flat_ref_atom14 = ref_atom14[atom14_mask]
+    flat_pred_atom14 = pred_atom14[atom14_mask]
+    batch_expand = batch[..., None].expand(-1, atom14_mask.shape[-1])[atom14_mask]
+    edge_index = radius_graph(flat_ref_atom14, r, batch_expand, max_num_neighbors=max_num_neighbors)
+
+    pred_dist_vec = flat_pred_atom14[edge_index[0]] - flat_pred_atom14[edge_index[1]]
+    pred_dists = torch.linalg.vector_norm(pred_dist_vec + eps, dim=-1)
+
+    ref_dist_vec = flat_ref_atom14[edge_index[0]] - flat_ref_atom14[edge_index[1]]
+    ref_dists = torch.linalg.vector_norm(ref_dist_vec + eps, dim=-1)
+
+    dist_se = torch.square(pred_dists - ref_dists)
+
+    edge_batch = batch_expand[edge_index[1]]
+    num_graph = batch_expand.max().item() + 1
+    graphwise_dist_se = scatter(
+        dist_se,
+        edge_batch,
+        dim=0,
+        dim_size=num_graph
+    )
+    graphwise_num_edges = scatter(
+        torch.ones_like(edge_batch),
+        edge_batch,
+        dim=0,
+        dim_size=num_graph
+    )
+    graphwise_num_res = scatter(
+        res_mask.long(),
+        batch,
+        dim=0,
+        dim_size=num_graph
+    )
+    return graphwise_dist_se / (graphwise_num_edges - graphwise_num_res)
+
+
+def residue_knn_neighborhood_atomic_dist_loss(gt_ref_atom14,
                                   alt_ref_atom14,
                                   pred_atom14,
                                   gt_atom14_mask,

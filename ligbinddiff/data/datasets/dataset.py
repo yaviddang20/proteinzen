@@ -197,6 +197,7 @@ class PdbDataset(data.Dataset):
         csv_row = self.csv.iloc[example_idx]
         processed_file_path = csv_row['processed_path']
         chain_feats = self._process_csv_row(processed_file_path)
+        chain_feats['name'] = csv_row['pdb_name']
         chain_feats['csv_idx'] = torch.ones(1, dtype=torch.long) * idx
         return chain_feats
 

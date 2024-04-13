@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import torch_geometric.utils as pygu
+from torch_geometric.nn import radius_graph
 
 from ligbinddiff.utils.openfold import rigid_utils as ru
 from ligbinddiff.utils.atom_reps import atom14_sidechain_angles, atom14_residue_angles
@@ -14,78 +15,31 @@ from .openfold import compute_fape
 
 from ligbinddiff.stoch_interp.interpolate import so3_utils as so3_fm_utils
 
-def all_atom_fape_loss(pred_atom91,
-                  ref_atom91,
-                  seq,
-                  data_lens,
-                  x_mask,
-                  no_bb=True,
-                  eps=1e-6):
-    angle_atom_idx_select = []
-    angle_store = atom14_sidechain_angles if no_bb else atom14_residue_angles
-    for atom_list in angle_store.values():
-        angle_atom_idx_select += atom_list
-    angle_atom_idx_select = torch.as_tensor(angle_atom_idx_select, device=ref_atom91.device).long() # n_frame x 3
-
-    pred_atom14, _ = atom91_to_atom14(pred_atom91, seq)
-    ref_atom14, atom14_mask = atom91_to_atom14(ref_atom91, seq)
-    atom14_mask = atom14_mask.any(dim=-1)
-
-    frame_mask = atom14_mask[:, angle_atom_idx_select].any(dim=-1)  # n_res x n_frame
-    ref_frame_atoms = ref_atom14[:, angle_atom_idx_select]  # n_res x n_frame x 3 x 3
-    pred_frame_atoms = pred_atom14[:, angle_atom_idx_select]  # n_res x n_frame x 3 x 3
-
-    all_atom_fape = []
-    splits = [0] + np.cumsum(data_lens).tolist()
-    for i in range(len(splits)-1):
-        start = splits[i]
-        end = splits[i+1]
-        subset_ref_frame_atoms = ref_frame_atoms[start:end]
-        subset_pred_frame_atoms = pred_frame_atoms[start:end]
-        subset_ref_atom14 = ref_atom14[start:end]
-        subset_pred_atom14 = pred_atom14[start:end]
-        subset_x_mask = x_mask[start:end]
-        subset_atom14_mask = atom14_mask[start:end]
-        subset_frame_mask = frame_mask[start:end]
-
-        flat_ref_frame_atoms = subset_ref_frame_atoms[~subset_x_mask].view(-1, 3, 3)
-        flat_pred_frame_atoms = subset_pred_frame_atoms[~subset_x_mask].view(-1, 3, 3)
-        flat_frame_mask = subset_frame_mask[~subset_x_mask].view(-1)
-        dummy_frame_mask = torch.zeros_like(flat_frame_mask).bool()[~flat_frame_mask]
-
-        flat_atom14_mask = subset_atom14_mask[~subset_x_mask].view(-1)
-        flat_pred_atom14 = subset_pred_atom14[~subset_x_mask].view(-1, 3)
-        flat_pred_atom14 = flat_pred_atom14[~flat_atom14_mask]
-        flat_ref_atom14 = subset_ref_atom14[~subset_x_mask].view(-1, 3)
-        flat_ref_atom14 = flat_ref_atom14[~flat_atom14_mask]
-        dummy_atom14_mask = torch.zeros_like(flat_atom14_mask).bool()[~flat_atom14_mask]
-
-        flat_ref_frames = ru.Rigid.from_3_points(
-            flat_ref_frame_atoms[..., 0, :],
-            flat_ref_frame_atoms[..., 1, :],
-            flat_ref_frame_atoms[..., 2, :]
-        )[~flat_frame_mask]
-        flat_pred_frames = ru.Rigid.from_3_points(
-            flat_pred_frame_atoms[..., 0, :],
-            flat_pred_frame_atoms[..., 1, :],
-            flat_pred_frame_atoms[..., 2, :]
-        )[~flat_frame_mask]
-
-
-        subset_all_atom_fape = compute_fape(
-            flat_pred_frames,
-            flat_ref_frames,
-            ~dummy_frame_mask,
-            flat_pred_atom14,
-            flat_ref_atom14,
-            ~dummy_atom14_mask,
-            l1_clamp_distance=10
+def all_atom_fape_loss(
+    pred_atom14,
+    gt_atom14,
+    pred_rigids,
+    gt_rigids,
+    batch,
+    atom14_mask,
+):
+    ret = []
+    for i in range(batch.max().item()+1):
+        subset = (batch == i)
+        fape = compute_fape(
+            pred_frames=pred_rigids[subset],
+            target_frames=gt_rigids[subset],
+            frames_mask=atom14_mask[subset, 1],
+            pred_positions=pred_atom14[subset],
+            target_positions=gt_atom14[subset],
+            positions_mask=atom14_mask[subset],
+            length_scale=10.,
+            l1_clamp_distance=10.
         )
-        all_atom_fape.append(subset_all_atom_fape.unsqueeze(0))
+        ret.append(fape)
+    loss = torch.cat(ret, dim=-1)
+    return _nodewise_to_graphwise(loss, batch, atom14_mask[:, 1])
 
-    all_atom_fape = torch.cat(all_atom_fape, dim=0)
-    return all_atom_fape
-    return _nodewise_to_graphwise(all_atom_fape, data_lens, frame_mask)
 
 def angle_axis_rot_score_loss(
         pred_rot_score,
@@ -481,3 +435,73 @@ def bb_frame_clash_loss(batch,
         "bb_clash_loss": clash_loss,
         "scaled_bb_clash_loss": scaled_clash_loss
     }
+
+
+def sparse_fape_loss(
+    pred_atom14,
+    gt_atom14,
+    alt_atom14,
+    rigids,
+    batch,
+    atom14_mask,
+    r=10,
+    eps=1e-6,
+    max_num_neighbors=100,
+):
+    res_mask = atom14_mask[:, 1]
+    # re: ambiguous atom14 naming
+    # im gonna use a heuristic for the ref atom14
+    # where we'll just take the ref residue atom ordering
+    # as the one which is lowest in rmsd to the predicted structure
+    # in a lot of cases this probably won't hold but it will at least work
+    # in low rmsd regimes i think
+    with torch.no_grad():
+        pred_gt_diff = torch.square(pred_atom14 - gt_atom14).sum(dim=-1)
+        pred_alt_diff = torch.square(pred_atom14 - alt_atom14).sum(dim=-1)
+        pred_gt_mse = torch.sum(pred_gt_diff * atom14_mask, dim=-1)
+        pred_alt_mse = torch.sum(pred_alt_diff * atom14_mask, dim=-1)
+
+        gt_over_alt = pred_gt_mse < pred_alt_mse
+        ref_atom14 = gt_atom14 * gt_over_alt[..., None, None] + alt_atom14 * ~gt_over_alt[..., None, None]
+
+    flat_ref_atom14 = ref_atom14[atom14_mask]
+    flat_pred_atom14 = pred_atom14[atom14_mask]
+    batch_expand = batch[..., None].expand(-1, atom14_mask.shape[-1])[atom14_mask]
+    edge_index = radius_graph(flat_ref_atom14, r, batch_expand, max_num_neighbors=max_num_neighbors)
+
+    atom_to_rigid = torch.arange(pred_atom14.shape[0], device=pred_atom14.device)
+    atom_to_rigid = atom_to_rigid[..., None].expand(-1, 14)
+    flat_atom_to_rigid = atom_to_rigid[atom14_mask]
+    flat_rigids = rigids[flat_atom_to_rigid]
+
+    pred_dist_vec = flat_pred_atom14[edge_index[0]] - flat_pred_atom14[edge_index[1]]
+    pred_dists = torch.linalg.vector_norm(pred_dist_vec + eps, dim=-1)
+
+    ref_dist_vec = flat_ref_atom14[edge_index[0]] - flat_ref_atom14[edge_index[1]]
+    ref_dists = torch.linalg.vector_norm(ref_dist_vec + eps, dim=-1)
+
+    dist_se = torch.square(pred_dists - ref_dists)
+
+    edge_batch = batch_expand[edge_index[1]]
+    num_graph = batch_expand.max().item() + 1
+    graphwise_dist_se = scatter(
+        dist_se,
+        edge_batch,
+        dim=0,
+        dim_size=num_graph
+    )
+    graphwise_num_edges = scatter(
+        torch.ones_like(edge_batch),
+        edge_batch,
+        dim=0,
+        dim_size=num_graph
+    )
+    graphwise_num_res = scatter(
+        res_mask.long(),
+        batch,
+        dim=0,
+        dim_size=num_graph
+    )
+    return graphwise_dist_se / (graphwise_num_edges - graphwise_num_res)
+
+

@@ -20,7 +20,7 @@ class BatchSampler:
                       including batches of a single element
     :param shuffle: if `True`, batches in shuffled order
     '''
-    def __init__(self, dataset: PdbDataset, batch_size=3000, drop_last=False, shuffle=True):
+    def __init__(self, dataset: PdbDataset, batch_size=3000, drop_last=False, shuffle=True, batch_by_edge_fn=None):
         self.dataset = dataset
         self.batch_size = batch_size
         self.drop_last = drop_last
@@ -28,6 +28,7 @@ class BatchSampler:
 
         self.node_counts = dataset.csv.modeled_seq_len.tolist()
         self.idx = [i for i in range(len(self.node_counts))]
+        self.batch_by_edge_fn = batch_by_edge_fn
 
         self._form_batches()
 
@@ -41,7 +42,10 @@ class BatchSampler:
             n_nodes = 0
             while idx and n_nodes + self.node_counts[idx[0]] <= self.batch_size:
                 next_idx, idx = idx[0], idx[1:]
-                n_nodes += self.node_counts[next_idx]
+                if self.batch_by_edge_fn is not None:
+                    n_nodes += self.batch_by_edge_fn(self.node_counts[next_idx])
+                else:
+                    n_nodes += self.node_counts[next_idx]
                 batch.append(next_idx)
             self.batches.append(batch)
 
@@ -69,13 +73,14 @@ class ClusteredBatchSampler:
                       including batches of a single element
     :param shuffle: if `True`, batches in shuffled order
     '''
-    def __init__(self, dataset: PdbDataset, batch_size=3000, drop_last=False, shuffle=True):
+    def __init__(self, dataset: PdbDataset, batch_size=3000, drop_last=False, shuffle=True, batch_by_edge_fn=None):
         self.dataset = dataset
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.shuffle = shuffle
         self.clusters = self.dataset.csv.cluster.unique()
         self.dataset.csv['iloc'] = list(range(len(dataset.csv)))
+        self.batch_by_edge_fn = batch_by_edge_fn
 
         self._form_batches()
 
@@ -101,6 +106,8 @@ class ClusteredBatchSampler:
         current_node_count = 0
         for i, iloc in enumerate(idx):
             sample_node_count = node_counts[i]
+            if self.batch_by_edge_fn is not None:
+                sample_node_count = self.batch_by_edge_fn(sample_node_count)
             if sample_node_count + current_node_count <= self.batch_size:
                 batch.append(iloc)
                 current_node_count += sample_node_count

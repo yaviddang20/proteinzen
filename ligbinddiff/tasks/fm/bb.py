@@ -5,9 +5,9 @@ import tqdm
 import tree
 import torch
 import numpy as np
+from torch_scatter import scatter
 
 from torch_geometric.data import HeteroData, Batch
-
 
 from ligbinddiff.data.openfold import data_transforms
 from ligbinddiff.utils.openfold import rigid_utils as ru
@@ -16,7 +16,7 @@ from ligbinddiff.model.utils.graph import batchwise_to_nodewise
 
 from ligbinddiff.runtime.loss.frames import bb_frame_fm_loss, rg_loss, frame_traj_loss, bb_frame_clash_loss
 from ligbinddiff.runtime.loss.atomic.hbond import bb_hbond_loss
-from ligbinddiff.stoch_interp.interpolate.se3 import SE3Interpolant, _centered_gaussian, _uniform_so3
+from ligbinddiff.stoch_interp.interpolate.se3 import SE3Interpolant, _centered_gaussian, _uniform_so3, HarmonicPrior
 import ligbinddiff.stoch_interp.interpolate.utils as du
 from ligbinddiff.utils.framediff import all_atom
 
@@ -32,13 +32,15 @@ class BackboneFrameInterpolation(Task):
                  aux_loss_t_min=0.25,
                  rigid_traj_loss=False,
                  sep_rot_loss=False,
-                 local_atomic_dist_r=6):
+                 local_atomic_dist_r=6,
+                 trans_loss_rescale=1):
         super().__init__()
         self.se3_noiser = se3_noiser
         self.aux_loss_t_min = aux_loss_t_min
         self.rigid_traj_loss = rigid_traj_loss
         self.sep_rot_loss = sep_rot_loss
         self.local_atomic_dist_r = local_atomic_dist_r
+        self.trans_loss_rescale = trans_loss_rescale
 
     def gen_diffuse_mask(self, data: HeteroData):
         return torch.ones_like(data['res_mask']).bool()
@@ -115,9 +117,23 @@ class BackboneFrameInterpolation(Task):
         batch = Batch.from_data_list(data_list)
         res_data = batch['residue']
         # Set-up initial prior samples
-        trans_0 = (
-            _centered_gaussian(res_data.batch, device) * du.NM_TO_ANG_SCALE
-        )
+        if self.se3_noiser.harmonic_trans_noise:
+            noise = []
+            for l in num_res:
+                prior = HarmonicPrior(l)
+                noise.append(prior.sample().to(device))
+            noise = torch.cat(noise, dim=0)
+            center = scatter(
+                noise,
+                index=res_data.batch,
+                dim=0,
+                reduce='mean'
+            )
+            trans_0 = noise - center[res_data.batch]
+        else:
+            trans_0 = (
+                _centered_gaussian(res_data.batch, device) * du.NM_TO_ANG_SCALE
+            )
         rotmats_0 = _uniform_so3(total_num_res, device)
 
         # Set-up time
@@ -204,7 +220,7 @@ class BackboneFrameInterpolation(Task):
         # )
         # rg_loss_dict = rg_loss(inputs, outputs)
         bb_denoising_loss = (
-            bb_frame_diffusion_loss_dict["trans_vf_loss"] * 2 +
+            bb_frame_diffusion_loss_dict["trans_vf_loss"] * 2 * self.trans_loss_rescale +
             bb_frame_diffusion_loss_dict["rot_vf_loss"]
         )
 

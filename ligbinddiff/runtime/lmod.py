@@ -38,6 +38,28 @@ class MedianMetric(Metric):
         return torch.median(dim_zero_cat(self.seq_recov))
 
 
+def t_stratified_loss(batch_t, batch_loss, num_bins=4, loss_name=None):
+    """Stratify loss by binning t."""
+    batch_t = batch_t.numpy(force=True)
+    batch_loss = batch_loss.numpy(force=True)
+    flat_losses = batch_loss.flatten()
+    flat_t = batch_t.flatten()
+    bin_edges = np.linspace(0.0, 1.0 + 1e-3, num_bins+1)
+    bin_idx = np.sum(bin_edges[:, None] <= flat_t[None, :], axis=0) - 1
+    t_binned_loss = np.bincount(bin_idx, weights=flat_losses)
+    t_binned_n = np.bincount(bin_idx)
+    stratified_losses = {}
+    if loss_name is None:
+        loss_name = 'loss'
+    for t_bin in np.unique(bin_idx).tolist():
+        bin_start = bin_edges[t_bin]
+        bin_end = bin_edges[t_bin+1]
+        t_range = f'{loss_name} t=[{bin_start:.2f},{bin_end:.2f})'
+        range_loss = t_binned_loss[t_bin] / t_binned_n[t_bin]
+        stratified_losses[t_range] = range_loss
+    return stratified_losses
+
+
 class BackboneModule(L.LightningModule):
     def __init__(self, model, optim, val_dir="validation"):
         super().__init__()
@@ -63,6 +85,19 @@ class BackboneModule(L.LightningModule):
             for key, value in
             sorted(log_dict.items(), key = lambda x: x[0])
         }
+        t = batch['t']
+        for loss_name, loss_list in loss_dict.items():
+            if loss_name in ['loss', 'frameflow_loss']:
+                continue
+            stratified_losses = t_stratified_loss(
+                t, loss_list, loss_name=loss_name)
+            for k,v in stratified_losses.items():
+                self._log_scalar(
+                    f"train/{k}",
+                    v,
+                    prog_bar=False,
+                    on_epoch=True,
+                    batch_size=batch.num_graphs)
 
         self.log_dict(
             log_dict,
@@ -75,6 +110,29 @@ class BackboneModule(L.LightningModule):
         self._log.info(gen_pbar_str(loss_dict))
         return loss_dict
 
+    def _log_scalar(
+            self,
+            key,
+            value,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=True,
+            batch_size=None,
+            sync_dist=False,
+            rank_zero_only=True
+        ):
+        if sync_dist and rank_zero_only:
+            raise ValueError('Unable to sync dist when rank_zero_only=True')
+        self.log(
+            key,
+            value,
+            on_step=on_step,
+            on_epoch=on_epoch,
+            prog_bar=prog_bar,
+            batch_size=batch_size,
+            sync_dist=sync_dist,
+            rank_zero_only=rank_zero_only
+        )
     # def validation_step(self, batch, batch_idx):
     #     task: TaskList = batch['task']
 
@@ -679,9 +737,10 @@ class ProteinModule(L.LightningModule):
 
     def configure_optimizers(self):
         # return self.optim(self.model.denoiser.parameters())
-        return self.optim(
-            list(self.model.denoiser.parameters())
-            + list(self.model.encoder.parameters())
-            + list(self.model.decoder.parameters())
-        )
+        return self.optim(self.model.parameters())
+        # return self.optim(
+        #     list(self.model.denoiser.parameters())
+        #     + list(self.model.encoder.parameters())
+        #     + list(self.model.decoder.parameters())
+        # )
 

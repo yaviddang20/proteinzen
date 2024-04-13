@@ -6,7 +6,7 @@ from ligbinddiff.data.openfold.residue_constants import restype_order_with_x
 
 from .utils import _nodewise_to_graphwise
 from .atomic.atom14 import atom14_mse_loss, chi_loss
-from .atomic.atomic import atomic_neighborhood_dist_loss
+from .atomic.atomic import residue_knn_neighborhood_atomic_dist_loss, local_atomic_context_loss
 from .atomic.interresidue import intersidechain_clash_loss
 from .latent import so3_embedding_kl, scalars_kl_div
 
@@ -95,7 +95,7 @@ def autoencoder_losses(batch,
         res_data.batch,
         denoiser_mask)
     atom14_rmsd = atom14_mse.sqrt()
-    sidechain_dists_mse = atomic_neighborhood_dist_loss(
+    sidechain_dists_mse = residue_knn_neighborhood_atomic_dist_loss(
         gt_ref_atom14=gt_atom14,
         alt_ref_atom14=alt_atom14,
         pred_atom14=pred_atom14_gt_seq,
@@ -103,6 +103,20 @@ def autoencoder_losses(batch,
         alt_atom14_mask=atom14_alt_gt_mask.bool(),
         batch=res_data.batch
     )
+    local_atomic_dist_loss = local_atomic_context_loss(
+        pred_atom14=pred_atom14_gt_seq,
+        gt_atom14=gt_atom14,
+        alt_atom14=alt_atom14,
+        batch=res_data.batch,
+        atom14_mask=atom14_gt_mask.bool()
+    )
+    t = batch['t']
+    norm_scale = 1 - torch.min(
+        t, torch.as_tensor(0.9)
+    )
+    scaled_local_atomic_dist_loss = local_atomic_dist_loss / norm_scale * 0.01
+    scaled_atom14_mse = atom14_mse / norm_scale * 0.01
+
     sidechain_chi_loss = chi_loss(
         gt_torsions[..., 3:, :],
         alt_torsions[..., 3:, :],
@@ -110,13 +124,12 @@ def autoencoder_losses(batch,
         res_data.batch,
         torsions_mask[..., 3:]
     )
-    # pred_atom14_clash_loss = intersidechain_clash_loss(
-    #     pred_atom14=pred_atom14,
-    #     atom14_mask=model_outputs['decoded_atom14_mask'].bool(),
-    #     seq=seq_logits.argmax(dim=-1),
-    #     batch=res_data.batch
-    # )
-
+    pred_atom14_clash_loss = intersidechain_clash_loss(
+        pred_atom14=pred_atom14,
+        atom14_mask=model_outputs['decoded_atom14_mask'].bool(),
+        seq=seq_logits.argmax(dim=-1),
+        batch=res_data.batch
+    )
 
     latent_mu = model_outputs['latent_mu']
     latent_logvar = model_outputs['latent_logvar']
@@ -128,7 +141,10 @@ def autoencoder_losses(batch,
         "atom14_mse": atom14_mse,
         "atom14_rmsd": atom14_rmsd,
         "sidechain_dists_mse": sidechain_dists_mse,
-        # "pred_sidechain_clash_loss": pred_atom14_clash_loss,
+        "local_atomic_dist_loss": local_atomic_dist_loss,
+        "scaled_local_atomic_dist_loss": scaled_local_atomic_dist_loss,
+        "scaled_atom14_mse": scaled_atom14_mse,
+        "pred_sidechain_clash_loss": pred_atom14_clash_loss,
         # "bond_length_mse": bond_length_mse,
         # "bond_angle_loss": bond_angle_loss,
         "chi_loss": sidechain_chi_loss,
@@ -194,7 +210,7 @@ def pt_autoencoder_losses(batch,
         res_data.batch,
         denoiser_mask)
     atom14_rmsd = atom14_mse.sqrt()
-    sidechain_dists_mse = atomic_neighborhood_dist_loss(
+    sidechain_dists_mse = residue_knn_neighborhood_atomic_dist_loss(
         gt_ref_atom14=gt_atom14,
         alt_ref_atom14=alt_atom14,
         pred_atom14=pred_atom14,
@@ -374,7 +390,7 @@ def dirichlet_fm_losses(batch,
         res_data.batch,
         denoiser_mask)
     atom14_rmsd = atom14_mse.sqrt()
-    sidechain_dists_mse = atomic_neighborhood_dist_loss(
+    sidechain_dists_mse = residue_knn_neighborhood_atomic_dist_loss(
         gt_ref_atom14=gt_atom14,
         alt_ref_atom14=alt_atom14,
         pred_atom14=pred_atom14_gt_seq,

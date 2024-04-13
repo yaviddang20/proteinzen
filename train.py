@@ -7,6 +7,7 @@ import hydra
 from hydra_zen import zen
 import omegaconf
 import torch
+import numpy as np
 
 from lightning import LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers.wandb import WandbLogger
@@ -98,12 +99,26 @@ def main(model,
     os.chdir(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)
     log.info(f"Experiment started in folder: {os.getcwd()}")
 
+
     # datamodule and optim are all partial'd __init__s
     # so we instantiate instances of each
     model = lmodule(model, experiment['optim'])
     os.makedirs(model.val_dir, exist_ok=True)
     task_sampler = single_task_sampler(tasks(corrupter))
-    datamodule_inst = datamodule(task_sampler=task_sampler)
+
+    # TODO: there's gotta be a nicer way of doing this
+    if hasattr(model.model, "lrange_logn_scale") and model.model.lrange_logn_scale > 0:
+        _model = model.model
+        def batch_by_edge_fn(n):
+            lrange = round(
+                max(_model.lrange_k, _model.lrange_logn_scale * np.log2(n) + _model.lrange_logn_offset)
+            )
+            knn = _model.knn_k
+            return (lrange + knn) * n
+        datamodule_inst = datamodule(task_sampler=task_sampler, batch_by_edge_fn=batch_by_edge_fn)
+    else:
+        datamodule_inst = datamodule(task_sampler=task_sampler)
+
     exp = Experiment(
         model=model,
         datamodule=datamodule_inst,

@@ -131,7 +131,8 @@ class Experiment:
                     #     prot_models = []
                     #     for i, _ in enumerate(clean_traj):
                     #         clean = clean_traj[i]
-                    #         seq = "".join([restypes[j] for j in clean_seq[i].tolist()])
+                    #         seq = clean_seq[i].argmax(dim=-1)
+                    #         seq = "".join([restypes[j] for j in seq.tolist()])
                     #         print(seq)
                     #         prot = prot_traj[i]
                     #         sample_len = clean.shape[0]
@@ -142,18 +143,18 @@ class Experiment:
                     #             "A"
                     #         )
                     #         all_ala = "".join(["A" for _ in range(sample_len)])
-                    #         prot_atom91, _ = atom14_to_atom91(all_ala, prot.numpy(force=True))
-                    #         prot_chain = atom91_to_chain(
-                    #             all_ala,
-                    #             prot_atom91,
-                    #             "A"
-                    #         )
+                    #         # prot_atom91, _ = atom14_to_atom91(all_ala, prot.numpy(force=True))
+                    #         # prot_chain = atom91_to_chain(
+                    #         #     all_ala,
+                    #         #     prot_atom91,
+                    #         #     "A"
+                    #         # )
                     #         clean_model = chains_to_model([clean_chain], model_id=i)
-                    #         prot_model = chains_to_model([prot_chain], model_id=i)
+                    #         # prot_model = chains_to_model([prot_chain], model_id=i)
                     #         clean_models.append(clean_model)
-                    #         prot_models.append(prot_model)
+                    #         # prot_models.append(prot_model)
                     #     save_struct(models_to_struct(clean_models), clean_traj_name)
-                    #     save_struct(models_to_struct(prot_models), prot_traj_name)
+                    #     # save_struct(models_to_struct(prot_models), prot_traj_name)
 
 
 
@@ -226,7 +227,7 @@ if __name__ == '__main__':
             print("debug")
             cfg['datamodule']['sample_lengths'] = {
                 # 60: 1
-                # 60: 5,
+                60: 5,
                 # 70: 5,
                 # 80: 5,
                 # 90: 5,
@@ -235,28 +236,30 @@ if __name__ == '__main__':
                 # 120: 5
             }
         else:
-            # cfg['datamodule']['sample_lengths'] = {
-            #     i: 10
-            #     for i in range(60, 128+1)
-            # }
-            cfg['datamodule']['sample_lengths'] = {
-                i: 50
-                for i in range(100, 300+1, 50)
-            }
+            if cfg['datamodule']['max_len'] == 128:
+                cfg['datamodule']['sample_lengths'] = {
+                    i: 10
+                    for i in range(60, 128+1)
+                }
+            else:
+                cfg['datamodule']['sample_lengths'] = {
+                    i: 50
+                    for i in range(100, 300+1, 50)
+                }
 
     if cfg['domain']['domain'] == "protein":
         if args.debug:
             print("debug")
             cfg['datamodule']['sample_lengths'] = {
-                # 60: 1
+                60: 1
                 # 60: 5,
                 # 70: 5,
                 # 80: 5,
                 # 90: 5,
                 # 100: 1,
                 # 110: 5,
-                # 120: 5
-                230: 1
+                # 120: 1
+                # 230: 1
             }
         else:
             # cfg['datamodule']['sample_lengths'] = {
@@ -264,9 +267,13 @@ if __name__ == '__main__':
             #     for i in range(60, 128+1)
             # }
             cfg['datamodule']['sample_lengths'] = {
-                i: 50
-                for i in range(100, 300+1, 50)
+                i: 10
+                for i in range(60, 128+1)
             }
+            # cfg['datamodule']['sample_lengths'] = {
+            #     i: 50
+            #     for i in range(100, 300+1, 50)
+            # }
 
     samples_dir = os.path.join(args.run_dir, args.out_prefix)
     os.makedirs(
