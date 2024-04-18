@@ -76,7 +76,7 @@ class HarmonicPriorInterpolant:
     @torch.no_grad()
     def corrupt_batch(self, batch: HeteroData):
         atom_data = batch["ligand"]
-        bond_data = batch["ligand", "bonds", "ligand"]
+        bond_data = batch["ligand", "ligand"]
 
         # [N]
         # atom_mask = atom_data["res_mask"]
@@ -99,6 +99,9 @@ class HarmonicPriorInterpolant:
         atom_data["noised_atom_pos"] = noised_atoms
         return batch
 
-    def _euler_step(self, d_t, t, x_1, x_t):
-        x_vf = (x_1 - x_t) / (1 - t)
+    # def _euler_step(self, d_t, t, x_1, x_t):
+    #     x_vf = (x_1 - x_t) / (1 - t)
+    #     return x_t + x_vf * d_t
+    def _euler_step(self, d_t, t, x_1, x_t, x_0):
+        x_vf = (x_1 - x_0)
         return x_t + x_vf * d_t

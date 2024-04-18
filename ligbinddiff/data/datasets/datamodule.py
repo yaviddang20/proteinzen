@@ -2,6 +2,7 @@ import os
 from functools import partial
 from typing import List
 
+import torch
 from torch.utils.data import DataLoader
 from torch_geometric.data import Batch, HeteroData
 import lightning as L
@@ -15,8 +16,11 @@ from .sampler import BatchSampler, LengthBatchSampler, AtomicBatchSampler, Clust
 
 def gen_collate_fn(task_sampler: TaskSampler):
     def collate_fn(data_list: List[HeteroData]):
-        batch = Batch.from_data_list(data_list)
+        batch = Batch.from_data_list(data_list, exclude_keys=["mask_rotate"])
+        #batch = Batch.from_data_list(data_list)
         task = task_sampler.sample_task()
+        if 'ligand' in batch.node_types and 'mask_rotate' in data_list[0]['ligand', 'ligand']:
+            batch['ligand', 'ligand'].mask_rotate = [d['ligand', 'ligand']['mask_rotate'] for d in data_list]
         batch = task.compile_task_inputs(batch)
         batch.task = task
         return batch
@@ -105,7 +109,8 @@ class FramediffDataModule(L.LightningDataModule):
                  },
                  length_batch=False,
                  sample_from_clusters=False,
-                 batch_by_edge_fn=None
+                 batch_by_edge_fn=None,
+                 min_ordered_percent=None,
                  ):
         super().__init__()
         self.data_dir = data_dir
@@ -123,6 +128,7 @@ class FramediffDataModule(L.LightningDataModule):
             os.path.join(self.data_dir, csv),
             min_num_res=min_len,
             max_num_res=max_len,
+            min_percent_ordered=min_ordered_percent
         )
         self.val_dataset = LengthDataset(self.sample_lengths, batch_size=batch_size)
 
@@ -205,8 +211,8 @@ class GeomDataModule(L.LightningDataModule):
         df = pd.read_csv(os.path.join(self.data_dir, csv))
         # num_train = len(df) // 10 * 9
         # num_test = len(df) // 10
-        num_train = 1
-        num_test = -1
+        num_train = 1000 #int(3e5)
+        num_test = -10 # -100
         # csv = "mini_metadata.csv"
         self.train_dataset = GEOMDataset(
             os.path.join(self.data_dir, csv),

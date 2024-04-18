@@ -1,6 +1,8 @@
 import pandas as pd
 
-df = pd.read_csv("framediff_monomers.csv")
+# df = pd.read_csv("framediff_monomers.csv")
+df = pd.read_csv("metadata.csv")
+df = df[df["oligomeric_detail"] == "monomeric"]
 
 pdb_to_cluster = {}
 with open("clusters-by-entity-30.txt", "r") as f:

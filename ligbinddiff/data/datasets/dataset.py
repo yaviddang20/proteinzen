@@ -8,6 +8,7 @@ import torch
 import torch.utils.data as data
 import tree
 
+
 from torch_geometric.data import HeteroData
 
 from ligbinddiff.utils.atom_reps import atom91_atom_masks, letter_to_num
@@ -18,6 +19,7 @@ from ligbinddiff.data.datasets.featurize.sidechain import featurize_atomic, feat
 from ligbinddiff.data.openfold.residue_constants import restype_order_with_x
 
 from ligbinddiff.data.datasets.featurize.molecule import featurize_props
+from ligbinddiff.utils.torsion import get_transformation_mask
 
 
 class ProteinGraphDataset(data.Dataset):
@@ -123,6 +125,7 @@ class PdbDataset(data.Dataset):
             csv_path,
             min_num_res=30,
             max_num_res=500,
+            min_percent_ordered=None,
             subset=None,
             split=None
         ):
@@ -132,6 +135,7 @@ class PdbDataset(data.Dataset):
         self.max_num_res = max_num_res
         self.subset = subset
         self.split = split
+        self.min_percent_ordered = min_percent_ordered
         self._init_metadata()
 
     def _init_metadata(self):
@@ -148,6 +152,16 @@ class PdbDataset(data.Dataset):
 
         if self.split is not None:
             pdb_csv = pdb_csv[pdb_csv.splits == self.split]
+
+        # this is kinda hacky but im doing this for backwards compatibility
+        # TODO: get rid of the backward compatible stuff
+        if self.min_percent_ordered is None:
+            if "frameflow" in self.csv_path:
+                self.min_percent_ordered = 0
+            elif "framediff" in self.csv_path:
+                self.min_percent_ordered = 0.5
+
+        pdb_csv = pdb_csv[pdb_csv["coil_percent"] < (1 - self.min_percent_ordered)]
 
         self.csv = pdb_csv
 
@@ -284,6 +298,9 @@ class GEOMDataset(data.Dataset):
         unprocessed_feats = data_dict['conformer_property_dicts'][int(conformer_id)]
         graph = featurize_props(unprocessed_feats)
         graph['rd_mol'] = data_dict['rd_mols']
+        mask_edges, mask_rotate = get_transformation_mask(graph)
+        graph['ligand', 'ligand']['rotatable_bonds'] = torch.as_tensor(mask_edges)
+        graph['ligand', 'ligand']['mask_rotate'] = torch.as_tensor(mask_rotate)
 
         return graph
 

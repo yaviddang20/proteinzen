@@ -262,18 +262,16 @@ if __name__ == '__main__':
                 # 230: 1
             }
         else:
-            # cfg['datamodule']['sample_lengths'] = {
-            #     i: 10
-            #     for i in range(60, 128+1)
-            # }
-            cfg['datamodule']['sample_lengths'] = {
-                i: 10
-                for i in range(60, 128+1)
-            }
-            # cfg['datamodule']['sample_lengths'] = {
-            #     i: 50
-            #     for i in range(100, 300+1, 50)
-            # }
+            if cfg['datamodule']['max_len'] == 128:
+                cfg['datamodule']['sample_lengths'] = {
+                    i: 10
+                    for i in range(60, 128+1)
+                }
+            else:
+                cfg['datamodule']['sample_lengths'] = {
+                    i: 50
+                    for i in range(100, 300+1, 50)
+                }
 
     samples_dir = os.path.join(args.run_dir, args.out_prefix)
     os.makedirs(
@@ -286,7 +284,7 @@ if __name__ == '__main__':
         exist_ok=True
     )
     cfg['experiment']['samples_dir'] = samples_dir
-    # if cfg['domain']['domain'] == "molecule":
-    #     cfg['lmodule']['val_dir'] = samples_dir
+    if cfg['domain']['domain'] == "molecule":
+        cfg['lmodule']['val_dir'] = samples_dir
 
     zen(main, unpack_kwargs=True)(cfg)

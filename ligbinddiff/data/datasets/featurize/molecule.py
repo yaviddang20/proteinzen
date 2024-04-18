@@ -258,7 +258,7 @@ def featurize_props(mol_props: Dict, center=True):
     data["ligand"].x = atom_pos
     data["ligand"].atom_pos = atom_pos
     data["ligand"].atom_mask = torch.ones(atom_pos.shape[0]).bool()
-    data["ligand", "bonds", "ligand"].edge_index = mol_props["bond_edge_index"].T
+    data["ligand", "ligand"].edge_index = mol_props["bond_edge_index"].T
 
     for prop, prop_type in prop_featurization.items():
         if "atom" in prop:
@@ -272,13 +272,13 @@ def featurize_props(mol_props: Dict, center=True):
                 data["ligand"][prop] = (mol_props[prop] / max_val).float()
         elif "bond" in prop:
             if prop_type is None:
-                data["ligand", "bonds", "ligand"][prop] = mol_props[prop].float()
+                data["ligand", "ligand"][prop] = mol_props[prop].float()
             elif prop_type[0] == "categorical":
                 max_val = prop_type[1]
-                data["ligand", "bonds", "ligand"][prop] = one_hot(mol_props[prop], max_val).float()
+                data["ligand", "ligand"][prop] = one_hot(mol_props[prop], max_val).float()
             elif prop_type[0] == "ordinal":
                 max_val = prop_type[1]
-                data["ligand", "bonds", "ligand"][prop] = (mol_props[prop] / max_val).float()
+                data["ligand", "ligand"][prop] = (mol_props[prop] / max_val).float()
 
     return data
 

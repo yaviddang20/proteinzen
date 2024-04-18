@@ -4,7 +4,7 @@ import seaborn as sns
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 
-df = pd.read_csv("best_sc_rmsd.csv")
+df = pd.read_csv("esmfold/best_sc_rmsd.csv")
 df["seq_len"] = pd.to_numeric(df["name"].str.split("_", expand=True)[1], errors="coerce").astype(np.int64)
 
 designable = pd.to_numeric(df["sc_rmsd"] < 2).astype(np.float32)
@@ -30,4 +30,4 @@ pos.x1 += 0.10
 cbar.ax.set_position(pos)
 
 ax.axhline(y=2.0, color='red', linestyle='--')
-plt.savefig("../designability_over_len.png")
+plt.savefig("designability_over_len.png")

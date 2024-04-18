@@ -16,9 +16,12 @@ if __name__ == '__main__':
     df = pd.read_csv(args.csv)
     designable_samples = df[df.sc_rmsd < 2]
 
-    out_dir = os.path.join(args.samples, "../designable_samples")
-    if not os.path.isdir(out_dir):
-        os.mkdir(out_dir)
+    out_dir1 = os.path.join(args.samples, "../designable_samples")
+    out_dir2 = os.path.join(args.samples, "../designable_samples_folded")
+    if not os.path.isdir(out_dir1):
+        os.mkdir(out_dir1)
+    if not os.path.isdir(out_dir2):
+        os.mkdir(out_dir2)
 
     for _, row in tqdm.tqdm(list(designable_samples.iterrows())):
         sample_path = os.path.join(
@@ -36,8 +39,8 @@ if __name__ == '__main__':
                 current_folded = path
                 break
 
-        shutil.copy(sample_path, out_dir)
+        shutil.copy(sample_path, out_dir1)
         shutil.copy(
             current_folded,
-            os.path.join(out_dir, row['name'] + "_sc.pdb")
+            os.path.join(out_dir2, row['name'] + "_sc.pdb")
         )
