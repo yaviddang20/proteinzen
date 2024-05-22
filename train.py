@@ -28,11 +28,13 @@ class Experiment:
     def __init__(self,
                  model,
                  datamodule,
+                 checkpointer,
                  cfg):
         self._cfg = cfg
         self._exp_cfg = cfg.experiment
         self._datamodule: LightningDataModule = datamodule
         self._model: LightningModule = model
+        self._checkpointer: ModelCheckpoint = checkpointer
 
     def train(self):
         callbacks = []
@@ -44,16 +46,13 @@ class Experiment:
                 **remove_zen_keys(self._exp_cfg.wandb),
             )
 
-            # Checkpoint directory.
-            ckpt_dir = self._exp_cfg.checkpointer.dirpath
-            os.makedirs(ckpt_dir, exist_ok=True)
-            log.info(f"Checkpoints saved to {ckpt_dir}")
+        # # Checkpoint directory.
+        # ckpt_dir = self._exp_cfg.checkpointer.dirpath
+        # os.makedirs(ckpt_dir, exist_ok=True)
+        # log.info(f"Checkpoints saved to {ckpt_dir}")
 
-            # Model checkpoints
-            callbacks.append(
-                ModelCheckpoint(
-                    **remove_zen_keys(self._exp_cfg.checkpointer)
-            ))
+        # Model checkpoints
+        callbacks.append(self._checkpointer)
 
         if torch.cuda.is_available():
             devices = list(range(torch.cuda.device_count()))
@@ -99,10 +98,10 @@ def main(model,
     os.chdir(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)
     log.info(f"Experiment started in folder: {os.getcwd()}")
 
-
     # datamodule and optim are all partial'd __init__s
     # so we instantiate instances of each
     model = lmodule(model, experiment['optim'])
+    checkpointer = experiment['checkpointer']
     os.makedirs(model.val_dir, exist_ok=True)
     task_sampler = single_task_sampler(tasks(corrupter))
 
@@ -114,7 +113,8 @@ def main(model,
                 max(_model.lrange_k, _model.lrange_logn_scale * np.log2(n) + _model.lrange_logn_offset)
             )
             knn = _model.knn_k
-            return (lrange + knn) * n
+            edges_per_node = min(lrange+knn, n)
+            return edges_per_node * n
         datamodule_inst = datamodule(task_sampler=task_sampler, batch_by_edge_fn=batch_by_edge_fn)
     else:
         datamodule_inst = datamodule(task_sampler=task_sampler)
@@ -122,6 +122,7 @@ def main(model,
     exp = Experiment(
         model=model,
         datamodule=datamodule_inst,
+        checkpointer=checkpointer,
         cfg=zen_cfg)
     exp.train()
 

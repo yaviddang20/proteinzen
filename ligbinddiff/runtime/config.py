@@ -1,6 +1,7 @@
 import torch
 from hydra_zen import store, just, builds, make_custom_builds_fn, make_config, kwargs_of
 import omegaconf
+from datetime import timedelta
 
 from lightning import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
@@ -225,16 +226,11 @@ def config_hydra_store():
     optim_store(pbuilds(get_std_opt, d_model=128), name="noam")
 
     exp_store(
-        pbuilds(
-            ModelCheckpoint,
-            dirpath="ckpt",
-            every_n_epochs=1,
-            save_on_train_epoch_end=True,
-            save_last=True,
-            save_top_k=3,
-            monitor="valid/non_coil_percent",
-            mode="max"
-        ),
+        ModelCheckpoint,
+        save_top_k=-1,
+        save_on_train_epoch_end=True,
+        save_last=True,
+        train_time_interval=timedelta(days=1),
         group="experiment/checkpointer",
         name="bb")
     exp_store(
@@ -286,7 +282,7 @@ def config_hydra_store():
     # breaking the hydra_zen/hydra/omegaconf abstraction here a little
     # but this allows for nice swappable configs
     ExperimentConfig = make_config(
-        debug=False,
+        debug=True,
         hydra_defaults=[
             {"paradigm": "diffusion"},
             {"domain": "bb"},

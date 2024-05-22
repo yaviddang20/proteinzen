@@ -211,8 +211,8 @@ class GeomDataModule(L.LightningDataModule):
         df = pd.read_csv(os.path.join(self.data_dir, csv))
         # num_train = len(df) // 10 * 9
         # num_test = len(df) // 10
-        num_train = 1000 #int(3e5)
-        num_test = -10 # -100
+        num_train = 1 # int(3e5)
+        num_test = -1 # -100
         # csv = "mini_metadata.csv"
         self.train_dataset = GEOMDataset(
             os.path.join(self.data_dir, csv),

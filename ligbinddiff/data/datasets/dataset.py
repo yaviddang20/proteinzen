@@ -275,6 +275,8 @@ class GEOMDataset(data.Dataset):
         # Process CSV with different filtering criterions.
         pdb_csv = pd.read_csv(self.csv_path)
         self.raw_csv = pdb_csv
+
+        pdb_csv = pdb_csv[~pdb_csv.smiles.str.contains('.', regex=False)]
         if self.subset is not None:
             if self.subset > 0:
                 pdb_csv = pdb_csv.iloc[:self.subset]
@@ -295,9 +297,11 @@ class GEOMDataset(data.Dataset):
             a=np.arange(len(weights)),
             p=np.array(weights) / np.sum(weights)
         )
+        conformer_id = 0
         unprocessed_feats = data_dict['conformer_property_dicts'][int(conformer_id)]
         graph = featurize_props(unprocessed_feats)
         graph['rd_mol'] = data_dict['rd_mols']
+        graph['path'] = processed_file_path
         mask_edges, mask_rotate = get_transformation_mask(graph)
         graph['ligand', 'ligand']['rotatable_bonds'] = torch.as_tensor(mask_edges)
         graph['ligand', 'ligand']['mask_rotate'] = torch.as_tensor(mask_rotate)

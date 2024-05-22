@@ -4,14 +4,14 @@ import pandas as pd
 
 df = pd.read_csv("filtered_metadata.csv")
 print(df[df["strand_percent"] < 0.05])
-sns.jointplot(df, x="helix_percent", y="strand_percent")
+sns.jointplot(df, x="helix_percent", y="strand_percent", hue="modeled_seq_len", s=5)
 plt.xlim(0,1)
 plt.ylim(0,1)
 plt.savefig("ss_comp_unclustered.png")
 
 cluster_df = df.groupby("cluster").sample(1)
 print(cluster_df[cluster_df["strand_percent"] < 0.05])
-sns.jointplot(cluster_df, x="helix_percent", y="strand_percent")
+sns.jointplot(cluster_df, x="helix_percent", y="strand_percent", hue="modeled_seq_len", s=5)
 plt.xlim(0,1)
 plt.ylim(0,1)
 plt.savefig("ss_comp_clustered.png")

@@ -7,7 +7,7 @@
 #$ -q gpu.q
 #$ -pe smp 1
 #$ -l mem_free=32G
-#$ -l h_rt=4:00:00
+#$ -l h_rt=6:00:00
 #$ -l compute_cap=61,gpu_mem=40G
 
 export CUDA_VISIBLE_DEVICES=$SGE_GPU
@@ -23,10 +23,17 @@ cd $ROOT_DIR
 # OUTPREFIX=$3
 OUTPREFIX=$2
 
+if [ -n "$3" ]
+then
+    CHECKPOINTIDX=$3
+else
+    CHECKPOINTIDX=-1
+fi
+
 ## generate samples
 conda activate proteinzen
 
-python predict.py --run_dir=$RUN_DIR --out_prefix=$OUTPREFIX
+python predict.py --run_dir=$RUN_DIR --out_prefix=$OUTPREFIX --checkpoint_idx=$CHECKPOINTIDX
 
 ## sample with ProteinMPNN
 cd ~/software/ProteinMPNN/scripts
@@ -59,4 +66,5 @@ cd esmfold
 bash ~/projects/ligbinddiff/scripts/analysis/esmfold.sh > esmfold.log
 conda activate proteinzen
 python ~/projects/ligbinddiff/scripts/analysis/esm_analysis.py --esmlog esmfold.log --folded_folder $PWD --samples ../samples | tail -n 2 > ${RUN_DIR}/$OUTPREFIX/num_designable.txt
-
+cd ..
+bash ~/projects/ligbinddiff/scripts/analysis/analysis_suite.sh

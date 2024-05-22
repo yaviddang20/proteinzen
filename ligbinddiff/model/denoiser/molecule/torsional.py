@@ -13,7 +13,8 @@ from ligbinddiff.model.modules.common import GaussianRandomFourierBasis
 from ligbinddiff.model.modules.layers.edge.tfn import FasterTensorProduct
 from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddings, _rbf
 from ligbinddiff.utils.openfold import rigid_utils as ru
-from ligbinddiff.utils.torsion import modify_conformer_torsion_angles_batch
+from ligbinddiff.model.modules.openfold.frames import Linear
+from ligbinddiff.utils.torsion import modify_conformer_torsion_angles_batch_cached
 
 def get_irrep_seq(ns, nv, reduce_pseudoscalars):
     irrep_seq = [
@@ -162,9 +163,11 @@ class TensorConvLayer(nn.Module):
             out = scatter_mean(tp, edge_src, dim=0, dim_size=atom_features.shape[0])
         else:
             out = scatter_mean(tp, edge_src, dim=0)
+
         if self.residual:
             padded = F.pad(atom_features, (0, out.shape[-1] - atom_features.shape[-1]))
             out = out + padded
+        # print(tp.shape, edge_src, out.shape)
         out = self.norm(out)
 
         if self.update_edge:
@@ -210,6 +213,7 @@ class EmbeddingLayer(nn.Module):
             )
         return node_features
 
+
 class UpdateLayer(nn.Module):
     def __init__(self,
                  feat_irreps,
@@ -225,17 +229,24 @@ class UpdateLayer(nn.Module):
         ns = feat_irreps.count("0e")
         self.ns = ns
 
-        self.bond_tpc = TensorConvLayer(
-            feat_irreps,
-            sh_irreps,
-            feat_irreps,
-            h_edge
+        self.bond_tpc = nn.ModuleList([
+            TensorConvLayer(
+                feat_irreps,
+                sh_irreps,
+                feat_irreps,
+                h_edge,
+                update_edge=True
+            )
+            for _ in range(5)]
         )
-        self.spatial_tpc = TensorConvLayer(
-            feat_irreps,
-            sh_irreps,
-            feat_irreps,
-            h_edge
+        self.spatial_tpc = nn.ModuleList([
+            TensorConvLayer(
+                feat_irreps,
+                sh_irreps,
+                feat_irreps,
+                h_edge,
+            )
+            for _ in range(5)]
         )
         self.node_transition = NodeTransition(feat_irreps)
 
@@ -253,10 +264,15 @@ class UpdateLayer(nn.Module):
             residual=False,
             slower=True
         )
+        def init_fn(weight, bias):
+            nn.init.normal_(weight, std=0.01)
+            # nn.init.normal_(bias, std=0.01)
+
         self.tor_final_layer = nn.Sequential(
             nn.Linear(2 * ns, ns, bias=False),
-            nn.Tanh(),
-            nn.Linear(ns, 1, bias=False),
+            nn.ReLU(),
+            # nn.Tanh(),
+            Linear(ns, 1, bias=False, init_fn=init_fn),
             nn.Tanh()
         )
 
@@ -284,23 +300,28 @@ class UpdateLayer(nn.Module):
                 spatial_sh,
                 spatial_edge_index,
                 rotatable_bonds,
-                mask_rotate,
-                batch):
+                batch,
+                update_instructs):
 
-        atom_features, bond_features = self.bond_tpc(
-            atom_features,
-            bond_features,
-            bond_sh,
-            bond_edge_index)
-        atom_features, _ = self.spatial_tpc(
-            atom_features,
-            spatial_features,
-            spatial_sh,
-            spatial_edge_index)
-        atom_features = self.node_transition(atom_features)
+        # print("bond")
+        for bond_tpc, spatial_tpc in zip(self.bond_tpc, self.spatial_tpc):
+            atom_features, bond_features = bond_tpc(
+                atom_features,
+                bond_features,
+                bond_sh,
+                bond_edge_index)
+            # print("spatial")
+            atom_features, _ = spatial_tpc(
+                atom_features,
+                spatial_features,
+                spatial_sh,
+                spatial_edge_index)
+        # atom_features = self.node_transition(atom_features)
 
         rot_bond_edge_index = bond_edge_index[:, rotatable_bonds]
+        # print(rot_bond_edge_index, rotatable_bonds.sum())
         tor_bond_edge_index, tor_bond_edge_features, tor_bond_edge_sh = self.build_bond_conv_graph(atom_pos, rot_bond_edge_index, batch)
+        # print(tor_bond_edge_index)
 
         tor_bond_vec = atom_pos[tor_bond_edge_index[1]] - atom_pos[tor_bond_edge_index[0]]
         tor_bond_attr = atom_features[tor_bond_edge_index[0]] + atom_features[tor_bond_edge_index[1]]
@@ -310,18 +331,18 @@ class UpdateLayer(nn.Module):
             tor_bond_attr[tor_bond_edge_index[0], :self.ns]
         ], dim=-1)
         tor_bonds_sh = o3.spherical_harmonics("2e", tor_bond_vec, normalize=True, normalization='component')
+        # print("torsion")
         tor_edge_sh = self.tp_tor(tor_bond_edge_sh, tor_bonds_sh[tor_bond_edge_index[0]])
 
         # we flip cuz my code is mainly "source_to_target" but above is "target_to_src"
         tor_update, _ = self.tor_bond_conv(atom_features, tor_edge_attr, tor_edge_sh, tor_bond_edge_index.flip(0), enforce_dim_size=False)
-        tor_update = self.tor_final_layer(tor_update).squeeze(-1) * torch.pi
+        tor_update = self.tor_final_layer(tor_update).squeeze(-1) * torch.pi + 1e-4
+        # print(tor_update)
 
-        new_atom_pos = modify_conformer_torsion_angles_batch(
+        new_atom_pos = modify_conformer_torsion_angles_batch_cached(
             atom_pos,
-            rot_bond_edge_index,
-            batch,
-            mask_rotate,
-            tor_update
+            tor_update,
+            update_instructs
         )
 
         return new_atom_pos, atom_features, bond_features, tor_update
@@ -342,7 +363,7 @@ class MoleculeTorsionDenoiser(nn.Module):
                  self_conditioning=True):
         super().__init__()
         self.irreps_seq = get_irrep_seq(c_s, c_v, reduce_pseudoscalars=False)
-        self.feat_irreps = self.irreps_seq[-1]
+        self.feat_irreps = o3.Irreps(self.irreps_seq[-1])
         self.sh_irreps = o3.Irreps.spherical_harmonics(lmax=sh_lmax)
         self.self_conditioning = self_conditioning
         self.n_rbf = n_rbf
@@ -439,7 +460,7 @@ class MoleculeTorsionDenoiser(nn.Module):
             atom_pos[bond_edge_index[0]] - atom_pos[bond_edge_index[1]] + eps,
             dim=-1
         )
-        bond_len_rbf = _rbf(bond_len, D_min=0., D_max=10., D_count=self.n_rbf, device=bond_len.device)
+        bond_len_rbf = _rbf(bond_len, D_min=0., D_max=5., D_count=self.n_rbf, device=bond_len.device)
         bond_features.append(bond_len_rbf)
 
         bond_features = torch.cat(bond_features, dim=-1).float()
@@ -537,14 +558,17 @@ class MoleculeTorsionDenoiser(nn.Module):
                 spatial_sh,
                 spatial_edge_index,
                 bond_data.rotatable_bonds,
-                bond_data.mask_rotate,
-                lig_data.batch)
+                lig_data.batch,
+                data['conformer_update_instructions'])
 
             atom_traj.append(atom_pos)
             total_tor_update = total_tor_update + tor_update
+            # print(total_tor_update)
+
+        total_tor_update = torch.fmod(total_tor_update + np.pi, 2 * np.pi) - np.pi
 
         return {
             "pred_atom_pos": atom_pos,
             "atom_traj": atom_traj,
-            "pred_torsion_noise": total_tor_update
+            "pred_torsion_update": total_tor_update
         }

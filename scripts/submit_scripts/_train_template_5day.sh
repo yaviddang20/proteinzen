@@ -7,7 +7,7 @@
 #$ -q gpu.q
 #$ -pe smp 1
 #$ -l mem_free=32G
-#$ -l h_rt=48:00:00
+#$ -l h_rt=120:00:00
 #$ -l compute_cap=61,gpu_mem=40G
 
 echo $JOB_ID
@@ -25,7 +25,7 @@ dcgmi stats -g $gpuprof -s $JOB_ID
 
 ulimit -n 2048
 cd ~/projects/ligbinddiff
-python train.py "$@" +job_id=${JOB_ID} +num_days=2
+python train.py "$@" +job_id=${JOB_ID} +num_days=5
 # args = ARGS
 
 dcgmi stats -g $gpuprof -x $JOB_ID

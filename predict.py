@@ -175,6 +175,14 @@ def main(model,
     # model = lmodule(model, experiment['optim'])
     model = BackboneModule(model, experiment['optim'])
     task_sampler = single_task_sampler(tasks(corrupter))
+
+    # corrupter._sample_cfg.num_timesteps = 200
+    # corrupter._sample_cfg.num_timesteps = 500
+    # corrupter._sample_cfg.num_timesteps = 200
+    # corrupter._rots_cfg.exp_rate = 6
+    # corrupter._rots_cfg.sample_schedule = 'linear'
+
+
     datamodule_inst = datamodule(task_sampler=task_sampler)
     exp = Experiment(
         model=model,
@@ -188,6 +196,7 @@ if __name__ == '__main__':
     parser.add_argument("--run_dir")
     # parser.add_argument("--epoch", type=int, default=-1)
     parser.add_argument("--out_prefix", default="samples_24hr")
+    parser.add_argument("--checkpoint_idx", default=-1, type=int)
     parser.add_argument("--debug", action="store_true", default=False)
     parser.add_argument("--save_traj", action="store_true", default=False)
     args = parser.parse_args()
@@ -210,12 +219,12 @@ if __name__ == '__main__':
     #         )
     #     ))[0]
 
-    ckpt_path = list(glob.glob(
+    ckpt_path = sorted(list(glob.glob(
         os.path.join(
             args.run_dir,
             "lightning_logs/version_0/checkpoints/*.ckpt",
         )
-    ))[0]
+    )))[args.checkpoint_idx]
 
 
     cfg = load_from_yaml(config_path)

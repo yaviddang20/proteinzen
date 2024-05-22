@@ -16,9 +16,9 @@ from ligbinddiff.tasks import Task
 from ligbinddiff.stoch_interp.interpolate.molecule import HarmonicPriorInterpolant, sample_harmonic_prior
 from ligbinddiff.stoch_interp.interpolate.torsion import TorsionInterpolant, sample_torsion_prior
 from ligbinddiff.model.utils.graph import get_data_lens
-from ligbinddiff.runtime.loss.molecular.harmonic import harmonic_fm_loss
+from ligbinddiff.runtime.loss.molecular.torsional import torsional_fm_loss
 from ligbinddiff.runtime.loss.molecular.atomic import local_atomic_context_loss
-from ligbinddiff.utils.torsion import get_transformation_mask
+from ligbinddiff.utils.torsion import gen_conformer_update_instructs, modify_conformer_torsion_angles_batch
 
 
 def batchwise_center(pos, batch):
@@ -177,9 +177,20 @@ class TorsionalFlowMatching(Task):
     def process_input(self, data: HeteroData):
         data = copy.deepcopy(data)
         atom_data = data['ligand']
-        atom_data['atom_pos'] = batchwise_center(atom_data['atom_pos'], atom_data.batch)
+        atom_data['atom_pos'] = batchwise_center(atom_data['atom_pos'], atom_data.batch).float()
+        bond_data = data['ligand', 'ligand']
+        data['conformer_update_instructions'] = gen_conformer_update_instructs(
+            bond_data.edge_index[:, bond_data.rotatable_bonds],
+            atom_data.batch,
+            bond_data.mask_rotate
+        )
         # noise data
-        noised_data = self.torsion_noiser.corrupt_batch(data)
+        try:
+            noised_data = self.torsion_noiser.corrupt_batch(data)
+        except Exception as e:
+            print(data)
+            print(data.path)
+            raise e
         # noised_data['ligand'][self.atom_x_t_key] = batchwise_center(noised_data['ligand'][self.atom_x_t_key], atom_data.batch)
 
         return noised_data
@@ -200,15 +211,18 @@ class TorsionalFlowMatching(Task):
                     device='cuda:0'):
         atom_data = inputs['ligand']
         bond_data = inputs['ligand', 'ligand']
+        num_tor = bond_data.rotatable_bonds.sum()
+
+        tor_0 = self.torsion_noiser.sample_tor_noise(num_tor, device=atom_data.atom_pos.device)
         # Set-up initial prior samples
-        atoms_0 = sample_torsion_prior(
+        atoms_0 = modify_conformer_torsion_angles_batch(
             atom_data.atom_pos,
-            bond_data.rotatable_bonds,
+            bond_data.edge_index[:, bond_data.rotatable_bonds],
+            atom_data.batch,
             bond_data.mask_rotate,
-            bond_data.edge_index,
-            atom_data.batch
+            tor_0,
         )
-        atoms_0 = batchwise_center(atoms_0, atom_data.batch)
+        # atoms_0 = batchwise_center(atoms_0, atom_data.batch)
 
         # Set-up time
         ts = torch.linspace(self.torsion_noiser.min_t, 1.0, self.num_timesteps)
@@ -228,10 +242,11 @@ class TorsionalFlowMatching(Task):
 
             # Process model output.
             pred_atom_pos = denoiser_out[self.atom_x_0_pred_key]
-            pred_torsion_noise = denoiser_out['pred_torsion_noise']
+            pred_torsion_noise = denoiser_out['pred_torsion_update']
             clean_traj.append(
                 pred_atom_pos.detach().cpu()
             )
+            pred_torsion_noise[:-1] *= 0
 
             # Take reverse step
             d_t = t_2 - t_1
@@ -250,7 +265,7 @@ class TorsionalFlowMatching(Task):
         # We only integrated to min_t, so need to make a final step
         t_1 = ts[-1]
         # Run model.
-        atom_pos_t_1 = batchwise_center(mol_traj[-1], atom_data.batch)
+        # atom_pos_t_1 = batchwise_center(mol_traj[-1], atom_data.batch)
         atom_data[self.atom_x_t_key] = atom_pos_t_1
         t = torch.ones(inputs.num_graphs, device=device) * t_1
         inputs["t"] = t
@@ -279,7 +294,7 @@ class TorsionalFlowMatching(Task):
         }
 
     def compute_loss(self, inputs, outputs: Dict):
-        fm_loss_dict = harmonic_fm_loss(
+        fm_loss_dict = torsional_fm_loss(
             inputs, outputs, loss_clip=None)
         atom_dist_loss = local_atomic_context_loss(
             outputs["pred_atom_pos"],
@@ -291,10 +306,11 @@ class TorsionalFlowMatching(Task):
             t, torch.as_tensor(0.9)
         )
 
+        aux_loss = fm_loss_dict['atom_pos_mse'] * 0.01 * (t > 0.75)
+
         loss = (
-            fm_loss_dict['atom_pos_mse']
-            + fm_loss_dict['atom_pos_traj_mse']
-            + (atom_dist_loss / norm_scale).mean()
+            fm_loss_dict['torsion_fm_loss']
+            + aux_loss
         ).mean()
 
 

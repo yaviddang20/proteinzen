@@ -36,11 +36,11 @@ class BatchSampler:
         self.batches = []
         if self.shuffle:
             random.shuffle(self.idx)
-        idx = self.idx
-        while idx:
+        idx = np.array(self.idx)
+        while len(idx) > 0:
             batch = []
             n_nodes = 0
-            while idx and n_nodes + self.node_counts[idx[0]] <= self.batch_size:
+            while len(idx) > 0 and n_nodes + self.node_counts[idx[0]] <= self.batch_size:
                 next_idx, idx = idx[0], idx[1:]
                 if self.batch_by_edge_fn is not None:
                     n_nodes += self.batch_by_edge_fn(self.node_counts[next_idx])
@@ -112,7 +112,8 @@ class ClusteredBatchSampler:
                 batch.append(iloc)
                 current_node_count += sample_node_count
             else:
-                self.batches.append(batch)
+                if len(batch) > 0:
+                    self.batches.append(batch)
                 current_node_count = sample_node_count
                 batch = [iloc]
         if not self.drop_last:
@@ -221,13 +222,15 @@ class AtomicBatchSampler:
 
     def _form_batches(self):
         self.batches = []
+
         if self.shuffle:
             random.shuffle(self.idx)
-        idx = self.idx
-        while idx:
+
+        idx = np.array(self.idx)
+        while len(idx) > 0:
             batch = []
             n_nodes = 0
-            while idx and n_nodes + self.node_counts[idx[0]] <= self.batch_size:
+            while len(idx) > 0 and n_nodes + self.node_counts[idx[0]] <= self.batch_size:
                 next_idx, idx = idx[0], idx[1:]
                 n_nodes += self.node_counts[next_idx]
                 batch.append(next_idx)

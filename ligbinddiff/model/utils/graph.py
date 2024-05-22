@@ -176,6 +176,27 @@ def sample_logn_inv_cubic_edges(
     return edge_index[:, ~edge_mask], knn_edge_select[~edge_mask], lrange_edge_select[~edge_mask]
 
 
+def sample_all_edges(
+    batched_x_mask,
+    batch,
+):
+    # TODO: change x_mask to be True for retained positions
+    edge_indicies = []
+    offset = 0
+    for i in range(batch.max().item() + 1):
+        x_mask = batched_x_mask[batch == i]
+        edge_sources = torch.arange(x_mask.shape[0]).repeat_interleave(x_mask.shape[0]).to(x_mask.device)
+        edge_sinks = torch.arange(x_mask.shape[0]).repeat(x_mask.shape[0]).to(x_mask.device)
+        edge_index = torch.stack([edge_sinks.flatten(), edge_sources], dim=0)
+        edge_indicies.append(edge_index + offset)
+        offset = offset + (batch == i).long().sum()
+
+    edge_index = torch.cat(edge_indicies, dim=-1)
+    edge_mask = batched_x_mask[edge_index].any(dim=0)
+    return edge_index[:, ~edge_mask], None, None
+
+
+
 
 def sparse_to_knn_graph(edge_features, edge_index):
     src = edge_index[1]

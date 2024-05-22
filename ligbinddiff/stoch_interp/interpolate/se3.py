@@ -276,7 +276,8 @@ class SE3Interpolant:
 
     def _rots_euler_step(self, d_t, t, rotmats_1, rotmats_t):
         if self._rots_cfg.sample_schedule == "linear":
-            scaling = 1 / (1 - t)
+            # scaling = 1 / (1 - t)
+            scaling = 1 / (1 - t.clip(max=0.9))
         elif self._rots_cfg.sample_schedule == "exp":
             scaling = self._rots_cfg.exp_rate
         else:

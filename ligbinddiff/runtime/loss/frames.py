@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import torch.nn.functional as F
 import torch_geometric.utils as pygu
 from torch_geometric.nn import radius_graph
 
@@ -232,7 +233,8 @@ def bb_frame_fm_loss(batch,
                      denoiser_outputs,
                      t_norm_clip=0.9,
                      sep_rot_loss=False,
-                     local_atomic_dist_r=6):
+                     local_atomic_dist_r=6,
+                     square_aux_loss_time_factor=False):
     res_data = batch['residue']
     res_mask = res_data['res_mask']
     noising_mask = res_data['noising_mask']
@@ -303,8 +305,12 @@ def bb_frame_fm_loss(batch,
     )
 
     # this seems to work well
-    scaled_dist_mat_loss = dist_mat_loss / norm_scale * 0.01
-    scaled_backbone_mse = backbone_mse / norm_scale * 0.01
+    if square_aux_loss_time_factor:
+        scaled_dist_mat_loss = dist_mat_loss / (norm_scale ** 2) * 0.01
+        scaled_backbone_mse = backbone_mse / (norm_scale ** 2) * 0.01
+    else:
+        scaled_dist_mat_loss = dist_mat_loss / norm_scale * 0.01
+        scaled_backbone_mse = backbone_mse / norm_scale * 0.01
 
     # testing this
     # scaled_dist_mat_loss = dist_mat_loss * 0.01
@@ -344,6 +350,61 @@ def bb_frame_fm_loss(batch,
         # "bb_angles_loss": bb_conn_angles
     }
 
+
+def bb_plddt_loss(batch,
+                  denoiser_outputs,
+                  local_atomic_dist_r=15,
+                  cutoffs=[0.5, 1, 2, 4],
+                  max_num_neighbors=1000,
+                  eps=1e-8):
+    res_data = batch['residue']
+    res_mask = res_data['res_mask']
+    pred_bb = denoiser_outputs['denoised_bb']
+    ref_bb = res_data['atom37'][:, (0, 1, 2, 4, 3)]
+
+    flat_ref_bb = ref_bb[res_mask].reshape(-1, 3)
+    flat_pred_bb = pred_bb[res_mask].reshape(-1, 3)
+    batch_expand = res_data.batch[res_mask].repeat_interleave(5, dim=0)
+    node_idx_expand = torch.arange(res_data.num_nodes, device=batch_expand.device)[res_mask].repeat_interleave(5, dim=0)
+    edge_index = radius_graph(flat_ref_bb, local_atomic_dist_r, batch_expand, max_num_neighbors=max_num_neighbors)
+
+    pred_dist_vec = flat_pred_bb[edge_index[0]] - flat_pred_bb[edge_index[1]]
+    pred_dists = torch.linalg.vector_norm(pred_dist_vec + eps, dim=-1)
+
+    ref_dist_vec = flat_ref_bb[edge_index[0]] - flat_ref_bb[edge_index[1]]
+    ref_dists = torch.linalg.vector_norm(ref_dist_vec + eps, dim=-1)
+
+    dist_error = torch.abs(pred_dists - ref_dists)
+    dist_cutoffs = torch.as_tensor(cutoffs, device=dist_error.device)
+    preserved = dist_error[..., None] < dist_cutoffs[None]
+    edge_to_res_idx = node_idx_expand[edge_index[1]]
+    lddt = pygu.scatter(
+        preserved.float(),
+        edge_to_res_idx,
+        dim=0,
+        dim_size=ref_bb.shape[0],
+        reduce='mean'
+    )
+    lddt = lddt.mean(dim=-1)
+    assert not lddt.requires_grad
+
+    plddt_bin_logits = denoiser_outputs['plddt_logits']
+    num_bins = plddt_bin_logits.shape[-1]
+    plddt_bin_values = (torch.arange(num_bins, device=plddt_bin_logits.device) * 2 + 1) / 100
+    plddt = torch.sum(torch.softmax(plddt_bin_logits, dim=-1) * plddt_bin_values, dim=-1)
+    lddt_bins = torch.arange(num_bins - 1, device=plddt_bin_logits.device) / num_bins
+    lddt_discritized = torch.bucketize(lddt, lddt_bins)
+    plddt_loss = F.cross_entropy(plddt_bin_logits, lddt_discritized, reduction='none')
+
+    graphwise_plddt_loss = _nodewise_to_graphwise(plddt_loss, res_data.batch, res_mask)
+    graphwise_plddt = _nodewise_to_graphwise(plddt, res_data.batch, res_mask)
+    graphwise_lddt = _nodewise_to_graphwise(lddt, res_data.batch, res_mask)
+
+    return {
+        "plddt_loss": graphwise_plddt_loss,
+        "plddt": graphwise_plddt * 100,
+        "lddt": graphwise_lddt * 100
+    }
 
 def _radius_of_gyration(rigids: ru.Rigid, batch, mask):
     trans = rigids.get_trans()
@@ -503,5 +564,3 @@ def sparse_fape_loss(
         dim_size=num_graph
     )
     return graphwise_dist_se / (graphwise_num_edges - graphwise_num_res)
-
-

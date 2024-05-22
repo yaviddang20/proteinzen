@@ -415,21 +415,22 @@ class MoleculeModule(L.LightningModule):
             for idx, (sample, clean_traj, mol_traj, rd_mol_list) in enumerate(zip(samples, clean_trajs, mol_trajs, rd_mols)):
                 # "copying" a molecule
                 sample_mol = Chem.Mol(rd_mol_list[0])
+                sample_mol = Chem.RemoveHs(sample_mol)
                 sample_conf = sample_mol.GetConformer()
                 set_conf(sample_conf, sample)
-                sample_mol = Chem.RemoveHs(sample_mol)
 
                 all_confs_mol = Chem.Mol(rd_mol_list[0])
                 all_confs_mol = Chem.RemoveHs(all_confs_mol)
                 all_confs_mol.RemoveAllConformers()
-                all_confs_mol.AddConformer(sample_mol.GetConformer())
-                for conf_id, mol in enumerate(rd_mol_list[:10]):
-                    out_path = os.path.join(
-                        self.val_dir,
-                        f"sample_{idx}_gt_conf_{conf_id}.sdf"
-                    )
-                    sd_writer = Chem.SDWriter(out_path)
-                    sd_writer.write(mol, confId=0)
+                all_confs_mol.AddConformer(sample_conf)
+                for conf_id, mol in enumerate(rd_mol_list):
+                    if conf_id < 10:
+                        out_path = os.path.join(
+                            self.val_dir,
+                            f"sample_{idx}_gt_conf_{conf_id}.sdf"
+                        )
+                        sd_writer = Chem.SDWriter(out_path)
+                        sd_writer.write(mol, confId=0)
                     mol = Chem.RemoveHs(mol)
                     all_confs_mol.AddConformer(mol.GetConformer())
 
@@ -442,7 +443,7 @@ class MoleculeModule(L.LightningModule):
                     f"sample_{idx}.sdf"
                 )
                 sd_writer = Chem.SDWriter(out_path)
-                sd_writer.write(sample_mol, confId=0)
+                sd_writer.write(sample_conf.GetOwningMol(), confId=0)
 
                 # write the clean trajectory to a PDB file
                 traj_len = clean_traj.shape[0]
@@ -493,6 +494,13 @@ class MoleculeModule(L.LightningModule):
 
         log_df = pd.DataFrame(log_metrics)
         self.validation_epoch_metrics.append(log_df)
+
+    def on_before_optimizer_step(self, optimizer):
+        # Compute the 2-norm for each layer
+        # If using mixed precision, the gradients are already unscaled here
+        for name, parameter in self.model.named_parameters():
+            if parameter.grad is not None:
+                print(name, parameter.grad.norm())
 
     def on_validation_epoch_end(self):
         val_epoch_metrics = pd.concat(self.validation_epoch_metrics)
@@ -743,4 +751,3 @@ class ProteinModule(L.LightningModule):
         #     + list(self.model.encoder.parameters())
         #     + list(self.model.decoder.parameters())
         # )
-

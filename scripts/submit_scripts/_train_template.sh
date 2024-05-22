@@ -23,8 +23,9 @@ gpuprof=$(dcgmi group -c mygpus -a $SGE_GPU | awk '{print $10}')
 dcgmi stats -g $gpuprof -e
 dcgmi stats -g $gpuprof -s $JOB_ID
 
+ulimit -n 2048
 cd ~/projects/ligbinddiff
-python train.py "$@" +job_id=${JOB_ID}
+python train.py "$@" +job_id=${JOB_ID} +num_days=1
 # args = ARGS
 
 dcgmi stats -g $gpuprof -x $JOB_ID

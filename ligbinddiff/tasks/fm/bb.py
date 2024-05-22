@@ -14,7 +14,7 @@ from ligbinddiff.utils.openfold import rigid_utils as ru
 from ligbinddiff.tasks import Task
 from ligbinddiff.model.utils.graph import batchwise_to_nodewise
 
-from ligbinddiff.runtime.loss.frames import bb_frame_fm_loss, rg_loss, frame_traj_loss, bb_frame_clash_loss
+from ligbinddiff.runtime.loss.frames import bb_frame_fm_loss, rg_loss, frame_traj_loss, bb_frame_clash_loss, bb_plddt_loss
 from ligbinddiff.runtime.loss.atomic.hbond import bb_hbond_loss
 from ligbinddiff.stoch_interp.interpolate.se3 import SE3Interpolant, _centered_gaussian, _uniform_so3, HarmonicPrior
 import ligbinddiff.stoch_interp.interpolate.utils as du
@@ -33,7 +33,10 @@ class BackboneFrameInterpolation(Task):
                  rigid_traj_loss=False,
                  sep_rot_loss=False,
                  local_atomic_dist_r=6,
-                 trans_loss_rescale=1):
+                 trans_loss_rescale=1,
+                 use_hbond_loss=False,
+                 use_plddt_loss=False,
+                 square_aux_loss_time_factor=False):
         super().__init__()
         self.se3_noiser = se3_noiser
         self.aux_loss_t_min = aux_loss_t_min
@@ -41,6 +44,9 @@ class BackboneFrameInterpolation(Task):
         self.sep_rot_loss = sep_rot_loss
         self.local_atomic_dist_r = local_atomic_dist_r
         self.trans_loss_rescale = trans_loss_rescale
+        self.use_plddt_loss = use_plddt_loss
+        self.use_hbond_loss = use_hbond_loss
+        self.square_aux_loss_time_factor = square_aux_loss_time_factor
 
     def gen_diffuse_mask(self, data: HeteroData):
         return torch.ones_like(data['res_mask']).bool()
@@ -211,7 +217,8 @@ class BackboneFrameInterpolation(Task):
         bb_frame_diffusion_loss_dict = bb_frame_fm_loss(
             inputs, outputs,
             sep_rot_loss=self.sep_rot_loss,
-            local_atomic_dist_r=self.local_atomic_dist_r)
+            local_atomic_dist_r=self.local_atomic_dist_r,
+            square_aux_loss_time_factor=self.square_aux_loss_time_factor)
         # bb_frame_clash_loss_dict = bb_frame_clash_loss(
         #     inputs, outputs
         # )
@@ -231,10 +238,33 @@ class BackboneFrameInterpolation(Task):
             # + torch.stack(list(bb_hbond_loss_dict.values())).sum(dim=0)
         ) * (inputs['t'] > self.aux_loss_t_min)
 
+        if self.use_plddt_loss:
+            plddt_loss_dict = bb_plddt_loss(
+                inputs,
+                outputs
+            )
+            plddt_loss = plddt_loss_dict['plddt_loss']
+        else:
+            plddt_loss = torch.zeros_like(bb_denoising_loss)
+
+
         loss = (
             bb_denoising_loss
             + 0.25 * bb_denoising_finegrain_loss
-        ).mean()
+            + plddt_loss
+        )
+
+        if self.use_hbond_loss:
+            bb_hbond_loss_dict = bb_hbond_loss(inputs, outputs)
+            hbond_loss = (
+                bb_hbond_loss_dict['delta_mse'] * 0.01 / (1 - inputs['t'].clip(max=0.9)) ** (2 if self.square_aux_loss_time_factor else 1)
+                + bb_hbond_loss_dict['theta_mse']
+                + bb_hbond_loss_dict['psi_mse']
+                + bb_hbond_loss_dict['X_mse']
+            )
+            loss = loss + hbond_loss
+
+        loss = loss.mean()
 
         ff_loss = (
             bb_denoising_loss
@@ -243,7 +273,13 @@ class BackboneFrameInterpolation(Task):
 
         loss_dict = {"loss": loss, "frameflow_loss": ff_loss}
         loss_dict.update(bb_frame_diffusion_loss_dict)
+        if self.use_plddt_loss:
+            loss_dict.update(plddt_loss_dict)
+        if self.use_hbond_loss:
+            loss_dict.update(bb_hbond_loss_dict)
         # loss_dict.update(bb_frame_clash_loss_dict)
         # loss_dict.update(bb_hbond_loss_dict)
         # loss_dict.update(rg_loss_dict)
+
+
         return loss_dict
