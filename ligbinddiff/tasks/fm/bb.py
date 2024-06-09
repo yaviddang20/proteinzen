@@ -115,7 +115,8 @@ class BackboneFrameInterpolation(Task):
                 residue={
                     "res_mask": torch.ones(n, device=device),
                     "noising_mask": torch.ones(n, device=device),
-                    "num_nodes": n
+                    "num_nodes": n,
+                    "data_lens": torch.as_tensor([n], device=device)
                 }
             )
             data_list.append(data)
@@ -176,6 +177,14 @@ class BackboneFrameInterpolation(Task):
             d_t = t_2 - t_1
             trans_t_2 = self.se3_noiser._trans_euler_step(d_t, t_1, pred_trans_1, trans_t_1)
             rotmats_t_2 = self.se3_noiser._rots_euler_step(d_t, t_1, pred_rotmats_1, rotmats_t_1)
+
+            if self.se3_noiser.sfm:
+                trans_sfm_noise = self.se3_noiser.trans_sfm_noise(trans_t_1, t[res_data.batch])
+                rotmat_sfm_noise = self.se3_noiser.rot_sfm_noise(res_data.num_nodes, d_t, device)
+
+                trans_t_2 = trans_t_2 + trans_sfm_noise
+                rotmats_t_2 = rotmats_t_2 @ rotmat_sfm_noise
+
             prot_traj.append((trans_t_2, rotmats_t_2, pred_psis))
             t_1 = t_2
 

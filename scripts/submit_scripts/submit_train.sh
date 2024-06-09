@@ -8,4 +8,4 @@ sed -e "s|OUTFILE|${ROOT_DIR}/outputs/sge_outs/train_${SUBMIT_TIME}|g" \
     > "${ROOT_DIR}/scripts/submit_scripts/autogen_scripts/train_${SUBMIT_TIME}.sh"
 echo "#ARGS = $@" >> "${ROOT_DIR}/scripts/submit_scripts/autogen_scripts/train_${SUBMIT_TIME}.sh"
 
-qsub "${ROOT_DIR}/scripts/submit_scripts/autogen_scripts/train_${SUBMIT_TIME}.sh" "$@"
+qsub -terse "${ROOT_DIR}/scripts/submit_scripts/autogen_scripts/train_${SUBMIT_TIME}.sh" "$@"

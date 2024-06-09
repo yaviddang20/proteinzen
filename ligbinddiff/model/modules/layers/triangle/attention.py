@@ -8,30 +8,41 @@ from ligbinddiff.data.datasets.featurize.sidechain import _rbf
 from ligbinddiff.model.modules.openfold.frames import Linear
 from ligbinddiff.model.utils.graph import sparse_to_knn_graph, knn_to_sparse_graph
 
-# inspired by proteus
-class SparseTriangleAttention(nn.Module):
+from torch_cluster import knn, knn_graph
+
+# heavily inspired by proteus
+class TriangleSelfAttention(nn.Module):
     def __init__(self,
                  c_s,
                  c_z,
+                 c_gate_s=16,
                  num_heads=4,
                  num_rbf=64,
                  inf=1e4,
+                 gate_out=True,
+                 dropout=0,
                  assume_sorted=False):
         super().__init__()
         self.c_s = c_s
         self.c_z = c_z
+        self.c_gate_s = c_gate_s
         self.num_rbf = num_rbf
         self.num_heads = num_heads
+        self.gate_out = gate_out
+        self.dropout_rate = dropout
 
-        self.dist_bias_gate = nn.Sequential(
-            nn.Linear(2*c_s, num_heads),
-            nn.Sigmoid()
-        )
-        self.dist_bias = nn.Linear(self.num_rbf, num_heads)
+        self.node_left = Linear(c_s, c_gate_s)
+        self.node_right = Linear(c_s, c_gate_s)
+        self.bias_gate = Linear(c_gate_s*c_gate_s, c_z, init='gating')
+        self.dist_bias = nn.Linear(self.num_rbf, c_z)
+        self.to_bias = Linear(c_z, num_heads, bias=False, init="normal")
 
-        self.lin_qk = nn.Linear(c_z, 2*c_z)
-        self.lin_v = nn.Linear(c_z, c_z)
+        self.layer_norm = nn.LayerNorm(c_z)
+        self.lin_q = Linear(c_z, c_z, init='glorot')
+        self.lin_kv = Linear(c_z, 2*c_z, init='glorot')
         self.lin_out = Linear(c_z, c_z, init='final')
+        if self.gate_out:
+            self.out_gate = Linear(c_z, c_z, init='gating')
         self.assume_sorted = assume_sorted
 
         self.inf = inf
@@ -57,16 +68,36 @@ class SparseTriangleAttention(nn.Module):
             sorted_edge_index = edge_index
             sorted_edge_features = edge_features
 
-        knn_edge_features, knn_edge_index, knn_edge_mask = sparse_to_knn_graph(sorted_edge_features, sorted_edge_index)
+        knn_edge_features, knn_edge_index, knn_edge_mask = sparse_to_knn_graph(sorted_edge_features, sorted_edge_index, num_nodes=num_nodes)
         k = knn_edge_index.shape[-1]
+        if self.dropout_rate > 0 and self.training:
+            num_drop_edges = round(k * self.dropout_rate)
+            num_keep_edges = k - num_drop_edges
+            idxs = np.repeat(np.arange(k)[None], knn_edge_features.shape[0], 0)
+            # this is a kinda jenk way of doing this
+            # but i think this will allow checkpointing to control the seed used for permutation
+            torch_rng = torch.Generator()
+            rng = np.random.default_rng(torch_rng.initial_seed())
+            shuffled_idxs = rng.permutation(idxs, axis=1)
+            keep_mask = torch.as_tensor(shuffled_idxs < num_keep_edges, device=knn_edge_features.device)
+            knn_edge_features = knn_edge_features[keep_mask].reshape(-1, num_keep_edges, self.c_z)
+            knn_edge_index = knn_edge_index[keep_mask].reshape(-1, num_keep_edges)
+            knn_edge_mask = knn_edge_mask[keep_mask].reshape(-1, num_keep_edges)
+            k = num_keep_edges
 
-        edge1 = knn_edge_index[..., None].expand(-1, -1, k),
-        edge2 = knn_edge_index[..., None, :].expand(-1, k, -1)
+        knn_edge_features = self.layer_norm(knn_edge_features)
 
-        edge3_node1 = node_features[edge1]
-        edge3_node2 = node_features[edge2]
-        edge3_gate = self.dist_bias_gate(
-            torch.cat([edge3_node1, edge3_node2], dim=-1)
+        edge1 = knn_edge_index[..., None]
+        edge2 = knn_edge_index[..., None, :]
+
+        node_left = self.node_left(node_features)
+        node_right = self.node_right(node_features)
+
+        edge3_node1 = node_left[knn_edge_index]
+        edge3_node2 = node_right[knn_edge_index]
+        edge3 = torch.einsum("bik,bjl->bikjl", edge3_node1, edge3_node2)
+        edge3_gate = self.bias_gate(
+            edge3.view(-1, k, k, self.c_gate_s * self.c_gate_s)
         )
 
         node_trans = rigids.get_trans()
@@ -78,10 +109,12 @@ class SparseTriangleAttention(nn.Module):
         )
 
         edge3_dist_features = _rbf(edge3_dist, D_count=self.num_rbf, device=edge3_dist.device)
-        edge3_dist_bias = edge3_gate * self.dist_bias(edge3_dist_features)  # n x k x k x h
+        edge3_dist_bias = self.dist_bias(edge3_dist_features)  # n x k x k x h
+        edge3_dist_bias = self.to_bias(torch.sigmoid(edge3_gate) * edge3_dist_bias)
 
-        edge_qk = self.lin_qk(knn_edge_features)
-        edge_q, edge_k = edge_qk.split([self.c_z, self.c_z], dim=-1)
+        edge_q = self.lin_q(knn_edge_features)
+        edge_kv = self.lin_kv(knn_edge_features)
+        edge_k, edge_v = edge_kv.split([self.c_z, self.c_z], dim=-1)
         edge_q = edge_q.view(num_nodes, k, self.num_heads, -1)
         edge_k = edge_k.view(num_nodes, k, -1, self.num_heads)
 
@@ -94,13 +127,16 @@ class SparseTriangleAttention(nn.Module):
         edge_attn = edge_attn - self.inf * (~edge_edge_mask[..., None]).float()
         edge_attn = torch.softmax(edge_attn, dim=-2) # n x k x k x h
 
-        edge_v = self.lin_v(knn_edge_features).view(num_nodes, k, self.num_heads, -1)  # n x k x h x c_z//h
+        edge_v = edge_v.view(num_nodes, k, self.num_heads, -1)  # n x k x h x c_z//h
         edge_update = torch.sum(
             edge_v[..., None, :, :]  # n x k x 1 x h x c_z//h
             * edge_attn[..., None]
             * edge_edge_mask[..., None, None],  # n x k x k x h x 1
         dim=-3)  # n x k x h x c_z//h
-        edge_update = self.lin_out(edge_update.view(-1, k, self.c_z))
+        edge_update = edge_update.view(-1, k, self.c_z)
+        if self.gate_out:
+            edge_update = edge_update * torch.sigmoid(self.out_gate(knn_edge_features))
+        edge_update = self.lin_out(edge_update)
         edge_update, _ = knn_to_sparse_graph(edge_update, knn_edge_index, knn_edge_mask)
 
         if not self.assume_sorted:
@@ -114,43 +150,53 @@ class SparseTriangleAttention(nn.Module):
         return edge_update
 
 
-# inspired by proteus
-class SparseSubsampledTriangleAttention(nn.Module):
+# heavily inspired by proteus
+class SparseTriangleSelfAttention(nn.Module):
     def __init__(self,
                  c_s,
                  c_z,
-                 k=60,
-                 subsample_k=20,
+                 c_gate_s=16,
                  num_heads=4,
                  num_rbf=64,
+                 inf=1e4,
+                 gate_out=True,
+                 dropout=0,
                  assume_sorted=False):
         super().__init__()
         self.c_s = c_s
         self.c_z = c_z
-        self.k = k
-        self.subsample_k = subsample_k
+        self.c_gate_s = c_gate_s
         self.num_rbf = num_rbf
         self.num_heads = num_heads
+        self.gate_out = gate_out
+        self.dropout_rate = dropout
 
-        self.dist_bias_gate = nn.Sequential(
-            nn.Linear(2*c_s, num_heads),
-            nn.Sigmoid()
-        )
-        self.dist_bias = nn.Linear(self.num_rbf, num_heads)
+        self.node_left = Linear(c_s, c_gate_s)
+        self.node_right = Linear(c_s, c_gate_s)
+        self.bias_gate = Linear(c_gate_s*c_gate_s, c_z, init='gating')
+        self.dist_bias = nn.Linear(self.num_rbf, c_z)
+        self.to_bias = Linear(c_z, num_heads, bias=False, init="normal")
 
-        self.lin_qk = nn.Linear(c_z, 2*c_z)
-        self.lin_v = nn.Linear(c_z, c_z)
+        self.layer_norm = nn.LayerNorm(c_z)
+        self.lin_q = Linear(c_z, c_z, init='glorot')
+        self.lin_kv = Linear(c_z, 2*c_z, init='glorot')
         self.lin_out = Linear(c_z, c_z, init='final')
+        if self.gate_out:
+            self.out_gate = Linear(c_z, c_z, init='gating')
         self.assume_sorted = assume_sorted
+
+        self.inf = inf
 
     def forward(self,
                 node_features,
                 rigids,
                 edge_features,
                 edge_index,
+                k=None,
                 eps=1e-8):
         num_nodes = node_features.shape[0]
         num_edges = edge_index.shape[-1]
+        node_trans = rigids.get_trans()
 
         if not self.assume_sorted:
             sorted_edge_index, edge_map = pygu.sort_edge_index(
@@ -164,78 +210,74 @@ class SparseSubsampledTriangleAttention(nn.Module):
             sorted_edge_index = edge_index
             sorted_edge_features = edge_features
 
-        semidense_dst = sorted_edge_index[0].view(-1, self.k)  # n x k
+        if k is None:
+            # max for pygu knn_graph with loop=False
+            k = 99
 
-        edge1 = semidense_dst[..., None].expand(-1, -1, self.subsample_k)  # n x k x subsample_k
-        # select a random subsample_k of remaining edges
-        # randperm = torch.empty((num_nodes, self.k, self.k), dtype=torch.long, device=edge1.device)
-        # for i in range(num_nodes):
-        #     for j in range(self.k):
-        #         randperm[i, j] = torch.randperm(self.k, device=randperm.device)
-        randperm = torch.stack([torch.randperm(self.k, device=edge1.device) for _ in range(num_nodes * self.k)])
-        randperm = randperm.view(num_nodes, self.k, self.k)
+        edge_edge_index = knn_graph(
+            node_trans[sorted_edge_index[0]],
+            k=k,
+            batch=sorted_edge_index[1]
+        )
+        edge_edge_index = pygu.coalesce(edge_edge_index, sort_by_row=False)
+        edge_edge_index, _ = pygu.dropout_edge(edge_index=edge_edge_index, p=self.dropout_rate, training=self.training)
+        assert (sorted_edge_index[1, edge_edge_index[1]] == sorted_edge_index[1, edge_edge_index[0]]).all()
+        edge3_node1_idx = sorted_edge_index[0, edge_edge_index[1]]
+        edge3_node2_idx = sorted_edge_index[0, edge_edge_index[0]]
 
-        subsample_idx = randperm[..., :self.subsample_k]
-        edge2 = semidense_dst[..., None, :].expand(-1, self.k, -1)
-        edge2 = torch.gather(
-            edge2,
-            -1,
-            subsample_idx
-        )  # n x k x subsample_k
+        sorted_edge_features = self.layer_norm(sorted_edge_features)
 
-        def _gather(nodes, triangles):
-            return nodes[triangles.reshape(-1)].view(
-                list(triangles.shape) + [-1])
+        node_left = self.node_left(node_features)
+        node_right = self.node_right(node_features)
 
-        edge3_node1 = _gather(node_features, edge1)
-        edge3_node2 = _gather(node_features, edge2)
-        edge3_gate = self.dist_bias_gate(
-            torch.cat([edge3_node1, edge3_node2], dim=-1)
+        edge3_node1 = node_left[edge3_node1_idx]
+        edge3_node2 = node_right[edge3_node2_idx]
+        edge3 = torch.einsum("bi,bj->bij", edge3_node1, edge3_node2)
+        edge3_gate = self.bias_gate(
+            edge3.view(-1, self.c_gate_s * self.c_gate_s)
         )
 
-        node_trans = rigids.get_trans()
-        edge3_node1_trans = _gather(node_trans, edge1)
-        edge3_node2_trans = _gather(node_trans, edge2)
+        edge3_node1_trans = node_trans[edge3_node1_idx]
+        edge3_node2_trans = node_trans[edge3_node2_idx]
         edge3_dist = torch.linalg.vector_norm(
             edge3_node1_trans - edge3_node2_trans + eps,
             dim=-1
         )
 
         edge3_dist_features = _rbf(edge3_dist, D_count=self.num_rbf, device=edge3_dist.device)
-        edge3_dist_bias = edge3_gate * self.dist_bias(edge3_dist_features)  # n x k x subsample_k x h
+        edge3_dist_bias = self.dist_bias(edge3_dist_features)  # n x k x k x h
+        edge3_dist_bias = self.to_bias(torch.sigmoid(edge3_gate) * edge3_dist_bias)
 
-        edges = sorted_edge_features.view(num_nodes, self.k, -1)
-        edge_qk = self.lin_qk(edges)
-        edge_q, edge_k = edge_qk.split([self.c_z, self.c_z], dim=-1)
-        edge_q = edge_q.view(num_nodes, self.k, self.num_heads, -1)
-        edge_k = edge_k.view(num_nodes, self.k, self.num_heads, -1)
+        edge_q = self.lin_q(sorted_edge_features)
+        edge_kv = self.lin_kv(sorted_edge_features)
+        edge_k, edge_v = edge_kv.split([self.c_z, self.c_z], dim=-1)
+        edge_q = edge_q.view(-1, self.num_heads, self.c_z//self.num_heads)
+        edge_k = edge_k.view(-1, self.num_heads, self.c_z//self.num_heads)
 
-        edge_k = torch.gather(
-            edge_k[:, None].expand(-1, self.k, -1, -1, -1),  # n x k x k x c_z//h x h
-            1,
-            subsample_idx[..., None, None].expand(-1, -1, -1, self.num_heads, self.c_z//self.num_heads)  # n x k x subsample_k x c_z//h x h
-        )  # n x k x subsample_k x c_z//h x h
+        edge_edge_q = edge_q[edge_edge_index[1]]
+        edge_edge_k = edge_k[edge_edge_index[0]]
 
-        edge_attn = torch.sum(
-            edge_q[:, :, None]  # n x k x 1 x h x c_z//h
-            * edge_k,  # n x k x subsample_k x h x c_z//h
-        dim=-1)  # n x k x subsample_k x h
-        edge_attn = 1 / np.sqrt(self.c_z) * edge_attn
-        edge_attn = edge_attn + edge3_dist_bias
-        edge_attn = torch.softmax(edge_attn, dim=-2) # n x k x subsample_k x h
+        attn = torch.einsum("bhi,bhi->bh", edge_edge_q, edge_edge_k)  # n_e_e x h
+        attn = 1 / np.sqrt(self.c_z) * attn
+        attn = attn + edge3_dist_bias
+        attn = pygu.softmax(
+            attn,
+            index=edge_edge_index[1],
+            dim=0
+        )
 
-        edge_v = self.lin_v(edges).view(num_nodes, self.k, self.num_heads, -1)  # n x k x h x c_z//h
-        edge_v = torch.gather(
-            edge_v[:, None].expand(-1, self.k, -1, -1, -1),  # n x k x k x c_z//h x h
-            1,
-            subsample_idx[..., None, None].expand(-1, -1, -1, self.num_heads, self.c_z//self.num_heads)  # n x k x subsample_k x c_z//h x h
-        )  # n x k x subsample_k x c_z//h x h
-
-        edge_update = torch.sum(
-            edge_v  # n x k x subsample_k x h x c_z//h
-            * edge_attn[..., None],  # n x k x subsample_k x h x 1
-        dim=-3)  # n x k x h x c_z//h
-        edge_update = self.lin_out(edge_update.view(num_edges, self.c_z))
+        edge_v = edge_v.view(-1, self.num_heads, self.c_z//self.num_heads)  # n x h x c_z//h
+        edge_edge_v = edge_v[edge_edge_index[0]]
+        edge_update = pygu.scatter(
+            edge_edge_v * attn[..., None],
+            index=edge_edge_index[1],
+            dim=0,
+            dim_size=sorted_edge_features.shape[0]
+        )
+        edge_update = edge_update.view(-1, self.c_z)
+        if self.gate_out:
+            edge_update = edge_update * torch.sigmoid(self.out_gate(sorted_edge_features))
+        edge_update = self.lin_out(edge_update)
 
         if not self.assume_sorted:
             edge_update = pygu.scatter(
@@ -252,119 +294,34 @@ class TriangleCrossAttention(nn.Module):
     def __init__(self,
                  c_s,
                  c_z,
+                 c_gate_s=16,
                  num_heads=4,
                  num_rbf=64,
                  inf=1e4,
+                 dropout=0,
+                 gate_out=True,
                  assume_sorted=False):
         super().__init__()
         self.c_s = c_s
         self.c_z = c_z
+        self.c_gate_s = c_gate_s
         self.num_rbf = num_rbf
         self.num_heads = num_heads
+        self.gate_out = gate_out
+        self.dropout_rate = dropout
 
-        self.dist_bias_gate = nn.Sequential(
-            nn.Linear(2*c_s, num_heads),
-            nn.Sigmoid()
-        )
-        self.dist_bias = nn.Linear(self.num_rbf, num_heads)
+        self.node_left = Linear(c_s, c_gate_s)
+        self.node_right = Linear(c_s, c_gate_s)
+        self.bias_gate = Linear(c_gate_s*c_gate_s, c_z, init='gating')
+        self.dist_bias = nn.Linear(self.num_rbf, c_z)
+        self.to_bias = Linear(c_z, num_heads, bias=False, init="normal")
 
-        self.lin_q = nn.Linear(c_z, c_z)
-        self.lin_k = nn.Linear(c_z, c_z)
-        self.lin_v = nn.Linear(c_z, c_z)
+        self.layer_norm = nn.LayerNorm(c_z)
+        self.lin_q = Linear(c_z, c_z, init='glorot')
+        self.lin_kv = Linear(c_z, 2*c_z, init='glorot')
         self.lin_out = Linear(c_z, c_z, init='final')
-        self.assume_sorted = assume_sorted
-
-        self.inf = inf
-
-    def forward(self,
-                node_features,
-                rigids,
-                src_edge_features,
-                src_edge_index,
-                dst_edge_features,
-                dst_edge_index,
-                eps=1e-8):
-        num_nodes = node_features.shape[0]
-
-        knn_src_edge_features, knn_src_edge_index, knn_src_edge_mask = sparse_to_knn_graph(src_edge_features, src_edge_index)
-        knn_dst_edge_features, knn_dst_edge_index, knn_dst_edge_mask = sparse_to_knn_graph(dst_edge_features, dst_edge_index)
-        k_src = knn_src_edge_index.shape[-1]
-        k_dst = knn_dst_edge_index.shape[-1]
-
-        edge1 = knn_dst_edge_index[..., None].expand(-1, -1, k_src)
-        edge2 = knn_src_edge_index[..., None, :].expand(-1, k_dst, -1),
-
-        edge3_node1 = node_features[edge1]
-        edge3_node2 = node_features[edge2]
-        edge3_gate = self.dist_bias_gate(
-            torch.cat([edge3_node1, edge3_node2], dim=-1)
-        )
-
-        node_trans = rigids.get_trans()
-        edge3_node1_trans = node_trans[edge1]
-        edge3_node2_trans = node_trans[edge2]
-        edge3_dist = torch.linalg.vector_norm(
-            edge3_node1_trans - edge3_node2_trans + eps,
-            dim=-1
-        )
-
-        edge3_dist_features = _rbf(edge3_dist, D_count=self.num_rbf, device=edge3_dist.device)
-        edge3_dist_bias = edge3_gate * self.dist_bias(edge3_dist_features)  # n x k_dst x k_src x h
-
-        edge_q = self.lin_q(knn_dst_edge_features)
-        edge_k = self.lin_k(knn_src_edge_features)
-        edge_q = edge_q.view(num_nodes, k_dst, self.num_heads, -1)  # n x k_dst x h x c_z//h
-        edge_k = edge_k.view(num_nodes, k_src, -1, self.num_heads)  # n x k_src x c_z//h x h
-
-        edge_attn = edge_q.transpose(-2, -3) @ edge_k.transpose(-1, -3)  # n x h x k_dst x k_src
-        edge_attn = edge_attn.transpose(-2, -3).transpose(-1, -2)  # n x k_dst x k_src x h
-        edge_attn = 1 / np.sqrt(self.c_z) * edge_attn
-        edge_attn = edge_attn + edge3_dist_bias
-
-        edge_edge_mask = knn_src_edge_mask[..., None, :] & knn_dst_edge_mask[..., None]  # n x k_dst x k_src
-        edge_attn = edge_attn - self.inf * (~edge_edge_mask[..., None]).float()
-        edge_attn = torch.softmax(edge_attn, dim=-2) # n x k_dst x k_src x h
-
-        edge_v = self.lin_v(knn_src_edge_features).view(num_nodes, k_src, self.num_heads, -1)  # n x k_src x h x c_z//h
-        edge_update = torch.sum(
-            edge_v[..., None, :, :, :]  # n x 1 x k_src x h x c_z//h
-            * edge_attn[..., None]
-            * edge_edge_mask[..., None, None],  # n x k_dst x k_src x h x 1
-        dim=-3)  # n x k x h x c_z//h
-        edge_update = self.lin_out(edge_update.view(-1, k_dst, self.c_z))
-        edge_update, _ = knn_to_sparse_graph(edge_update, knn_dst_edge_index, knn_dst_edge_mask)
-
-        return edge_update
-
-
-class TriangleCrossAttention2(nn.Module):
-    def __init__(self,
-                 c_s,
-                 c_z,
-                 num_heads=4,
-                 num_rbf=64,
-                 inf=1e4,
-                 assume_sorted=False):
-        super().__init__()
-        self.c_s = c_s
-        self.c_z = c_z
-        self.num_rbf = num_rbf
-        self.num_heads = num_heads
-
-        self.dist_bias_gate = nn.Sequential(
-            nn.Linear(2*c_s, num_heads),
-            nn.Sigmoid()
-        )
-        self.dist_bias = nn.Sequential(
-            nn.Linear(self.num_rbf, self.num_rbf),
-            nn.ReLU(),
-            nn.Linear(self.num_rbf, num_heads),
-        )
-
-        self.lin_q = nn.Linear(c_z, c_z)
-        self.lin_k = nn.Linear(c_z, c_z)
-        self.lin_v = nn.Linear(c_z, c_z)
-        self.lin_out = Linear(c_z, c_z)
+        if self.gate_out:
+            self.out_gate = Linear(c_z, c_z, init='gating')
         self.assume_sorted = assume_sorted
 
         self.inf = inf
@@ -376,20 +333,47 @@ class TriangleCrossAttention2(nn.Module):
                 knn_src_edge_index,
                 dst_edge_features,
                 dst_edge_index,
+                knn_edge_mask=None,
                 eps=1e-8):
         num_nodes = node_features.shape[0]
         num_edges = dst_edge_features.shape[0]
-
         k = knn_src_edge_index.shape[-1]
+
+        if knn_edge_mask is None:
+            knn_edge_mask = torch.ones_like(knn_src_edge_index[0]).bool()
+        elif len(knn_edge_mask.shape) == 4:
+            knn_edge_mask = knn_edge_mask[0]
+
+        if self.dropout_rate > 0 and self.training:
+            num_drop_edges = round(k * self.dropout_rate)
+            num_keep_edges = k - num_drop_edges
+            idxs = np.repeat(np.arange(k)[None], knn_src_edge_features.shape[0], 0)
+            # this is a kinda jenk way of doing this
+            # but i think this will allow checkpointing to control the seed used for permutation
+            torch_rng = torch.Generator()
+            rng = np.random.default_rng(torch_rng.initial_seed())
+            shuffled_idxs = rng.permutation(idxs, axis=1)
+            keep_mask = torch.as_tensor(shuffled_idxs < num_keep_edges, device=knn_src_edge_features.device)
+            knn_src_edge_features = knn_src_edge_features[keep_mask].reshape(-1, num_keep_edges, self.c_z)
+            knn_src_edge_index = knn_src_edge_index[keep_mask].reshape(-1, num_keep_edges)
+            knn_edge_mask = knn_edge_mask[keep_mask].reshape(-1, num_keep_edges)
+            k = num_keep_edges
+
+        knn_src_edge_features = self.layer_norm(knn_src_edge_features)
 
         edge1 = dst_edge_index[..., None]
         edge2 = knn_src_edge_index
 
-        # edge3_node1 = node_features[edge1[0]]
-        # edge3_node2 = node_features[edge2[0]]
-        # edge3_gate = self.dist_bias_gate(
-        #     torch.cat([edge3_node1, edge3_node2], dim=-1)
-        # )
+        node_left = self.node_left(node_features)
+        node_right = self.node_right(node_features)
+
+        edge3_node1 = node_left[edge1[0]]
+        edge3_node2 = node_right[edge2[0]]
+        # print(edge3_node1.shape, edge3_node2.shape)
+        edge3 = torch.einsum("bik,bjl->bijkl", edge3_node1, edge3_node2)
+        edge3_gate = self.bias_gate(
+            edge3.view(-1, k, self.c_gate_s * self.c_gate_s)
+        )
 
         node_trans = rigids.get_trans()
         edge3_node1_trans = node_trans[edge1[0]]
@@ -400,137 +384,186 @@ class TriangleCrossAttention2(nn.Module):
         )
 
         edge3_dist_features = _rbf(edge3_dist, D_count=self.num_rbf, device=edge3_dist.device)
-        # edge3_dist_bias = edge3_gate * self.dist_bias(edge3_dist_features)  # n_edge x k x h
-        edge3_dist_bias = self.dist_bias(edge3_dist_features)  # n_edge x k x h
+        edge3_dist_bias = self.dist_bias(edge3_dist_features)  # n x k x k x h
+        edge3_dist_bias = self.to_bias(torch.sigmoid(edge3_gate) * edge3_dist_bias)
 
         edge_q = self.lin_q(dst_edge_features)
-        edge_k = self.lin_k(knn_src_edge_features)
+        edge_kv = self.lin_kv(knn_src_edge_features)
         edge_q = edge_q.view(num_edges, 1, self.num_heads, -1)  # n_edge x 1 x h x c_z//h
+        edge_k, edge_v = edge_kv.split([self.c_z, self.c_z], dim=-1)
         edge_k = edge_k.view(num_edges, k, -1, self.num_heads)  # n_edge x k x c_z//h x h
 
         edge_attn = edge_q.transpose(-2, -3) @ edge_k.transpose(-1, -3)  # n_edge x h x 1 x k
         edge_attn = edge_attn.squeeze(-2).transpose(-1, -2)  # n_edge x k x h
         edge_attn = 1 / np.sqrt(self.c_z) * edge_attn
-        edge_attn = edge_attn + edge3_dist_bias
+        edge_attn = edge_attn + edge3_dist_bias + self.inf * (1 - knn_edge_mask.float()[..., None])
         edge_attn = torch.softmax(edge_attn, dim=-2) # n_edge x k x h
 
-        edge_v = self.lin_v(knn_src_edge_features).view(num_edges, k, self.num_heads, -1)  # n_edge x k x h x c_z//h
+        edge_v = edge_v.view(num_edges, k, self.num_heads, -1)  # n_edge x k x h x c_z//h
+        # print(edge_v.shape, edge_attn.shape, knn_edge_mask.shape)
         edge_update = torch.sum(
-            edge_v * edge_attn[..., None],
+            edge_v * edge_attn[..., None] * knn_edge_mask.float()[..., None, None],
             dim=-3
         )  # n_edge x h x c_z//h
-        edge_update = self.lin_out(edge_update.view(num_edges, self.c_z))
+        # print(edge_update.shape)
+        edge_update = edge_update.view(num_edges, self.c_z)
+        if self.gate_out:
+            edge_update = edge_update * torch.sigmoid(self.out_gate(dst_edge_features))
+        edge_update = self.lin_out(edge_update)
 
         return edge_update
 
 
-class TwoScaleTriangleCrossAttention(nn.Module):
+# heavily inspired by proteus
+class SparseTriangleCrossAttention(nn.Module):
     def __init__(self,
                  c_s,
                  c_z,
+                 c_gate_s=16,
                  num_heads=4,
-                 num_rbf=64):
+                 num_rbf=64,
+                 inf=1e4,
+                 gate_out=True,
+                 dropout=0,
+                 assume_sorted=False):
         super().__init__()
+        self.c_s = c_s
+        self.c_z = c_z
+        self.c_gate_s = c_gate_s
+        self.num_rbf = num_rbf
+        self.num_heads = num_heads
+        self.gate_out = gate_out
+        self.dropout_rate = dropout
 
-        self.self_attn = TriangleCrossAttention(
-            c_s=c_s,
-            c_z=c_z,
-            num_heads=num_heads,
-            num_rbf=num_rbf
-        )
-        self.self_ln = nn.LayerNorm(c_z)
+        self.node_left = Linear(c_s, c_gate_s)
+        self.node_right = Linear(c_s, c_gate_s)
+        self.bias_gate = Linear(c_gate_s*c_gate_s, c_z, init='gating')
+        self.dist_bias = nn.Linear(self.num_rbf, c_z)
+        self.to_bias = Linear(c_z, num_heads, bias=False, init="normal")
 
-        self.cross_attn = TriangleCrossAttention(
-            c_s=c_s,
-            c_z=c_z,
-            num_heads=num_heads,
-            num_rbf=num_rbf
-        )
-        self.cross_ln = nn.LayerNorm(c_z)
+        self.dst_layer_norm = nn.LayerNorm(c_z)
+        self.src_layer_norm = nn.LayerNorm(c_z)
+        self.lin_q = Linear(c_z, c_z, init='glorot')
+        self.lin_kv = Linear(c_z, 2*c_z, init='glorot')
+        self.lin_out = Linear(c_z, c_z, init='final')
+        if self.gate_out:
+            self.out_gate = Linear(c_z, c_z, init='gating')
+        self.assume_sorted = assume_sorted
+
+        self.inf = inf
 
     def forward(self,
                 node_features,
                 rigids,
-                self_edge_features,
-                self_edge_index,
-                cross_edge_features,
-                cross_edge_index):
-
-        self_edge_update = self.self_attn(
-            node_features,
-            rigids,
-            self_edge_features,
-            self_edge_index,
-            self_edge_features,
-            self_edge_index,
-        )
-        self_edge_features = self.self_ln(self_edge_update + self_edge_features)
-
-        cross_edge_update = self.cross_attn(
-            node_features,
-            rigids,
-            self_edge_features,
-            self_edge_index,
-            cross_edge_features,
-            cross_edge_index,
-        )
-        cross_edge_features = self.cross_ln(cross_edge_update + cross_edge_features)
-
-        return self_edge_features, cross_edge_features
-
-
-class ThreeScaleTriangleCrossAttention(nn.Module):
-    def __init__(self,
-                 c_s,
-                 c_z,
-                 num_heads=4,
-                 num_rbf=64):
-        super().__init__()
-
-        self.self_attn = TriangleCrossAttention(
-            c_s=c_s,
-            c_z=c_z,
-            num_heads=num_heads,
-            num_rbf=num_rbf
-        )
-        self.self_ln = nn.LayerNorm(c_z)
-
-        self.cross_attn = TriangleCrossAttention(
-            c_s=c_s,
-            c_z=c_z,
-            num_heads=num_heads,
-            num_rbf=num_rbf
-        )
-        self.cross_ln = nn.LayerNorm(c_z)
-
-    def forward(self,
-                node_features,
-                rigids,
+                dst_edge_features,
+                dst_edge_index,
                 src_edge_features,
                 src_edge_index,
-                self_edge_features,
-                self_edge_index,
-                cross_edge_features,
-                cross_edge_index):
+                k=None,
+                eps=1e-8):
+        num_nodes = node_features.shape[0]
+        node_trans = rigids.get_trans()
 
-        self_edge_update = self.self_attn(
-            node_features,
-            rigids,
-            src_edge_features,
-            src_edge_index,
-            self_edge_features,
-            self_edge_index,
+        if not self.assume_sorted:
+            dst_num_edges = dst_edge_features.shape[0]
+            dst_edge_index, dst_edge_map = pygu.sort_edge_index(
+                dst_edge_index,
+                edge_attr=torch.arange(dst_num_edges, device=dst_edge_index.device),
+                sort_by_row=False
+            )
+            dst_edge_features = dst_edge_features[dst_edge_map]
+
+            src_num_edges = src_edge_features.shape[0]
+            src_edge_index, src_edge_map = pygu.sort_edge_index(
+                src_edge_index,
+                edge_attr=torch.arange(src_num_edges, device=src_edge_index.device),
+                sort_by_row=False
+            )
+            src_edge_features = src_edge_features[src_edge_map]
+        # else:
+        #     dst_edge_map = torch.arange(dst_edge_index.shape[1], device=dst_edge_index.device)
+        #     src_edge_map = torch.arange(src_edge_index.shape[1], device=src_edge_index.device)
+
+        if k is None:
+            # max for pygu knn
+            k = 100
+
+        edge_edge_index = knn(
+            x=node_trans[dst_edge_index[0]],
+            y=node_trans[src_edge_index[0]],
+            k=k,
+            batch_x=dst_edge_index[1],
+            batch_y=src_edge_index[1]
         )
-        self_edge_features = self.self_ln(self_edge_update + self_edge_features)
+        edge_edge_index = edge_edge_index.flip(0)
 
-        cross_edge_update = self.cross_attn(
-            node_features,
-            rigids,
-            self_edge_features,
-            self_edge_index,
-            cross_edge_features,
-            cross_edge_index,
+        edge_edge_index = pygu.coalesce(edge_edge_index, sort_by_row=False)
+        edge_edge_index, _ = pygu.dropout_edge(edge_index=edge_edge_index, p=self.dropout_rate, training=self.training)
+        assert (src_edge_index[1, edge_edge_index[1]] == dst_edge_index[1, edge_edge_index[0]]).all()
+        edge3_node1_idx = src_edge_index[0, edge_edge_index[1]]
+        edge3_node2_idx = dst_edge_index[0, edge_edge_index[0]]
+
+        dst_edge_features = self.dst_layer_norm(dst_edge_features)
+        src_edge_features = self.src_layer_norm(src_edge_features)
+
+        node_left = self.node_left(node_features)
+        node_right = self.node_right(node_features)
+
+        edge3_node1 = node_left[edge3_node1_idx]
+        edge3_node2 = node_right[edge3_node2_idx]
+        edge3 = torch.einsum("bi,bj->bij", edge3_node1, edge3_node2)
+        edge3_gate = self.bias_gate(
+            edge3.view(-1, self.c_gate_s * self.c_gate_s)
         )
-        cross_edge_features = self.cross_ln(cross_edge_update + cross_edge_features)
 
-        return self_edge_features, cross_edge_features
+        edge3_node1_trans = node_trans[edge3_node1_idx]
+        edge3_node2_trans = node_trans[edge3_node2_idx]
+        edge3_dist = torch.linalg.vector_norm(
+            edge3_node1_trans - edge3_node2_trans + eps,
+            dim=-1
+        )
+
+        edge3_dist_features = _rbf(edge3_dist, D_count=self.num_rbf, device=edge3_dist.device)
+        edge3_dist_bias = self.dist_bias(edge3_dist_features)  # n x k x k x h
+        edge3_dist_bias = self.to_bias(torch.sigmoid(edge3_gate) * edge3_dist_bias)
+
+        edge_q = self.lin_q(src_edge_features)
+        edge_kv = self.lin_kv(dst_edge_features)
+        edge_k, edge_v = edge_kv.split([self.c_z, self.c_z], dim=-1)
+        edge_q = edge_q.view(-1, self.num_heads, self.c_z//self.num_heads)
+        edge_k = edge_k.view(-1, self.num_heads, self.c_z//self.num_heads)
+
+        edge_edge_q = edge_q[edge_edge_index[1]]
+        edge_edge_k = edge_k[edge_edge_index[0]]
+
+        attn = torch.einsum("bhi,bhi->bh", edge_edge_q, edge_edge_k)  # n_e_e x h
+        attn = 1 / np.sqrt(self.c_z) * attn
+        attn = attn + edge3_dist_bias
+        attn = pygu.softmax(
+            attn,
+            index=edge_edge_index[1],
+            dim=0
+        )
+
+        edge_v = edge_v.view(-1, self.num_heads, self.c_z//self.num_heads)  # n x h x c_z//h
+        edge_edge_v = edge_v[edge_edge_index[0]]
+        edge_update = pygu.scatter(
+            edge_edge_v * attn[..., None],
+            index=edge_edge_index[1],
+            dim=0,
+            dim_size=src_edge_features.shape[0]
+        )
+        edge_update = edge_update.view(-1, self.c_z)
+        if self.gate_out:
+            edge_update = edge_update * torch.sigmoid(self.out_gate(src_edge_features))
+        edge_update = self.lin_out(edge_update)
+
+        if not self.assume_sorted:
+            edge_update = pygu.scatter(
+                edge_update,
+                index=src_edge_map,
+                dim=0,
+                dim_size=src_num_edges
+            )
+
+        return edge_update

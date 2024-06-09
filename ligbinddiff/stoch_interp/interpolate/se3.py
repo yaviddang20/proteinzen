@@ -94,7 +94,8 @@ class SE3Interpolant:
                  use_batch_ot=False,
                  prealign_noise=True,
                  uniform_rot_noise=False,
-                 harmonic_trans_noise=False):
+                 harmonic_trans_noise=False,
+                 sfm=False):
         self._cfg = cfg
         self._rots_cfg = cfg.rots
         self._trans_cfg = cfg.trans
@@ -104,6 +105,7 @@ class SE3Interpolant:
         self.prealign_noise = prealign_noise
         self.uniform_rot_noise = uniform_rot_noise
         self.harmonic_trans_noise = harmonic_trans_noise
+        self.sfm = sfm
         print(self.igso3)
 
     @property
@@ -117,7 +119,7 @@ class SE3Interpolant:
         self._device = device
 
     def sample_t(self, num_batch):
-        t = torch.rand(num_batch, device=self._device)
+        t = torch.rand(num_batch, device=self._device).float()
         return t * (1 - 2 * self._cfg.min_t) + self._cfg.min_t
 
     def _corrupt_trans(self, trans_1, t, res_mask, batch):
@@ -159,8 +161,18 @@ class SE3Interpolant:
                 trans_0, _, _ = du.align_structures(trans_0, batch, trans_1)
         # trans_0 = self._batch_ot(trans_0, trans_1, res_mask)
         trans_t = (1 - t[..., None]) * trans_0 + t[..., None] * trans_1
+
+        if self.sfm:
+            z_t = self.trans_sfm_noise(trans_t, t)
+            trans_t = trans_t + z_t
+
         trans_t = _trans_diffuse_mask(trans_t, trans_1, res_mask)
         return trans_t * res_mask[..., None]
+
+    def trans_sfm_noise(self, trans_t, t, g=0.1):
+        batch_sig = g**2 * t * (1 - t)
+        z_t = torch.randn_like(trans_t) * torch.sqrt(batch_sig)[..., None]
+        return z_t
 
     def _trans_batch_ot(self, trans_0, trans_1, res_mask):
         num_batch, num_res = trans_0.shape[:2]
@@ -193,7 +205,7 @@ class SE3Interpolant:
             noisy_rotmats = _uniform_so3(num_res, self._device)
         else:
             noisy_rotmats = self.igso3.sample(torch.tensor([1.5]), num_res).to(self._device)
-            noisy_rotmats = noisy_rotmats.squeeze(0)
+            noisy_rotmats = noisy_rotmats.squeeze(0).float()
         if self.use_batch_ot:
             # this requires samples to be length batched
             sample_len = int((batch == 0).sum().item())
@@ -211,7 +223,22 @@ class SE3Interpolant:
         rotmats_t = rotmats_t * res_mask[..., None, None] + identity[None] * (
             ~res_mask[..., None, None]
         )
+
+        if self.sfm:
+            g = 0.1
+            batch_sig = g**2 * t * (1 - t)
+            z_rotmats = self.igso3.sample(batch_sig.sqrt(), 1).to(self._device)
+            z_rotmats = z_rotmats.squeeze(1)
+            rotmats_t = torch.einsum("...ij,...jk->...ik", rotmats_t, z_rotmats)
+
         return _rots_diffuse_mask(rotmats_t, rotmats_1, res_mask)
+
+    def rot_sfm_noise(self, num_samples, dt, device, g=0.1):
+        z = torch.randn(
+            (num_samples, 3), device=device
+        )
+        dB_skew_sym = so3_utils.rotvec_to_rotmat(g * torch.sqrt(dt).view(1,1).to(device) * z)
+        return dB_skew_sym
 
     def _rot_batch_ot(self, rot_0, rot_1, res_mask):
         num_batch, num_res = rot_0.shape[:2]

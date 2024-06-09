@@ -11,6 +11,7 @@
 #$ -l compute_cap=61,gpu_mem=40G
 
 export CUDA_VISIBLE_DEVICES=$SGE_GPU
+export GEOMSTATS_BACKEND=pytorch
 echo $SGE_GPU
 echo $CUDA_VISIBLE_DEVICES
 

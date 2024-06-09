@@ -7,7 +7,7 @@ from ligbinddiff.model.modules.common import GaussianRandomFourierBasis
 from ligbinddiff.model.modules.layers.edge.sitewise import EdgeTransition
 from ligbinddiff.model.modules.layers.node.attention import GraphInvariantPointAttention
 from ligbinddiff.model.modules.layers.lrange.vn import VirtualNodeAttnUpdate, VirtualNodeMPNNUpdate
-from ligbinddiff.model.modules.layers.triangle.attention import SparseTriangleAttention, TriangleCrossAttention, TriangleCrossAttention2, TwoScaleTriangleCrossAttention, ThreeScaleTriangleCrossAttention
+from ligbinddiff.model.modules.layers.triangle.attention import TriangleSelfAttention, TriangleCrossAttention, SparseTriangleSelfAttention, SparseTriangleCrossAttention
 from ligbinddiff.model.modules.layers.triangle.mult import FusedSparseTriangleMultiplicativeTransition
 from ligbinddiff.model.modules.layers.node.mpnn import IPMP
 
@@ -16,6 +16,7 @@ from ligbinddiff.utils.framediff.all_atom import compute_backbone, adjust_oxygen
 
 from ligbinddiff.data.datasets.featurize.common import _node_positional_embeddings
 from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddings, _rbf
+from ligbinddiff.data.datasets.featurize.sidechain import _dihedrals, _ideal_virtual_Cb
 
 from ligbinddiff.model.modules.openfold.frames import BackboneUpdate, StructureModuleTransition, Linear
 
@@ -28,7 +29,7 @@ from .framediff import TorsionAngles
 from ligbinddiff.model.modules.layers.lrange.anchor import ProjectivePoolUpdate, AnchorUpdate
 from ligbinddiff.model.modules.layers.interres import OneParamPairwiseEquilibrate
 
-from torch_geometric.utils import coalesce, sort_edge_index
+from torch_geometric.utils import coalesce, sort_edge_index, scatter
 from torch_cluster import knn, knn_graph
 
 from torch.profiler import profile, record_function, ProfilerActivity
@@ -491,6 +492,106 @@ class GraphIpaFrameDenoiser(nn.Module):
         return ret
 
 
+class AnchorNodeLayer(nn.Module):
+    def __init__(self,
+                 c_s,
+                 c_z,
+                 c_hidden,
+                 num_heads,
+                 num_qk_pts,
+                 num_v_pts):
+        super().__init__()
+        self.anchors_ipa = GraphInvariantPointAttention(
+            c_s=c_s,
+            c_z=c_z,
+            c_hidden=c_hidden,
+            no_heads=num_heads,
+            no_qk_points=num_qk_pts,
+            no_v_points=num_v_pts,
+        )
+        self.anchors_ln = nn.LayerNorm(c_s)
+
+        self.anchor_edge_transition = EdgeTransition(
+            node_embed_size=c_s,
+            edge_embed_in=c_z,
+            edge_embed_out=c_z
+        )
+
+    def forward(self,
+                node_features,
+                rigids,
+                anchor_edge_features,
+                anchor_edge_index,
+                res_mask):
+
+        node_update = self.anchor_ipa(
+            s=node_features,
+            z=anchor_edge_features,
+            edge_index=anchor_edge_index,
+            r=rigids,
+            mask=res_mask.float()
+        )
+        node_update = node_update * res_mask[..., None]
+        node_features = self.anchor_ln(node_features + node_update)
+
+        a2a_edge_features = self.anchor_edge_transition(node_features, anchor_edge_features, anchor_edge_index)
+
+        return node_features, anchor_edge_features
+
+
+def gen_anchor_graphs(num_nodes, nodes_per_anchor, device):
+    num_anchors = []
+    anchor_load = []
+    anchor_node_idx = []
+    num_nodes = [int(i) for i in num_nodes]
+
+    offset = 0
+    for n in num_nodes:
+        num_full_anchors = n // nodes_per_anchor
+        num_last_anchor = n % nodes_per_anchor
+        anchor_load += [nodes_per_anchor] * num_full_anchors
+        if num_last_anchor > 0:
+            anchor_load.append(num_last_anchor)
+        anchor_node_idx += [
+            nodes_per_anchor * i + nodes_per_anchor//2 + offset
+            for i in range(num_full_anchors)
+        ]
+        if num_last_anchor > 0:
+            anchor_node_idx.append(num_full_anchors * nodes_per_anchor + num_last_anchor//2 + offset)
+        offset += n
+
+        if num_last_anchor > 0:
+            num_anchors.append(num_full_anchors + 1)
+        else:
+            num_anchors.append(num_full_anchors)
+
+    anchor_node_idx = torch.as_tensor(anchor_node_idx)
+    anchor_load = torch.as_tensor(anchor_load)
+
+    node_idx = torch.arange(sum(num_nodes))
+    anchor_idx = torch.repeat_interleave(anchor_load)
+    anchor_idx = anchor_node_idx[anchor_idx]
+
+    n2a_edge_index = torch.stack([node_idx, anchor_idx], dim=0)
+
+    offset = 0
+    a2a_edge_index = []
+    num_anchors = [int(n) for n in num_anchors]
+    for n in num_anchors:
+        src = torch.repeat_interleave(
+            torch.ones(n).long() * n
+        )
+        dst = torch.arange(n).repeat(n)
+        a2a_edge_index.append(
+            torch.stack([dst, src]) + offset
+        )
+        offset += n
+    a2a_edge_index = torch.cat(a2a_edge_index, dim=-1)
+    a2a_edge_index = anchor_node_idx[a2a_edge_index]
+
+    return n2a_edge_index.to(device), a2a_edge_index.to(device)
+
+
 class GraphIpaFrameDenoisingLayer2(nn.Module):
     """ Denoising layer on sidechain densities """
     def __init__(self,
@@ -502,8 +603,10 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
                  num_v_pts,
                  self_conditioning=False,
                  triangle_attention=False,
+                 triangle_in_attention=False,
                  triangle_mult=False,
                  triangle_transfer=False,
+                 triangle_in_transfer=False,
                  triangle_num_heads=4,
                  vn_mode=None,
                  embed_seq_edge=False,
@@ -517,9 +620,15 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
                  num_rbf=64,
                  knn_k=20,
                  lrange_k=40,
+                 triangle_transfer_k=None,
+                 triangle_attn_k=None,
                  use_old_edges=False,
                  fuse_new_edges_to_old_edges=True,
                  use_compile=False,
+                 extra_node_transitions=False,
+                 extra_seq_ipa=False,
+                 use_anchors=False,
+                 triangle_dropout=0
                  ):
         """
         Args
@@ -531,21 +640,33 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
         self.last = last
 
         if triangle_attention:
-            # self.triangle_attention = SparseTriangleAttention(
-            #     c_s=c_s,
-            #     c_z=c_z,
-            #     num_heads=num_heads,
-            #     num_rbf=num_rbf,
-            # )
-            self.triangle_attention = TriangleCrossAttention2(
-                c_s,
-                c_z,
-                triangle_num_heads,
-                num_rbf
+            self.triangle_attention = SparseTriangleSelfAttention(
+                c_s=c_s,
+                c_z=c_z,
+                num_heads=triangle_num_heads,
+                num_rbf=num_rbf,
+                dropout=triangle_dropout
             )
             self.edge_ln = nn.LayerNorm(c_z)
         else:
             self.triangle_attention = None
+
+        if triangle_in_attention:
+            self.triangle_in_attention = SparseTriangleSelfAttention(
+                c_s=c_s,
+                c_z=c_z,
+                num_heads=triangle_num_heads,
+                num_rbf=num_rbf,
+                dropout=triangle_dropout
+            )
+            # self.triangle_attention = TriangleCrossAttention2(
+            #     c_s,
+            #     c_z,
+            #     triangle_num_heads,
+            #     num_rbf
+            # )
+        else:
+            self.triangle_in_attention = None
 
         if triangle_mult:
             self.triangle_mult = FusedSparseTriangleMultiplicativeTransition(
@@ -558,19 +679,25 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
             self.triangle_mult = None
 
         if triangle_transfer:
-            # self.triangle_transfer = ThreeScaleTriangleCrossAttention(
-            #     c_s,
-            #     c_z,
-            #     num_heads
-            # )
-            self.triangle_transfer = TriangleCrossAttention2(
+            self.triangle_transfer = SparseTriangleCrossAttention(
                 c_s,
                 c_z,
-                triangle_num_heads
+                num_heads=triangle_num_heads,
+                dropout=triangle_dropout
             )
             self.transfer_edge_ln = nn.LayerNorm(c_z)
         else:
             self.triangle_transfer = None
+
+        if triangle_in_transfer:
+            self.triangle_in_transfer = SparseTriangleCrossAttention(
+                c_s,
+                c_z,
+                num_heads=triangle_num_heads,
+                dropout=triangle_dropout
+            )
+        else:
+            self.triangle_in_transfer = None
 
 
         self.attn_spatial = GraphInvariantPointAttention(
@@ -582,8 +709,14 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
             no_v_points=num_v_pts,
         )
         self.ln_s1 = nn.LayerNorm(c_s)
+        if extra_node_transitions:
+            self.spatial_node_transition = StructureModuleTransition(c_s)
+        else:
+            self.spatial_node_transition = None
+
 
         self.use_seq_edge = use_seq_edge
+        self.extra_seq_ipa = extra_seq_ipa
         if use_seq_edge:
             if add_nodes_to_edge:
                 self.seq_edge_update = nn.Sequential(
@@ -618,6 +751,67 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
             )
             self.ln_s2 = nn.LayerNorm(c_s)
 
+            if extra_node_transitions:
+                self.seq_node_transition = StructureModuleTransition(c_s)
+            else:
+                self.seq_node_transition = None
+
+            if extra_seq_ipa:
+                self.extra_attn_seq = GraphInvariantPointAttention(
+                    c_s=c_s,
+                    c_z=c_z,
+                    c_hidden=c_hidden,
+                    no_heads=ipa_num_heads,
+                    no_qk_points=num_qk_pts,
+                    no_v_points=num_v_pts,
+                )
+                self.extra_ln_s2 = nn.LayerNorm(c_s)
+                if extra_node_transitions:
+                    self.extra_seq_node_transition = StructureModuleTransition(c_s)
+                else:
+                    self.extra_seq_node_transition = None
+            else:
+                self.extra_attn_seq = None
+                self.extra_ln_s2 = None
+                self.extra_seq_node_transition = None
+
+        self.use_anchors = use_anchors
+        if use_anchors:
+            if add_nodes_to_edge:
+                self.anchor_edge_update = nn.Sequential(
+                    nn.Linear(c_s*2 + c_z + 4 + self_conditioning * (c_z//2 + 4), c_z),
+                    nn.ReLU(),
+                    nn.Linear(c_z, c_z),
+                    nn.ReLU(),
+                    nn.Linear(c_z, c_z),
+                )
+            else:
+                self.anchor_edge_update = nn.Sequential(
+                    nn.Linear(c_z + 4 + self_conditioning * (c_z//2 + 4), c_z),
+                    nn.ReLU(),
+                    nn.Linear(c_z, c_z),
+                    nn.ReLU(),
+                    nn.Linear(c_z, c_z),
+                )
+            self.anchor_edge_ln = nn.LayerNorm(c_z)
+
+            self.attn_anchor = GraphInvariantPointAttention(
+                c_s=c_s,
+                c_z=c_z,
+                c_hidden=c_hidden,
+                no_heads=ipa_num_heads,
+                no_qk_points=num_qk_pts,
+                no_v_points=num_v_pts,
+            )
+            self.anchor_ln = nn.LayerNorm(c_s)
+
+        else:
+            self.anchor_edge_update = None
+            self.anchor_update = None
+            self.anchor_edge_ln = None
+            self.anchor_ln = None
+
+
         self.use_transformer = use_transformer
         if use_transformer:
             tfmr_layer = torch.nn.TransformerEncoderLayer(
@@ -625,11 +819,11 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
                 nhead=4,
                 dim_feedforward=c_s,
                 batch_first=True,
-                dropout=0.0,
+                dropout=0.2,
                 norm_first=False
             )
             self.seq_tfmr = torch.nn.TransformerEncoder(
-                tfmr_layer, 2, enable_nested_tensor=True)
+                tfmr_layer, 4, enable_nested_tensor=True)
             self.post_tfmr = Linear(
                 c_s, c_s, init="final")
 
@@ -695,6 +889,18 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
                     if mod_obj is not None:
                         setattr(self, mod, torch.compile(mod_obj))
 
+        self.lrange_k = lrange_k
+        self.knn_k = knn_k
+        if triangle_transfer_k is None:
+            self.triangle_transfer_k = lrange_k + knn_k
+        else:
+            self.triangle_transfer_k = triangle_transfer_k
+
+        if triangle_attn_k is None:
+            self.triangle_attn_k = lrange_k + knn_k
+        else:
+            self.triangle_attn_k = triangle_attn_k
+
     def forward(
             self,
             node_features,
@@ -709,6 +915,9 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
             new_seq_edge_inputs,
             seq_edge_features,
             seq_edge_index,
+            new_anchor_edge_inputs,
+            anchor_edge_features,
+            anchor_edge_index,
             res_data,
     ):
         if self.use_old_edges and not self.fuse_new_edges_to_old_edges and not self.first:
@@ -729,7 +938,7 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
                 if self.first:
                     old_edge_features = edge_features
                     old_edge_index = edge_index
-                sorted_old_edge_index, sorted_old_edge_features  = sort_edge_index(
+                sorted_old_edge_index, sorted_old_edge_features = sort_edge_index(
                     old_edge_index,
                     old_edge_features,
                     sort_by_row=False
@@ -768,53 +977,129 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
                 old_edge_features = edge_features
                 old_edge_index = edge_index
 
-            old_dst = old_edge_index[0]
-            old_src = old_edge_index[1]
-            rigid_trans = rigids.get_trans()
-            old_X_dst = rigid_trans[old_dst]
-            new_dst = edge_index[0]
-            new_src = edge_index[1]
-            new_X_dst = rigid_trans[new_dst]
-            transfer_index = knn(old_X_dst, new_X_dst, k=10, batch_x=old_src, batch_y=new_src)
-            transfer_index = torch.stack([transfer_index[1], transfer_index[0]], dim=0)  # "source_to_target"
-            transfer_edge_features = old_edge_features[transfer_index[0]]
-            transfer_edge_index = old_edge_index[:, transfer_index[0]]
+            # # the min edge stuff is to safeguard against issues with "bad edges"
+            # min_num_edges = scatter(
+            #     torch.ones_like(old_edge_index[1]),
+            #     old_edge_index[1],
+            #     dim=0,
+            #     dim_size=old_edge_index.max()+1
+            # )
+            # min_num_edges = min_num_edges[min_num_edges != 0]
+            # transfer_k = min(min_num_edges.min().item(), self.triangle_transfer_k)
+            # print("triangle transfer k", transfer_k)
 
-            # this isn't resistant to bugs but it should be much faster
-            num_edges = edge_features.shape[0]
-            knn_transfer_edge_features = transfer_edge_features.view(num_edges, 10, -1)
-            knn_transfer_edge_index = transfer_edge_index.view(2, num_edges, 10)
+            # old_dst = old_edge_index[0]
+            # old_src = old_edge_index[1]
+            # rigid_trans = rigids.get_trans()
+            # old_X_dst = rigid_trans[old_dst]
+            # new_dst = edge_index[0]
+            # new_src = edge_index[1]
+            # new_X_dst = rigid_trans[new_dst]
+            # transfer_index = knn(old_X_dst, new_X_dst, k=transfer_k, batch_x=old_src, batch_y=new_src)
+            # transfer_index = torch.stack([transfer_index[1], transfer_index[0]], dim=0)  # "source_to_target"
+            # transfer_edge_features = old_edge_features[transfer_index[0]]
+            # transfer_edge_index = old_edge_index[:, transfer_index[0]]
 
-            edge_update = self.triangle_transfer(
+            # # this isn't resistant to bugs but it should be much faster
+            # num_edges = edge_features.shape[0]
+            # knn_transfer_edge_features = transfer_edge_features.view(num_edges, transfer_k, -1)
+            # knn_transfer_edge_index = transfer_edge_index.view(2, num_edges, transfer_k)
+
+            # edge_update = torch.utils.checkpoint.checkpoint(
+            #     self.triangle_transfer,
+            #     node_features,
+            #     rigids,
+            #     knn_transfer_edge_features,
+            #     knn_transfer_edge_index,
+            #     edge_features,
+            #     edge_index,
+            #     use_reentrant=False)
+            edge_update = torch.utils.checkpoint.checkpoint(
+                self.triangle_transfer,
                 node_features,
                 rigids,
-                knn_transfer_edge_features,
-                knn_transfer_edge_index,
+                old_edge_features,
+                old_edge_index,
                 edge_features,
-                edge_index)
+                edge_index,
+                k=self.triangle_transfer_k,
+                use_reentrant=False)
+            if self.triangle_in_transfer is not None:
+                flip_old_edge_index = old_edge_index.flip(0)
+                flip_edge_index = edge_index.flip(0)
+                edge_in_update = torch.utils.checkpoint.checkpoint(
+                    self.triangle_in_transfer,
+                    node_features,
+                    rigids,
+                    old_edge_features,
+                    flip_old_edge_index,
+                    edge_features,
+                    flip_edge_index,
+                    k=self.triangle_transfer_k,
+                    use_reentrant=False)
+            else:
+                edge_in_update = 0
             edge_features = self.transfer_edge_ln(edge_features + edge_update)
 
         if self.triangle_attention is not None:
-            dst = edge_index[0]
-            src = edge_index[1]
-            rigid_trans = rigids.get_trans()
-            X_dst = rigid_trans[dst]
-            transfer_index = knn_graph(X_dst, k=10, batch=src)
-            transfer_edge_features = edge_features[transfer_index[0]]
-            transfer_edge_index = edge_index[:, transfer_index[0]]
-            # this isn't resistant to bugs but it should be much faster
-            num_edges = edge_features.shape[0]
-            knn_transfer_edge_features = transfer_edge_features.view(num_edges, 10, -1)
-            knn_transfer_edge_index = transfer_edge_index.view(2, num_edges, 10)
+            #if self.triangle_attn_k < self.lrange_k + self.knn_k:
+            #    # the min edge stuff is to safeguard against issues with "bad edges"
+            #    min_num_edges = scatter(
+            #        torch.ones_like(edge_index[1]),
+            #        edge_index[1],
+            #        dim=0,
+            #        dim_size=edge_index.max()+1
+            #    )
+            #    min_num_edges = min_num_edges[min_num_edges != 0]
+            #    transfer_k = min(min_num_edges.min().item(), self.triangle_attn_k) - 1
+            #    print("triangle_attn_k", transfer_k)
 
-            edge_update = self.triangle_attention(
+            #    dst = edge_index[0]
+            #    src = edge_index[1]
+            #    rigid_trans = rigids.get_trans()
+            #    X_dst = rigid_trans[dst]
+            #    # we subtract one cuz of self edge
+            #    transfer_index = knn_graph(X_dst, k=transfer_k, batch=src)
+            #    transfer_edge_features = edge_features[transfer_index[0]]
+            #    transfer_edge_index = edge_index[:, transfer_index[0]]
+            #    # this isn't resistant to bugs but it should be much faster
+            #    num_edges = edge_features.shape[0]
+            #    knn_transfer_edge_features = transfer_edge_features.view(num_edges, transfer_k, -1)
+            #    knn_transfer_edge_index = transfer_edge_index.view(2, num_edges, transfer_k)
+
+            #    edge_update = torch.utils.checkpoint.checkpoint(
+            #        self.triangle_attention,
+            #        node_features,
+            #        rigids,
+            #        knn_transfer_edge_features,
+            #        knn_transfer_edge_index,
+            #        edge_features,
+            #        edge_index,
+            #        use_reentrant=False)
+            #else:
+            edge_update = torch.utils.checkpoint.checkpoint(
+                self.triangle_attention,
                 node_features,
                 rigids,
-                knn_transfer_edge_features,
-                knn_transfer_edge_index,
                 edge_features,
-                edge_index)
-            edge_features = self.edge_ln(edge_features + edge_update)
+                edge_index,
+                k=self.triangle_attn_k-1,
+                use_reentrant=False)
+
+            if self.triangle_in_attention is not None:
+                flip_edge_index = edge_index.flip(0)
+                edge_in_update = torch.utils.checkpoint.checkpoint(
+                    self.triangle_in_attention,
+                    node_features,
+                    rigids,
+                    edge_features,
+                    flip_edge_index,
+                    k=self.triangle_attn_k-1,
+                    use_reentrant=False)
+            else:
+                edge_in_update = 0
+            edge_features = self.edge_ln(edge_features + edge_update + edge_in_update)
+
 
         if self.triangle_mult is not None:
             edge_features = torch.utils.checkpoint.checkpoint(
@@ -838,6 +1123,36 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
         )
         node_s_update = node_s_update * (~res_mask)[..., None]
         node_features = self.ln_s1(node_features + node_s_update)
+        if self.spatial_node_transition is not None:
+            node_features = self.spatial_node_transition(node_features)
+
+        if self.use_anchors:
+            if self.add_nodes_to_edge:
+                anchor_edge_inputs = torch.cat([
+                    new_anchor_edge_inputs,
+                    node_features[anchor_edge_index[0]],
+                    node_features[anchor_edge_index[1]]
+                ], dim=-1)
+                anchor_edge_features = self.anchor_edge_ln(
+                    anchor_edge_features +
+                    self.anchor_edge_update(anchor_edge_inputs)
+                )
+            else:
+                anchor_edge_features = self.anchor_edge_ln(
+                    anchor_edge_features +
+                    self.anchor_edge_update(anchor_edge_inputs)
+                )
+
+            node_s_update = self.attn_anchor(
+                s=node_features,
+                z=anchor_edge_features,
+                edge_index=anchor_edge_index,
+                r=rigids,
+                mask=(~res_mask).float()
+            )
+            node_s_update = node_s_update * (~res_mask)[..., None]
+            node_features = self.anchor_ln(node_features + node_s_update)
+
 
         if self.use_seq_edge:
             node_s_update = self.attn_seq(
@@ -849,6 +1164,22 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
             )
             node_s_update = node_s_update * (~res_mask)[..., None]
             node_features = self.ln_s2(node_features + node_s_update)
+            if self.seq_node_transition is not None:
+                node_features = self.seq_node_transition(node_features)
+
+            if self.extra_seq_ipa:
+                node_s_update = self.extra_attn_seq(
+                    s=node_features,
+                    z=seq_edge_features,
+                    edge_index=seq_edge_index,
+                    r=rigids,
+                    mask=(~res_mask).float()
+                )
+                node_s_update = node_s_update * (~res_mask)[..., None]
+                node_features = self.extra_ln_s2(node_features + node_s_update)
+                if self.extra_seq_node_transition is not None:
+                    node_features = self.extra_seq_node_transition(node_features)
+
 
         if self.use_transformer:
             data_lens = get_data_lens(res_data)
@@ -900,7 +1231,7 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
                 edge_index
             )
 
-        return node_features, rigids, vn_features, edge_features, seq_edge_features
+        return node_features, rigids, vn_features, edge_features, seq_edge_features, anchor_edge_features
         # return node_features, rigids, seq_edge_features
 
 
@@ -954,6 +1285,147 @@ class IPMPRefineLayer(nn.Module):
         return node_features, rigids, edge_features
 
 
+class PairwiseAtomicEmbedding(nn.Module):
+    def __init__(self,
+                 num_rbf=16,
+                 num_pos_embed=16,
+                 scale=1,
+                 D_min=0.0,
+                 D_max=20.0):
+        super().__init__()
+        self.num_rbf = num_rbf
+        self.num_pos_embed = num_pos_embed
+
+        self.scale = scale
+        self.D_min = D_min
+        self.D_max = D_max
+
+        self.out_dim = (
+            + (5 * 5) * num_rbf     # bb x bb dist
+            + num_pos_embed         # rel pos embed
+        )
+
+    def forward(self, bb, edge_index, eps=1e-8):
+        dst = edge_index[0]
+        src = edge_index[1]
+        num_edges = edge_index.shape[-1]
+        edge_features = []
+
+        virtual_Cb = _ideal_virtual_Cb(bb)
+        bb = torch.cat([bb, virtual_Cb[..., None, :]], dim=-2)
+
+        ## bb edge distances
+        edge_bb_src = bb[src]
+        edge_bb_dst = bb[dst]
+        edge_bb_dists = torch.linalg.vector_norm(
+            edge_bb_src[..., None, :] - edge_bb_dst[..., None, :, :] + eps,
+            dim=-1)
+        edge_bb_dists = edge_bb_dists.view(edge_index.shape[1], -1, 1)
+        edge_rbf = _rbf(edge_bb_dists, D_min=self.D_min, D_max=self.D_max, D_count=self.num_rbf, device=edge_index.device)
+        edge_rbf = edge_rbf.view(num_edges, -1)
+        edge_features.append(edge_rbf)  # 256
+
+        ## edge rel pos embedding
+        edge_dist_rel_pos = _edge_positional_embeddings(edge_index, num_embeddings=self.num_pos_embed, device=edge_index.device)
+        edge_features.append(edge_dist_rel_pos)  # 16
+
+        return torch.cat(edge_features, dim=-1).float()
+
+
+class IPMPSelfConditioningEncoder(nn.Module):
+    def __init__(self,
+                 c_s=128,
+                 c_z=128,
+                 c_hidden=128,
+                 c_s_in=6,
+                 num_rbf=16,
+                 num_pos_embed=16,
+                 num_layers=4,
+                 k=30,
+                 dropout=0.0):
+        super().__init__()
+        self.c_s = c_s
+        self.c_z = c_z
+        self.c_hidden = c_hidden
+        self.num_rbf = num_rbf
+        self.num_pos_embed = num_pos_embed
+
+        self.embed_node = nn.Sequential(
+            nn.Linear(c_s_in, 2*c_s),
+            nn.ReLU(),
+            nn.Linear(2*c_s, 2*c_s),
+            nn.ReLU(),
+            nn.Linear(2*c_s, c_s),
+            nn.LayerNorm(c_s),
+        )
+        self.init_edge_embed = PairwiseAtomicEmbedding(
+            num_rbf=self.num_rbf,
+            num_pos_embed=self.num_pos_embed,
+        )
+        self.embed_edge = nn.Sequential(
+            nn.Linear(self.init_edge_embed.out_dim, 2*c_z),
+            nn.ReLU(),
+            nn.Linear(2*c_z, 2*c_z),
+            nn.ReLU(),
+            nn.Linear(2*c_z, c_z),
+            nn.LayerNorm(c_z),
+        )
+        self.update = nn.ModuleList([
+            IPMP(
+                c_s=c_s,
+                c_z=c_z,
+                c_hidden=c_hidden,
+                dropout=dropout
+            )
+            for _ in range(num_layers)
+        ])
+
+        self.k = k
+
+    @torch.no_grad()
+    def _prep_features(self, bb, res_mask, batch):
+        # node features
+        X_ca = bb[..., 1, :]
+        dihedrals = _dihedrals(bb)
+        node_features = dihedrals
+
+        # edge graph
+        masked_X_ca = X_ca.clone()
+        masked_X_ca[~res_mask] = torch.inf
+        edge_index = knn_graph(masked_X_ca, self.k, batch)
+
+        # # edge features
+        # virtual_Cb = _ideal_virtual_Cb(bb)
+        # bb = torch.cat([bb, virtual_Cb[..., None, :]], dim=-2)
+        src = edge_index[1]
+        dst = edge_index[0]
+
+        edge_features = self.init_edge_embed(bb, edge_index)
+        # technically this shouldn't be necessary but just to be safe
+        edge_mask = res_mask[src] & res_mask[dst]
+        edge_features = edge_features * edge_mask[..., None]
+        return node_features, edge_features, edge_index
+
+
+    def forward(self, bb, rigids, res_mask, batch, eps=1e-8):
+        ## prep features
+        node_features, edge_features, edge_index = self._prep_features(bb, res_mask, batch)
+
+        node_features = self.embed_node(node_features)
+        edge_features = self.embed_edge(edge_features)
+
+        for layer in self.update:
+            node_features, edge_features = layer(
+                node_features,
+                edge_features,
+                edge_index,
+                rigids,
+                res_mask.float()
+            )
+
+        return node_features
+
+
 class DynamicGraphIpaFrameDenoiser(nn.Module):
     """ Denoising model on sidechain densities """
     def __init__(self,
@@ -961,13 +1433,15 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  c_z=128,
                  c_hidden=256,
                  num_heads=8,
-                 triangle_num_heads=8,
+                 triangle_num_heads=4,
                  num_qk_pts=8,
                  num_v_pts=12,
                  h_time=64,
                  n_layers=4,
                  knn_k=20,
                  lrange_k=40,
+                 triangle_transfer_k=None,
+                 triangle_attn_k=None,
                  lrange_logn_scale=0,
                  lrange_logn_offset=0,
                  num_vn=4,
@@ -977,7 +1451,11 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  use_anchors=False,
                  interres_equilibrate=False,
                  use_triangle_attn=False,
+                 use_triangle_in_attn=False,
                  use_triangle_mult=False,
+                 use_triangle_transfer=False,
+                 use_triangle_in_transfer=False,
+                 triangle_dropout=0,
                  use_self_edge=False,
                  update_seq_edge=False,
                  use_ipmp_seq_edge=False,
@@ -989,13 +1467,15 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  rbf_encode_sc_trans=False,
                  use_transformer=False,
                  add_nodes_to_edge=True,
-                 use_triangle_transfer=False,
                  use_edge_transition=False,
                  preserve_edges=False,
                  fuse_new_edges_to_old=True,
                  impute_oxy=False,
                  use_plddt=False,
-                 num_plddt_bins=50):
+                 num_plddt_bins=50,
+                 ipmp_self_condition=False,
+                 extra_node_transitions=False,
+                 extra_seq_ipa=False):
         super().__init__()
 
         self.c_s = c_s
@@ -1016,6 +1496,7 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         self.rbf_encode_sc_trans = rbf_encode_sc_trans
         self.use_plddt = use_plddt
         self.preserve_edges = preserve_edges
+        self.ipmp_self_condition = ipmp_self_condition
 
         self.h_time = h_time
         self.time_rbf = GaussianRandomFourierBasis(n_basis=h_time//2)
@@ -1023,6 +1504,9 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         # node_embedding + time_embedding + fixed_mask + self_conditioning
         if rbf_encode_sc_trans:
             self.node_in = c_s + h_time + 1 + self_conditioning * (c_s + 7 + self.num_rbf + use_plddt * num_plddt_bins)
+        elif ipmp_self_condition:
+            self.self_condition_embed = IPMPSelfConditioningEncoder()
+            self.node_in = c_s + h_time + 1 + self_conditioning * (c_s + 7 + self.self_condition_embed.c_s)
         else:
             self.node_in = c_s + h_time + 1 + self_conditioning * (c_s + 7 + use_plddt * num_plddt_bins)
 
@@ -1072,8 +1556,11 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  use_ipmp_seq_edge=use_ipmp_seq_edge,
                  knn_k=knn_k,
                  lrange_k=lrange_k,
+                 triangle_transfer_k=triangle_transfer_k,
+                 triangle_attn_k=triangle_attn_k,
                  num_rbf=self.num_rbf,
                  triangle_attention=use_triangle_attn,
+                 triangle_in_attention=use_triangle_in_attn,
                  triangle_mult=use_triangle_mult,
                  triangle_num_heads=triangle_num_heads,
                  vn_mode=vn_mode,
@@ -1081,9 +1568,13 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  add_nodes_to_edge=add_nodes_to_edge,
                  first=(i==0),
                  triangle_transfer=use_triangle_transfer,
+                 triangle_in_transfer=use_triangle_in_transfer,
                  transition_edges=use_edge_transition,
                  use_old_edges=preserve_edges,
-                 fuse_new_edges_to_old_edges=fuse_new_edges_to_old
+                 fuse_new_edges_to_old_edges=fuse_new_edges_to_old,
+                 extra_node_transitions=extra_node_transitions,
+                 extra_seq_ipa=extra_seq_ipa,
+                 use_anchors=use_anchors
             )
             for i in range(n_layers)
         ])
@@ -1317,7 +1808,20 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                     [node_input, self_cond_nodes, quat_rel, trans_unit_vec, trans_rbf],
                     dim=-1
                 )
+            elif self.ipmp_self_condition:
+                t7_rel = torch.cat([quat_rel, trans_rel], dim=-1)
 
+                sc_bb = self_condition['denoised_bb'][:, :4]
+                sc_embed_node_features = self.self_condition_embed(
+                    sc_bb,
+                    self_cond_rigids,
+                    res_mask,
+                    batch)
+
+                node_input = torch.cat(
+                    [node_input, self_cond_nodes, t7_rel, sc_embed_node_features],
+                    dim=-1
+                )
             else:
                 t7_rel = torch.cat([quat_rel, trans_rel], dim=-1)
 
@@ -1335,7 +1839,9 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                 (0, self.node_in - node_input.shape[-1])
             )
 
-        return node_input, vn_features, seq_local_edge_index
+        _, anchor_edge_index = gen_anchor_graphs(res_data['data_lens'], nodes_per_anchor=10, device=node_input.device)
+
+        return node_input, vn_features, seq_local_edge_index, anchor_edge_index
 
 
     def forward(self, data, self_condition=None):
@@ -1350,13 +1856,15 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         (
             node_input,
             vn_features,
-            seq_edge_index
+            seq_edge_index,
+            anchor_edge_index
         ) = self._gen_inital_features(data, self_condition=self_condition)
 
         # embed features
         node_features = self.embed_node(node_input)
         node_features = node_features * res_mask[..., None]
         seq_edge_features = torch.zeros((seq_edge_index.shape[-1], self.c_z), device=node_features.device)
+        anchor_edge_features = torch.zeros((anchor_edge_index.shape[-1], self.c_z), device=node_features.device)
 
         ## denoising
         rigids_t = rigids_t.scale_translation(0.1)
@@ -1377,8 +1885,12 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                 rigids.scale_translation(10),
                 seq_edge_index,
                 self_condition)
+            new_anchor_edge_inputs = self._gen_seq_edge_features(
+                rigids.scale_translation(10),
+                anchor_edge_index,
+                self_condition)
 
-            node_features, rigids, vn_features, edge_features, seq_edge_features = layer(
+            node_features, rigids, vn_features, edge_features, seq_edge_features, anchor_edge_features = layer(
                 node_features,
                 rigids,
                 vn_features,
@@ -1391,6 +1903,9 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                 new_seq_edge_inputs,
                 seq_edge_features,
                 seq_edge_index,
+                new_anchor_edge_inputs,
+                anchor_edge_features,
+                anchor_edge_index,
                 res_data,
             )
             old_edge_features = edge_features#[lrange_edge_select]

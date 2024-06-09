@@ -260,7 +260,7 @@ if __name__ == '__main__':
         if args.debug:
             print("debug")
             cfg['datamodule']['sample_lengths'] = {
-                60: 1
+                60: 5
                 # 60: 5,
                 # 70: 5,
                 # 80: 5,

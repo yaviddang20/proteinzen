@@ -198,11 +198,12 @@ def sample_all_edges(
 
 
 
-def sparse_to_knn_graph(edge_features, edge_index):
+def sparse_to_knn_graph(edge_features, edge_index, num_nodes=None):
     src = edge_index[1]
     assert (torch.sort(src)[0] == src).all(), "edge index must have monotonic increasing node index"
 
-    num_nodes = int(edge_index.max() + 1)
+    if num_nodes is None:
+        num_nodes = int(edge_index.max() + 1)
     num_edges_per_node = scatter(
         torch.ones_like(edge_index[1]),
         edge_index[1],
@@ -210,21 +211,38 @@ def sparse_to_knn_graph(edge_features, edge_index):
     )
     # max_k = int(num_edges_per_node.max())
 
-    edges_per_node = edge_features.split(num_edges_per_node.tolist(), dim=0)
-    knn_edge_features = pad_sequence(
-        edges_per_node,
-        batch_first=True,
-        padding_value=0.
-    )
-    edge_index_per_node = edge_index[0].split(num_edges_per_node.tolist(), dim=0)
-    knn_edge_index = pad_sequence(
-        edge_index_per_node,
-        batch_first=True,
-        padding_value=-1
-    )
+    if (num_edges_per_node == num_edges_per_node[0]).all():
+        # we can just reshape which saves us a lot of time and memory
+        num_edges = num_edges_per_node[0].item()
+        knn_edge_features = edge_features.view(num_nodes, num_edges, -1)
+        knn_edge_index = edge_index[0].view(num_nodes, num_edges)
+        edge_mask = (knn_edge_index != -1)
+    else:
+        # edges_per_node = edge_features.split(num_edges_per_node.tolist(), dim=0)
+        # knn_edge_features = pad_sequence(
+        #     edges_per_node,
+        #     batch_first=True,
+        #     padding_value=0.
+        # )
+        knn_edge_features = torch.zeros(
+            (num_nodes, num_edges_per_node.max().item(), edge_features.shape[-1]),
+            device=edge_features.device,
+            dtype=edge_features.dtype
+        )
+        start = 0
+        for i, num_edges in enumerate(num_edges_per_node):
+            knn_edge_features[i, :num_edges] = edge_features[start:start+num_edges]
+            start += num_edges
 
-    edge_mask = (knn_edge_index != -1)
-    knn_edge_index[~edge_mask] = 0
+        edge_index_per_node = edge_index[0].split(num_edges_per_node.tolist(), dim=0)
+        knn_edge_index = pad_sequence(
+            edge_index_per_node,
+            batch_first=True,
+            padding_value=-1
+        )
+
+        edge_mask = (knn_edge_index != -1)
+        knn_edge_index[~edge_mask] = 0
 
     return knn_edge_features, knn_edge_index, edge_mask
 

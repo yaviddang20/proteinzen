@@ -5,7 +5,7 @@
 #$ -r y
 #$ -cwd
 #$ -q gpu.q
-#$ -pe smp 1
+#$ -pe smp 2
 #$ -l mem_free=32G
 #$ -l h_rt=120:00:00
 #$ -l compute_cap=61,gpu_mem=40G

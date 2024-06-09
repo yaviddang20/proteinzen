@@ -14,12 +14,22 @@ class SparseTriangleMultiplicativeUpdate(nn.Module):
     def __init__(self,
                  c_s,
                  c_z,
+                 c_gate_s=16,
                  num_rbf=64,
                  assume_sorted=False):
         super().__init__()
         self.c_s = c_s
         self.c_z = c_z
+        self.c_gate_s = c_gate_s
         self.num_rbf = num_rbf
+
+        self.node_left = nn.Linear(c_s, c_gate_s)
+        self.node_right = nn.Linear(c_s, c_gate_s)
+
+        self.edge_left = nn.Linear(c_s, c_s)
+        self.edge_left_gate = Linear(c_s, c_s)
+        self.edge_right = nn.Linear(c_s, c_s)
+        self.edge_right_gate = Linear(c_s, c_s)
 
         self.dist_bias_gate = nn.Sequential(
             nn.Linear(2*c_s, c_z),
@@ -57,8 +67,8 @@ class SparseTriangleMultiplicativeUpdate(nn.Module):
         k = knn_edge_index.shape[-1]
         # print(knn_edge_index.shape)
 
-        edge1 = knn_edge_index[..., None].expand(-1, -1, k)
-        edge2 = knn_edge_index[..., None, :].expand(-1, k, -1)
+        edge1 = knn_edge_index[..., None]
+        edge2 = knn_edge_index[..., None, :]
 
         edge3_node1 = node_features[edge1]
         edge3_node2 = node_features[edge2]
@@ -110,13 +120,13 @@ class FusedSparseTriangleMultiplicativeTransition(nn.Module):
         self.c_z = c_z
         self.num_rbf = num_rbf
 
-        # self.incoming = SparseTriangleMultiplicativeUpdate(
-        #     c_s=c_s,
-        #     c_z=c_z,
-        #     num_rbf=num_rbf,
-        #     assume_sorted=False
-        # )
-        # self.incoming_ln = nn.LayerNorm(c_z)
+        self.incoming = SparseTriangleMultiplicativeUpdate(
+            c_s=c_s,
+            c_z=c_z,
+            num_rbf=num_rbf,
+            assume_sorted=False
+        )
+        self.incoming_ln = nn.LayerNorm(c_z)
         self.outgoing = SparseTriangleMultiplicativeUpdate(
             c_s=c_s,
             c_z=c_z,

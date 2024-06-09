@@ -192,7 +192,12 @@ class PdbDataset(data.Dataset):
             "res_mask": processed_feats['bb_mask'].astype(bool),
             "num_nodes": num_nodes,
             "data_lens": [num_nodes],
+            "dssp_helix": processed_feats["ss"] == "H",
+            "dssp_sheet": processed_feats["ss"] == "E",
+            "dssp_coil": processed_feats["ss"] == "C",
         }
+        # print({k: v.shape if hasattr(v, "shape") else processed_feats["ss"] for k, v in res_data.items() })
+        # print(processed_file_path)
 
         graph = HeteroData(
             residue={

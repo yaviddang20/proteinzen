@@ -71,6 +71,10 @@ class BackboneModule(L.LightningModule):
 
         self.median_metric = MedianMetric()
 
+    def on_train_epoch_start(self):
+        if hasattr(self.trainer.train_dataloader.batch_sampler, "epoch"):
+            self.trainer.train_dataloader.batch_sampler.set_epoch(self.trainer.current_epoch)
+
     def training_step(self, batch):
         task: TaskList = batch.task
         outputs = task.run_evals(self.model, batch)
@@ -91,13 +95,15 @@ class BackboneModule(L.LightningModule):
                 continue
             stratified_losses = t_stratified_loss(
                 t, loss_list, loss_name=loss_name)
-            for k,v in stratified_losses.items():
-                self._log_scalar(
-                    f"train/{k}",
-                    v,
-                    prog_bar=False,
-                    on_epoch=True,
-                    batch_size=batch.num_graphs)
+            stratified_losses = {f"train/{k}": torch.as_tensor(v, device=log_dict['train/loss'].device) for k,v in stratified_losses.items()}
+            self.log_dict(
+                stratified_losses,
+                prog_bar=False,
+                logger=True,
+                on_step=None,
+                on_epoch=True,
+                batch_size=batch.num_graphs,
+                sync_dist=False)
 
         self.log_dict(
             log_dict,
@@ -105,9 +111,9 @@ class BackboneModule(L.LightningModule):
             on_epoch=True,
             prog_bar=True,
             logger=True,
-            batch_size=batch.num_graphs,
-            sync_dist=True)
-        self._log.info(gen_pbar_str(loss_dict))
+            sync_dist=True,
+            batch_size=batch.num_graphs)
+        # self._log.info(gen_pbar_str(loss_dict))
         return loss_dict
 
     def _log_scalar(
@@ -118,8 +124,8 @@ class BackboneModule(L.LightningModule):
             on_epoch=False,
             prog_bar=True,
             batch_size=None,
-            sync_dist=False,
-            rank_zero_only=True
+            sync_dist=True,#False,
+            rank_zero_only=False,#True
         ):
         if sync_dist and rank_zero_only:
             raise ValueError('Unable to sync dist when rank_zero_only=True')
@@ -189,7 +195,7 @@ class BackboneModule(L.LightningModule):
 
         self.median_metric.update(sample_loss_dict['autoenc_per_seq_recov'])
         self.log("median_seq_recov", self.median_metric, on_step=False, on_epoch=True)
-        self._log.info(gen_pbar_str(sample_loss_dict))
+        # self._log.info(gen_pbar_str(sample_loss_dict))
         return sample_loss_dict
 
     def predict_step(self, batch, batch_idx):
@@ -242,7 +248,7 @@ class SidechainModule(L.LightningModule):
             logger=True,
             batch_size=batch.num_graphs,
             sync_dist=True)
-        self._log.info(gen_pbar_str(loss_dict))
+        # self._log.info(gen_pbar_str(loss_dict))
         return loss_dict
 
     # def on_after_backward(self):
@@ -271,7 +277,7 @@ class SidechainModule(L.LightningModule):
             logger=True,
             batch_size=batch.num_graphs,
             sync_dist=True)
-        self._log.info(gen_pbar_str(loss_dict))
+        # self._log.info(gen_pbar_str(loss_dict))
 
         batch = copy.copy(batch)
         batch['residue']['noising_mask'] = torch.ones_like(batch['residue']['noising_mask'])
@@ -290,7 +296,7 @@ class SidechainModule(L.LightningModule):
             logger=True,
             batch_size=batch.num_graphs,
             sync_dist=True)
-        self._log.info(gen_pbar_str(loss_dict))
+        # self._log.info(gen_pbar_str(loss_dict))
 
         sample_outputs = task.run_predicts(self.model, batch)
         sample_loss_dict = task.compile_task_losses(batch, sample_outputs)
@@ -305,7 +311,7 @@ class SidechainModule(L.LightningModule):
             batch_size=batch.num_graphs,
             sync_dist=True)
         sample_loss_dict = {"sample_" + k: v for k,v in sample_loss_dict.items()}
-        self._log.info(gen_pbar_str(sample_loss_dict))
+        # self._log.info(gen_pbar_str(sample_loss_dict))
         return loss_dict
 
 
@@ -322,7 +328,7 @@ class SidechainModule(L.LightningModule):
         log_dict = {"val_" + k: v for k,v in log_dict.items()}
         self.one_shot_median_metric.update(loss_dict['per_seq_recov'])
         self.log("median_seq_recov", self.one_shot_median_metric, on_step=False, on_epoch=True)
-        self._log.info(gen_pbar_str(loss_dict))
+        # self._log.info(gen_pbar_str(loss_dict))
 
         sample_outputs = task.run_predicts(self.model, batch)
         sample_loss_dict = task.compile_task_losses(batch, sample_outputs)
@@ -341,7 +347,7 @@ class SidechainModule(L.LightningModule):
 
         self.sample_median_metric.update(sample_loss_dict['per_seq_recov'])
         self.log("sample_median_seq_recov", self.sample_median_metric, on_step=False, on_epoch=True)
-        self._log.info(gen_pbar_str(sample_loss_dict))
+        # self._log.info(gen_pbar_str(sample_loss_dict))
         return sample_loss_dict
 
     def predict_step(self, batch, batch_idx):
@@ -388,7 +394,7 @@ class MoleculeModule(L.LightningModule):
             logger=True,
             batch_size=batch.num_graphs,
             sync_dist=True)
-        self._log.info(gen_pbar_str(loss_dict))
+        # self._log.info(gen_pbar_str(loss_dict))
         return loss_dict
 
     def validation_step(self, batch, batch_idx):
@@ -533,7 +539,7 @@ class MoleculeModule(L.LightningModule):
 
         self.median_metric.update(sample_loss_dict['autoenc_per_seq_recov'])
         self.log("median_seq_recov", self.median_metric, on_step=False, on_epoch=True)
-        self._log.info(gen_pbar_str(sample_loss_dict))
+        # self._log.info(gen_pbar_str(sample_loss_dict))
         return sample_loss_dict
 
     def predict_step(self, batch, batch_idx):
@@ -673,7 +679,7 @@ class ProteinModule(L.LightningModule):
             logger=True,
             batch_size=batch.num_graphs,
             sync_dist=True)
-        self._log.info(gen_pbar_str(loss_dict))
+        # self._log.info(gen_pbar_str(loss_dict))
         return loss_dict
 
     # def validation_step(self, batch, batch_idx):
@@ -729,7 +735,7 @@ class ProteinModule(L.LightningModule):
         self.median_metric.update(sample_loss_dict['autoenc_per_seq_recov'])
         self.log("median_seq_recov", self.median_metric, on_step=False, on_epoch=True)
         print(gen_pbar_str(sample_loss_dict))
-        self._log.info(gen_pbar_str(sample_loss_dict))
+        # self._log.info(gen_pbar_str(sample_loss_dict))
         return sample_loss_dict
 
     def predict_step(self, batch, batch_idx):

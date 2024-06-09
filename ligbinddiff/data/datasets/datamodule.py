@@ -1,7 +1,9 @@
 import os
 from functools import partial
 from typing import List
+import sys
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torch_geometric.data import Batch, HeteroData
@@ -132,7 +134,6 @@ class FramediffDataModule(L.LightningDataModule):
         )
         self.val_dataset = LengthDataset(self.sample_lengths, batch_size=batch_size)
 
-
     def build_dataloader(self, x):
         collate_fn = gen_collate_fn(self.task_sampler)
         if self.length_batch:
@@ -144,10 +145,18 @@ class FramediffDataModule(L.LightningDataModule):
                 shuffle=False
             )
         elif self.sample_from_clusters:
+            rank = self.trainer.local_rank
+            num_replicas = self.trainer.num_devices
             dataloader = DataLoader(
                 x,
                 num_workers=self.num_workers,
-                batch_sampler=ClusteredBatchSampler(x, batch_size=self.batch_size, batch_by_edge_fn=self.batch_by_edge_fn),
+                batch_sampler=ClusteredBatchSampler(
+                    x,
+                    batch_size=self.batch_size,
+                    batch_by_edge_fn=self.batch_by_edge_fn,
+                    rank=rank,
+                    num_replicas=num_replicas
+                ),
                 collate_fn=collate_fn,
                 shuffle=False
             )

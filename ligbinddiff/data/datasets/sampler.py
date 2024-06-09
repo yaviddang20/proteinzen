@@ -1,6 +1,7 @@
 """ Batch samplers for datasets """
 import numpy as np
 import random
+import torch
 
 from torch.utils import data
 
@@ -73,7 +74,16 @@ class ClusteredBatchSampler:
                       including batches of a single element
     :param shuffle: if `True`, batches in shuffled order
     '''
-    def __init__(self, dataset: PdbDataset, batch_size=3000, drop_last=False, shuffle=True, batch_by_edge_fn=None):
+    def __init__(self,
+                 dataset: PdbDataset,
+                 batch_size=3000,
+                 drop_last=False,
+                 shuffle=True,
+                 batch_by_edge_fn=None,
+                 num_replicas=1,
+                 rank=0,
+                 seed=0,
+                 ):
         self.dataset = dataset
         self.batch_size = batch_size
         self.drop_last = drop_last
@@ -81,6 +91,12 @@ class ClusteredBatchSampler:
         self.clusters = self.dataset.csv.cluster.unique()
         self.dataset.csv['iloc'] = list(range(len(dataset.csv)))
         self.batch_by_edge_fn = batch_by_edge_fn
+
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.epoch = 0
+        self.seed = seed
+        self.generator = np.random.default_rng(self.seed)
 
         self._form_batches()
 
@@ -91,11 +107,13 @@ class ClusteredBatchSampler:
         df = self.dataset.csv
 
         if self.shuffle:
-            np.random.shuffle(self.clusters)
+            # deterministically shuffle based on epoch and seed
+            g = np.random.default_rng(self.seed + self.epoch)
+            g.shuffle(self.clusters)
 
         # sample one example per cluster
         for cluster in self.clusters:
-            cluster_sample = df[df['cluster'] == cluster].sample(1)
+            cluster_sample = df[df['cluster'] == cluster].sample(1, random_state=g)
             iloc = cluster_sample['iloc'].iloc[0]
             assert df.iloc[iloc].pdb_name == cluster_sample.pdb_name.iloc[0]
             idx.append(iloc)
@@ -119,17 +137,37 @@ class ClusteredBatchSampler:
         if not self.drop_last:
             self.batches.append(batch)
 
+        split_size = len(self.batches) // self.num_replicas
+        splits = []
+        for i in range(self.num_replicas):
+            splits.append(self.batches[split_size*i: split_size*(i+1)])
+
+        self.batches = splits[self.rank]
+
+
     def __len__(self):
         if not hasattr(self, "batches"):
             self._form_batches()
         return len(self.batches)
 
     def __iter__(self):
-        for batch in self.batches:
-            yield batch
         if self.shuffle:
             self._form_batches()
+        print(f"rank {self.rank}: epoch is {self.epoch}")
 
+        for batch in self.batches:
+            yield batch
+
+    def set_epoch(self, epoch: int) -> None:
+        r"""
+        Sets the epoch for this sampler. When :attr:`shuffle=True`, this ensures all replicas
+        use a different random ordering for each epoch. Otherwise, the next iteration of this
+        sampler will yield the same ordering.
+
+        Args:
+            epoch (int): Epoch number.
+        """
+        self.epoch = epoch
 
 class LengthBatchSampler:
     '''

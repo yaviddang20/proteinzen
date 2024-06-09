@@ -56,12 +56,13 @@ def get_hbond_params(D, H, A, AB, R):
 def bb_hbond_loss(batch,
                   denoiser_outputs,
                   distance_cutoff=2.5):  # TODO: this is pretty arbitrary https://proteopedia.org/wiki/index.php/Hydrogen_bonds
-    """ Add MSE loss on hbond parameters delta_HA, Theta, Psi, X """
+    """ Add MSE loss on hbond parameters delta_HA, Theta, Psi, X for bb hbonds which aren't helix-helix"""
     pred_bb = denoiser_outputs['denoised_bb']
     res_data = batch['residue']
     ref_bb = res_data['atom37'][:, (0, 1, 2, 4)]
     num_nodes = get_data_lens(batch, hetero_key='residue')
     res_mask = res_data['res_mask']
+    is_helix = res_data['dssp_helix']
     pred_H, _ = compute_bb_n_h(pred_bb, num_nodes, res_mask)
     ref_H, ref_h_mask = compute_bb_n_h(ref_bb, num_nodes, res_mask)
 
@@ -98,6 +99,18 @@ def bb_hbond_loss(batch,
     assert edge_index.numel() > 0
     edge_index = torch.stack([edge_index[1], edge_index[0]])  # O is 0, H is 1
     # print(edge_index.shape)
+    dst, src = edge_index
+    print(is_helix.shape, edge_index.max())
+    helix_helix_hbond = is_helix[src] & is_helix[dst]
+    edge_index = edge_index[:, ~helix_helix_hbond]
+    if edge_index.numel() == 0:
+        zeros = torch.zeros(res_data.batch.max() + 1, device=is_helix.device)
+        return {
+            "delta_mse": zeros,
+            "theta_mse": zeros,
+            "psi_mse": zeros,
+            "X_mse": zeros
+        }
     dst, src = edge_index
 
     data_lens = [0] + num_nodes

@@ -79,9 +79,11 @@ def angle_axis_rot_vf_loss(
         ref_rot_vf,
         batch,
         res_mask,
+        norm_scale,
         angle_loss_weight=0.5,
         eps=1e-8):
-    pred_rot_vf = pred_rot_vf
+    pred_rot_vf = pred_rot_vf / norm_scale[batch, None]
+    ref_rot_vf = ref_rot_vf / norm_scale[batch, None]
 
     gt_rot_angle = torch.norm(ref_rot_vf, dim=-1, keepdim=True)
     gt_rot_axis = ref_rot_vf / (gt_rot_angle + eps)
@@ -284,11 +286,11 @@ def bb_frame_fm_loss(batch,
     pred_rot_vf = so3_fm_utils.calc_rot_vf(rots_t, rots_1_pred)
     gt_rot_vf = so3_fm_utils.calc_rot_vf(rots_t, rots_1)
     if sep_rot_loss:
-        rot_vf_loss = angle_axis_rot_vf_loss(pred_rot_vf, gt_rot_vf, res_data.batch, mask)
+        rot_vf_loss = angle_axis_rot_vf_loss(pred_rot_vf, gt_rot_vf, res_data.batch, mask, norm_scale)
     else:
         rot_vf_loss = torch.square(pred_rot_vf - gt_rot_vf).sum(dim=-1)
         rot_vf_loss = _nodewise_to_graphwise(rot_vf_loss, res_data.batch, mask)
-    rot_vf_loss = rot_vf_loss / (norm_scale ** 2)
+        rot_vf_loss = rot_vf_loss / (norm_scale ** 2)
 
     trans_1_pred = denoised_bb_frames.get_trans()
     trans_1 = bb_frames.get_trans()
