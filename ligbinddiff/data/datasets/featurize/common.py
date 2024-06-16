@@ -2,7 +2,7 @@ import numpy as np
 import torch
 
 
-def _rbf(D, D_min=0., D_max=20., D_count=16, device='cpu'):
+def _rbf(D, D_min=0., D_max=20., D_count=16, device='cpu', dtype=None):
     '''
     From https://github.com/jingraham/neurips19-graph-protein-design
 
@@ -10,7 +10,7 @@ def _rbf(D, D_min=0., D_max=20., D_count=16, device='cpu'):
     That is, if `D` has shape [...dims], then the returned tensor will have
     shape [...dims, D_count].
     '''
-    D_mu = torch.linspace(D_min, D_max, D_count, device=device)
+    D_mu = torch.linspace(D_min, D_max, D_count, device=device, dtype=dtype)
     D_mu = D_mu.view([1, -1])
     D_sigma = (D_max - D_min) / D_count
     D_expand = torch.unsqueeze(D, -1)

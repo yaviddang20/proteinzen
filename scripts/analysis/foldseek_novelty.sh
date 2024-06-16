@@ -1,8 +1,17 @@
 #!/bin/bash
+#$ -S /bin/bash
+#$ -o /dev/null
+#$ -j y
+#$ -r y
+#$ -cwd
+#$ -l mem_free=8G
+#$ -l h_rt=6:00:00
 conda activate foldseek
 
 DESIGNABLE_DIR=$1
 OUTPUTDIR=$2
+mkdir $OUTPUTDIR
+
 # i think i also got this from jason yim, need to double check
 foldseek easy-search $DESIGNABLE_DIR \
     /wynton/group/kortemme/foldseek_db/PDB \

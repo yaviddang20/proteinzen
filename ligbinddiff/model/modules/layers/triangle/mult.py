@@ -3,6 +3,7 @@ import torch
 from torch import nn
 
 import torch_geometric.utils as pygu
+from torch_cluster import knn_graph
 
 from ligbinddiff.data.datasets.featurize.sidechain import _rbf
 from ligbinddiff.model.modules.openfold.frames import Linear
@@ -16,30 +17,34 @@ class SparseTriangleMultiplicativeUpdate(nn.Module):
                  c_z,
                  c_gate_s=16,
                  num_rbf=64,
+                 vpa=False,
+                 gate_out=True,
+                 dropout=0,
+                 dtype=torch.bfloat16,
                  assume_sorted=False):
         super().__init__()
         self.c_s = c_s
         self.c_z = c_z
         self.c_gate_s = c_gate_s
         self.num_rbf = num_rbf
+        self.vpa = vpa
+        self.layer_norm = nn.LayerNorm(c_z, dtype=dtype)
+        self.gate_out = gate_out
+        self.dropout_rate = dropout
+        self.dtype = dtype
 
-        self.node_left = nn.Linear(c_s, c_gate_s)
-        self.node_right = nn.Linear(c_s, c_gate_s)
+        self.node_left = nn.Linear(c_s, c_gate_s, dtype=dtype)
+        self.node_right = nn.Linear(c_s, c_gate_s, dtype=dtype)
 
-        self.edge_left = nn.Linear(c_s, c_s)
-        self.edge_left_gate = Linear(c_s, c_s)
-        self.edge_right = nn.Linear(c_s, c_s)
-        self.edge_right_gate = Linear(c_s, c_s)
+        self.edge_proj = Linear(c_z, c_z, dtype=dtype)
+        self.edge_gate = Linear(c_z, c_z, dtype=dtype)
+        self.dist_gate = Linear(c_gate_s*c_gate_s, c_z, init='gating', dtype=dtype)
+        self.dist_proj = Linear(self.num_rbf, c_z, dtype=dtype)
+        self.ln_out = nn.LayerNorm(c_z, dtype=dtype)
+        self.lin_out = Linear(c_z, c_z, init='final', dtype=dtype)
+        if self.gate_out:
+            self.out_gate = Linear(c_z, c_z, init='gating', dtype=dtype)
 
-        self.dist_bias_gate = nn.Sequential(
-            nn.Linear(2*c_s, c_z),
-            nn.Sigmoid()
-        )
-        self.dist_bias = nn.Linear(self.num_rbf, c_z)
-
-        self.lin_edge = nn.Linear(c_z, c_z)
-        self.ln = nn.LayerNorm(c_z)
-        self.lin_out = Linear(c_z, c_z, init='final')
         self.assume_sorted = assume_sorted
 
     def forward(self,
@@ -47,9 +52,14 @@ class SparseTriangleMultiplicativeUpdate(nn.Module):
                 rigids,
                 edge_features,
                 edge_index,
+                k=None,
                 eps=1e-8):
         num_nodes = node_features.shape[0]
         num_edges = edge_index.shape[-1]
+        initial_dtype = edge_features.dtype
+        node_features = node_features.to(self.dtype)
+        edge_features = edge_features.to(self.dtype)
+        node_trans = rigids.get_trans()
 
         if not self.assume_sorted:
             sorted_edge_index, edge_map = pygu.sort_edge_index(
@@ -63,39 +73,66 @@ class SparseTriangleMultiplicativeUpdate(nn.Module):
             sorted_edge_index = edge_index
             sorted_edge_features = edge_features
 
-        knn_edge_features, knn_edge_index, knn_edge_mask = sparse_to_knn_graph(sorted_edge_features, sorted_edge_index)
-        k = knn_edge_index.shape[-1]
-        # print(knn_edge_index.shape)
+        if k is None:
+            # max for pygu knn_graph with loop=False
+            k = 99
+        edge_edge_index = knn_graph(
+            node_trans[sorted_edge_index[0]],
+            k=k,
+            batch=sorted_edge_index[1]
+        )
+        node_trans = node_trans.to(self.dtype)
+        edge_edge_index = pygu.coalesce(edge_edge_index, sort_by_row=False)
+        edge_edge_index, _ = pygu.dropout_edge(edge_index=edge_edge_index, p=self.dropout_rate, training=self.training)
+        assert (sorted_edge_index[1, edge_edge_index[1]] == sorted_edge_index[1, edge_edge_index[0]]).all()
+        edge3_node1_idx = sorted_edge_index[0, edge_edge_index[1]]
+        edge3_node2_idx = sorted_edge_index[0, edge_edge_index[0]]
 
-        edge1 = knn_edge_index[..., None]
-        edge2 = knn_edge_index[..., None, :]
+        sorted_edge_features = self.layer_norm(sorted_edge_features)
 
-        edge3_node1 = node_features[edge1]
-        edge3_node2 = node_features[edge2]
-        edge3_gate = self.dist_bias_gate(
-            torch.cat([edge3_node1, edge3_node2], dim=-1)
+        node_left = self.node_left(node_features)
+        node_right = self.node_right(node_features)
+
+        edge3_node1 = node_left[edge3_node1_idx]
+        edge3_node2 = node_right[edge3_node2_idx]
+        edge3 = torch.einsum("bi,bj->bij", edge3_node1, edge3_node2)
+        edge3_gate = self.dist_gate(
+            edge3.view(-1, self.c_gate_s * self.c_gate_s)
         )
 
-        node_trans = rigids.get_trans()
-        edge3_node1_trans = node_trans[edge1]
-        edge3_node2_trans = node_trans[edge2]
+        edge3_node1_trans = node_trans[edge3_node1_idx]
+        edge3_node2_trans = node_trans[edge3_node2_idx]
         edge3_dist = torch.linalg.vector_norm(
             edge3_node1_trans - edge3_node2_trans + eps,
             dim=-1
         )
 
-        edge3_dist_features = _rbf(edge3_dist, D_count=self.num_rbf, device=edge3_dist.device)
-        edge3_dist_bias = edge3_gate * self.dist_bias(edge3_dist_features)  # n x k x k x ch
+        edge3_dist_features = _rbf(edge3_dist, D_count=self.num_rbf, device=edge3_dist.device, dtype=self.dtype)
+        edge3_dist_features = self.dist_proj(edge3_dist_features)  # n x k x k x h
+        edge3_features = torch.sigmoid(edge3_gate) * edge3_dist_features
 
-        knn_edge_features = self.lin_edge(knn_edge_features)  # n x k x ch
+        edge2_features = self.edge_proj(sorted_edge_features)
+        edge2_gate = self.edge_gate(sorted_edge_features)
+        edge2_features = torch.sigmoid(edge2_gate) * edge2_features
+        edge2_features = edge2_features[edge_edge_index[0]]
+        edge_update = edge2_features * edge3_features
 
-        # mult_update = edge3_dist_bias * knn_edge_features[..., None, :, :]  # n x k x k x ch
-        # edge_update = mult_update.sum(dim=-2)
-        edge_update = torch.einsum("nijh,nih->njh", edge3_dist_bias, knn_edge_features)
+        edge_update = pygu.scatter(
+            edge_update,
+            edge_edge_index[0],
+            reduce='sum'
+        )
+        if self.vpa:
+            reduce_factor = pygu.scatter(
+                torch.ones_like(edge_edge_index[0]),
+                edge_edge_index[0]
+            )
+            reduce_factor[reduce_factor <= 0] = 1
+            edge_update = edge_update / torch.sqrt(reduce_factor)
 
-        edge_update = self.ln(edge_update)
-        edge_update, _ = knn_to_sparse_graph(edge_update, knn_edge_index, knn_edge_mask)
-        edge_update = self.lin_out(edge_update)
+        edge_update = self.lin_out(self.ln_out(edge_update))
+        if self.gate_out:
+            edge_update = edge_update * torch.sigmoid(self.out_gate(sorted_edge_features))
 
         if not self.assume_sorted:
             edge_update = pygu.scatter(
@@ -104,6 +141,8 @@ class SparseTriangleMultiplicativeUpdate(nn.Module):
                 dim=0,
                 dim_size=num_edges
             )
+        
+        edge_update = edge_update.to(dtype=initial_dtype)
 
         return edge_update
 

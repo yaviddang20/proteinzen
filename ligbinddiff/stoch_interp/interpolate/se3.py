@@ -4,7 +4,8 @@ from . import so3_utils
 from . import utils as du
 from scipy.spatial.transform import Rotation
 import copy
-from scipy.optimize import linear_sum_assignment
+from functools import partial
+from scipy.optimize import linear_sum_assignment, differential_evolution, Bounds, NonlinearConstraint
 
 from ligbinddiff.utils.framediff import all_atom
 from ligbinddiff.utils.openfold import rigid_utils as ru
@@ -92,7 +93,10 @@ class SE3Interpolant:
     def __init__(self,
                  cfg,
                  use_batch_ot=False,
+                 separate_ot=True,
+                 fancy_joint_ot=False,
                  prealign_noise=True,
+                 rotate_rots_by_trans_align=False,
                  uniform_rot_noise=False,
                  harmonic_trans_noise=False,
                  sfm=False):
@@ -102,10 +106,14 @@ class SE3Interpolant:
         self._sample_cfg = cfg.sampling
         self._igso3 = None
         self.use_batch_ot = use_batch_ot
+        self.separate_ot = separate_ot
+        self.fancy_joint_ot = fancy_joint_ot
         self.prealign_noise = prealign_noise
+        self.rotate_rots_by_trans_align = rotate_rots_by_trans_align
         self.uniform_rot_noise = uniform_rot_noise
         self.harmonic_trans_noise = harmonic_trans_noise
         self.sfm = sfm
+
         print(self.igso3)
 
     @property
@@ -122,7 +130,7 @@ class SE3Interpolant:
         t = torch.rand(num_batch, device=self._device).float()
         return t * (1 - 2 * self._cfg.min_t) + self._cfg.min_t
 
-    def _corrupt_trans(self, trans_1, t, res_mask, batch):
+    def _sample_trans_0(self, batch, device):
         if self.harmonic_trans_noise:
             sample_lens = scatter(
                 torch.ones_like(batch),
@@ -131,7 +139,7 @@ class SE3Interpolant:
             noise = []
             for l in sample_lens.tolist():
                 prior = HarmonicPrior(l)
-                noise.append(prior.sample().to(self._device))
+                noise.append(prior.sample().to(device))
             noise = torch.cat(noise, dim=0)
             center = scatter(
                 noise,
@@ -141,25 +149,12 @@ class SE3Interpolant:
             )
             trans_0 = noise - center[batch]
         else:
-            trans_nm_0 = _centered_gaussian(batch, self._device)
+            trans_nm_0 = _centered_gaussian(batch, device)
             trans_0 = trans_nm_0 * du.NM_TO_ANG_SCALE
-        if self.use_batch_ot:
-            # this requires samples to be length batched
-            sample_len = int((batch == 0).sum().item())
-            assert batch.numel() % sample_len == 0, (
-                f"minibatch OT can only be applied to length batches, "
-                f"but you have {batch.numel()} nodes and sample 0 is length {sample_len}")
-            trans_0 = self._trans_batch_ot(
-                trans_0.view(-1, sample_len, 3),
-                trans_1.view(-1, sample_len, 3),
-                res_mask.view(-1, sample_len)
-            )
-            trans_0 = trans_0.view(-1, 3)
-        else:
-            if self.prealign_noise:
-                # rotate each structure to align as best as possible with noise
-                trans_0, _, _ = du.align_structures(trans_0, batch, trans_1)
-        # trans_0 = self._batch_ot(trans_0, trans_1, res_mask)
+
+        return trans_0.to(device)
+
+    def _corrupt_trans(self, trans_1, trans_0, t, res_mask):
         trans_t = (1 - t[..., None]) * trans_0 + t[..., None] * trans_1
 
         if self.sfm:
@@ -174,7 +169,7 @@ class SE3Interpolant:
         z_t = torch.randn_like(trans_t) * torch.sqrt(batch_sig)[..., None]
         return z_t
 
-    def _trans_batch_ot(self, trans_0, trans_1, res_mask):
+    def _trans_batch_ot(self, trans_1, trans_0, res_mask):
         num_batch, num_res = trans_0.shape[:2]
         noise_idx, gt_idx = torch.where(
             torch.ones(num_batch, num_batch))
@@ -199,25 +194,17 @@ class SE3Interpolant:
         noise_perm, gt_perm = linear_sum_assignment(du.to_numpy(cost_matrix))
         return aligned_nm_0[(tuple(gt_perm), tuple(noise_perm))]
 
-    def _corrupt_rotmats(self, rotmats_1, t, res_mask, batch):
-        num_res = res_mask.shape[0]
+    def _sample_rotmats_0(self, rotmats_1):
+        num_res = rotmats_1.shape[0]
         if self.uniform_rot_noise:
-            noisy_rotmats = _uniform_so3(num_res, self._device)
+            rotmats_0 = _uniform_so3(num_res, rotmats_1.device)
         else:
-            noisy_rotmats = self.igso3.sample(torch.tensor([1.5]), num_res).to(self._device)
+            noisy_rotmats = self.igso3.sample(torch.tensor([1.5]), num_res).to(rotmats_1.device)
             noisy_rotmats = noisy_rotmats.squeeze(0).float()
-        if self.use_batch_ot:
-            # this requires samples to be length batched
-            sample_len = int((batch == 0).sum().item())
-            assert batch.numel() % sample_len == 0, (
-                f"minibatch OT can only be applied to length batches, "
-                f"but you have {batch.numel()} nodes and sample 0 is length {sample_len}")
-            noisy_rotmats = self._rot_batch_ot(
-                noisy_rotmats.view(-1, sample_len, 3, 3),
-                rotmats_1.view(-1, sample_len, 3, 3),
-                res_mask.view(-1, sample_len))
-            noisy_rotmats = noisy_rotmats.view(-1, 3, 3)
-        rotmats_0 = torch.einsum("...ij,...jk->...ik", rotmats_1, noisy_rotmats)
+            rotmats_0 = torch.einsum("...ij,...jk->...ik", rotmats_1, noisy_rotmats)
+        return rotmats_0
+
+    def _corrupt_rotmats(self, rotmats_1, rotmats_0, t, res_mask):
         rotmats_t = so3_utils.geodesic_t(t[..., None], rotmats_1, rotmats_0)
         identity = torch.eye(3, device=self._device)
         rotmats_t = rotmats_t * res_mask[..., None, None] + identity[None] * (
@@ -258,6 +245,57 @@ class SE3Interpolant:
         batch_rot_0 = batch_rot_0.view(num_batch, num_batch, num_res, 3, 3)
         return batch_rot_0[(tuple(gt_perm), tuple(noise_perm))]
 
+    def joint_batch_ot(self, trans_1, trans_0, rot_1, rot_0, res_mask):
+        num_batch, num_res = trans_0.shape[:2]
+        noise_idx, gt_idx = torch.where(
+            torch.ones(num_batch, num_batch))
+        batch_nm_0 = trans_0[noise_idx]
+        batch_nm_1 = trans_1[gt_idx]
+        batch_mask = res_mask[gt_idx]
+        batch_rot_0 = rot_0[noise_idx]
+        batch_rot_1 = rot_1[gt_idx]
+
+        if self.fancy_joint_ot:
+            aligned_nm_0, batch_rot_0 = align_rigids(
+                batch_nm_1.view(num_batch, num_batch, num_res, 3),
+                batch_nm_0.view(num_batch, num_batch, num_res, 3),
+                batch_rot_1.view(num_batch, num_batch, num_res, 3, 3),
+                batch_rot_0.view(num_batch, num_batch, num_res, 3, 3),
+                # batch_mask.view(num_batch, num_batch, num_res)
+            )
+            batch_rot_0 = batch_rot_0.view(-1, num_res, 3, 3)
+            aligned_nm_1 = batch_nm_1.view(num_batch, num_batch, num_res, 3)
+        else:
+            if self.prealign_noise:
+                aligned_nm_0, aligned_nm_1, align_rot = du.batch_align_structures(
+                    batch_nm_0, batch_nm_1, mask=batch_mask
+                )
+            else:
+                aligned_nm_0 = batch_nm_0
+                aligned_nm_1 = batch_nm_1
+                align_rot = None
+            aligned_nm_0 = aligned_nm_0.reshape(num_batch, num_batch, num_res, 3)
+            aligned_nm_1 = aligned_nm_1.reshape(num_batch, num_batch, num_res, 3)
+            if self.rotate_rots_by_trans_align:
+                assert align_rot is not None, "need to prealign noise if you want to rotate by trans align"
+                rot_0 = rot_0.compose_r(align_rot)
+
+        # Compute cost matrix of aligned noise to ground truth
+        batch_mask = batch_mask.reshape(num_batch, num_batch, num_res)
+        trans_cost_matrix = torch.sum(
+            torch.linalg.norm(aligned_nm_0 - aligned_nm_1, dim=-1), dim=-1
+        ) / torch.sum(batch_mask, dim=-1)
+        rot_cost_matrix = torch.sum(
+            so3_utils.geodesic_dist(batch_rot_0, batch_rot_1), # num_batch ** 2 x num_res x 3 x 3
+            dim=-1
+        ) / torch.sum(batch_mask, dim=-1).view(-1)  # num_batch ** 2
+        rot_cost_matrix = rot_cost_matrix.view(num_batch, num_batch)
+        cost_matrix = (trans_cost_matrix**2 + rot_cost_matrix**2)
+        noise_perm, gt_perm = linear_sum_assignment(du.to_numpy(cost_matrix))
+        batch_rot_0 = batch_rot_0.view(num_batch, num_batch, num_res, 3, 3)
+
+        return aligned_nm_0[(tuple(gt_perm), tuple(noise_perm))], batch_rot_0[(tuple(gt_perm), tuple(noise_perm))]
+
     @torch.no_grad()
     def corrupt_batch(self, batch: HeteroData):
         res_data = batch["residue"]
@@ -278,9 +316,43 @@ class SE3Interpolant:
         nodewise_t = batchwise_to_nodewise(t, res_data.batch)
         batch["t"] = t
 
+        if "rotmats_0" in res_data:
+            rotmats_0 = res_data['rotmats_0']
+        else:
+            rotmats_0 = self._sample_rotmats_0(rotmats_1)
+        if "trans_0" in res_data:
+            trans_0 = res_data['trans_0']
+        else:
+            trans_0 = self._sample_trans_0(res_data.batch, trans_1.device)
+
+        if self.prealign_noise and not self.use_batch_ot:
+            # rotate each structure to align as best as possible with noise
+            trans_0, _, _ = du.align_structures(trans_0, res_data.batch, trans_1)
+
         # Apply corruptions
-        trans_t = self._corrupt_trans(trans_1, nodewise_t, mask, res_data.batch)
-        rotmats_t = self._corrupt_rotmats(rotmats_1, nodewise_t, mask, res_data.batch)
+        if self.use_batch_ot:
+            sample_lens = scatter(
+                torch.ones_like(res_data.batch),
+                res_data.batch
+            )
+            assert (sample_lens[0] == sample_lens).all(), "batch ot can only be used with length batches"
+            trans_0 = trans_0.view(-1, sample_lens[0].long().item(), 3)
+            trans_1 = trans_1.view(-1, sample_lens[0].long().item(), 3)
+            rotmats_0 = rotmats_0.view(-1, sample_lens[0].long().item(), 3, 3)
+            rotmats_1 = rotmats_1.view(-1, sample_lens[0].long().item(), 3, 3)
+            batch_res_mask = res_mask.view(-1, sample_lens[0].long().item())
+            if self.separate_ot:
+                trans_0 = self._trans_batch_ot(trans_1, trans_0, batch_res_mask)
+                rotmats_0 = self._rot_batch_ot(rotmats_1, rotmats_0, batch_res_mask)
+            else:
+                trans_0, rotmats_0 = self.joint_batch_ot(trans_1, trans_0, rotmats_1, rotmats_0, batch_res_mask)
+            trans_0 = trans_0.contiguous().view(-1, 3)
+            trans_1 = trans_1.view(-1, 3)
+            rotmats_0 = rotmats_0.contiguous().view(-1, 3, 3)
+            rotmats_1 = rotmats_1.view(-1, 3, 3)
+
+        trans_t = self._corrupt_trans(trans_1, trans_0, nodewise_t, mask)
+        rotmats_t = self._corrupt_rotmats(rotmats_1, rotmats_0, nodewise_t, mask)
         rigids_t = ru.Rigid(
             rots=ru.Rotation(rot_mats=rotmats_t), trans=trans_t
         )
@@ -313,105 +385,88 @@ class SE3Interpolant:
             )
         return so3_utils.geodesic_t(scaling * d_t, rotmats_1, rotmats_t)
 
-    def sample(
-        self,
-        model,
-        num_res,
-    ):
-        total_num_res = sum(num_res)
-        data_list = []
-        for n in num_res:
-            data = HeteroData(
-                residue={
-                    "res_mask": torch.ones(n, device=self._device),
-                    "noising_mask": torch.ones(n, device=self._device),
-                    "num_nodes": n
-                }
-            )
-            data_list.append(data)
-        batch = Batch.from_data_list(data_list)
-        res_data = batch['residue']
-        # Set-up initial prior samples
-        if self.harmonic_trans_noise:
-            noise = []
-            for l in num_res:
-                prior = HarmonicPrior(l)
-                noise.append(prior.sample().to(self._device))
-            noise = torch.cat(noise, dim=0)
-            center = scatter(
-                noise,
-                index=res_data.batch,
-                dim=0,
-                reduce='mean'
-            )
-            trans_0 = noise - center[res_data.batch]
-        else:
-            trans_0 = (
-                _centered_gaussian(res_data.batch, self._device) * du.NM_TO_ANG_SCALE
-            )
-        rotmats_0 = _uniform_so3(total_num_res, self._device)
+# TODO: https://ieeexplore.ieee.org/abstract/document/8718799 for alignment
 
-        # Set-up time
-        ts = torch.linspace(self._cfg.min_t, 1.0, self._sample_cfg.num_timesteps)
-        t_1 = ts[0]
+# I got the so3 part of this from chatgpt
+# and emperically i've shown this is not optimal but
+# it does consistently reduce the cost so i'm keeping it for now
+def align_rigids(trans_1, trans_0, rotmats_1, rotmats_0):
+    r3_cov = torch.einsum("...ki,...kj->...ij", trans_0, trans_1)
+    rel_rotmat = so3_utils.rot_mult(rotmats_1, rotmats_0.transpose(-1, -2))
+    rel_skew_sym = so3_utils.rotmat_to_skew_matrix(rel_rotmat).sum(dim=-3)
+    cov = r3_cov + rel_skew_sym
 
-        prot_traj = [(trans_0, rotmats_0, torch.zeros((total_num_res, 2), device=self._device))]
-        clean_traj = []
-        denoiser_out = None
-        for t_2 in tqdm.tqdm(ts[1:]):
-            # Run model.
-            trans_t_1, rotmats_t_1, _ = prot_traj[-1]
-            res_data["trans_t"] = trans_t_1
-            res_data["rotmats_t"] = rotmats_t_1
-            res_data['rigids_t'] = ru.Rigid(
-                rots=ru.Rotation(rot_mats=rotmats_t_1),
-                trans=trans_t_1
-            ).to_tensor_7()
-            t = torch.ones(batch.num_graphs, device=self._device) * t_1
-            batch["t"] = t
-            with torch.no_grad():
-                denoiser_out = model(batch, self_condition=denoiser_out)
+    # Perform singular value decomposition. (all [B x 3 x 3])
+    u, _, v_t = torch.linalg.svd(cov)
+    # Convenience transposes.
+    u_t = u.transpose(-1, -2)
+    v = v_t.transpose(-1, -2)
 
-            # Process model output.
-            pred_rigids = denoiser_out['final_rigids']
-            pred_trans_1 = pred_rigids.get_trans()
-            pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
-            pred_psis = denoiser_out['psi'].detach().cpu()
-            clean_traj.append(
-                (pred_trans_1.detach().cpu(), pred_rotmats_1.detach().cpu(), pred_psis)
-            )
+    # Compute rotation matrix correction for ensuring right-handed coordinate system
+    # For comparison with other sources: det(AB) = det(A)*det(B) and det(A) = det(A.T)
+    sign_correction = torch.sign(torch.linalg.det(
+        torch.einsum("...ij,...jk->...ik", v, u_t)
+    ))
+    # Correct transpose of U: diag(1, 1, sign_correction) @ U.T
+    u_t[..., 2, :] = u_t[..., 2, :] * sign_correction[..., None]
 
-            # Take reverse step
-            d_t = t_2 - t_1
-            trans_t_2 = self._trans_euler_step(d_t, t_1, pred_trans_1, trans_t_1)
-            rotmats_t_2 = self._rots_euler_step(d_t, t_1, pred_rotmats_1, rotmats_t_1)
-            prot_traj.append((trans_t_2, rotmats_t_2, pred_psis))
-            t_1 = t_2
+    # Compute optimal rotation matrix (R = V @ diag(1, 1, sign_correction) @ U.T).
+    rotation_matrices = torch.einsum("...ij,...jk->...ik", v, u_t)
 
-        # We only integrated to min_t, so need to make a final step
-        t_1 = ts[-1]
-        trans_t_1, rotmats_t_1, _ = prot_traj[-1]
-        res_data["trans_t"] = trans_t_1
-        res_data["rotmats_t"] = rotmats_t_1
-        res_data['rigids_t'] = ru.Rigid(
-            rots=ru.Rotation(rot_mats=rotmats_t_1),
-            trans=trans_t_1
-        ).to_tensor_7()
-        t = torch.ones(batch.num_graphs, device=self._device) * t_1
-        batch["t"] = t
-        with torch.no_grad():
-            denoiser_out = model(batch, self_condition=denoiser_out)
+    new_trans_0 = torch.einsum("bcij,bcnj->bcni", rotation_matrices, trans_0)
+    new_rotmats_0 = torch.einsum("bcnij,bcjk->bcnik", rotmats_0, rotation_matrices)
+    return new_trans_0, new_rotmats_0
 
-        # Process model output.
-        pred_rigids = denoiser_out['final_rigids']
-        pred_trans_1 = pred_rigids.get_trans()
-        pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
-        pred_psis = denoiser_out['psi'].detach().cpu()
-        clean_traj.append(
-            (pred_trans_1.detach().cpu(), pred_rotmats_1.detach().cpu(), pred_psis)
-        )
-
-        # Convert trajectories to atom37.
-        atom37_traj = all_atom.transrotpsi_to_atom37(prot_traj, res_data.res_mask)
-        clean_atom37_traj = all_atom.transrotpsi_to_atom37(clean_traj, res_data.res_mask)
-        return atom37_traj, clean_atom37_traj, clean_traj
+# def _cost(rotvecs, trans_1, trans_0, rotmats_1, rotmats_0, batch_mask, num_batch, num_res):
+#     rotvec = torch.as_tensor(rotvecs, device=trans_1.device).float().view(num_batch, num_batch, 3)
+#     test_rotmat = so3_utils.rotvec_to_rotmat(rotvec)
+#     test_rotmat = test_rotmat.view(num_batch, num_batch, 3, 3)
+#     aligned_trans_0 = torch.einsum("bcij,bcni->bcnj", test_rotmat, trans_0)
+#     aligned_rotmats_0 = torch.einsum("bcnij,bcjk->bcnik", rotmats_0, test_rotmat)
+#
+#     trans_cost_matrix = torch.sum(
+#         torch.linalg.norm(aligned_trans_0 - trans_1, dim=-1), dim=-1
+#     ) / torch.sum(batch_mask, dim=-1)
+#     rot_cost_matrix = torch.sum(
+#         so3_utils.geodesic_dist(
+#             aligned_rotmats_0.view(-1, num_res, 3, 3),
+#             rotmats_1.view(-1, num_res, 3, 3)
+#         ), # num_batch ** 2 x num_res x 3 x 3
+#         dim=-1
+#     ) / torch.sum(batch_mask, dim=-1).view(-1)  # num_batch ** 2
+#     rot_cost_matrix = rot_cost_matrix.view(num_batch, num_batch)
+#     cost_matrix = (trans_cost_matrix**2 + rot_cost_matrix**2)
+#     cost = cost_matrix.sum()
+#     return cost.double().numpy(force=True)
+#
+# def align_rigids(trans_1, trans_0, rotmats_1, rotmats_0, batch_mask):
+#     num_batch, _, num_res = trans_1.shape[:3]
+#     batch_mask = batch_mask.reshape(num_batch, num_batch, num_res)
+#
+#     def constraint_fn(x):
+#         x = x.reshape(num_batch**2, 3)
+#         return np.linalg.norm(x, axis=-1)
+#     constraint = NonlinearConstraint(constraint_fn, 0, np.pi)
+#
+#     result = differential_evolution(
+#         func=partial(
+#             _cost,
+#             trans_1=trans_1,
+#             trans_0=trans_0,
+#             rotmats_1=rotmats_1,
+#             rotmats_0=rotmats_0,
+#             batch_mask=batch_mask,
+#             num_batch=num_batch,
+#             num_res=num_res
+#         ),
+#         bounds=Bounds(-np.pi * np.ones(3 * num_batch**2), np.pi * np.ones(3 * num_batch ** 2)),
+#         # constraints=constraint,
+#     )
+#     # print(result)
+#     best_rotvec = torch.as_tensor(result.x).float().view(num_batch, num_batch, 3)
+#     rotation_matrices = so3_utils.rotvec_to_rotmat(best_rotvec)
+#     rotation_matrices = rotation_matrices.view(num_batch, num_batch, 3, 3)
+#
+#     new_trans_0 = torch.einsum("bcij,bcnj->bcni", rotation_matrices, trans_0)
+#     new_rotmats_0 = torch.einsum("bcnij,bcjk->bcnik", rotmats_0, rotation_matrices)
+#     return new_trans_0, new_rotmats_0

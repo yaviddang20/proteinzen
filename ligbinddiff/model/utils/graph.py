@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
-from torch_geometric.utils import sort_edge_index, scatter
+from torch_geometric.utils import sort_edge_index, scatter, coalesce
 from ligbinddiff.data.datasets.featurize.common import _rbf
 
 from ligbinddiff.data.datasets.featurize.common import _edge_positional_embeddings
@@ -97,7 +97,8 @@ def sample_logn_inv_cubic_edges(
     min_inv_cube_edges=40,
     logn_scale=8,
     logn_offset=-12,
-    self_edge=False
+    self_edge=False,
+    gen_triangle_edges=False,
 ):
     # TODO: change x_mask to be True for retained positions
     edge_indicies = []
@@ -157,10 +158,10 @@ def sample_logn_inv_cubic_edges(
         edge_sinks = torch.cat([knn_edges, sampled_edges], dim=-1)  # B x N x (knn_k + inv_cube_k)
         edge_sources = torch.arange(X_ca.shape[0]).repeat_interleave(knn_k + inv_cube_k).to(edge_sinks.device)
         edge_index = torch.stack([edge_sinks.flatten(), edge_sources], dim=0)
+
         # sorting not strictly necessarily but it help if we ever hack things to dense knn graphs
         # edge_indicies.append(sort_edge_index(edge_index, sort_by_row=False) + offset)
         edge_indicies.append(edge_index + offset)
-        offset = offset + (batch == i).long().sum()
         num_nodes = X_ca.shape[0]
         knn_edge_select.append(torch.cat(
             [torch.ones(knn_k), torch.zeros(inv_cube_k)]
@@ -169,11 +170,31 @@ def sample_logn_inv_cubic_edges(
             [torch.zeros(knn_k), torch.ones(inv_cube_k)]
         ).repeat(num_nodes).bool().to(X_ca.device))
 
+        if gen_triangle_edges:
+           triag_edge_src = sampled_edges[..., None, :].expand(-1, inv_cube_k, -1)
+           triag_edge_dst = sampled_edges[..., None].expand(-1, -1, inv_cube_k)
+           triag_edge_index = torch.stack([triag_edge_dst, triag_edge_src]).view(2, -1)
+           edge_indicies.append(triag_edge_index + offset)
+           triag_offset = triag_edge_index.shape[-1]
+           knn_edge_select.append(torch.zeros(triag_offset, device=X_ca.device))
+           lrange_edge_select.append(torch.zeros(triag_offset, device=X_ca.device))
+
+        offset = offset + (batch == i).long().sum()
+
     edge_index = torch.cat(edge_indicies, dim=-1)
     knn_edge_select = torch.cat(knn_edge_select, dim=0)
     lrange_edge_select = torch.cat(lrange_edge_select, dim=0)
     edge_mask = batched_x_mask[edge_index].any(dim=0)
-    return edge_index[:, ~edge_mask], knn_edge_select[~edge_mask], lrange_edge_select[~edge_mask]
+    edge_index, knn_edge_select, lrange_edge_select = edge_index[:, ~edge_mask], knn_edge_select[~edge_mask], lrange_edge_select[~edge_mask]
+    if gen_triangle_edges:
+        edge_index, (knn_edge_select, lrange_edge_select) = coalesce(
+            edge_index, [knn_edge_select.long(), lrange_edge_select.long()],
+            reduce="mul"
+        )
+        knn_edge_select = knn_edge_select.bool()
+        lrange_edge_select = lrange_edge_select.bool()
+
+    return edge_index, knn_edge_select, lrange_edge_select
 
 
 def sample_all_edges(

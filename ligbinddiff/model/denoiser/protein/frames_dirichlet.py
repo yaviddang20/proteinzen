@@ -183,6 +183,7 @@ class DynamicGraphIpaFrameDirichletDenoiser(nn.Module):
                  lrange_k=40,
                  self_conditioning=False,
                  use_seq_edge=True,
+                 use_final_transition=False,
                  impute_oxy=False,
                  num_aa=20):
         super().__init__()
@@ -239,6 +240,11 @@ class DynamicGraphIpaFrameDirichletDenoiser(nn.Module):
         ])
         self.knn_k = knn_k
         self.lrange_k = lrange_k
+
+        if use_final_transition:
+            self.final_transition = StructureModuleTransition(c_s)
+        else:
+            self.final_transition = None
 
         self.torsion_angles = nn.Linear(c_s + num_aa, 81 * 2)
         self.seq_logits = nn.Linear(c_s, num_aa)
@@ -411,6 +417,9 @@ class DynamicGraphIpaFrameDirichletDenoiser(nn.Module):
             )
 
         rigids = rigids.scale_translation(10)
+
+        if self.final_transition is not None:
+            node_features = self.final_transition(node_features)
 
         seq_logits = self.seq_logits(node_features)
         torsions = self.torsion_angles(

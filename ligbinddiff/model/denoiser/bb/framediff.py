@@ -1,10 +1,14 @@
 """Fork of Openfold's IPA."""
 
+from abc import ABC, abstractmethod
 import numpy as np
 import torch
 import math
 from scipy.stats import truncnorm
 import torch.nn as nn
+import torch.nn.functional as F
+from functools import partialmethod
+from typing import Union, Tuple
 from typing import Optional, Callable, List, Sequence
 
 import functools as fn
@@ -14,8 +18,18 @@ from ligbinddiff.data.datasets.featurize.common import _node_positional_embeddin
 from ligbinddiff.model.modules.common import GaussianRandomFourierBasis
 from ligbinddiff.model.modules.openfold.frames import Linear, flatten_final_dims, ipa_point_weights_init_
 from ligbinddiff.model.utils.graph import get_data_lens, batchwise_to_nodewise, gen_spatial_graph_features, sample_inv_cubic_edges, sequence_local_graph
+import ligbinddiff.utils.openfold.rigid_utils as ru
 from ligbinddiff.utils.openfold.rigid_utils import Rigid, batchwise_center
 from ligbinddiff.utils.framediff.all_atom import compute_backbone
+
+import importlib
+deepspeed_is_installed = importlib.util.find_spec("deepspeed") is not None
+ds4s_is_installed = deepspeed_is_installed and importlib.util.find_spec("deepspeed.ops.deepspeed4science") is not None
+if deepspeed_is_installed:
+    import deepspeed
+
+if ds4s_is_installed:
+    from deepspeed.ops.deepspeed4science import DS4Sci_EvoformerAttention
 
 
 def permute_final_dims(tensor: torch.Tensor, inds: List[int]):
@@ -571,11 +585,26 @@ def get_timestep_embedding(timesteps, embedding_dim, max_positions=10000):
     return emb
 
 
+def calc_distogram(pos, min_bin, max_bin, num_bins):
+    dists_2d = torch.linalg.norm(
+        pos[:, :, None, :] - pos[:, None, :, :], axis=-1)[..., None]
+    lower = torch.linspace(
+        min_bin,
+        max_bin,
+        num_bins,
+        device=pos.device)
+    upper = torch.cat([lower[1:], lower.new_tensor([1e8])], dim=-1)
+    dgram = ((dists_2d > lower) * (dists_2d < upper)).type(pos.dtype)
+    return dgram
+
 
 class Embedder(nn.Module):
 
-    def __init__(self, c_s, c_z,
-                 index_embed_size=32):
+    def __init__(self,
+                 c_s,
+                 c_z,
+                 index_embed_size=32,
+                 use_init_distogram=False):
         super(Embedder, self).__init__()
 
         # Time step embedding
@@ -586,6 +615,12 @@ class Embedder(nn.Module):
         # Sequence index embedding
         node_embed_dims += index_embed_size
         edge_in += index_embed_size
+        edge_in += 22
+
+        self.use_init_distogram = use_init_distogram
+        if use_init_distogram:
+            edge_in += 22
+
 
         node_embed_size = c_s
         self.node_embedder = nn.Sequential(
@@ -628,6 +663,8 @@ class Embedder(nn.Module):
             seq_idx,
             t,
             fixed_mask,
+            self_conditioning_ca,
+            init_ca=None
         ):
         """Embeds a set of inputs
 
@@ -659,6 +696,23 @@ class Embedder(nn.Module):
         rel_seq_offset = rel_seq_offset.reshape([num_batch, num_res**2])
         pair_feats.append(self.index_embedder(rel_seq_offset))
 
+        sc_dgram = calc_distogram(
+            self_conditioning_ca,
+            1e-5,
+            20,
+            22
+        )
+        pair_feats.append(sc_dgram.reshape([num_batch, num_res**2, -1]))
+        if self.use_init_distogram:
+            init_dgram = calc_distogram(
+                init_ca,
+                1e-5,
+                20,
+                22
+            )
+            pair_feats.append(init_dgram.reshape([num_batch, num_res**2, -1]))
+
+
         node_embed = self.node_embedder(torch.cat(node_feats, dim=-1).float())
         edge_embed = self.edge_embedder(torch.cat(pair_feats, dim=-1).float())
         edge_embed = edge_embed.reshape([num_batch, num_res, num_res, -1])
@@ -668,7 +722,7 @@ class Embedder(nn.Module):
 class IpaScore(nn.Module):
 
     def __init__(self,
-                 diffuser,
+                 #diffuser,
                  c_s=256,
                  c_z=128,
                  c_skip=64,
@@ -677,9 +731,14 @@ class IpaScore(nn.Module):
                  num_qk_points=8,
                  num_v_points=12,
                  num_blocks=4,
-                 coordinate_scaling=0.1):
+                 coordinate_scaling=0.1,
+                 update_edges_with_dist=False,
+                 use_proteus_edge_transition=False,
+                 ):
         super(IpaScore, self).__init__()
-        self.diffuser = diffuser
+        # self.diffuser = diffuser
+        self.update_edges_with_dist = update_edges_with_dist
+        self.use_proteus_edge_transition = use_proteus_edge_transition
 
         self.scale_pos = lambda x: x * coordinate_scaling
         self.scale_rigids = lambda x: x.apply_trans_fn(self.scale_pos)
@@ -724,12 +783,31 @@ class IpaScore(nn.Module):
 
             if b < num_blocks-1:
                 # No edge update on the last block.
-                edge_in = c_z
-                self.trunk[f'edge_transition_{b}'] = EdgeTransition(
-                    node_embed_size=c_s,
-                    edge_embed_in=edge_in,
-                    edge_embed_out=c_z,
-                )
+                if update_edges_with_dist:
+                    edge_in = c_z + 22
+                else:
+                    edge_in = c_z
+                if self.use_proteus_edge_transition:
+                    self.trunk[f'edge_transition_{b}'] = LocalTriangleAttentionNew(
+                        c_s=c_s,
+                        c_z=c_z,
+                        c_rbf=64,
+                        c_gate_s=16,
+                        c_hidden=128,
+                        c_hidden_mul=128,
+                        no_heads=4,
+                        transition_n=2,
+                        k_neighbour=32,
+                        k_linear=0,
+                        inf=1e9,
+                        pair_dropout=0.25
+                    )
+                else:
+                    self.trunk[f'edge_transition_{b}'] = EdgeTransition(
+                        node_embed_size=c_s,
+                        edge_embed_in=edge_in,
+                        edge_embed_out=c_z,
+                    )
 
         self.torsion_pred = TorsionAngles(c_s, 1)
 
@@ -768,29 +846,45 @@ class IpaScore(nn.Module):
                 rigid_update * diffuse_mask[..., None])
 
             if b < self.num_blocks-1:
-                edge_embed = self.trunk[f'edge_transition_{b}'](
-                    node_embed, edge_embed)
+                if self.update_edges_with_dist:
+                    pos = curr_rigids.get_trans()
+                    dists_2d = torch.linalg.norm(
+                        pos[:, :, None, :] - pos[:, None, :, :], axis=-1)
+                    curr_dgram = _rbf(dists_2d, 1e-5, 20, D_count=22, device=dists_2d.device)
+                    edge_embed_in = torch.cat(
+                        [edge_embed, curr_dgram],
+                        dim=-1
+                    )
+                else:
+                    edge_embed_in = edge_embed
+
+                if self.use_proteus_edge_transition:
+                    edge_embed = self.trunk[f'edge_transition_{b}'](
+                        node_embed, edge_embed, curr_rigids, edge_mask)
+                else:
+                    edge_embed = self.trunk[f'edge_transition_{b}'](
+                        node_embed, edge_embed_in)
                 edge_embed *= edge_mask[..., None]
-        rot_score = self.diffuser.calc_rot_score(
-            init_rigids.get_rots(), # .get_rot_mats(),
-            curr_rigids.get_rots(), # .get_rot_mats(),
-            input_feats['t']
-        )
-        rot_score = rot_score * node_mask[..., None]
+        # rot_score = self.diffuser.calc_rot_score(
+        #     init_rigids.get_rots(), # .get_rot_mats(),
+        #     curr_rigids.get_rots(), # .get_rot_mats(),
+        #     input_feats['t']
+        # )
+        # rot_score = rot_score * node_mask[..., None]
 
         curr_rigids = self.unscale_rigids(curr_rigids)
-        trans_score = self.diffuser.calc_trans_score(
-            init_rigids.get_trans(),
-            curr_rigids.get_trans(),
-            input_feats['t'][:, None, None],
-            use_torch=True
-        )
-        trans_score = trans_score * node_mask[..., None]
+        # trans_score = self.diffuser.calc_trans_score(
+        #     init_rigids.get_trans(),
+        #     curr_rigids.get_trans(),
+        #     input_feats['t'][:, None, None],
+        #     use_torch=True
+        # )
+        # trans_score = trans_score * node_mask[..., None]
         _, psi_pred = self.torsion_pred(node_embed)
         model_out = {
             'psi': psi_pred,
-            'rot_score': rot_score,
-            'trans_score': trans_score,
+            # 'rot_score': rot_score,
+            # 'trans_score': trans_score,
             'final_rigids': curr_rigids,
             'node_embed': node_embed
         }
@@ -799,7 +893,7 @@ class IpaScore(nn.Module):
 
 class IpaScoreWrapper(nn.Module):
     def __init__(self,
-                 diffuser,
+                 # diffuser,
                  c_s=256,
                  c_z=128,
                  c_skip=64,
@@ -808,11 +902,20 @@ class IpaScoreWrapper(nn.Module):
                  num_qk_points=8,
                  num_v_points=12,
                  num_blocks=4,
+                 use_init_dgram=False,
+                 update_edges_with_dgram=False,
+                 use_proteus_transition=False,
                  ):
         super().__init__()
+        # some compatibility code
+        self.self_conditioning = True
+        self.lrange_k = 10000
+        self.knn_k = 10000
+        self.lrange_logn_scale = 10000
+        self.lrange_logn_offset = 10000
 
         self.ipa_score = IpaScore(
-            diffuser,
+            # diffuser,
             c_s=c_s,
             c_z=c_z,
             c_skip=c_skip,
@@ -820,33 +923,53 @@ class IpaScoreWrapper(nn.Module):
             num_heads=num_heads,
             num_qk_points=num_qk_points,
             num_v_points=num_v_points,
-            num_blocks=num_blocks
+            num_blocks=num_blocks,
+            update_edges_with_dist=update_edges_with_dgram,
+            use_proteus_edge_transition=use_proteus_transition
         )
-        self.embedder = Embedder(c_s=c_s, c_z=c_z)
+        self.embedder = Embedder(c_s=c_s, c_z=c_z, use_init_distogram=use_init_dgram)
 
-    def forward(self, data):
-        device = data['x'].device
+    def forward(self, data, self_condition=None):
+        res_data = data['residue']
+        res_mask = (res_data['res_mask']).bool()
+
+        rigids_t = ru.Rigid.from_tensor_7(res_data['rigids_t'])
+        # center the training example at the mean of the x_cas
+        center = ru.batchwise_center(rigids_t, res_data.batch, res_data['res_mask'].bool())
+        rigids_t = rigids_t.translate(-center)
 
         data_list = data.to_data_list()
-        seq_idx = [torch.arange(data_list[0].num_nodes, device=device) for _ in data_list]
+        seq_idx = [torch.arange(data_list[0].num_nodes, device=center.device) for _ in data_list]
         seq_idx = torch.stack(seq_idx)
         t = data['t']
         batch_size = t.shape[0]
-        fixed_mask = data['fixed_mask'].view(batch_size, -1)
+        fixed_mask = torch.zeros_like(res_mask).view(batch_size, -1)
+        print(fixed_mask.shape)
 
-        node_embed, edge_embed = self.embedder(seq_idx=seq_idx, t=t, fixed_mask=fixed_mask)
+        if self_condition is not None:
+            self_conditioning_ca = self_condition['final_rigids'].get_trans().view(batch_size, -1, 3)
+        else:
+            self_conditioning_ca = torch.zeros_like(rigids_t.get_trans().view(batch_size, -1, 3))
 
-        node_mask = ~data['x_mask'].view(batch_size, -1)
+
 
         # center the training example at the mean of the x_cas
-        rigids_t = Rigid.from_tensor_7(data['rigids_t'])
-        center = batchwise_center(rigids_t, data.batch, node_mask)
+        rigids_t = Rigid.from_tensor_7(res_data['rigids_t'])
+        center = batchwise_center(rigids_t, res_data.batch, res_mask)
         rigids_t = rigids_t.translate(-center)
         rigids_t = rigids_t.view([t.shape[0], -1])
 
+        node_embed, edge_embed = self.embedder(
+            seq_idx=seq_idx,
+            t=t,
+            fixed_mask=fixed_mask,
+            self_conditioning_ca=self_conditioning_ca,
+            init_ca=rigids_t.get_trans()
+        )
+
         input_feats = {
             'fixed_mask': fixed_mask,
-            'res_mask': node_mask,
+            'res_mask': res_mask.view(batch_size, -1),
             'rigids_t': rigids_t.to_tensor_7(),
             't': t
         }
@@ -869,6 +992,747 @@ class IpaScoreWrapper(nn.Module):
         ret['psi'] = psi
 
         return ret
+
+
+class TriangleAttentionCore(nn.Module):
+    """
+    Standard multi-head attention using AlphaFold's default layer
+    initialization. Allows multiple bias vectors.
+    """
+    def __init__(
+        self,
+        c_q: int,
+        c_k: int,
+        c_v: int,
+        c_hidden: int,
+        no_heads: int,
+        gating: bool = True,
+    ):
+        """
+        Args:
+            c_q:
+                Input dimension of query data
+            c_k:
+                Input dimension of key data
+            c_v:
+                Input dimension of value data
+            c_hidden:
+                Per-head hidden dimension
+            no_heads:
+                Number of attention heads
+            gating:
+                Whether the output should be gated using query data
+        """
+        super().__init__()
+
+        self.c_q = c_q
+        self.c_k = c_k
+        self.c_v = c_v
+        self.c_hidden = c_hidden
+        self.no_heads = no_heads
+        self.gating = gating
+
+        # DISCREPANCY: c_hidden is not the per-head channel dimension, as
+        # stated in the supplement, but the overall channel dimension.
+
+        self.linear_q = Linear(
+            self.c_q, self.c_hidden * self.no_heads, bias=False, init="glorot"
+        )
+        self.linear_k = Linear(
+            self.c_k, self.c_hidden * self.no_heads, bias=False, init="glorot"
+        )
+        self.linear_v = Linear(
+            self.c_v, self.c_hidden * self.no_heads, bias=False, init="glorot"
+        )
+        self.linear_o = Linear(
+            self.c_hidden * self.no_heads, self.c_q, init="final"
+        )
+
+        self.linear_g = None
+        if self.gating:
+            self.linear_g = Linear(
+                self.c_q, self.c_hidden * self.no_heads, init="gating"
+            )
+
+        self.sigmoid = nn.Sigmoid()
+
+    def _prep_qkv(self,
+        q_x: torch.Tensor,
+        kv_x: torch.Tensor,
+        apply_scale: bool = True
+    ):
+        # [*, Q/K/V, H * C_hidden]
+        q = self.linear_q(q_x)
+        k = self.linear_k(kv_x)
+        v = self.linear_v(kv_x)
+
+        # [*, Q/K, H, C_hidden]
+        q = q.view(q.shape[:-1] + (self.no_heads, -1))
+        k = k.view(k.shape[:-1] + (self.no_heads, -1))
+        v = v.view(v.shape[:-1] + (self.no_heads, -1))
+
+        # [*, H, Q/K, C_hidden]
+        q = q.transpose(-2, -3)
+        k = k.transpose(-2, -3)
+        v = v.transpose(-2, -3)
+
+        if apply_scale:
+            q /= math.sqrt(self.c_hidden)
+
+        return q, k, v
+
+    def _wrap_up(self,
+        o: torch.Tensor,
+        q_x: torch.Tensor
+    ) -> torch.Tensor:
+        if self.linear_g is not None:
+            g = self.sigmoid(self.linear_g(q_x))
+
+            # [*, Q, H, C_hidden]
+            g = g.view(g.shape[:-1] + (self.no_heads, -1))
+            o = o * g
+
+        # [*, Q, H * C_hidden]
+        o = flatten_final_dims(o, 2)
+
+        # [*, Q, C_q]
+        o = self.linear_o(o)
+
+        return o
+
+    def forward(
+        self,
+        q_x: torch.Tensor,
+        kv_x: torch.Tensor,
+        biases: Optional[List[torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            q_x:
+                [*, Q, C_q] query data
+            kv_x:
+                [*, K, C_k] key data
+            biases:
+                List of biases that broadcast to [*, H, Q, K]
+            use_memory_efficient_kernel:
+                Whether to use a custom memory-efficient attention kernel.
+                This should be the default choice for most. If none of the
+                "use_<...>" flags are True, a stock PyTorch implementation
+                is used instead
+            use_deepspeed_evo_attention:
+                Whether to use DeepSpeed memory-efficient attention kernel.
+                If none of the "use_<...>" flags are True, a stock PyTorch
+                implementation is used instead
+            use_lma:
+                Whether to use low-memory attention (Staats & Rabe 2021). If
+                none of the "use_<...>" flags are True, a stock PyTorch
+                implementation is used instead
+            lma_q_chunk_size:
+                Query chunk size (for LMA)
+            lma_kv_chunk_size:
+                Key/Value chunk size (for LMA)
+        Returns
+            [*, Q, C_q] attention update
+        """
+        # DeepSpeed attention kernel applies scaling internally
+        q, k, v = self._prep_qkv(q_x, kv_x,
+                                 apply_scale=False)
+
+        o = _deepspeed_evo_attn(q, k, v, biases)
+
+        o = self._wrap_up(o, q_x)
+
+        return o
+
+
+class TriangleAttention(nn.Module):
+    def __init__(
+        self, c_in, c_hidden, no_heads, starting=True, inf=1e9
+    ):
+        """
+        Args:
+            c_in:
+                Input channel dimension
+            c_hidden:
+                Overall hidden channel dimension (not per-head)
+            no_heads:
+                Number of attention heads
+        """
+        super(TriangleAttention, self).__init__()
+
+        self.c_in = c_in
+        self.c_hidden = c_hidden
+        self.no_heads = no_heads
+        self.starting = starting
+        self.inf = inf
+
+        self.layer_norm = nn.LayerNorm(self.c_in)
+
+        self.linear = Linear(c_in, self.no_heads, bias=False, init="normal")
+
+        self.mha = TriangleAttentionCore(
+            self.c_in, self.c_in, self.c_in, self.c_hidden, self.no_heads
+        )
+
+    def forward(self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x:
+                [*, I, J, C_in] input tensor (e.g. the pair representation)
+        Returns:
+            [*, I, J, C_in] output tensor
+        """
+        if mask is None:
+            # [*, I, J]
+            mask = x.new_ones(
+                x.shape[:-1],
+            )
+
+        if(not self.starting):
+            x = x.transpose(-2, -3)
+            mask = mask.transpose(-1, -2)
+
+        # [*, I, J, C_in]
+        x = self.layer_norm(x)
+
+        # [*, I, 1, 1, J]
+        mask_bias = (self.inf * (mask - 1))[..., :, None, None, :]
+
+        # [*, H, I, J]
+        triangle_bias = permute_final_dims(self.linear(x), (2, 0, 1))
+
+        # [*, 1, H, I, J]
+        triangle_bias = triangle_bias.unsqueeze(-4)
+
+        biases = [mask_bias, triangle_bias]
+
+        x = self.mha(
+            q_x=x,
+            kv_x=x,
+            biases=biases,
+        )
+
+        if(not self.starting):
+            x = x.transpose(-2, -3)
+
+        return x
+
+
+@torch.jit.ignore
+def _deepspeed_evo_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    biases: List[torch.Tensor],
+):
+    """""
+    Compute attention using the DeepSpeed DS4Sci_EvoformerAttention kernel.
+
+    Args:
+        q:
+            [*, H, Q, C_hidden] query data
+        k:
+            [*, H, K, C_hidden] key data
+        v:
+            [*, H, V, C_hidden] value data
+        biases:
+            List of biases that broadcast to [*, H, Q, K]
+    """
+
+    if not ds4s_is_installed:
+        raise ValueError(
+            "_deepspeed_evo_attn requires that DeepSpeed be installed "
+            "and that the deepspeed.ops.deepspeed4science package exists"
+        )
+
+    def reshape_dims(x):
+        no_batch_dims = len(x.shape[:-3])
+        if no_batch_dims < 2:
+            return x.reshape(*((1,) * (2 - no_batch_dims) + x.shape))
+        if no_batch_dims > 2:
+            return x.reshape(*((x.shape[0], -1) + x.shape[-3:]))
+        return x
+
+    # [*, Q/K, H, C_hidden]
+    q = q.transpose(-2, -3)
+    k = k.transpose(-2, -3)
+    v = v.transpose(-2, -3)
+
+    # Reshape tensors to match expected input shape [B, N, Q/K, H, C_hidden]
+    # for DS4Sci_EvoformerAttention() by adding or flattening batch dims as needed.
+    orig_shape = q.shape
+    if len(orig_shape[:-3]) != 2:
+        q = reshape_dims(q)
+        k = reshape_dims(k)
+        v = reshape_dims(v)
+        biases = [reshape_dims(b) for b in biases]
+
+    # DeepSpeed attn. kernel requires inputs to be type bf16 or fp16
+    # Cast to bf16 so kernel can be used during inference
+    orig_dtype = q.dtype
+    if orig_dtype not in [torch.bfloat16, torch.float16]:
+        o = DS4Sci_EvoformerAttention(q.to(dtype=torch.bfloat16),
+                                      k.to(dtype=torch.bfloat16),
+                                      v.to(dtype=torch.bfloat16),
+                                      [b.to(dtype=torch.bfloat16) for b in biases])
+
+        o = o.to(dtype=orig_dtype)
+    else:
+        o = DS4Sci_EvoformerAttention(q, k, v, biases)
+
+    o = o.reshape(orig_shape)
+    return o
+
+
+class PairTransition(nn.Module):
+    """
+    Implements Algorithm 15.
+    """
+
+    def __init__(self, c_z, n):
+        """
+        Args:
+            c_z:
+                Pair transition channel dimension
+            n:
+                Factor by which c_z is multiplied to obtain hidden channel
+                dimension
+        """
+        super(PairTransition, self).__init__()
+
+        self.c_z = c_z
+        self.n = n
+
+        self.layer_norm = nn.LayerNorm(self.c_z)
+        self.linear_1 = Linear(self.c_z, self.n * self.c_z, init="relu")
+        self.relu = nn.ReLU()
+        self.linear_2 = Linear(self.n * self.c_z, c_z, init="final")
+
+    def _transition(self, z, mask):
+        # [*, N_res, N_res, C_z]
+        z = self.layer_norm(z)
+
+        # [*, N_res, N_res, C_hidden]
+        z = self.linear_1(z)
+        z = self.relu(z)
+
+        # [*, N_res, N_res, C_z]
+        z = self.linear_2(z)
+        z = z * mask
+
+        return z
+
+
+    def forward(self,
+        z: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            z:
+                [*, N_res, N_res, C_z] pair embedding
+        Returns:
+            [*, N_res, N_res, C_z] pair embedding update
+        """
+        # DISCREPANCY: DeepMind forgets to apply the mask in this module.
+        if mask is None:
+            mask = z.new_ones(z.shape[:-1])
+
+        # [*, N_res, N_res, 1]
+        mask = mask.unsqueeze(-1)
+        z = self._transition(z=z, mask=mask)
+
+        return z
+
+class Dropout(nn.Module):
+    """
+    Implementation of dropout with the ability to share the dropout mask
+    along a particular dimension.
+
+    If not in training mode, this module computes the identity function.
+    """
+
+    def __init__(self, r: float, batch_dim: Union[int, List[int]]):
+        """
+        Args:
+            r:
+                Dropout rate
+            batch_dim:
+                Dimension(s) along which the dropout mask is shared
+        """
+        super(Dropout, self).__init__()
+
+        self.r = r
+        if type(batch_dim) == int:
+            batch_dim = [batch_dim]
+        self.batch_dim = batch_dim
+        self.dropout = nn.Dropout(self.r)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x:
+                Tensor to which dropout is applied. Can have any shape
+                compatible with self.batch_dim
+        """
+        shape = list(x.shape)
+        if self.batch_dim is not None:
+            for bd in self.batch_dim:
+                shape[bd] = 1
+        mask = x.new_ones(shape)
+        mask = self.dropout(mask)
+        x *= mask
+        return x
+
+
+class DropoutRowwise(Dropout):
+    """
+    Convenience class for rowwise dropout as described in subsection
+    1.11.6.
+    """
+
+    __init__ = partialmethod(Dropout.__init__, batch_dim=-3)
+
+
+class DropoutColumnwise(Dropout):
+    """
+    Convenience class for columnwise dropout as described in subsection
+    1.11.6.
+    """
+
+    __init__ = partialmethod(Dropout.__init__, batch_dim=-2)
+
+
+class BaseTriangleMultiplicativeUpdate(nn.Module, ABC):
+    """
+    Implements Algorithms 11 and 12.
+    """
+    @abstractmethod
+    def __init__(self, c_z, c_hidden, _outgoing):
+        """
+        Args:
+            c_z:
+                Input channel dimension
+            c:
+                Hidden channel dimension
+        """
+        super(BaseTriangleMultiplicativeUpdate, self).__init__()
+        self.c_z = c_z
+        self.c_hidden = c_hidden
+        self._outgoing = _outgoing
+
+        self.linear_g = Linear(self.c_z, self.c_z, init="gating")
+        self.linear_z = Linear(self.c_hidden, self.c_z, init="final")
+
+        self.layer_norm_in = nn.LayerNorm(self.c_z)
+        self.layer_norm_out = nn.LayerNorm(self.c_hidden)
+
+        self.sigmoid = nn.Sigmoid()
+
+    def _combine_projections(self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        _inplace_chunk_size: Optional[int] = None
+    ) -> torch.Tensor:
+        if(self._outgoing):
+            a = permute_final_dims(a, (2, 0, 1))
+            b = permute_final_dims(b, (2, 1, 0))
+        else:
+            a = permute_final_dims(a, (2, 1, 0))
+            b = permute_final_dims(b,  (2, 0, 1))
+
+        if(_inplace_chunk_size is not None):
+            # To be replaced by torch vmap
+            for i in range(0, a.shape[-3], _inplace_chunk_size):
+                a_chunk = a[..., i: i + _inplace_chunk_size, :, :]
+                b_chunk = b[..., i: i + _inplace_chunk_size, :, :]
+                a[..., i: i + _inplace_chunk_size, :, :] = (
+                    torch.matmul(
+                        a_chunk,
+                        b_chunk,
+                    )
+                )
+
+            p = a
+        else:
+            p = torch.matmul(a, b)
+
+        return permute_final_dims(p, (1, 2, 0))
+
+    @abstractmethod
+    def forward(self,
+        z: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        inplace_safe: bool = False,
+        _add_with_inplace: bool = False
+    ) -> torch.Tensor:
+        """
+        Args:
+            x:
+                [*, N_res, N_res, C_z] input tensor
+            mask:
+                [*, N_res, N_res] input mask
+        Returns:
+            [*, N_res, N_res, C_z] output tensor
+        """
+        pass
+
+
+class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
+    """
+    Implements Algorithms 11 and 12.
+    """
+    def __init__(self, c_z, c_hidden, _outgoing=True):
+        """
+        Args:
+            c_z:
+                Input channel dimension
+            c:
+                Hidden channel dimension
+        """
+        super(TriangleMultiplicativeUpdate, self).__init__(c_z=c_z,
+                                                           c_hidden=c_hidden,
+                                                           _outgoing=_outgoing)
+
+        self.linear_a_p = Linear(self.c_z, self.c_hidden)
+        self.linear_a_g = Linear(self.c_z, self.c_hidden, init="gating")
+        self.linear_b_p = Linear(self.c_z, self.c_hidden)
+        self.linear_b_g = Linear(self.c_z, self.c_hidden, init="gating")
+
+
+    def forward(self,
+        z: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x:
+                [*, N_res, N_res, C_z] input tensor
+            mask:
+                [*, N_res, N_res] input mask
+        Returns:
+            [*, N_res, N_res, C_z] output tensor
+        """
+        if mask is None:
+            mask = z.new_ones(z.shape[:-1])
+
+        mask = mask.unsqueeze(-1)
+
+        z = self.layer_norm_in(z)
+        a = mask
+        a = a * self.sigmoid(self.linear_a_g(z))
+        a = a * self.linear_a_p(z)
+        b = mask
+        b = b * self.sigmoid(self.linear_b_g(z))
+        b = b * self.linear_b_p(z)
+
+        x = self._combine_projections(a, b)
+
+        del a, b
+        x = self.layer_norm_out(x)
+        x = self.linear_z(x)
+        g = self.sigmoid(self.linear_g(z))
+        x = x * g
+
+        return x
+
+
+class TriangleMultiplicationOutgoing(TriangleMultiplicativeUpdate):
+    """
+    Implements Algorithm 11.
+    """
+    __init__ = partialmethod(TriangleMultiplicativeUpdate.__init__, _outgoing=True)
+
+
+class TriangleMultiplicationIncoming(TriangleMultiplicativeUpdate):
+    """
+    Implements Algorithm 12.
+    """
+    __init__ = partialmethod(TriangleMultiplicativeUpdate.__init__, _outgoing=False)
+
+
+class LocalTriangleAttentionNew(nn.Module):
+    def __init__(
+            self,
+            c_s,
+            c_z,
+            c_rbf,
+            c_gate_s,
+            c_hidden,
+            c_hidden_mul,
+            no_heads,
+            transition_n,
+            k_neighbour,
+            k_linear,
+            inf,
+            pair_dropout,
+            **kwargs,
+        ):
+        super(LocalTriangleAttentionNew, self).__init__()
+        self.embed_size = ( c_s // 2 ) * 2 + c_z
+        self.no_heads = no_heads
+        self.c_hidden = c_hidden
+        self.c_rbf = c_rbf
+        self.k_neighbour = k_neighbour
+        self.k_linear = k_linear
+        self.inf = inf
+        self.NM_TO_ANG_SCALE = 10.0
+
+        self.proj_left = Linear(c_s, c_gate_s)
+        self.proj_right = Linear(c_s, c_gate_s)
+        self.to_gate = Linear(c_gate_s*c_gate_s, c_z,init="gating")
+
+        self.emb_rbf = nn.Linear(c_rbf, c_z)
+        self.to_bias = Linear(c_z, self.no_heads, bias=False, init="normal")
+
+        self.tri_mul_out = TriangleMultiplicationOutgoing(c_z,c_hidden_mul)
+        self.tri_mul_in = TriangleMultiplicationIncoming(c_z,c_hidden_mul)
+
+        self.pair_transition = PairTransition(
+            c_z,
+            transition_n,
+        )
+
+        self.mha_start = TriangleAttentionCore(c_z, c_z, c_z, self.c_hidden, self.no_heads)
+        self.mha_end = TriangleAttentionCore(c_z, c_z, c_z, self.c_hidden, self.no_heads)
+
+        # self.tri_attn_out = TriangleAttention(c_z,c_hidden, no_heads, starting=False)
+        # self.tri_attn_in = TriangleAttention(c_z,c_hidden, no_heads, starting=True)
+
+        self.dropout_row_layer = DropoutRowwise(pair_dropout)
+        self.dropout_col_layer = DropoutColumnwise(pair_dropout)
+
+        self.layer_norm = nn.LayerNorm(c_z)
+
+    def local_mha(self, x, rigids, num_neighbour,num_linear,triangle_bias, mask, starting_node):
+        '''
+        Args:
+            x: [batch_size, residue_num, residue_num, embed_size]
+            rigids: [batch_size, residue_num, 3, 3]
+            num_neighbour: int
+            num_linear: int
+            triangle_bias: [batch_size, residue_num, residue_num, num_heads]
+            mask: [batch_size, residue_num, residue_num]
+            starting_node: bool
+        Returns:
+            x: [batch_size, residue_num, residue_num, embed_size]
+        '''
+        B, N, _, D = x.size()
+        B, N, _, H = triangle_bias.size()
+
+        out_x = torch.zeros_like(x)
+        coords = rigids.get_trans()
+
+        if not starting_node:
+            x = x.transpose(-2, -3)
+            triangle_bias = triangle_bias.transpose(-2, -3)
+            mask = mask.transpose(-1, -2)
+
+        # # [batch_size, residue_num, num_neighbour]
+        # indices = self.knn_indices(coords, num_neighbour,num_linear, pair_mask=mask)
+        # num_neighbour = num_neighbour + num_linear
+
+        # x = torch.gather(
+        #     x, dim=2, index=indices.unsqueeze(-1).expand(B, N, num_neighbour, D)
+        # )
+        x = self.layer_norm(x)
+        # # [B, I, K]
+        # mask = torch.gather(
+        #     mask, dim=2, index=indices
+        # )
+        # [B, I, 1, 1, K]
+        mask_bias = (self.inf * (mask - 1))[..., :, None, None, :]
+
+        # # [B, I, J, K, H]
+        # triangle_bias = triangle_bias.unsqueeze(-2).expand(B, N, N, N, H,)
+        # # [B, I, k, K, H]
+        # triangle_bias = torch.gather(
+        #     triangle_bias, dim=2, index=indices[...,None,None].expand((B,N,num_neighbour,N,H,))
+        # )
+        # # [B, I, k, k, H]
+        # triangle_bias = torch.gather(
+        #     triangle_bias, dim=3, index=indices[...,None,:,None].expand((B,N,num_neighbour,num_neighbour,H,))
+        # )
+        # [B, I, H, k, k]
+        triangle_bias = permute_final_dims(triangle_bias, (2, 1, 0))
+        triangle_bias = triangle_bias[:, None]
+
+        biases = [mask_bias, triangle_bias]
+
+        print(x.shape, mask_bias.shape, triangle_bias.shape)
+        if starting_node:
+            x = self.mha_start(q_x=x, kv_x=x, biases=biases)
+        else:
+            x = self.mha_end(q_x=x, kv_x=x, biases=biases)
+
+        # out_x = out_x.scatter(2, indices.unsqueeze(-1).expand(B, N, num_neighbour, D), x)
+
+        if not starting_node:
+            out_x = out_x.transpose(-2, -3)
+
+        return out_x
+
+    def knn_indices(self, x, num_neighbour,num_linear, pair_mask = None):
+        _,nres = x.shape[:2]
+
+        # Warning : we advise to use this commented no bug line for new model, we left the buggy line to keep with the original trained model.
+        # distances = torch.norm(x.unsqueeze(2) - x.unsqueeze(1), dim=-1) * self.NM_TO_ANG_SCALE
+        distances = torch.norm(x.unsqueeze(2) - x.unsqueeze(1), dim=-1)
+        distances[:, torch.arange(0, nres, dtype=torch.long), torch.arange(0, nres, dtype=torch.long)] = self.inf
+
+        # set distance between linear neighbour to 0
+        for i in range(1,num_linear//2+1):
+            row_indices = torch.arange(0, nres, dtype=torch.long)
+            indices = torch.arange(i, nres+i, dtype=torch.long)
+            distances[:, row_indices[:nres-i], indices[:nres-i]] = 0
+            indices = torch.arange(i*-1, nres-i, dtype=torch.long)
+            distances[:, row_indices[i:], indices[i:]] = 0
+
+        if pair_mask is not None:
+            distances = distances + (self.inf * (pair_mask - 1))
+
+        _, indices = torch.topk(distances, num_neighbour+num_linear, dim=-1, largest=False)  # Shape: [B, N, K]
+        return indices
+
+    def rbf(self, D, D_min=0.0, D_sigma=0.5):
+        # Distance radial basis function
+        D_max = D_min + (self.c_rbf-1) * D_sigma
+        D_mu = torch.linspace(D_min, D_max, self.c_rbf).to(D.device)
+        D_mu = D_mu[None,:]
+        D_expand = torch.unsqueeze(D, -1)
+        rbf_feat = torch.exp(-((D_expand - D_mu) / D_sigma)**2)
+        rbf_feat = self.emb_rbf(rbf_feat)
+        return rbf_feat
+
+    def forward(self, node_embed, edge_embed, rigids, edge_mask):
+
+        batch_size, num_res, _ = node_embed.shape
+
+        # get pair bias from rbf of distance
+        coords = rigids.get_trans()
+        distances = torch.norm(coords.unsqueeze(2) - coords.unsqueeze(1), dim=-1)
+        bias = self.rbf(distances)
+
+        # gate pair bias with sequence embedding
+        left = self.proj_left(node_embed)
+        right = self.proj_right(node_embed)
+        gate = torch.einsum('bli,bmj->blmij', left, right).reshape(batch_size,num_res,num_res,-1)
+        gate = torch.sigmoid(self.to_gate(gate))
+        bias = bias * gate
+        # pair bias shape : [B,N,N,h]
+        bias = self.to_bias(bias)
+
+        z = edge_embed
+        z = z + self.dropout_row_layer(self.tri_mul_out(z, mask=edge_mask))
+        z = z + self.dropout_row_layer(self.tri_mul_in(z, mask=edge_mask))
+        z = z + self.dropout_row_layer(self.local_mha(z, rigids, self.k_neighbour,self.k_linear, triangle_bias=bias, mask=edge_mask, starting_node=True))
+        z = z + self.dropout_col_layer(self.local_mha(z, rigids, self.k_neighbour,self.k_linear, triangle_bias=bias, mask=edge_mask, starting_node=False))
+
+        return z
+
 
 
 class KnnInvariantPointAttention(nn.Module):

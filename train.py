@@ -129,6 +129,7 @@ def main(model,
 
 if __name__ == '__main__':
     config_hydra_store()
+    torch.set_float32_matmul_precision("medium")
 
     # we use 1.2 so we can use .cache at the root dir
     # and change into the output directory at main()

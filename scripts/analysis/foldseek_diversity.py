@@ -37,6 +37,6 @@ def run_easy_cluster(designable_dir, output_dir):
 
 if __name__ == '__main__':
     os.makedirs("designable_clusters", exist_ok=True)
-    num_clusters = run_easy_cluster("designable_samples", "designable_clusters")
+    num_clusters = run_easy_cluster("designable_samples_folded", "designable_clusters")
     with open("num_foldseek_clusters.txt", "w") as fp:
         fp.write(f"Num clusters: {num_clusters}")

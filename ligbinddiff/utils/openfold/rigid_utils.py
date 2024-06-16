@@ -1417,6 +1417,15 @@ class Rigid:
         """
         return Rigid(self._rots.to(device, dtype=self._rots.dtype), self._trans.to(device))
 
+    def to_type(self, dtype) -> Rigid:
+        """
+            Change the dtype of the Rigid
+
+            Returns:
+                A version of the transformation with the specified dtype 
+        """
+        return Rigid(self._rots.to(device=self._rots.device, dtype=dtype), self._trans.to(dtype=dtype))
+
     def view(self, *shape) -> Rigid:
         """
             Moves the transformation object to GPU memory

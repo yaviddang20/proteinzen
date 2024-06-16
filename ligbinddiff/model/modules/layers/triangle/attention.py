@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 import torch_geometric.utils as pygu
 
@@ -21,7 +22,8 @@ class TriangleSelfAttention(nn.Module):
                  inf=1e4,
                  gate_out=True,
                  dropout=0,
-                 assume_sorted=False):
+                 assume_sorted=False,
+                 dtype=torch.float32):
         super().__init__()
         self.c_s = c_s
         self.c_z = c_z
@@ -30,19 +32,20 @@ class TriangleSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.gate_out = gate_out
         self.dropout_rate = dropout
+        self.dtype = dtype
 
-        self.node_left = Linear(c_s, c_gate_s)
-        self.node_right = Linear(c_s, c_gate_s)
-        self.bias_gate = Linear(c_gate_s*c_gate_s, c_z, init='gating')
-        self.dist_bias = nn.Linear(self.num_rbf, c_z)
-        self.to_bias = Linear(c_z, num_heads, bias=False, init="normal")
+        self.node_left = Linear(c_s, c_gate_s, dtype=dtype)
+        self.node_right = Linear(c_s, c_gate_s, dtype=dtype)
+        self.bias_gate = Linear(c_gate_s*c_gate_s, c_z, init='gating', dtype=dtype)
+        self.dist_bias = nn.Linear(self.num_rbf, c_z, dtype=dtype)
+        self.to_bias = Linear(c_z, num_heads, bias=False, init="normal", dtype=dtype)
 
-        self.layer_norm = nn.LayerNorm(c_z)
-        self.lin_q = Linear(c_z, c_z, init='glorot')
-        self.lin_kv = Linear(c_z, 2*c_z, init='glorot')
-        self.lin_out = Linear(c_z, c_z, init='final')
+        self.layer_norm = nn.LayerNorm(c_z, dtype=dtype)
+        self.lin_q = Linear(c_z, c_z, init='glorot', dtype=dtype)
+        self.lin_kv = Linear(c_z, 2*c_z, init='glorot', dtype=dtype)
+        self.lin_out = Linear(c_z, c_z, init='final', dtype=dtype)
         if self.gate_out:
-            self.out_gate = Linear(c_z, c_z, init='gating')
+            self.out_gate = Linear(c_z, c_z, init='gating', dtype=dtype)
         self.assume_sorted = assume_sorted
 
         self.inf = inf
@@ -52,6 +55,7 @@ class TriangleSelfAttention(nn.Module):
                 rigids,
                 edge_features,
                 edge_index,
+                flash=True,
                 eps=1e-8):
         num_nodes = node_features.shape[0]
         num_edges = edge_index.shape[-1]
@@ -115,24 +119,40 @@ class TriangleSelfAttention(nn.Module):
         edge_q = self.lin_q(knn_edge_features)
         edge_kv = self.lin_kv(knn_edge_features)
         edge_k, edge_v = edge_kv.split([self.c_z, self.c_z], dim=-1)
-        edge_q = edge_q.view(num_nodes, k, self.num_heads, -1)
-        edge_k = edge_k.view(num_nodes, k, -1, self.num_heads)
+        if flash:
+            edge_q = edge_q.view(num_nodes, k, self.num_heads, -1).transpose(-2, -3)
+            edge_k = edge_k.view(num_nodes, k, self.num_heads, -1).transpose(-2, -3)
+            edge_v = edge_v.view(num_nodes, k, self.num_heads, -1).transpose(-2, -3)  
 
-        edge_attn = edge_q.transpose(-2, -3) @ edge_k.transpose(-1, -3)  # n x h x k x k
-        edge_attn = edge_attn.transpose(-2, -3).transpose(-1, -2)  # n x k x k x h
-        edge_attn = 1 / np.sqrt(self.c_z) * edge_attn
-        edge_attn = edge_attn + edge3_dist_bias
+            edge_edge_mask = knn_edge_mask[..., None] & knn_edge_mask[..., None, :]  # n x k x k
+            attn_bias = edge3_dist_bias.permute(0, 3, 1, 2) - self.inf * edge_edge_mask[:, None]
 
-        edge_edge_mask = knn_edge_mask[..., None] & knn_edge_mask[..., None, :]  # n x k x k
-        edge_attn = edge_attn - self.inf * (~edge_edge_mask[..., None]).float()
-        edge_attn = torch.softmax(edge_attn, dim=-2) # n x k x k x h
+            edge_update = F.scaled_dot_product_attention(
+                query=edge_q,
+                key=edge_k,
+                value=edge_v,
+                attn_mask=attn_bias
+            )
 
-        edge_v = edge_v.view(num_nodes, k, self.num_heads, -1)  # n x k x h x c_z//h
-        edge_update = torch.sum(
-            edge_v[..., None, :, :]  # n x k x 1 x h x c_z//h
-            * edge_attn[..., None]
-            * edge_edge_mask[..., None, None],  # n x k x k x h x 1
-        dim=-3)  # n x k x h x c_z//h
+        else:
+            edge_q = edge_q.view(num_nodes, k, self.num_heads, -1)
+            edge_k = edge_k.view(num_nodes, k, -1, self.num_heads)
+
+            edge_attn = edge_q.transpose(-2, -3) @ edge_k.transpose(-1, -3)  # n x h x k x k
+            edge_attn = edge_attn.transpose(-2, -3).transpose(-1, -2)  # n x k x k x h
+            edge_attn = 1 / np.sqrt(self.c_z) * edge_attn
+            edge_attn = edge_attn + edge3_dist_bias
+
+            edge_edge_mask = knn_edge_mask[..., None] & knn_edge_mask[..., None, :]  # n x k x k
+            edge_attn = edge_attn - self.inf * (~edge_edge_mask[..., None]).float()
+            edge_attn = torch.softmax(edge_attn, dim=-2) # n x k x k x h
+
+            edge_v = edge_v.view(num_nodes, k, self.num_heads, -1)  # n x k x h x c_z//h
+            edge_update = torch.sum(
+                edge_v[..., None, :, :]  # n x k x 1 x h x c_z//h
+                * edge_attn[..., None]
+                * edge_edge_mask[..., None, None],  # n x k x k x h x 1
+            dim=-3)  # n x k x h x c_z//h
         edge_update = edge_update.view(-1, k, self.c_z)
         if self.gate_out:
             edge_update = edge_update * torch.sigmoid(self.out_gate(knn_edge_features))
@@ -161,6 +181,7 @@ class SparseTriangleSelfAttention(nn.Module):
                  inf=1e4,
                  gate_out=True,
                  dropout=0,
+                 dtype=torch.bfloat16,
                  assume_sorted=False):
         super().__init__()
         self.c_s = c_s
@@ -170,19 +191,20 @@ class SparseTriangleSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.gate_out = gate_out
         self.dropout_rate = dropout
+        self.dtype = dtype
 
-        self.node_left = Linear(c_s, c_gate_s)
-        self.node_right = Linear(c_s, c_gate_s)
-        self.bias_gate = Linear(c_gate_s*c_gate_s, c_z, init='gating')
-        self.dist_bias = nn.Linear(self.num_rbf, c_z)
-        self.to_bias = Linear(c_z, num_heads, bias=False, init="normal")
+        self.node_left = Linear(c_s, c_gate_s, dtype=dtype)
+        self.node_right = Linear(c_s, c_gate_s, dtype=dtype)
+        self.bias_gate = Linear(c_gate_s*c_gate_s, c_z, init='gating', dtype=dtype)
+        self.dist_bias = nn.Linear(self.num_rbf, c_z, dtype=dtype)
+        self.to_bias = Linear(c_z, num_heads, bias=False, init="normal", dtype=dtype)
 
-        self.layer_norm = nn.LayerNorm(c_z)
-        self.lin_q = Linear(c_z, c_z, init='glorot')
-        self.lin_kv = Linear(c_z, 2*c_z, init='glorot')
-        self.lin_out = Linear(c_z, c_z, init='final')
+        self.layer_norm = nn.LayerNorm(c_z, dtype=dtype)
+        self.lin_q = Linear(c_z, c_z, init='glorot', dtype=dtype)
+        self.lin_kv = Linear(c_z, 2*c_z, init='glorot', dtype=dtype)
+        self.lin_out = Linear(c_z, c_z, init='final', dtype=dtype)
         if self.gate_out:
-            self.out_gate = Linear(c_z, c_z, init='gating')
+            self.out_gate = Linear(c_z, c_z, init='gating', dtype=dtype)
         self.assume_sorted = assume_sorted
 
         self.inf = inf
@@ -196,6 +218,10 @@ class SparseTriangleSelfAttention(nn.Module):
                 eps=1e-8):
         num_nodes = node_features.shape[0]
         num_edges = edge_index.shape[-1]
+        input_dtype = edge_features.dtype
+
+        node_features = node_features.to(self.dtype)
+        edge_features = edge_features.to(self.dtype)
         node_trans = rigids.get_trans()
 
         if not self.assume_sorted:
@@ -226,7 +252,6 @@ class SparseTriangleSelfAttention(nn.Module):
         edge3_node2_idx = sorted_edge_index[0, edge_edge_index[0]]
 
         sorted_edge_features = self.layer_norm(sorted_edge_features)
-
         node_left = self.node_left(node_features)
         node_right = self.node_right(node_features)
 
@@ -237,6 +262,7 @@ class SparseTriangleSelfAttention(nn.Module):
             edge3.view(-1, self.c_gate_s * self.c_gate_s)
         )
 
+        node_trans = node_trans.to(self.dtype)
         edge3_node1_trans = node_trans[edge3_node1_idx]
         edge3_node2_trans = node_trans[edge3_node2_idx]
         edge3_dist = torch.linalg.vector_norm(
@@ -244,7 +270,7 @@ class SparseTriangleSelfAttention(nn.Module):
             dim=-1
         )
 
-        edge3_dist_features = _rbf(edge3_dist, D_count=self.num_rbf, device=edge3_dist.device)
+        edge3_dist_features = _rbf(edge3_dist, D_count=self.num_rbf, device=edge3_dist.device, dtype=self.dtype)
         edge3_dist_bias = self.dist_bias(edge3_dist_features)  # n x k x k x h
         edge3_dist_bias = self.to_bias(torch.sigmoid(edge3_gate) * edge3_dist_bias)
 
@@ -287,6 +313,7 @@ class SparseTriangleSelfAttention(nn.Module):
                 dim_size=num_edges
             )
 
+        edge_update = edge_update.to(input_dtype)
         return edge_update
 
 
@@ -369,7 +396,6 @@ class TriangleCrossAttention(nn.Module):
 
         edge3_node1 = node_left[edge1[0]]
         edge3_node2 = node_right[edge2[0]]
-        # print(edge3_node1.shape, edge3_node2.shape)
         edge3 = torch.einsum("bik,bjl->bijkl", edge3_node1, edge3_node2)
         edge3_gate = self.bias_gate(
             edge3.view(-1, k, self.c_gate_s * self.c_gate_s)
@@ -400,7 +426,6 @@ class TriangleCrossAttention(nn.Module):
         edge_attn = torch.softmax(edge_attn, dim=-2) # n_edge x k x h
 
         edge_v = edge_v.view(num_edges, k, self.num_heads, -1)  # n_edge x k x h x c_z//h
-        # print(edge_v.shape, edge_attn.shape, knn_edge_mask.shape)
         edge_update = torch.sum(
             edge_v * edge_attn[..., None] * knn_edge_mask.float()[..., None, None],
             dim=-3

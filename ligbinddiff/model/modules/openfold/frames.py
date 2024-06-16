@@ -94,6 +94,7 @@ class Linear(nn.Linear):
         bias: bool = True,
         init: str = "default",
         init_fn: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None,
+        dtype = torch.float32 
     ):
         """
         Args:
@@ -118,7 +119,7 @@ class Linear(nn.Linear):
                 A custom initializer taking weight and bias as inputs.
                 Overrides init if not None.
         """
-        super(Linear, self).__init__(in_dim, out_dim, bias=bias)
+        super(Linear, self).__init__(in_dim, out_dim, bias=bias, dtype=dtype)
 
         if bias:
             with torch.no_grad():

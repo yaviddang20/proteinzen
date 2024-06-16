@@ -169,6 +169,7 @@ class ClusteredBatchSampler:
         """
         self.epoch = epoch
 
+
 class LengthBatchSampler:
     '''
     Adapted from https://github.com/jingraham/neurips19-graph-protein-design.
@@ -181,14 +182,28 @@ class LengthBatchSampler:
                       including batches of a single element
     :param shuffle: if `True`, batches in shuffled order
     '''
-    def __init__(self, dataset: PdbDataset, batch_size=3000, drop_last=False, shuffle=True):
+    def __init__(self,
+                 dataset: PdbDataset,
+                 batch_size=3000,
+                 max_num_batch=None,
+                 drop_last=False,
+                 shuffle=True,
+                 num_replicas=1,
+                 rank=0,
+                 seed=0,
+                 batch_by_edge_fn=None,
+                 ):
         self.dataset = dataset
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.shuffle = shuffle
+        self.batch_by_edge_fn = batch_by_edge_fn
 
         self.node_counts = dataset.csv.modeled_seq_len.tolist()
         self.idx = list(range(len(self.node_counts)))
+        if max_num_batch is None:
+            max_num_batch = 10000
+        self.max_num_batch = max_num_batch
 
         self.len_idx_map = {}
         for node_count, idx in zip(self.node_counts, self.idx):
@@ -197,19 +212,30 @@ class LengthBatchSampler:
             else:
                 self.len_idx_map[node_count].append(idx)
 
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.epoch = 0
+        self.seed = seed
+
         self._form_batches()
 
     def _form_batches(self):
         self.batches = []
+        if self.shuffle:
+            # deterministically shuffle based on epoch and seed
+            g = np.random.default_rng(self.seed + self.epoch)
+
         for node_count, idxs in self.len_idx_map.items():
+            if self.batch_by_edge_fn is not None:
+                node_count = self.batch_by_edge_fn(node_count)
             idxs = idxs.copy()
             if self.shuffle:
-                random.shuffle(idxs)
+                g.shuffle(idxs)
 
             curr_batch_size = 0
             batch = []
             while len(idxs) > 0:
-                if curr_batch_size > self.batch_size:
+                if curr_batch_size + node_count > self.batch_size or len(batch) + 1 > self.max_num_batch:
                     self.batches.append(batch)
                     curr_batch_size = 0
                     batch = []
@@ -219,7 +245,15 @@ class LengthBatchSampler:
                 self.batches.append(batch)
 
         if self.shuffle:
-            random.shuffle(self.batches)
+            # deterministically shuffle based on epoch and seed
+            g.shuffle(self.batches)
+
+        split_size = len(self.batches) // self.num_replicas
+        splits = []
+        for i in range(self.num_replicas):
+            splits.append(self.batches[split_size*i: split_size*(i+1)])
+
+        self.batches = splits[self.rank]
 
     def __len__(self):
         if not hasattr(self, "batches"):
@@ -227,10 +261,23 @@ class LengthBatchSampler:
         return len(self.batches)
 
     def __iter__(self):
-        for batch in self.batches:
-            yield batch
         if self.shuffle:
             self._form_batches()
+        print(f"rank {self.rank}: epoch is {self.epoch}")
+
+        for batch in self.batches:
+            yield batch
+
+    def set_epoch(self, epoch: int) -> None:
+        r"""
+        Sets the epoch for this sampler. When :attr:`shuffle=True`, this ensures all replicas
+        use a different random ordering for each epoch. Otherwise, the next iteration of this
+        sampler will yield the same ordering.
+
+        Args:
+            epoch (int): Epoch number.
+        """
+        self.epoch = epoch
 
 
 class AtomicBatchSampler:

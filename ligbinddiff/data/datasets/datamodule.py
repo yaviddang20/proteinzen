@@ -100,6 +100,7 @@ class FramediffDataModule(L.LightningDataModule):
                  num_workers,
                  min_len=30,
                  max_len=1000,
+                 max_num_batch=None,
                  sample_lengths={
                     60: 5,
                     70: 5,
@@ -122,6 +123,7 @@ class FramediffDataModule(L.LightningDataModule):
         self.length_batch = length_batch
         self.sample_from_clusters = sample_from_clusters
         self.batch_by_edge_fn = batch_by_edge_fn
+        self.max_num_batch = max_num_batch
 
         self.sample_lengths = sample_lengths
         csv = "filtered_metadata.csv"
@@ -132,15 +134,27 @@ class FramediffDataModule(L.LightningDataModule):
             max_num_res=max_len,
             min_percent_ordered=min_ordered_percent
         )
-        self.val_dataset = LengthDataset(self.sample_lengths, batch_size=batch_size)
+        self.val_dataset = LengthDataset(
+            self.sample_lengths,
+            batch_size=batch_size,
+            same_length_per_batch=length_batch)
 
     def build_dataloader(self, x):
         collate_fn = gen_collate_fn(self.task_sampler)
         if self.length_batch:
+            rank = self.trainer.local_rank
+            num_replicas = self.trainer.num_devices
             dataloader = DataLoader(
                 x,
                 num_workers=self.num_workers,
-                batch_sampler=LengthBatchSampler(x, batch_size=self.batch_size),
+                batch_sampler=LengthBatchSampler(
+                    x,
+                    batch_size=self.batch_size,
+                    rank=rank,
+                    num_replicas=num_replicas,
+                    batch_by_edge_fn=self.batch_by_edge_fn,
+                    max_num_batch=self.max_num_batch
+                ),
                 collate_fn=collate_fn,
                 shuffle=False
             )

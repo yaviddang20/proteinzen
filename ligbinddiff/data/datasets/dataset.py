@@ -226,6 +226,7 @@ class LengthDataset(data.Dataset):
             self,
             lengths: Dict[int, int],
             batch_size: int = 3000,
+            same_length_per_batch=False,
         ):
         self._log = logging.getLogger(__name__)
         self.lengths = lengths
@@ -246,6 +247,12 @@ class LengthDataset(data.Dataset):
                 current_batch.append(sample_l)
                 current_sample_ids.append(sample_id)
                 sample_id += 1
+            if same_length_per_batch:
+                self.batches.append(current_batch)
+                self.sample_ids.append(current_sample_ids)
+                current_batch = []
+                current_sample_ids = []
+
         if len(current_batch) > 0:
             self.batches.append(current_batch)
         if len(current_sample_ids) > 0:

@@ -17,6 +17,7 @@ from ligbinddiff.stoch_interp.interpolate.torsion import TorsionInterpolant
 from ligbinddiff.stoch_interp.interpolate.dirichlet import DirichletConditionalFlow
 
 from ligbinddiff.model.denoiser.bb.frames import GraphIpaFrameDenoiser, DynamicGraphIpaFrameDenoiser
+from ligbinddiff.model.denoiser.bb.framediff import IpaScoreWrapper
 from ligbinddiff.model.denoiser.protein.frames_dirichlet import DynamicGraphIpaFrameDirichletDenoiser
 from ligbinddiff.model.denoiser.protein.frames_dirichlet_chi import DynamicGraphIpaFrameDirichletChiDenoiser
 from ligbinddiff.model.denoiser.protein.frames_dirichlet_multichi import DynamicGraphIpaFrameDirichletMultiChiDenoiser
@@ -177,7 +178,8 @@ def config_hydra_store():
     model_store = store(group="model")
     model_store(GraphIpaFrameDenoiser, name="diffusion_bb")
     # model_store(GraphIpaFrameDenoiser, name="fm_bb")
-    model_store(DynamicGraphIpaFrameDenoiser, name="fm_bb")
+    # model_store(DynamicGraphIpaFrameDenoiser, name="fm_bb")
+    model_store(IpaScoreWrapper, name="fm_bb")
     model_store(IPMPLatentWrapper, name="fm_protein")
     model_store(DynamicGraphIpaFrameDirichletDenoiser, name="dirichlet_protein")
     model_store(DynamicGraphIpaFrameDirichletDenoiser, name="fisher_protein")
