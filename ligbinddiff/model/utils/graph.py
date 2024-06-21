@@ -99,11 +99,15 @@ def sample_logn_inv_cubic_edges(
     logn_offset=-12,
     self_edge=False,
     gen_triangle_edges=False,
+    gen_knn_triangle_edges=False,
+    gen_lrange_triangle_edges=False,
+    gen_cross_range_triangle_edges=False,
 ):
     # TODO: change x_mask to be True for retained positions
     edge_indicies = []
     knn_edge_select = []
     lrange_edge_select = []
+    edge_colors = []
     offset = 0
     for i in range(batch.max().item() + 1):
         X_ca = batched_X_ca[batch == i]
@@ -155,7 +159,7 @@ def sample_logn_inv_cubic_edges(
         _, sampled_edges_relative_idx = torch.topk(perturbed_logprobs, k=inv_cube_k, dim=-1)
         sampled_edges = torch.gather(remaining_edges, -1, sampled_edges_relative_idx)  # N x inv_cube_k
 
-        edge_sinks = torch.cat([knn_edges, sampled_edges], dim=-1)  # B x N x (knn_k + inv_cube_k)
+        edge_sinks = torch.cat([knn_edges, sampled_edges], dim=-1)  # N x (knn_k + inv_cube_k)
         edge_sources = torch.arange(X_ca.shape[0]).repeat_interleave(knn_k + inv_cube_k).to(edge_sinks.device)
         edge_index = torch.stack([edge_sinks.flatten(), edge_sources], dim=0)
 
@@ -169,32 +173,54 @@ def sample_logn_inv_cubic_edges(
         lrange_edge_select.append(torch.cat(
             [torch.zeros(knn_k), torch.ones(inv_cube_k)]
         ).repeat(num_nodes).bool().to(X_ca.device))
+        edge_colors.append(torch.cat(
+            [torch.zeros(knn_k), torch.ones(inv_cube_k)]
+        ).repeat(num_nodes).to(X_ca.device))
 
-        if gen_triangle_edges:
-           triag_edge_src = sampled_edges[..., None, :].expand(-1, inv_cube_k, -1)
-           triag_edge_dst = sampled_edges[..., None].expand(-1, -1, inv_cube_k)
-           triag_edge_index = torch.stack([triag_edge_dst, triag_edge_src]).view(2, -1)
-           edge_indicies.append(triag_edge_index + offset)
-           triag_offset = triag_edge_index.shape[-1]
-           knn_edge_select.append(torch.zeros(triag_offset, device=X_ca.device))
-           lrange_edge_select.append(torch.zeros(triag_offset, device=X_ca.device))
+        if gen_knn_triangle_edges or gen_lrange_triangle_edges or gen_cross_range_triangle_edges:
+            trig_edge_src = edge_sinks[..., None, :].expand(-1, knn_k + inv_cube_k, -1)
+            trig_edge_dst = edge_sinks[..., None].expand(-1, -1, knn_k + inv_cube_k)
+            trig_edge_index = torch.stack([trig_edge_dst, trig_edge_src])
+            select_triangle_edges = torch.zeros((knn_k + inv_cube_k, knn_k + inv_cube_k), device=trig_edge_src.device).bool()
+            trig_edge_colors = torch.ones((knn_k + inv_cube_k, knn_k + inv_cube_k), device=trig_edge_src.device) * 4 
+            if gen_knn_triangle_edges:
+                select_triangle_edges[:knn_k, :knn_k] = True
+                trig_edge_colors[:knn_k, :knn_k] = 2 
+            if gen_lrange_triangle_edges:
+                select_triangle_edges[knn_k:, knn_k:] = True
+                trig_edge_colors[knn_k:, knn_k:] = 3 
+            if gen_cross_range_triangle_edges:
+                select_triangle_edges[knn_k:, :knn_k] = True
+                select_triangle_edges[:knn_k, knn_k:] = True
+            
+            trig_edge_index = trig_edge_index[select_triangle_edges[None, None].expand(2, X_ca.shape[0], -1, -1)].view(2, -1)
+            print(trig_edge_index.shape)
+            trig_edge_colors = trig_edge_colors[None].expand(X_ca.shape[0], -1, -1)[select_triangle_edges[None].expand(X_ca.shape[0], -1, -1)]
+            edge_indicies.append(trig_edge_index + offset)
+            trig_offset = trig_edge_index.shape[-1]
+            knn_edge_select.append(torch.zeros(trig_offset, device=X_ca.device))
+            lrange_edge_select.append(torch.zeros(trig_offset, device=X_ca.device))
+            edge_colors.append(trig_edge_colors)
 
         offset = offset + (batch == i).long().sum()
 
     edge_index = torch.cat(edge_indicies, dim=-1)
     knn_edge_select = torch.cat(knn_edge_select, dim=0)
     lrange_edge_select = torch.cat(lrange_edge_select, dim=0)
+    edge_colors = torch.cat(edge_colors, dim=0)
     edge_mask = batched_x_mask[edge_index].any(dim=0)
     edge_index, knn_edge_select, lrange_edge_select = edge_index[:, ~edge_mask], knn_edge_select[~edge_mask], lrange_edge_select[~edge_mask]
+    edge_colors = edge_colors[~edge_mask]
     if gen_triangle_edges:
-        edge_index, (knn_edge_select, lrange_edge_select) = coalesce(
-            edge_index, [knn_edge_select.long(), lrange_edge_select.long()],
-            reduce="mul"
+        edge_index, (knn_edge_select, lrange_edge_select, edge_colors) = coalesce(
+            edge_index, [knn_edge_select.long(), lrange_edge_select.long(), edge_colors.long()],
+            reduce="mean"
         )
         knn_edge_select = knn_edge_select.bool()
         lrange_edge_select = lrange_edge_select.bool()
+    edge_colors = edge_colors.long()
 
-    return edge_index, knn_edge_select, lrange_edge_select
+    return edge_index, knn_edge_select, lrange_edge_select, edge_colors
 
 
 def sample_all_edges(
@@ -219,7 +245,7 @@ def sample_all_edges(
 
 
 
-def sparse_to_knn_graph(edge_features, edge_index, num_nodes=None):
+def sparse_to_knn_graph(edge_features, edge_index, num_nodes=None, batch=None):
     src = edge_index[1]
     assert (torch.sort(src)[0] == src).all(), "edge index must have monotonic increasing node index"
 
@@ -250,10 +276,26 @@ def sparse_to_knn_graph(edge_features, edge_index, num_nodes=None):
             device=edge_features.device,
             dtype=edge_features.dtype
         )
-        start = 0
-        for i, num_edges in enumerate(num_edges_per_node):
-            knn_edge_features[i, :num_edges] = edge_features[start:start+num_edges]
-            start += num_edges
+
+        # there are a couple of assumptions here which could be broken without proper usage
+        # but it should be much faster
+        if batch is not None:
+            offset = 0
+            edge_batch = batch[edge_index[1]]
+            for i in range(edge_batch.max()+1):
+                select_edge = (edge_batch == i)
+                select_node = (batch == i)
+                num_edges = int(num_edges_per_node[select_node][0])
+                subset_edge_features = edge_features[select_edge].view(-1, num_edges, edge_features.shape[-1])
+                subset_num_nodes = subset_edge_features.shape[0]
+                knn_edge_features[offset:offset+subset_num_nodes, :num_edges] = subset_edge_features 
+                offset += subset_num_nodes
+            
+        else:
+            start = 0
+            for i, num_edges in enumerate(num_edges_per_node):
+                knn_edge_features[i, :num_edges] = edge_features[start:start+num_edges]
+                start += num_edges
 
         edge_index_per_node = edge_index[0].split(num_edges_per_node.tolist(), dim=0)
         knn_edge_index = pad_sequence(
@@ -266,6 +308,38 @@ def sparse_to_knn_graph(edge_features, edge_index, num_nodes=None):
         knn_edge_index[~edge_mask] = 0
 
     return knn_edge_features, knn_edge_index, edge_mask
+
+def sparse_to_nested(edge_features, edge_index, num_nodes=None):
+    src = edge_index[1]
+    assert (torch.sort(src)[0] == src).all(), "edge index must have monotonic increasing node index"
+
+    if num_nodes is None:
+        num_nodes = int(edge_index.max() + 1)
+    num_edges_per_node = scatter(
+        torch.ones_like(edge_index[1]),
+        edge_index[1],
+        dim_size=num_nodes,
+    )
+    # max_k = int(num_edges_per_node.max())
+
+    if (num_edges_per_node == num_edges_per_node[0]).all():
+        # we can just reshape which saves us a lot of time and memory
+        num_edges = num_edges_per_node[0].item()
+        nested_edge_features = edge_features.view(num_nodes, num_edges, -1)
+        nested_edge_index = edge_index[0].view(num_nodes, num_edges)
+    else:
+        # edges_per_node = edge_features.split(num_edges_per_node.tolist(), dim=0)
+        # knn_edge_features = pad_sequence(
+        #     edges_per_node,
+        #     batch_first=True,
+        #     padding_value=0.
+        # )
+        edge_features_split = edge_features.split(num_edges_per_node.tolist(), dim=0)
+        nested_edge_features = torch.nested.as_nested_tensor(list(edge_features_split))
+        edge_index_split = edge_index[0].split(num_edges_per_node.tolist(), dim=0)
+        nested_edge_index = torch.nested.as_nested_tensor(list(edge_index_split))
+
+    return nested_edge_features, nested_edge_index
 
 
 def knn_to_sparse_graph(edge_features, edge_index, edge_mask):

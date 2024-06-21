@@ -2,6 +2,7 @@ from .latent import LatentInterpolant
 from .se3 import SE3Interpolant, SE3InterpolantConfig
 from .fisher import FisherFlow
 from .dirichlet import DirichletConditionalFlow
+from .catflow import CatFlow
 from .sidechain_torsion import SidechainTorsionInterpolant, SidechainMultiTorsionInterpolant
 
 class ProteinInterpolant:
@@ -88,3 +89,16 @@ class ProteinFisherInterpolant:
             se3_cfg,
             use_batch_ot=use_batch_ot)
         self.sidechain_noiser = FisherFlow(prior=prior)
+
+
+class ProteinCatFlowInterpolant:
+    """ Wrapper for SE3Interpolant and FisherInterpolant """
+    def __init__(self,
+                 se3_cfg: SE3InterpolantConfig,
+                 use_batch_ot=False,
+    ):
+        self._cfg = se3_cfg
+        self.se3_noiser = SE3Interpolant(
+            se3_cfg,
+            use_batch_ot=use_batch_ot)
+        self.sidechain_noiser = CatFlow()
