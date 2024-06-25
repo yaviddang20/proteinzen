@@ -45,8 +45,9 @@ class SparseTriangleMultiplicativeUpdate(nn.Module):
         if self.gate_out:
             self.out_gate = Linear(c_z, c_z, init='gating', dtype=dtype)
 
-    
-    @torch.compile(dynamic=True)
+        self._gen_edge_update = torch.compile(self._gen_edge_update, dynamic=True)
+
+    # @torch.compile(dynamic=True)
     def _gen_edge_update(self, node_features, edge_features, node_trans, edge_index, edge_edge_index, eps=1e-8):
         edge3_node1_idx = edge_index[0, edge_edge_index[1]]
         edge3_node2_idx = edge_index[0, edge_edge_index[0]]
@@ -206,13 +207,14 @@ class TriangleMultiplicativeUpdate(nn.Module):
         if self.gate_out:
             self.out_gate = Linear(c_z, c_z, init='gating', dtype=dtype)
 
-    @torch.compile(dynamic=True)
+    # @torch.compile(dynamic=True)
     def forward(self,
                 node_features,
                 rigids,
                 edge_features,
                 edge_index,
                 batch,
+                res_mask,
                 eps=1e-8):
         num_nodes = node_features.shape[0]
         num_edges = edge_index.shape[-1]
@@ -221,7 +223,13 @@ class TriangleMultiplicativeUpdate(nn.Module):
         edge_features = edge_features.to(self.dtype)
         node_trans = rigids.get_trans().to(self.dtype)
 
-        knn_edge_features, knn_edge_index, knn_edge_mask = sparse_to_knn_graph(edge_features, edge_index, batch=batch) 
+        knn_edge_features, knn_edge_index, knn_edge_mask = sparse_to_knn_graph(
+            edge_features,
+            edge_index,
+            num_nodes=num_nodes,
+            batch=batch,
+            res_mask=res_mask
+        )
         knn_edge_features = self.layer_norm(knn_edge_features)
 
         node_left = self.node_left(node_features)
@@ -248,14 +256,14 @@ class TriangleMultiplicativeUpdate(nn.Module):
         edge2_features = self.edge_proj(knn_edge_features)
         edge2_gate = self.edge_gate(knn_edge_features)
         edge2_features = torch.sigmoid(edge2_gate) * edge2_features
-        edge_update = edge3_features.permute(0, 3, 1, 2) @ edge2_features.permute(0, 2, 1)[..., None] 
+        edge_update = edge3_features.permute(0, 3, 1, 2) @ edge2_features.permute(0, 2, 1)[..., None]
         edge_update = edge_update.squeeze(-1).permute(0, 2, 1)
 
         edge_update = self.lin_out(self.ln_out(edge_update))
         if self.gate_out:
             edge_update = edge_update * torch.sigmoid(self.out_gate(knn_edge_features))
 
-        edge_update, _ = knn_to_sparse_graph(knn_edge_features, knn_edge_index, knn_edge_mask) 
+        edge_update, _ = knn_to_sparse_graph(knn_edge_features, knn_edge_index, knn_edge_mask)
         edge_update = edge_update.to(dtype=initial_dtype)
 
         return edge_update
@@ -309,17 +317,17 @@ class NestedTriangleMultiplicativeUpdate(nn.Module):
         node_trans = rigids.get_trans().to(self.dtype)
 
         # we do this first since we can't index with nested tensors
-        # TODO: doing this might take up all our memory gains 
+        # TODO: doing this might take up all our memory gains
         node_left = self.node_left(node_features)
         node_right = self.node_right(node_features)
         edge3_node1 = node_left[edge_index[0]]
         edge3_node2 = node_right[edge_index[0]]
         print(edge3_node1.shape, edge3_node2.shape)
         # n_node x n_edge x hdim
-        edge3_node1, _ = sparse_to_nested(edge3_node1[..., None, :, None], edge_index) 
-        edge3_node2, _ = sparse_to_nested(edge3_node2[..., None, None, :], edge_index) 
+        edge3_node1, _ = sparse_to_nested(edge3_node1[..., None, :, None], edge_index)
+        edge3_node2, _ = sparse_to_nested(edge3_node2[..., None, None, :], edge_index)
 
-        edge_features, edge_index = sparse_to_nested(edge_features, edge_index) 
+        edge_features, edge_index = sparse_to_nested(edge_features, edge_index)
         edge_features = self.layer_norm(edge_features)
 
         # n_node x n_edge x 1 x hdim x 1 * n_node x 1 x n_edge x 1 x h_dim
@@ -339,7 +347,7 @@ class NestedTriangleMultiplicativeUpdate(nn.Module):
         edge2_features = self.edge_proj(edge_features)
         edge2_gate = self.edge_gate(edge_features)
         edge2_features = torch.sigmoid(edge2_gate) * edge2_features
-        edge_update = edge3_features.permute(0, 3, 1, 2) @ edge2_features.permute(0, 2, 1)[..., None] 
+        edge_update = edge3_features.permute(0, 3, 1, 2) @ edge2_features.permute(0, 2, 1)[..., None]
         edge_update = edge_update.squeeze(-1).permute(0, 2, 1)
 
         edge_update = self.lin_out(self.ln_out(edge_update))
@@ -391,7 +399,7 @@ class TriangleCrossMultiplicativeUpdate(nn.Module):
         if self.gate_out:
             self.out_gate = Linear(c_z, c_z, init='gating', dtype=dtype)
 
-    @torch.compile(dynamic=True)
+    # @torch.compile(dynamic=True)
     def forward(self,
                 node_features,
                 rigids,
@@ -400,10 +408,24 @@ class TriangleCrossMultiplicativeUpdate(nn.Module):
                 dst_edge_features,
                 dst_edge_index,
                 batch,
+                res_mask,
                 eps=1e-8):
+        num_nodes = node_features.shape[0]
 
-        knn_src_edge_features, knn_src_edge_index, knn_src_edge_mask = sparse_to_knn_graph(src_edge_features, src_edge_index, batch=batch)
-        knn_dst_edge_features, knn_dst_edge_index, knn_dst_edge_mask = sparse_to_knn_graph(dst_edge_features, dst_edge_index, batch=batch)
+        knn_src_edge_features, knn_src_edge_index, knn_src_edge_mask = sparse_to_knn_graph(
+            src_edge_features,
+            src_edge_index,
+            num_nodes=num_nodes,
+            batch=batch,
+            res_mask=res_mask
+        )
+        knn_dst_edge_features, knn_dst_edge_index, knn_dst_edge_mask = sparse_to_knn_graph(
+            dst_edge_features,
+            dst_edge_index,
+            num_nodes=num_nodes,
+            batch=batch,
+            res_mask=res_mask
+        )
 
         if self.dropout_rate > 0 and self.training:
             num_drop_edges = round(k * self.dropout_rate)
@@ -431,7 +453,7 @@ class TriangleCrossMultiplicativeUpdate(nn.Module):
         node_left = self.node_left(node_features)
         node_right = self.node_right(node_features)
 
-        # n_node x 
+        # n_node x
         edge3_node1 = node_left[knn_src_edge_index[0]]
         edge3_node2 = node_right[knn_dst_edge_index[0]]
 
@@ -456,14 +478,14 @@ class TriangleCrossMultiplicativeUpdate(nn.Module):
         edge2_features = self.edge_proj(knn_src_edge_features)
         edge2_gate = self.edge_gate(knn_src_edge_features)
         edge2_features = torch.sigmoid(edge2_gate) * edge2_features
-        edge_update = edge3_features.permute(0, 3, 1, 2) @ edge2_features.permute(0, 2, 1)[..., None] 
+        edge_update = edge3_features.permute(0, 3, 1, 2) @ edge2_features.permute(0, 2, 1)[..., None]
         edge_update = edge_update.squeeze(-1).permute(0, 2, 1)
 
         edge_update = self.lin_out(self.ln_out(edge_update))
         if self.gate_out:
             edge_update = edge_update * torch.sigmoid(self.out_gate(knn_dst_edge_features))
 
-        edge_update, _ = knn_to_sparse_graph(knn_dst_edge_features, knn_dst_edge_index, knn_dst_edge_mask) 
+        edge_update, _ = knn_to_sparse_graph(knn_dst_edge_features, knn_dst_edge_index, knn_dst_edge_mask)
         # edge_update = edge_update.to(dtype=initial_dtype)
 
         return edge_update
@@ -506,14 +528,14 @@ class SparseTriangleCrossMultiplicativeUpdate(nn.Module):
         if self.gate_out:
             self.out_gate = Linear(c_z, c_z, init='gating', dtype=dtype)
 
-    @torch.compile(dynamic=True)
-    def _gen_edge_update(self, 
-                         node_features, 
-                         dst_edge_features, 
-                         dst_edge_index, 
-                         src_edge_features, 
-                         src_edge_index, 
-                         node_trans, 
+    # @torch.compile(dynamic=True)
+    def _gen_edge_update(self,
+                         node_features,
+                         dst_edge_features,
+                         dst_edge_index,
+                         src_edge_features,
+                         src_edge_index,
+                         node_trans,
                          edge_edge_index, eps=1e-8):
         edge3_node1_idx = src_edge_index[0, edge_edge_index[1]]
         edge3_node2_idx = dst_edge_index[0, edge_edge_index[0]]

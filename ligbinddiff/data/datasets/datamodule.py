@@ -13,7 +13,7 @@ import pandas as pd
 from ligbinddiff.tasks import TaskSampler
 
 from .dataset import PdbDataset, LengthDataset, GEOMDataset
-from .sampler import BatchSampler, LengthBatchSampler, AtomicBatchSampler, ClusteredBatchSampler
+from .sampler import BatchSampler, LengthBatchSampler, AtomicBatchSampler, ClusteredBatchSampler, ClusteredLengthBatchSampler
 
 
 def gen_collate_fn(task_sampler: TaskSampler):
@@ -100,7 +100,7 @@ class FramediffDataModule(L.LightningDataModule):
                  num_workers,
                  min_len=30,
                  max_len=1000,
-                 max_num_batch=None,
+                 max_num_per_batch=None,
                  sample_lengths={
                     60: 5,
                     70: 5,
@@ -123,7 +123,7 @@ class FramediffDataModule(L.LightningDataModule):
         self.length_batch = length_batch
         self.sample_from_clusters = sample_from_clusters
         self.batch_by_edge_fn = batch_by_edge_fn
-        self.max_num_batch = max_num_batch
+        self.max_num_per_batch = max_num_per_batch
 
         self.sample_lengths = sample_lengths
         csv = "filtered_metadata.csv"
@@ -141,7 +141,24 @@ class FramediffDataModule(L.LightningDataModule):
 
     def build_dataloader(self, x):
         collate_fn = gen_collate_fn(self.task_sampler)
-        if self.length_batch:
+        if self.length_batch and self.sample_from_clusters:
+            rank = self.trainer.local_rank
+            num_replicas = self.trainer.num_devices
+            dataloader = DataLoader(
+                x,
+                num_workers=self.num_workers,
+                batch_sampler=ClusteredLengthBatchSampler(
+                    x,
+                    batch_size=self.batch_size,
+                    rank=rank,
+                    num_replicas=num_replicas,
+                    batch_by_edge_fn=self.batch_by_edge_fn,
+                    max_num_per_batch=self.max_num_per_batch
+                ),
+                collate_fn=collate_fn,
+                shuffle=False
+            )
+        elif self.length_batch:
             rank = self.trainer.local_rank
             num_replicas = self.trainer.num_devices
             dataloader = DataLoader(
@@ -153,7 +170,7 @@ class FramediffDataModule(L.LightningDataModule):
                     rank=rank,
                     num_replicas=num_replicas,
                     batch_by_edge_fn=self.batch_by_edge_fn,
-                    max_num_batch=self.max_num_batch
+                    max_num_batch=self.max_num_per_batch
                 ),
                 collate_fn=collate_fn,
                 shuffle=False

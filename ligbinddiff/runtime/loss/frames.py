@@ -306,11 +306,11 @@ def bb_frame_fm_loss(batch,
         r=local_atomic_dist_r
     )
 
-    # this seems to work well
     if square_aux_loss_time_factor:
         scaled_dist_mat_loss = dist_mat_loss / (norm_scale ** 2) * 0.01
         scaled_backbone_mse = backbone_mse / (norm_scale ** 2) * 0.01
     else:
+        # this seems to work well
         scaled_dist_mat_loss = dist_mat_loss / norm_scale * 0.01
         scaled_backbone_mse = backbone_mse / norm_scale * 0.01
 

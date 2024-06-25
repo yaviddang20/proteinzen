@@ -32,7 +32,7 @@ else
 fi
 
 ## generate samples
-conda activate proteinzen
+conda activate proteinzen-flash
 
 python predict.py --run_dir=$RUN_DIR --out_prefix=$OUTPREFIX --checkpoint_idx=$CHECKPOINTIDX
 

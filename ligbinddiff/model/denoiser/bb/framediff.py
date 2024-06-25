@@ -1569,6 +1569,7 @@ class LocalTriangleAttentionNew(nn.Module):
             k_linear,
             inf,
             pair_dropout,
+            use_edge_transition=False,
             **kwargs,
         ):
         super(LocalTriangleAttentionNew, self).__init__()
@@ -1591,10 +1592,15 @@ class LocalTriangleAttentionNew(nn.Module):
         self.tri_mul_out = TriangleMultiplicationOutgoing(c_z,c_hidden_mul)
         self.tri_mul_in = TriangleMultiplicationIncoming(c_z,c_hidden_mul)
 
+        # TODO: this is not used but kept for compatibility purposes
         self.pair_transition = PairTransition(
             c_z,
             transition_n,
         )
+        if use_edge_transition:
+            self.edge_transition = EdgeTransition(node_embed_size=c_s, edge_embed_in=c_z, edge_embed_out=c_z)
+        else:
+            self.edge_transition = None
 
         self.mha_start = TriangleAttentionCore(c_z, c_z, c_z, self.c_hidden, self.no_heads)
         self.mha_end = TriangleAttentionCore(c_z, c_z, c_z, self.c_hidden, self.no_heads)
@@ -1730,6 +1736,8 @@ class LocalTriangleAttentionNew(nn.Module):
         z = z + self.dropout_row_layer(self.tri_mul_in(z, mask=edge_mask))
         z = z + self.dropout_row_layer(self.local_mha(z, rigids, self.k_neighbour,self.k_linear, triangle_bias=bias, mask=edge_mask, starting_node=True))
         z = z + self.dropout_col_layer(self.local_mha(z, rigids, self.k_neighbour,self.k_linear, triangle_bias=bias, mask=edge_mask, starting_node=False))
+        if self.edge_transition is not None:
+            z = self.edge_transition(node_embed, z)
 
         return z
 

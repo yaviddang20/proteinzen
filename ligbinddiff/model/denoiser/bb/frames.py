@@ -592,9 +592,9 @@ def gen_anchor_graphs(num_nodes, nodes_per_anchor, device):
     return n2a_edge_index.to(device), a2a_edge_index.to(device)
 
 class EdgeEmbed(nn.Module):
-    def __init__(self, 
-                 edge_in, 
-                 edge_hidden, 
+    def __init__(self,
+                 edge_in,
+                 edge_hidden,
                  edge_out,
                  n_layers=3,
                  gate_edge=False,
@@ -615,7 +615,7 @@ class EdgeEmbed(nn.Module):
             self.gate = Linear(edge_hidden, edge_out)
         else:
             self.gate = None
-        
+
         if skip_conn:
             self.skip = Linear(edge_in, edge_out)
         else:
@@ -636,7 +636,7 @@ class EdgeEmbed(nn.Module):
             x = x + self.skip(edge_embed)
 
         x = self.ln(x)
-        
+
         return x
 
 
@@ -650,6 +650,7 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
                  num_qk_pts,
                  num_v_pts,
                  self_conditioning=False,
+                 sc_edge_unit_vecs=False,
                  triangle_attention=False,
                  triangle_in_attention=False,
                  triangle_mult=False,
@@ -728,6 +729,7 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
                 c_z=c_z,
                 num_rbf=num_rbf,
             )
+            self.triangle_mult = torch.compile(self.triangle_mult, dynamic=True)
             self.triangle_mult_ln = nn.LayerNorm(c_z)
         else:
             self.triangle_mult = None
@@ -754,6 +756,7 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
                 # num_heads=triangle_num_heads,
                 dropout=triangle_dropout
             )
+            self.triangle_transfer = torch.compile(self.triangle_transfer, dynamic=True)
             self.transfer_edge_ln = nn.LayerNorm(c_z)
         else:
             self.triangle_transfer = None
@@ -789,7 +792,7 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
         if use_seq_edge:
             if add_nodes_to_edge:
                 self.seq_edge_update = nn.Sequential(
-                    nn.Linear(c_s*2 + c_z + 4 + self_conditioning * (c_z//2 + 4), c_z),
+                    nn.Linear(c_s*2 + c_z + 4 + self_conditioning * (c_z//2 + 4 + 3 * sc_edge_unit_vecs), c_z),
                     nn.ReLU(),
                     nn.Linear(c_z, c_z),
                     nn.ReLU(),
@@ -797,7 +800,7 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
                 )
             else:
                 self.seq_edge_update = nn.Sequential(
-                    nn.Linear(c_z + 4 + self_conditioning * (c_z//2 + 4), c_z),
+                    nn.Linear(c_z + 4 + self_conditioning * (c_z//2 + 4 + 3 * sc_edge_unit_vecs), c_z),
                     nn.ReLU(),
                     nn.Linear(c_z, c_z),
                     nn.ReLU(),
@@ -919,7 +922,7 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
         self.add_nodes_to_edge = add_nodes_to_edge
         if add_nodes_to_edge:
             self.edge_embed = EdgeEmbed(
-                edge_in=c_s*2 + c_z + 4 + self_conditioning * (c_z//2 + 4) + num_edge_classes,
+                edge_in=c_s*2 + c_z + 4 + self_conditioning * (c_z//2 + 4 + 3 * sc_edge_unit_vecs) + num_edge_classes,
                 edge_hidden=c_z,
                 edge_out=c_z,
                 gate_edge=gate_spatial_edges,
@@ -935,7 +938,7 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
             # )
         else:
             self.edge_embed = EdgeEmbed(
-                edge_in=c_z + 4 + self_conditioning * (c_z//2 + 4) + num_edge_classes,
+                edge_in=c_z + 4 + self_conditioning * (c_z//2 + 4 + 3 * sc_edge_unit_vecs) + num_edge_classes,
                 edge_hidden=c_z,
                 edge_out=c_z,
                 gate_edge=gate_spatial_edges,
@@ -1156,7 +1159,8 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
                     old_edge_index,
                     edge_features,
                     edge_index,
-                    batch=res_data.batch
+                    batch=res_data.batch,
+                    res_mask=res_data['res_mask']
                     # k=self.triangle_transfer_k
                 )
 
@@ -1246,7 +1250,8 @@ class GraphIpaFrameDenoisingLayer2(nn.Module):
                     rigids,
                     edge_features,
                     edge_index,
-                    batch=res_data.batch
+                    batch=res_data.batch,
+                    res_mask=res_data['res_mask']
                 )
             if self.triangle_in_mult is not None:
                 if self.grad_checkpoint:
@@ -1590,13 +1595,13 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
     def __init__(self,
                  c_s=256,
                  c_z=128,
-                 c_hidden=256,
-                 num_heads=8,
+                 c_hidden=16,
+                 num_heads=16,
                  triangle_num_heads=4,
                  num_qk_pts=8,
                  num_v_pts=12,
                  h_time=64,
-                 n_layers=4,
+                 n_layers=8,
                  knn_k=20,
                  lrange_k=40,
                  undirected_spatial_edges=False,
@@ -1628,6 +1633,8 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  learnable_scale=False,
                  use_ipmp_refine=False,
                  sc_learned_features=True,
+                 sc_t7=True,
+                 sc_edge_unit_vecs=False,
                  rbf_encode_sc_trans=False,
                  use_transformer=False,
                  add_nodes_to_edge=True,
@@ -1664,6 +1671,8 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         self.use_self_edge = use_self_edge
         self.learnable_scale = learnable_scale
         self.sc_learned_features = sc_learned_features
+        self.sc_t7 = sc_t7
+        self.sc_edge_unit_vecs = sc_edge_unit_vecs
         self.rbf_encode_sc_trans = rbf_encode_sc_trans
         self.use_plddt = use_plddt
         self.preserve_edges = preserve_edges
@@ -1727,6 +1736,7 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  num_qk_pts,
                  num_v_pts,
                  self_conditioning=self_conditioning,
+                 sc_edge_unit_vecs=sc_edge_unit_vecs,
                  embed_seq_edge=update_seq_edge,
                  use_seq_edge=use_seq_edge,
                  last=update_seq_edge,
@@ -1757,7 +1767,7 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  gate_spatial_edges=gate_spatial_edges,
                  skip_conn_spatial_edges=skip_conn_spatial_edges,
                  num_edge_classes=num_edge_classes * use_edge_colors,
-                 use_compile=compile_mods
+                 use_compile=compile_mods,
             )
             for i in range(n_layers)
         ])
@@ -1898,7 +1908,12 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                 lrange_edge_select = lrange_edge_select.bool()
 
         # compute edge features
-        edge_features, _ = gen_spatial_graph_features(rigids, edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=self.c_z//2)
+        edge_features, _ = gen_spatial_graph_features(
+            rigids,
+            edge_index,
+            num_rbf_embed=self.c_z//2,
+            num_pos_embed=self.c_z//2
+        )
 
         if edge_colors is not None and self.use_edge_colors:
             edge_colors = F.one_hot(edge_colors, num_classes=self.num_edge_classes)
@@ -1906,7 +1921,13 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
 
         if self.self_conditioning and self_condition is not None:
             self_cond_rigids = self_condition['final_rigids']
-            self_cond_edge_features, _ = gen_spatial_graph_features(self_cond_rigids, edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=0)
+            self_cond_edge_features, _ = gen_spatial_graph_features(
+                self_cond_rigids,
+                edge_index,
+                num_rbf_embed=self.c_z//2,
+                num_pos_embed=0,
+                use_unit_vec=self.sc_edge_unit_vecs,
+            )
             edge_features = torch.cat(
                 [edge_features, self_cond_edge_features],
                 dim=-1
@@ -1914,7 +1935,7 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         elif self.self_conditioning:
             edge_features = F.pad(
                 edge_features,
-                (0, self.c_z//2 + 4)
+                (0, self.c_z//2 + 4 + 3 * self.sc_edge_unit_vecs)
             )
 
         return edge_features, edge_index, knn_edge_select, lrange_edge_select
@@ -1922,11 +1943,22 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
 
     def _gen_seq_edge_features(self, rigids, seq_edge_index, self_condition):
         # compute edge features
-        edge_features, _ = gen_spatial_graph_features(rigids, seq_edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=self.c_z//2)
+        edge_features, _ = gen_spatial_graph_features(
+            rigids,
+            seq_edge_index,
+            num_rbf_embed=self.c_z//2,
+            num_pos_embed=self.c_z//2
+        )
 
         if self.self_conditioning and self_condition is not None:
             self_cond_rigids = self_condition['final_rigids']
-            self_cond_edge_features, _ = gen_spatial_graph_features(self_cond_rigids, seq_edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=0)
+            self_cond_edge_features, _ = gen_spatial_graph_features(
+                self_cond_rigids,
+                seq_edge_index,
+                num_rbf_embed=self.c_z//2,
+                num_pos_embed=0,
+                use_unit_vec=self.sc_edge_unit_vecs,
+            )
             edge_features = torch.cat(
                 [edge_features, self_cond_edge_features],
                 dim=-1
@@ -1934,7 +1966,7 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         elif self.self_conditioning:
             edge_features = F.pad(
                 edge_features,
-                (0, self.c_z//2 + 4)
+                (0, self.c_z//2 + 4 + 3 * self.sc_edge_unit_vecs)
             )
         return edge_features
 
@@ -2004,6 +2036,7 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
             )
 
             if self.rbf_encode_sc_trans:
+                assert self.sc_t7
                 eps = 1e-8
                 trans_unit_vec = F.normalize(trans_rel + eps)
                 trans_dist = torch.linalg.vector_norm(trans_rel + eps, dim=-1)
@@ -2015,6 +2048,8 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                 )
             elif self.ipmp_self_condition:
                 t7_rel = torch.cat([quat_rel, trans_rel], dim=-1)
+                if not self.sc_t7:
+                    t7_rel = torch.zeros_like(t7_rel)
 
                 sc_bb = self_condition['denoised_bb'][:, :4]
                 sc_embed_node_features = self.self_condition_embed(
@@ -2029,6 +2064,8 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                 )
             else:
                 t7_rel = torch.cat([quat_rel, trans_rel], dim=-1)
+                if not self.sc_t7:
+                    t7_rel = torch.zeros_like(t7_rel)
 
                 node_input = torch.cat(
                     [node_input, self_cond_nodes, t7_rel],
@@ -2052,6 +2089,7 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
     def forward(self, data, self_condition=None):
         res_data = data['residue']
         res_mask = (res_data['res_mask']).bool()
+        print(data.num_graphs, res_data.num_nodes)
 
         rigids_t = ru.Rigid.from_tensor_7(res_data['rigids_t'])
         # center the training example at the mean of the x_cas

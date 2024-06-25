@@ -5,6 +5,7 @@ import tqdm
 import tree
 import torch
 import numpy as np
+import torch.nn.functional as F
 
 import torch_geometric.utils as pygu
 from torch_geometric.data import HeteroData, Batch
@@ -14,6 +15,7 @@ from ligbinddiff.data.openfold import data_transforms
 from ligbinddiff.utils.openfold import rigid_utils as ru
 from ligbinddiff.tasks import Task
 from ligbinddiff.model.utils.graph import batchwise_to_nodewise
+from ligbinddiff.runtime.loss.utils import _nodewise_to_graphwise
 
 from ligbinddiff.runtime.loss.frames import bb_frame_fm_loss, all_atom_fape_loss
 from ligbinddiff.runtime.loss.common import autoencoder_losses, latent_scalar_sidechain_fm_loss, _collect_from_seq, pt_autoencoder_losses
@@ -747,13 +749,13 @@ class ProteinDirichletInterpolation(Task):
 
     def compute_loss(self, inputs, outputs: Dict):
         bb_frame_diffusion_loss_dict = bb_frame_fm_loss(
-            inputs, outputs)
+            inputs, outputs, sep_rot_loss=True, square_aux_loss_time_factor=True)
         autoenc_loss_dict = autoencoder_losses(
             inputs, outputs
         )
 
         bb_denoising_loss = (
-            bb_frame_diffusion_loss_dict["trans_vf_loss"] * 2 +
+            bb_frame_diffusion_loss_dict["trans_vf_loss"] +
             bb_frame_diffusion_loss_dict["rot_vf_loss"]
         )
         bb_denoising_finegrain_loss = (
@@ -1609,6 +1611,7 @@ class ProteinFisherInterpolation(Task):
                         pred_trans_1.detach().cpu(),
                         pred_rotmats_1.detach().cpu(),
                         pred_seq_probs_1.detach().cpu(),
+                        denoiser_out['decoded_atom14'].detach().cpu()
                     )
                 )
 
@@ -1666,7 +1669,7 @@ class ProteinFisherInterpolation(Task):
         # atom37_traj = all_atom.transrotpsi_to_atom37(prot_traj, res_data.res_mask)
         # clean_atom37_traj = all_atom.transrotpsi_to_atom37(clean_traj, res_data.res_mask)
         clean_trajs = zip(*[traj[-1].split(num_res) for traj in clean_traj])
-        clean_traj_seqs = zip(*[traj[-1].split(num_res) for traj in clean_traj])
+        clean_traj_seqs = zip(*[traj[-2].split(num_res) for traj in clean_traj])
         prot_trajs = zip(*[traj[-1].split(num_res) for traj in prot_traj])
 
         return {
@@ -1681,13 +1684,13 @@ class ProteinFisherInterpolation(Task):
 
     def compute_loss(self, inputs, outputs: Dict):
         bb_frame_diffusion_loss_dict = bb_frame_fm_loss(
-            inputs, outputs)
+            inputs, outputs, sep_rot_loss=True)
         autoenc_loss_dict = autoencoder_losses(
             inputs, outputs
         )
 
         bb_denoising_loss = (
-            bb_frame_diffusion_loss_dict["trans_vf_loss"] * 2 +
+            bb_frame_diffusion_loss_dict["trans_vf_loss"] +
             bb_frame_diffusion_loss_dict["rot_vf_loss"]
         )
         bb_denoising_finegrain_loss = (
@@ -1714,17 +1717,28 @@ class ProteinFisherInterpolation(Task):
         else:
             clash_loss = 0
 
+        res_data = inputs['residue']
+        pred_seq_probs = F.softmax(outputs['decoded_seq_logits'], dim=-1)
+        seq_probs_t = res_data['seq_probs_t']
+        seq_probs_1 = res_data['seq_probs_1']
+        nodewise_t = inputs['t'][res_data.batch]
+        pred_hs_vf = self.sidechain_noiser.train_vf(nodewise_t, seq_probs_t, pred_seq_probs)
+        gt_hs_vf = self.sidechain_noiser.train_vf(nodewise_t, seq_probs_t, seq_probs_1)
+        seq_vf_loss = torch.square(pred_hs_vf - gt_hs_vf).sum(dim=-1)
+        seq_vf_loss = _nodewise_to_graphwise(seq_vf_loss, res_data.batch, res_data.seq_mask)
+
         loss = (
             bb_denoising_loss
             + 0.25 * bb_denoising_finegrain_loss
-            + autoenc_loss_dict["seq_loss"]
+            # + autoenc_loss_dict["seq_loss"]
+            + seq_vf_loss
             + autoenc_loss_dict['chi_loss']
             + sidechain_denoising_finegrain_loss
             # + vae_loss
             + 0.1 * clash_loss
         ).mean()
 
-        loss_dict = {"loss": loss, "frameflow_loss": (bb_denoising_loss + 0.25 * bb_denoising_finegrain_loss).mean()}
+        loss_dict = {"loss": loss, "frameflow_loss": (bb_denoising_loss + 0.25 * bb_denoising_finegrain_loss).mean(), "seq_vf_loss": seq_vf_loss}
         loss_dict.update(bb_frame_diffusion_loss_dict)
         loss_dict.update(autoenc_loss_dict)
         return loss_dict

@@ -181,9 +181,9 @@ class DynamicGraphIpaFrameDirichletDenoiser(nn.Module):
                  n_layers=4,
                  knn_k=20,
                  lrange_k=40,
-                 self_conditioning=False,
+                 self_conditioning=True,
                  use_seq_edge=True,
-                 use_final_transition=False,
+                 use_final_transition=True,
                  impute_oxy=False,
                  num_aa=20):
         super().__init__()

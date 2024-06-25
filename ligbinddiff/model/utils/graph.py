@@ -182,17 +182,17 @@ def sample_logn_inv_cubic_edges(
             trig_edge_dst = edge_sinks[..., None].expand(-1, -1, knn_k + inv_cube_k)
             trig_edge_index = torch.stack([trig_edge_dst, trig_edge_src])
             select_triangle_edges = torch.zeros((knn_k + inv_cube_k, knn_k + inv_cube_k), device=trig_edge_src.device).bool()
-            trig_edge_colors = torch.ones((knn_k + inv_cube_k, knn_k + inv_cube_k), device=trig_edge_src.device) * 4 
+            trig_edge_colors = torch.ones((knn_k + inv_cube_k, knn_k + inv_cube_k), device=trig_edge_src.device) * 4
             if gen_knn_triangle_edges:
                 select_triangle_edges[:knn_k, :knn_k] = True
-                trig_edge_colors[:knn_k, :knn_k] = 2 
+                trig_edge_colors[:knn_k, :knn_k] = 2
             if gen_lrange_triangle_edges:
                 select_triangle_edges[knn_k:, knn_k:] = True
-                trig_edge_colors[knn_k:, knn_k:] = 3 
+                trig_edge_colors[knn_k:, knn_k:] = 3
             if gen_cross_range_triangle_edges:
                 select_triangle_edges[knn_k:, :knn_k] = True
                 select_triangle_edges[:knn_k, knn_k:] = True
-            
+
             trig_edge_index = trig_edge_index[select_triangle_edges[None, None].expand(2, X_ca.shape[0], -1, -1)].view(2, -1)
             print(trig_edge_index.shape)
             trig_edge_colors = trig_edge_colors[None].expand(X_ca.shape[0], -1, -1)[select_triangle_edges[None].expand(X_ca.shape[0], -1, -1)]
@@ -245,7 +245,7 @@ def sample_all_edges(
 
 
 
-def sparse_to_knn_graph(edge_features, edge_index, num_nodes=None, batch=None):
+def sparse_to_knn_graph(edge_features, edge_index, num_nodes=None, batch=None, res_mask=None):
     src = edge_index[1]
     assert (torch.sort(src)[0] == src).all(), "edge index must have monotonic increasing node index"
 
@@ -280,17 +280,26 @@ def sparse_to_knn_graph(edge_features, edge_index, num_nodes=None, batch=None):
         # there are a couple of assumptions here which could be broken without proper usage
         # but it should be much faster
         if batch is not None:
+            # print("slower knn gen", num_edges_per_node)
+            assert res_mask is not None
             offset = 0
             edge_batch = batch[edge_index[1]]
             for i in range(edge_batch.max()+1):
                 select_edge = (edge_batch == i)
                 select_node = (batch == i)
-                num_edges = int(num_edges_per_node[select_node][0])
+                subset_res_mask = res_mask[select_node].bool()
+                subset_num_nodes = select_node.sum()
+                num_edges = int(num_edges_per_node[select_node].max().item())
                 subset_edge_features = edge_features[select_edge].view(-1, num_edges, edge_features.shape[-1])
-                subset_num_nodes = subset_edge_features.shape[0]
-                knn_edge_features[offset:offset+subset_num_nodes, :num_edges] = subset_edge_features 
+                subset_edge_features_store = torch.zeros(
+                    (subset_num_nodes, num_edges, edge_features.shape[-1]),
+                    device=edge_features.device,
+                    dtype=edge_features.dtype
+                )
+                subset_edge_features_store[subset_res_mask, :num_edges] = subset_edge_features
+                knn_edge_features[offset:offset+subset_num_nodes, :num_edges] = subset_edge_features_store
                 offset += subset_num_nodes
-            
+
         else:
             start = 0
             for i, num_edges in enumerate(num_edges_per_node):
@@ -449,7 +458,7 @@ def batchwise_to_nodewise(t_per_graph, batch):
     return t_per_graph[batch]
 
 
-def gen_spatial_graph_features(rigids: ru.Rigid, edge_index, num_rbf_embed, num_pos_embed):
+def gen_spatial_graph_features(rigids: ru.Rigid, edge_index, num_rbf_embed, num_pos_embed, use_unit_vec=False):
     X_ca = rigids.get_trans()
     quats = rigids.get_rots().get_quats()
     src_quat = quats[edge_index[1]]
@@ -470,6 +479,12 @@ def gen_spatial_graph_features(rigids: ru.Rigid, edge_index, num_rbf_embed, num_
         edge_features.append(
             _edge_positional_embeddings(edge_index, num_embeddings=num_pos_embed, device=edge_dist.device)  # edge_channels_list
         )
+
+    if use_unit_vec:
+        edge_unit_vec = F.normalize(edge_dist_vec + 1e-8, dim=-1)
+        edge_unit_vec_in_src_frame = rigids[edge_index[1]].get_rots().invert_apply(edge_unit_vec)
+        edge_features.append(edge_unit_vec_in_src_frame)
+
     edge_features = torch.cat(edge_features, dim=-1)
 
     return edge_features, edge_dist_vec

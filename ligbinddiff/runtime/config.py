@@ -1,5 +1,6 @@
 import torch
 from hydra_zen import store, just, builds, make_custom_builds_fn, make_config, kwargs_of
+from hydra.conf import HydraConf, RunDir
 import omegaconf
 from datetime import timedelta
 
@@ -68,6 +69,12 @@ se3_diffusion_cfg = {
 }
 
 def config_hydra_store():
+    # change hydra conf defaults to avoid run collisions
+    store(
+        HydraConf(
+            run=RunDir(dir="./outputs/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}")
+    ))
+
     ## switches to allow for hot-swapping between paradigms and domains
     paradigm_store = store(group="paradigm")
     paradigm_store({"paradigm": "diffusion"}, name="diffusion")
@@ -178,8 +185,8 @@ def config_hydra_store():
     model_store = store(group="model")
     model_store(GraphIpaFrameDenoiser, name="diffusion_bb")
     # model_store(GraphIpaFrameDenoiser, name="fm_bb")
-    # model_store(DynamicGraphIpaFrameDenoiser, name="fm_bb")
-    model_store(IpaScoreWrapper, name="fm_bb")
+    model_store(DynamicGraphIpaFrameDenoiser, name="fm_bb")
+    # model_store(IpaScoreWrapper, name="fm_bb")
     model_store(IPMPLatentWrapper, name="fm_protein")
     model_store(DynamicGraphIpaFrameDirichletDenoiser, name="dirichlet_protein")
     model_store(DynamicGraphIpaFrameDirichletDenoiser, name="fisher_protein")

@@ -114,8 +114,8 @@ def autoencoder_losses(batch,
     norm_scale = 1 - torch.min(
         t, torch.as_tensor(0.9)
     )
-    scaled_local_atomic_dist_loss = local_atomic_dist_loss / norm_scale * 0.01
-    scaled_atom14_mse = atom14_mse / norm_scale * 0.01
+    scaled_local_atomic_dist_loss = local_atomic_dist_loss / (norm_scale**2) * 0.01
+    scaled_atom14_mse = atom14_mse / (norm_scale**2) * 0.01
 
     sidechain_chi_loss = chi_loss(
         gt_torsions[..., 3:, :],

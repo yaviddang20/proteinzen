@@ -83,12 +83,22 @@ class ProteinFisherInterpolant:
     def __init__(self,
                  se3_cfg: SE3InterpolantConfig,
                  use_batch_ot=False,
-                 prior='dirichlet'):
+                 prior='dirichlet',
+                 train_sched="linear",
+                 train_c=1,
+                 sample_sched="linear",
+                 sample_c=1):
         self._cfg = se3_cfg
         self.se3_noiser = SE3Interpolant(
             se3_cfg,
             use_batch_ot=use_batch_ot)
-        self.sidechain_noiser = FisherFlow(prior=prior)
+        self.sidechain_noiser = FisherFlow(
+            prior=prior,
+            train_sched=train_sched,
+            train_c=train_c,
+            sample_sched=sample_sched,
+            sample_c=sample_c
+        )
 
 
 class ProteinCatFlowInterpolant:

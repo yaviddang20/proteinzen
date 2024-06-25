@@ -63,7 +63,7 @@ class TriangleSelfAttention(nn.Module):
         num_edges = edge_index.shape[-1]
 
         init_dtype = edge_features.dtype
-    
+
         node_features = node_features.to(self.dtype)
         edge_features = edge_features.to(self.dtype)
 
@@ -129,7 +129,7 @@ class TriangleSelfAttention(nn.Module):
         if flash:
             edge_q = edge_q.view(num_nodes, k, self.num_heads, -1).transpose(-2, -3)
             edge_k = edge_k.view(num_nodes, k, self.num_heads, -1).transpose(-2, -3)
-            edge_v = edge_v.view(num_nodes, k, self.num_heads, -1).transpose(-2, -3)  
+            edge_v = edge_v.view(num_nodes, k, self.num_heads, -1).transpose(-2, -3)
 
             edge_edge_mask = knn_edge_mask[..., None] & knn_edge_mask[..., None, :]  # n x k x k
             attn_bias = edge3_dist_bias.permute(0, 3, 1, 2) - self.inf * (~edge_edge_mask[:, None]).to(self.dtype)
@@ -173,7 +173,7 @@ class TriangleSelfAttention(nn.Module):
                 dim=0,
                 dim_size=num_edges
             )
-        
+
         edge_update = edge_update.to(init_dtype)
 
         return edge_update
@@ -216,8 +216,8 @@ class SparseTriangleSelfAttention(nn.Module):
             self.out_gate = Linear(c_z, c_z, init='gating', dtype=dtype)
 
         self.inf = inf
-    
-    @torch.compile(dynamic=True)
+
+    # @torch.compile(dynamic=True)
     def _gen_edge_update(self, node_features, node_trans, edge_features, edge_index, edge_edge_index, eps=1e-8):
         edge3_node1_idx = edge_index[0, edge_edge_index[1]]
         edge3_node2_idx = edge_index[0, edge_edge_index[0]]

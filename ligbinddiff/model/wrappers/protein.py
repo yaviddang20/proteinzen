@@ -52,6 +52,7 @@ class IPMPLatentWrapper(nn.Module):
             num_heads=num_heads,
             num_qk_pts=num_qk_pts,
             num_v_pts=num_v_pts,
+            n_layers=8,
             h_time=h_time,
             knn_k=knn_k,
             lrange_k=lrange_k,
