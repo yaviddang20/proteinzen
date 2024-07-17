@@ -266,12 +266,12 @@ class DynamicGraphIpaFrameDirichletMultiChiDenoiser(nn.Module):
     def __init__(self,
                  c_s=256,
                  c_z=128,
-                 c_hidden=256,
-                 num_heads=8,
+                 c_hidden=16,
+                 num_heads=16,
                  num_qk_pts=8,
                  num_v_pts=12,
                  h_time=64,
-                 n_layers=4,
+                 n_layers=8,
                  knn_k=20,
                  lrange_k=40,
                  self_conditioning=False,
@@ -366,6 +366,7 @@ class DynamicGraphIpaFrameDirichletMultiChiDenoiser(nn.Module):
             ])
 
         self.seq_logits = nn.Linear(c_s, num_aa)
+        self.final_transition = StructureModuleTransition(c_s)
 
 
     def _gen_spatial_edge_features(self, rigids, res_mask, batch, self_condition):
@@ -572,6 +573,7 @@ class DynamicGraphIpaFrameDirichletMultiChiDenoiser(nn.Module):
                 res_data,
             )
 
+        node_features = self.final_transition(node_features)
         rigids = rigids.scale_translation(10)
 
         psi = self.torsion_angles(node_features)

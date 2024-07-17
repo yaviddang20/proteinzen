@@ -234,7 +234,7 @@ def bb_frame_diffusion_loss(batch,
 def bb_frame_fm_loss(batch,
                      denoiser_outputs,
                      t_norm_clip=0.9,
-                     sep_rot_loss=False,
+                     sep_rot_loss=True,
                      local_atomic_dist_r=6,
                      square_aux_loss_time_factor=False):
     res_data = batch['residue']

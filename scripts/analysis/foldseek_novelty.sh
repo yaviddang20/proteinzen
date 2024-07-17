@@ -22,4 +22,6 @@ foldseek easy-search $DESIGNABLE_DIR \
     --tmscore-threshold 0.0 \
     --exhaustive-search \
     --max-seqs 10000000000  | tee -a foldseek_novelty.out
+
+conda activate proteinzen
 python ~/projects/ligbinddiff/scripts/analysis/summarize_foldseek.py

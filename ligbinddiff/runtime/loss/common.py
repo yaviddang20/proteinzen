@@ -14,9 +14,17 @@ from .latent import so3_embedding_kl, scalars_kl_div
 def seq_cce_loss(ref_seq,
                  seq_logits,
                  batch,
-                 mask):
+                 mask,
+                 label_smoothing=0.0,
+                 logits_as_probs=False):
     """ CCE loss on logits """
-    cce = F.cross_entropy(seq_logits, ref_seq * mask, reduction='none')
+    if logits_as_probs:
+        assert label_smoothing == 0, "Label smoothing not implemented for CCE with probs"
+        seq_probs = torch.gather(seq_logits, 1, (ref_seq * mask)[..., None])
+        cce = -torch.log(seq_probs)
+        cce = cce.squeeze(-1)
+    else:
+        cce = F.cross_entropy(seq_logits, ref_seq * mask, reduction='none', label_smoothing=label_smoothing)
     return _nodewise_to_graphwise(cce, batch, mask)
 
 def seq_recov(ref_seq,
@@ -44,7 +52,9 @@ def _collect_from_seq(tensor, seq, seq_mask):
 
 
 def autoencoder_losses(batch,
-                       model_outputs):
+                       model_outputs,
+                       label_smoothing=0.0,
+                       logit_norm_loss=0.0):
     res_data = batch['residue']
 
     gt_atom14 = res_data['atom14_gt_positions']
@@ -84,11 +94,21 @@ def autoencoder_losses(batch,
         atom14_alt_gt_mask,
         minimal_mask,
         no_bb=False)
-    seq_loss = seq_cce_loss(
-        seq,
-        seq_logits,
-        res_data.batch,
-        denoiser_mask)
+    if "seq_probs" in model_outputs and model_outputs["seq_probs"] is not None:
+        seq_loss = seq_cce_loss(
+            seq,
+            model_outputs["seq_probs"],
+            res_data.batch,
+            denoiser_mask,
+            label_smoothing=label_smoothing,
+            logits_as_probs=True)
+    else:
+        seq_loss = seq_cce_loss(
+            seq,
+            seq_logits,
+            res_data.batch,
+            denoiser_mask,
+            label_smoothing=label_smoothing)
     per_seq_recov = seq_recov(
         seq,
         seq_logits,
@@ -135,6 +155,12 @@ def autoencoder_losses(batch,
     latent_logvar = model_outputs['latent_logvar']
     kl_div = scalars_kl_div(latent_mu, latent_logvar, res_data.batch, minimal_mask)
 
+    logit_norm_loss = logit_norm_loss * _nodewise_to_graphwise(
+        torch.sum(seq_logits**2, dim=-1),
+        res_data.batch,
+        denoiser_mask
+    )
+
     out_dict = {
         "seq_loss": seq_loss,
         "per_seq_recov": per_seq_recov,
@@ -149,6 +175,7 @@ def autoencoder_losses(batch,
         # "bond_angle_loss": bond_angle_loss,
         "chi_loss": sidechain_chi_loss,
         "kl_div": kl_div,
+        "logit_norm_loss": logit_norm_loss,
         "percent_masked": _nodewise_to_graphwise(
             denoiser_mask.float(),
             res_data.batch,

@@ -308,7 +308,7 @@ class SE3Interpolant:
 
         # [N]
         res_mask = res_data["res_mask"]
-        noising_mask = res_data["noising_mask"]
+        noising_mask = res_data["res_noising_mask"]
         mask = res_mask & noising_mask
 
         # [B]

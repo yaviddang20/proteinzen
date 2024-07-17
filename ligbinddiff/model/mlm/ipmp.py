@@ -81,7 +81,7 @@ class IPMPEncoder(nn.Module):
                  k=30,
                  num_aa=20,
                  dropout=0.1,
-                 classic_mode=False):
+                 classic_mode=True):
         super().__init__()
         self.c_s = c_s
         self.c_z = c_z

@@ -12,7 +12,7 @@ from ligbinddiff.data.datasets.datamodule import ProteinDataModule, FramediffDat
 from ligbinddiff.diffusion.noisers.se3_diffuser import SE3Diffuser
 from ligbinddiff.diffusion.noisers.latent import SidechainDiffuser
 from ligbinddiff.stoch_interp.interpolate.se3 import SE3Interpolant, SE3InterpolantConfig
-from ligbinddiff.stoch_interp.interpolate.protein import ProteinInterpolant, ProteinDirichletInterpolant, ProteinDirichletChiInterpolant, ProteinDirichletMultiChiInterpolant, ProteinFisherInterpolant
+from ligbinddiff.stoch_interp.interpolate.protein import ProteinInterpolant, ProteinDirichletInterpolant, ProteinDirichletChiInterpolant, ProteinDirichletMultiChiInterpolant, ProteinFisherInterpolant, ProteinCatFlowInterpolant, ProteinFisherMultiChiInterpolant
 from ligbinddiff.stoch_interp.interpolate.molecule import HarmonicPriorInterpolant
 from ligbinddiff.stoch_interp.interpolate.torsion import TorsionInterpolant
 from ligbinddiff.stoch_interp.interpolate.dirichlet import DirichletConditionalFlow
@@ -36,7 +36,7 @@ from ligbinddiff.model.wrappers.protein import IPMPLatentWrapper
 from ligbinddiff.tasks.diffusion.bb import BackboneFrameNoising
 from ligbinddiff.tasks.diffusion.sidechain import DesignLatentSidechainNoising
 from ligbinddiff.tasks.fm.bb import BackboneFrameInterpolation
-from ligbinddiff.tasks.fm.protein import ProteinInterpolation, ProteinDirichletInterpolation, ProteinDirichletChiInterpolation, ProteinDirichletMultiChiInterpolation, ProteinFisherInterpolation
+from ligbinddiff.tasks.fm.protein import ProteinInterpolation, ProteinDirichletInterpolation, ProteinDirichletChiInterpolation, ProteinDirichletMultiChiInterpolation, ProteinFisherInterpolation, ProteinCatFlowInterpolation, ProteinFisherMultiChiInterpolation
 from ligbinddiff.tasks.fm.molecule import HarmonicFlowMatching, TorsionalFlowMatching
 from ligbinddiff.tasks.fm.sidechain import DirichletFlowMatching
 
@@ -81,11 +81,13 @@ def config_hydra_store():
     paradigm_store({"paradigm": "fm"}, name="fm")
     paradigm_store({"paradigm": "dirichlet"}, name="dirichlet")
     paradigm_store({"paradigm": "fisher"}, name="fisher")
+    paradigm_store({"paradigm": "catflow"}, name="catflow")
 
     domain_store = store(group="domain")
     domain_store({"domain": "backbone"}, name="bb")
     domain_store({"domain": "sidechain"}, name="sidechain")
     domain_store({"domain": "protein"}, name="protein")
+    domain_store({"domain": "protein_multichi"}, name="protein_multichi")
     domain_store({"domain": "molecule"}, name="molecule")
 
     corruption_store = store(group="corrupter")
@@ -112,14 +114,22 @@ def config_hydra_store():
         ProteinFisherInterpolant,
         se3_cfg=builds(SE3InterpolantConfig),
         name="fisher_protein")
+    corruption_store(
+        ProteinCatFlowInterpolant,
+        se3_cfg=builds(SE3InterpolantConfig),
+        name="catflow_protein")
     # corruption_store(
     #     ProteinDirichletChiInterpolant,
     #     se3_cfg=builds(SE3InterpolantConfig),
     #     name="dirichlet_protein")
-    # corruption_store(
-    #     ProteinDirichletMultiChiInterpolant,
-    #     se3_cfg=builds(SE3InterpolantConfig),
-    #     name="dirichlet_protein")
+    corruption_store(
+        ProteinDirichletMultiChiInterpolant,
+        se3_cfg=builds(SE3InterpolantConfig),
+        name="dirichlet_protein_multichi")
+    corruption_store(
+        ProteinFisherMultiChiInterpolant,
+        se3_cfg=builds(SE3InterpolantConfig),
+        name="fisher_protein_multichi")
     # corruption_store(
     #     HarmonicPriorInterpolant,
     #     name="fm_molecule")
@@ -181,6 +191,10 @@ def config_hydra_store():
         pbuilds(ProteinModule),
         name="protein"
     )
+    lmodule_store(
+        pbuilds(ProteinModule),
+        name="protein_multichi"
+    )
 
     model_store = store(group="model")
     model_store(GraphIpaFrameDenoiser, name="diffusion_bb")
@@ -190,8 +204,10 @@ def config_hydra_store():
     model_store(IPMPLatentWrapper, name="fm_protein")
     model_store(DynamicGraphIpaFrameDirichletDenoiser, name="dirichlet_protein")
     model_store(DynamicGraphIpaFrameDirichletDenoiser, name="fisher_protein")
+    model_store(DynamicGraphIpaFrameDirichletDenoiser, name="catflow_protein")
     # model_store(DynamicGraphIpaFrameDirichletChiDenoiser, name="dirichlet_protein")
-    # model_store(DynamicGraphIpaFrameDirichletMultiChiDenoiser, name="dirichlet_protein")
+    model_store(DynamicGraphIpaFrameDirichletMultiChiDenoiser, name="dirichlet_protein_multichi")
+    model_store(DynamicGraphIpaFrameDirichletMultiChiDenoiser, name="fisher_protein_multichi")
     #model_store(MoleculeDenoiser, name="fm_molecule")
     model_store(MoleculeTorsionDenoiser, name="fm_molecule")
     # model_store(
@@ -218,8 +234,10 @@ def config_hydra_store():
     task_store(pbuilds(ProteinInterpolation), name="fm_protein")
     task_store(pbuilds(ProteinDirichletInterpolation), name="dirichlet_protein")
     task_store(pbuilds(ProteinFisherInterpolation), name="fisher_protein")
+    task_store(pbuilds(ProteinCatFlowInterpolation), name="catflow_protein")
     # task_store(pbuilds(ProteinDirichletChiInterpolation), name="dirichlet_protein")
-    # task_store(pbuilds(ProteinDirichletMultiChiInterpolation), name="dirichlet_protein")
+    task_store(pbuilds(ProteinDirichletMultiChiInterpolation), name="dirichlet_protein_multichi")
+    task_store(pbuilds(ProteinFisherMultiChiInterpolation), name="fisher_protein_multichi")
     # task_store(pbuilds(HarmonicFlowMatching), name="fm_molecule")
     task_store(pbuilds(TorsionalFlowMatching), name="fm_molecule")
 
@@ -271,6 +289,14 @@ def config_hydra_store():
         train_time_interval=timedelta(days=1),
         group="experiment/checkpointer",
         name="protein")
+    exp_store(
+        ModelCheckpoint,
+        save_top_k=-1,
+        save_on_train_epoch_end=True,
+        save_last=True,
+        train_time_interval=timedelta(days=1),
+        group="experiment/checkpointer",
+        name="protein_multichi")
     exp_store(
         pbuilds(
             ModelCheckpoint,

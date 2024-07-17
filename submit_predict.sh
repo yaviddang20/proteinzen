@@ -7,7 +7,7 @@
 #$ -q gpu.q
 #$ -pe smp 1
 #$ -l mem_free=32G
-#$ -l h_rt=6:00:00
+#$ -l h_rt=5:00:00
 #$ -l compute_cap=61,gpu_mem=40G
 
 export CUDA_VISIBLE_DEVICES=$SGE_GPU
@@ -57,7 +57,7 @@ python ../protein_mpnn_run.py \
         --out_folder $output_dir \
         --num_seq_per_target 8 \
         --sampling_temp "0.1" \
-        --batch_size 1
+        --batch_size 8
 
 ## submit ESMFold
 cd $RUN_DIR
@@ -65,7 +65,8 @@ cd $OUTPREFIX
 mkdir esmfold
 cd esmfold
 bash ~/projects/ligbinddiff/scripts/analysis/esmfold.sh > esmfold.log
+
 conda activate proteinzen
-python ~/projects/ligbinddiff/scripts/analysis/esm_analysis.py --esmlog esmfold.log --folded_folder $PWD --samples ../samples | tail -n 2 > ${RUN_DIR}/$OUTPREFIX/num_designable.txt
+python ~/projects/ligbinddiff/scripts/analysis/esm_analysis.py --esmlog esmfold.log --folded_folder $PWD --samples ../samples | tail -n 3 > ${RUN_DIR}/$OUTPREFIX/num_designable.txt
 cd ..
 bash ~/projects/ligbinddiff/scripts/analysis/analysis_suite.sh

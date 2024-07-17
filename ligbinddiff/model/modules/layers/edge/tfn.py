@@ -15,6 +15,7 @@ class FasterTensorProduct(torch.nn.Module):
         assert o3.Irreps(sh_irreps) == o3.Irreps('1x0e+1x1o'), "sh_irreps don't look like 1st order spherical harmonics"
         self.in_irreps = o3.Irreps(in_irreps)
         self.out_irreps = o3.Irreps(out_irreps)
+        self.irreps_out = self.out_irreps
 
         in_muls = {'0e': 0, '1o': 0, '1e': 0, '0o': 0}
         out_muls = {'0e': 0, '1o': 0, '1e': 0, '0o': 0}

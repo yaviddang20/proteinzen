@@ -7,7 +7,10 @@ os.environ['GEOMSTATS_BACKEND'] = 'pytorch'
 import geomstats.backend as gs
 from geomstats.geometry.hypersphere import Hypersphere
 
+from . import sphere_utils
+
 torch.set_default_dtype(torch.float32)
+
 
 
 # implemented from https://arxiv.org/abs/2405.14664
@@ -17,8 +20,8 @@ class FisherFlow:
                  prior="hypersphere",
                  train_sched="linear",
                  train_c=1,
-                 sample_sched="linear",
-                 sample_c=1,
+                 sample_sched="exp",
+                 sample_c=10,
         ):
         self.D = D
         self.sphere = Hypersphere(dim=D-1)
@@ -78,6 +81,23 @@ class FisherFlow:
 
 
     def _geodesic_interpolant(self, x0_simplex, x1_simplex, t, schedule="linear", schedule_c=1):
+        """
+
+        In contrast to FrameFlow, we compute the interpolant based at x0 towards x1
+
+        Args:
+            x0_simplex (_type_): _description_
+            x1_simplex (_type_): _description_
+            t (_type_): _description_
+            schedule (str, optional): _description_. Defaults to "linear".
+            schedule_c (int, optional): _description_. Defaults to 1.
+
+        Raises:
+            ValueError: _description_
+
+        Returns:
+            _type_: _description_
+        """
         if schedule == 'linear':
             t = t
         elif schedule == 'exp':
@@ -111,16 +131,15 @@ class FisherFlow:
         nodewise_t = t[res_data.batch]
 
         # [N]
-        res_mask = res_data["res_mask"]
         seq_mask = res_data['seq_mask']
-        noising_mask = res_data["noising_mask"]
-        mask = res_mask & seq_mask
+        noising_mask = res_data["seq_noising_mask"]
 
         seq = res_data['seq']
         seq[~seq_mask] = 0
         noised_probs, gt_probs = self._corrupt_seq(seq, nodewise_t)
-        noised_probs[~mask] = 0
-        gt_probs[~mask] = 0
+        gt_probs[~seq_mask] = 0
+        noised_probs[~seq_mask] = 0
+        noised_probs[~noising_mask] = gt_probs[~noising_mask]
 
         res_data['seq_probs_t'] = noised_probs
         res_data['seq_probs_1'] = gt_probs
@@ -130,11 +149,11 @@ class FisherFlow:
     def train_vf(self, t, seq_probs_t, seq_probs_1, t_clip=0.9):
         device = seq_probs_t.device
         scaling = self.vf_scale(t, self.train_c, self.train_sched, t_clip=t_clip)
-        seq_t_hs = seq_probs_t.sqrt()
-        seq_1_hs = seq_probs_1.sqrt()
+        # this business is to avoid having 0s pass through the sqrt
+        seq_t_hs = F.normalize(seq_probs_t.clip(min=1e-12).sqrt(), dim=-1)
+        seq_1_hs = F.normalize(seq_probs_1.clip(min=1e-12).sqrt(), dim=-1)
         with torch.device(device):
-            hs_vf = self.sphere.metric.log(seq_1_hs, seq_t_hs)
-            scaling = self.vf_scale(t, self.sample_c, self.sample_sched).to(hs_vf.device)
+            hs_vf = sphere_utils.log(self.sphere.metric, seq_1_hs, seq_t_hs)
         return scaling[..., None] * hs_vf
 
 

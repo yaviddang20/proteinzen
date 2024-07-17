@@ -82,6 +82,7 @@ if __name__ == '__main__':
     print(df)
 
     rmsds = []
+    all_atom_rmsds = []
     superimpose = Superimposer()
     for _, row in tqdm.tqdm(list(df.iterrows())):
         sample_path = os.path.join(
@@ -105,8 +106,8 @@ if __name__ == '__main__':
                     break
 
         sample = pdb_to_structure(sample_path, silent=True)
-        sample_ca = [atom for atom in sample.get_atoms() if atom.get_name() == 'CA']
         folded = pdb_to_structure(current_folded, silent=True)
+        sample_ca = [atom for atom in sample.get_atoms() if atom.get_name() == 'CA']
         folded_ca = [atom for atom in folded.get_atoms() if atom.get_name() == 'CA']
         for _ in range(5):
             superimpose.set_atoms(
@@ -116,12 +117,25 @@ if __name__ == '__main__':
             superimpose.apply(folded_ca)
         rmsds.append(superimpose.rms)
 
+        if args.fold_original and row['sample'] == 0:
+            sample_all_atom = [atom for atom in sample.get_atoms()]
+            folded_all_atom = [atom for atom in folded.get_atoms()]
+            for _ in range(5):
+                superimpose.set_atoms(
+                    fixed=sample_all_atom,
+                    moving=folded_all_atom
+                )
+                superimpose.apply(folded_all_atom)
+            all_atom_rmsds.append(superimpose.rms)
+
     df['sc_rmsd'] = rmsds
 
     sc_df = df[df['sample'] != 0]
     sc_df.to_csv("sc_rmsd.csv")
 
     folding_df = df[df['sample'] == 0]
+    if len(all_atom_rmsds) == len(folding_df):
+        folding_df['sc_rmsd_all_atom'] = all_atom_rmsds
     folding_df.to_csv("folding_rmsd.csv")
 
     collapsed_df = []
@@ -132,4 +146,5 @@ if __name__ == '__main__':
     collapsed_df = pd.concat(collapsed_df)
     collapsed_df.to_csv("best_sc_rmsd.csv")
     print("Num designable:", len(collapsed_df[collapsed_df.sc_rmsd < 2]))
-    print("Num folded correctly:", len(folding_df[folding_df.sc_rmsd < 2]))
+    print("Num folded correctly (bb):", len(folding_df[folding_df.sc_rmsd < 2]))
+    print("Num folded correctly (aa):", len(folding_df[folding_df.sc_rmsd_all_atom < 2]))

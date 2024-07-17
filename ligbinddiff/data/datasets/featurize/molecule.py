@@ -68,12 +68,12 @@ hybridization = {
     HybridizationType.SP3D2: 4,
 }
 
-max_num_bonds = 6
-ring_size_min = 3
-ring_size_max = 8
-num_rings_max = 3
-max_abs_formal_charge = 5
-max_bond_order = 3
+MAX_NUM_BONDS = 6
+RING_SIZE_MIN = 3
+RING_SIZE_MAX = 8
+NUM_RINGS_MAX = 3
+MAX_ABS_FORMAL_CHARGE = 5
+MAX_BOND_ORDER = 3
 
 
 # ordered (featurization, max_value)
@@ -82,12 +82,12 @@ prop_featurization = {
     "atom_row": ("categorical", max(unique_rows)),  # 6
     "atom_chirality": ("ordinal", 1),  # 1
     "atom_hybridization": ("categorical", len(hybridization)),  # 5
-    "atom_implicit_hs": ("ordinal", max_num_bonds),  # 1
+    "atom_implicit_hs": ("ordinal", MAX_NUM_BONDS),  # 1
     "atom_formal_charge": ("ordinal", 5),  # 1
     "atom_aromatic": None,  # 1
     "atom_ring_props": None,  # 7
-    "atom_degree": ("ordinal", max_num_bonds),  # 1
-    "bond_order": ("ordinal", max_bond_order),  # 1
+    "atom_degree": ("ordinal", MAX_NUM_BONDS),  # 1
+    "bond_order": ("ordinal", MAX_BOND_ORDER),  # 1
     "bond_aromatic": None,  # 1
     "bond_type": ("categorical", max(bonds.values())),  # 4
     "bond_conjugated": None,  # 1
@@ -112,7 +112,7 @@ def bucket(val, options, default=None):
 
 
 # properties
-def conformer_props(conformer, implicit_H=True):
+def mol_props(mol, implicit_H=True):
     # if implicit_H is enabled, we make all Hs implicit in the structure
     # to simulate PDB structures with no H info
     # and also we can save ourselves some compute
@@ -121,7 +121,7 @@ def conformer_props(conformer, implicit_H=True):
     # of explicit Hs already attached
     # we then just skip over all H atom features and any bonds with Hs
 
-    mol = conformer.GetOwningMol()
+    # mol = conformer.GetOwningMol()
     ringinfo = mol.GetRingInfo()
     # atom features
     atom_period = []
@@ -159,30 +159,30 @@ def conformer_props(conformer, implicit_H=True):
         # implicit valence
         num_Hs = atom.GetImplicitValence() + atom.GetNumExplicitHs()
         atom_implicit_Hs.append(
-            bucket(num_Hs, list(range(max_num_bonds+1)))
+            bucket(num_Hs, list(range(MAX_NUM_BONDS+1)))
         )
         atom_degree.append(
-            bucket(atom.GetDegree(), list(range(max_num_bonds+1)))
+            bucket(atom.GetDegree(), list(range(MAX_NUM_BONDS+1)))
         )
         atom_formal_charge.append(atom.GetFormalCharge())
         atom_aromatic.append(int(atom.GetIsAromatic()))
         atom_ring_props.append(
             [
                 int(ringinfo.IsAtomInRingOfSize(idx, ring_size))
-                for ring_size in range(ring_size_min, ring_size_max+1)
+                for ring_size in range(RING_SIZE_MIN, RING_SIZE_MAX+1)
             ] # if atom is in a ring of size X
-            + [bucket(ringinfo.NumAtomRings(idx), list(range(num_rings_max+1)))] # how many rings is the atom in
+            + [bucket(ringinfo.NumAtomRings(idx), list(range(NUM_RINGS_MAX+1)))] # how many rings is the atom in
         )
 
     # get 3D coords, removing Hs
-    atom_pos = conformer.GetPositions()
+    # atom_pos = conformer.GetPositions()
     atom_idx_map = np.arange(mol.GetNumAtoms())
     if implicit_H:
         mol_H_mask = np.array(
             [atom.GetSymbol() != 'H' for atom in mol.GetAtoms()]
         )
         atom_idx_map = atom_idx_map[mol_H_mask]
-        atom_pos = atom_pos[mol_H_mask]
+        # atom_pos = atom_pos[mol_H_mask]
 
     # bond features
     bond_edge_index = []
@@ -219,7 +219,7 @@ def conformer_props(conformer, implicit_H=True):
 
 
     props = {
-        "atom_pos": atom_pos,                       # N x 3
+        # "atom_pos": atom_pos,                       # N x 3
         "atom_period": atom_period,                 # N, categorical
         "atom_row": atom_row,                       # N, categorical
         "atom_chirality": atom_chirality,           # N, ordinal
@@ -241,6 +241,21 @@ def conformer_props(conformer, implicit_H=True):
     }
 
     return props
+
+
+def conformer_props(conformer, implicit_H=True):
+    mol = conformer.GetOwningMol()
+    props = mol_props(mol, implicit_H=implicit_H)
+    atom_pos = conformer.GetPositions()
+    if implicit_H:
+        mol_H_mask = np.array(
+            [atom.GetSymbol() != 'H' for atom in mol.GetAtoms()]
+        )
+        atom_pos = atom_pos[mol_H_mask]
+    props["atom_pos"] = np.array(atom_pos)
+    return props
+
+
 
 def one_hot(cat_feats, max_val):
     one_hot_mat = torch.eye(max_val+1)

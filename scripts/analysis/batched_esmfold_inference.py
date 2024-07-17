@@ -98,7 +98,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-tokens-per-batch",
         type=int,
-        default=1024,
+        default=1500,
         help="Maximum number of tokens per gpu forward-pass. This will group shorter sequences together "
         "for batched prediction. Lowering this can help with out of memory issues, if these occur on "
         "short sequences.",

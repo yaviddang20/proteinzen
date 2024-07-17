@@ -22,7 +22,6 @@ class IPMPLatentWrapper(nn.Module):
                  sidechain_k=30,
                  knn_k=20,
                  lrange_k=40,
-                 num_vn=4,
                  self_conditioning=True,
                  ):
         super().__init__()
@@ -48,15 +47,14 @@ class IPMPLatentWrapper(nn.Module):
             c_s=c_s,
             c_latent=c_latent,
             c_z=c_z,
-            c_hidden=c_hidden,
-            num_heads=num_heads,
+            c_hidden=16,
+            num_heads=16,
             num_qk_pts=num_qk_pts,
             num_v_pts=num_v_pts,
             n_layers=8,
             h_time=h_time,
             knn_k=knn_k,
             lrange_k=lrange_k,
-            num_vn=num_vn,
             self_conditioning=self_conditioning,
         )
         self.c_latent = c_latent

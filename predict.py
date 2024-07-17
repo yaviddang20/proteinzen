@@ -69,13 +69,13 @@ class Experiment:
         trainer = Trainer(
             **trainer_cfg,
         )
-        assert self._cfg.domain.domain in ["backbone", "protein", "molecule"], self._cfg.domain
+        assert self._cfg.domain.domain in ["backbone", "protein", "protein_multichi", "molecule"], self._cfg.domain
         ret = trainer.predict(
             model=self._model,
             datamodule=self._datamodule,
             ckpt_path=self._exp_cfg.warm_start
         )
-        if self._cfg.domain.domain in ["backbone", "protein"]:
+        if self._cfg.domain.domain in ["backbone", "protein", "protein_multichi"]:
             os.chdir(self._exp_cfg['samples_dir'])
             for batch in ret:
                 samples = batch['samples']
@@ -112,8 +112,9 @@ class Experiment:
                     #     save_struct(models_to_struct(clean_models), clean_traj_name)
                     #     save_struct(models_to_struct(prot_models), prot_traj_name)
 
-                elif self._cfg.domain.domain == 'protein':
+                elif self._cfg.domain.domain in ['protein', 'protein_multichi']:
                     seqs = batch['seqs']
+                    # print(samples, sample_ids, seqs)
                     for sample, sample_id, seq in zip(samples, sample_ids, seqs):
                         sample_len = sample.shape[0]
                         seq = "".join([restypes[i] for i in seq.tolist()])
@@ -133,7 +134,6 @@ class Experiment:
                     #         clean = clean_traj[i]
                     #         seq = clean_seq[i].argmax(dim=-1)
                     #         seq = "".join([restypes[j] for j in seq.tolist()])
-                    #         print(seq)
                     #         prot = prot_traj[i]
                     #         sample_len = clean.shape[0]
                     #         clean_atom91, _ = atom14_to_atom91(seq, clean.numpy(force=True))
@@ -179,8 +179,12 @@ def main(model,
     # corrupter._sample_cfg.num_timesteps = 200
     # corrupter._sample_cfg.num_timesteps = 500
     # corrupter._sample_cfg.num_timesteps = 200
-    # corrupter._rots_cfg.exp_rate = 6
+    # corrupter._rots_cfg.exp_rate = 5
     # corrupter._rots_cfg.sample_schedule = 'linear'
+    # corrupter.se3_noiser._rots_cfg.exp_rate = 5
+    # corrupter.se3_noiser._rots_cfg.sample_schedule = 'linear'
+    # corrupter.sidechain_noiser.sample_sched = 'sigmoid'
+    # corrupter.sidechain_noiser.sample_c = 10
 
 
     datamodule_inst = datamodule(task_sampler=task_sampler)
@@ -256,16 +260,17 @@ if __name__ == '__main__':
                     for i in range(100, 300+1, 50)
                 }
 
-    if cfg['domain']['domain'] == "protein":
+    if cfg['domain']['domain'] in ["protein", "protein_multichi"]:
         if args.debug:
             print("debug")
             cfg['datamodule']['sample_lengths'] = {
-                60: 5
-                # 60: 5,
+                60: 5,
                 # 70: 5,
-                # 80: 5,
+                80: 5,
                 # 90: 5,
-                # 100: 1,
+                100: 5,
+                # 200: 5,
+                # 300: 5,
                 # 110: 5,
                 # 120: 1
                 # 230: 1

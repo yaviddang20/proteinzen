@@ -83,7 +83,7 @@ class ProteinFisherInterpolant:
     def __init__(self,
                  se3_cfg: SE3InterpolantConfig,
                  use_batch_ot=False,
-                 prior='dirichlet',
+                 prior='hypersphere',
                  train_sched="linear",
                  train_c=1,
                  sample_sched="linear",
@@ -99,6 +99,26 @@ class ProteinFisherInterpolant:
             sample_sched=sample_sched,
             sample_c=sample_c
         )
+
+class ProteinFisherMultiChiInterpolant:
+    """ Wrapper for SE3Interpolant and DirichletInterpolant """
+    def __init__(self,
+                 se3_cfg: SE3InterpolantConfig,
+                 use_batch_ot=False,
+                 use_uniform_chi_noise=False,
+                 chi_noise_sigma=1.5):
+        self._cfg = se3_cfg
+        self.se3_noiser = SE3Interpolant(
+            se3_cfg,
+            use_batch_ot=use_batch_ot)
+        self.sidechain_noiser = FisherFlow(
+            prior="hypersphere"
+        )
+        self.chi_noiser = SidechainMultiTorsionInterpolant(
+            uniform_rot_noise=use_uniform_chi_noise,
+            sigma=chi_noise_sigma
+        )
+
 
 
 class ProteinCatFlowInterpolant:

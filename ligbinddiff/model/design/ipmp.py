@@ -337,7 +337,11 @@ class IPMPDecoder(nn.Module):
         _, edge_features, edge_index = self._prep_features(graph, eps=eps)
 
         if t is None:
-            t = torch.zeros(graph.num_graphs, device=edge_features.device)
+            if "rigids_1" in res_data:
+                t = torch.ones(graph.num_graphs, device=edge_features.device)
+            else:
+                t = torch.zeros(graph.num_graphs, device=edge_features.device)
+
         timestep_embed = self.embed_time(t[..., None])
         timestep_embed = timestep_embed[res_data.batch]
 

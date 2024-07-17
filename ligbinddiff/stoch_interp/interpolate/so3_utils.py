@@ -161,7 +161,7 @@ def rotvec_to_rotmat(rotation_vectors: torch.Tensor, tol: float = 1e-7) -> torch
     return rotation_matrices
 
 
-def rotmat_to_rotvec(rotation_matrices: torch.Tensor) -> torch.Tensor:
+def rotmat_to_rotvec(rotation_matrices: torch.Tensor, pi_eps=1e-8) -> torch.Tensor:
     """
     Convert a batch of rotation matrices to rotation vectors (logarithmic map from SO(3) to so(3)).
     The standard logarithmic map can be derived from Rodrigues' formula via Taylor approximation
@@ -229,7 +229,14 @@ def rotmat_to_rotvec(rotation_matrices: torch.Tensor) -> torch.Tensor:
     id3 = _broadcast_identity(rotation_matrices)
     skew_outer = (id3 + rotation_matrices) / 2.0
     # Ensure diagonal is >= 0 for square root (uses identity for masking).
-    skew_outer = skew_outer + (torch.relu(skew_outer) - skew_outer) * id3
+    # skew_outer = skew_outer + (torch.relu(skew_outer) - skew_outer) * id3
+    skew_outer = skew_outer + (
+        torch.where(
+            skew_outer > pi_eps,
+            skew_outer,
+            torch.full_like(skew_outer, pi_eps)
+        ) - skew_outer
+    ) * id3
 
     # Get basic rotation vector as sqrt of diagonal (is unit vector).
     vector_pi = torch.sqrt(torch.diagonal(skew_outer, dim1=-2, dim2=-1))

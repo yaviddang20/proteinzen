@@ -130,6 +130,9 @@ def sample_logn_inv_cubic_edges(
             remaining_dist = sorted_dist[..., knn_k+1:]  # N x (N - knn_k - 1)
             remaining_edges = sorted_edges[..., knn_k+1:]  # N x (N - knn_k - 1)
 
+        # add this because sometimes we actually have fewer edges than knn_k
+        knn_k = knn_edges.shape[-1]
+
         ## inv cube
         uniform = torch.distributions.Uniform(0,1)
         dist_noise = uniform.sample(remaining_dist.shape).to(batched_X_ca.device)  # N x (N - knn_k - 1)
@@ -151,7 +154,7 @@ def sample_logn_inv_cubic_edges(
             max(min_inv_cube_edges, logn_scale * np.log2(num_nodes) + logn_offset)
         )
         if inv_cube_k > perturbed_logprobs.shape[-1] - max_num_bad_edges:
-            print(f"trimming down num edges from {inv_cube_k} to {perturbed_logprobs.shape[-1] - max_num_bad_edges}, {max_num_bad_edges} bad edges")
+            print(f"trimming down random k edges from {inv_cube_k} to {perturbed_logprobs.shape[-1] - max_num_bad_edges}, {max_num_bad_edges} bad edges")
             if perturbed_logprobs.shape[-1] - max_num_bad_edges == 0:
                 print(f"we shouldn't get rid of all edges... right now we see num_bad_edges as ", num_bad_edges)
             inv_cube_k = perturbed_logprobs.shape[-1] - max_num_bad_edges

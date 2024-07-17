@@ -96,13 +96,14 @@ if __name__ == '__main__':
     from rdkit.Chem import rdDetermineBonds
     from rdkit.Chem import AllChem
     from rdkit.Chem import Draw
-    mol = Chem.MolFromPDBBlock(pdb_str)
-    rdDetermineBonds.DetermineConnectivity(mol)
+    # mol = Chem.MolFromPDBBlock(pdb_str)
+    mol = Chem.MolFromSmiles("[NH3+]CC(=O)NCC(=O)NCC(=O)O")
     dos = Draw.MolDrawOptions()
     dos.addAtomIndices=True
     AllChem.Compute2DCoords(mol)
     img = Draw.MolToImage(mol, options=dos)
     img.save("test.png")
+    exit()
 
     # from io import StringIO
 

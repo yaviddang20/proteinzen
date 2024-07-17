@@ -100,6 +100,7 @@ class FramediffDataModule(L.LightningDataModule):
                  num_workers,
                  min_len=30,
                  max_len=1000,
+                 max_num_batch=None,  # for backwards compatibility
                  max_num_per_batch=None,
                  sample_lengths={
                     60: 5,
