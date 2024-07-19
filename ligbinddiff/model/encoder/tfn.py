@@ -127,7 +127,7 @@ class ProteinAtomicEmbedder(nn.Module):
         res_irrep_seq = res_irrep_seq + [res_irrep_seq[-1] for _ in range(n_layers - len(res_irrep_seq) + 1)]
         self.res_irrep_seq = res_irrep_seq
 
-        self.final_irrep = o3.Irreps(res_irrep_seq[-1])
+        self.final_irreps = o3.Irreps(res_irrep_seq[-1])
         self.atomic_num_rbf = atomic_num_rbf
         self.res_num_rbf = res_num_rbf
         self.num_timestep = num_timestep
@@ -215,7 +215,7 @@ class ProteinAtomicEmbedder(nn.Module):
 
         if h_frame is not None:
             self.to_frame_scalars = nn.Linear(
-                self.final_irrep.dim,
+                self.final_irreps.dim,
                 h_frame
             )
             self.out_ln = nn.LayerNorm(h_frame)
@@ -238,12 +238,18 @@ class ProteinAtomicEmbedder(nn.Module):
         edge_sh = o3.spherical_harmonics(self.sh_irreps, edge_vecs, normalize=True, normalization='component')
         return edge_rbf, edge_sh
 
-    def _gen_initial_features(self, data, ablate_timestep=False, zero_timestep=False):
+    def _gen_initial_features(self,
+                              data,
+                              ablate_timestep=False,
+                              zero_timestep=False,
+                              apply_noising_masks=False):
         assert not (ablate_timestep and zero_timestep)
 
         res_data = data['residue']
         atom14 = res_data['atom14_gt_positions'].float()
         atom14_mask = res_data['atom14_gt_exists'].bool()
+        if apply_noising_masks:
+            atom14_mask = atom14_mask & ~res_data['atom14_noising_mask']
         atom_coords = atom14[atom14_mask]
         seq = res_data['seq']
         t = data['t']
@@ -255,8 +261,12 @@ class ProteinAtomicEmbedder(nn.Module):
         X_ca_copy = X_ca.clone()
         X_ca_copy[~res_data['res_mask']] = torch.inf
 
+        seq_one_hot = F.one_hot(seq, num_classes=self.num_aa) * res_data['seq_mask'][..., None]
+        if apply_noising_masks:
+            seq_one_hot = seq_one_hot * res_data['seq_noising_mask'][..., None]
+
         res_features = [
-            F.one_hot(seq, num_classes=self.num_aa) * res_data['seq_mask'][..., None],
+            seq_one_hot,
             self.time_embed(reswise_t[..., None]) * ablate_timestep
         ]
         res_features = torch.cat(res_features, dim=-1)
@@ -278,7 +288,6 @@ class ProteinAtomicEmbedder(nn.Module):
             ], dim=-1)
         )
         res_features = self.res_embed(res_features)
-
 
         bond_graph = gen_bond_graph(seq, atom14_mask, res_data.batch)
         atom_features = bond_graph['atom_props'].float()
@@ -355,11 +364,17 @@ class ProteinAtomicEmbedder(nn.Module):
         }
 
 
-    def forward(self, data, ablate_timestep=False, zero_timestep=False):
+    def forward(self,
+                data,
+                ablate_timestep=False,
+                zero_timestep=False,
+                apply_noising_masks=False,
+    ):
         data_dict = self._gen_initial_features(
             data,
             ablate_timestep=ablate_timestep,
             zero_timestep=zero_timestep,
+            apply_noising_masks=False,
         )
         for layer in self.embedding_layers:
             atom_features, res_features = layer(data_dict)
@@ -369,6 +384,11 @@ class ProteinAtomicEmbedder(nn.Module):
         final_res_features = data_dict["res_features"]
 
         if self.to_frame_scalars is not None:
+            rigids_quat = data['residue']['rigids_1'][..., :4]
+            with torch.device(rigids_quat.device):
+                wigner_D = self.final_irreps.D_from_quaternion(rigids_quat)
+            inv_wigner_D = wigner_D.transpose(-1, -2).contiguous()
+            final_res_features = torch.einsum("...ij,...j->...i", inv_wigner_D, final_res_features)
             final_res_features = self.out_ln(self.to_frame_scalars(final_res_features))
 
 

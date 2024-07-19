@@ -119,7 +119,7 @@ class FisherFlow:
         return xt_simplex
 
     def _corrupt_seq(self, seq, t):
-        x1_simplex = F.one_hot(seq, num_classes=self.D)
+        x1_simplex = F.one_hot(seq, num_classes=self.D).float()
         x0_simplex = self.sample_prior(seq.shape[0]).to(x1_simplex.device)
 
         xt_simplex = self._geodesic_interpolant(x0_simplex, x1_simplex, t, schedule=self.train_sched, schedule_c=self.train_c)
