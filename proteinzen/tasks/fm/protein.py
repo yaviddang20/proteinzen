@@ -604,14 +604,10 @@ class ProteinSeqInterpolation(Task):
 
         # compute bb frame features
         diffuse_mask = self._gen_diffuse_mask(res_data)
-        res_data['res_noising_mask'] = diffuse_mask
-        res_data['seq_noising_mask'] = diffuse_mask
-        res_data['atom14_noising_mask'] = diffuse_mask
+        res_data['noising_mask'] = diffuse_mask
+        res_data['mlm_mask'] = ~diffuse_mask
         res_data['x'] = rigids_1.get_trans().float()  # for HeteroData's sake
         res_data['rigids_1'] = rigids_1.to_tensor_7().float()
-        ##  noise data
-        data = self.se3_noiser.corrupt_batch(data)
-        data = self.sidechain_noiser.corrupt_batch(data)
 
         # compute sidechain features
         ## generate data dict
@@ -638,6 +634,15 @@ class ProteinSeqInterpolation(Task):
             lambda x: torch.as_tensor(x),
             diff_feats_t)
         res_data.update(diff_feats_t)
+        res_data['chi_mask'] = res_data['torsion_angles_mask'][..., 3:].contiguous().bool()
+
+        # noising masks
+        res_data['res_noising_mask'] = res_data['res_mask']
+        res_data['seq_noising_mask'] = res_data['seq_mask']
+        res_data['atom14_noising_mask'] = res_data['atom14_mask']
+        ##  noise data
+        data = self.se3_noiser.corrupt_batch(data)
+        data = self.sidechain_noiser.corrupt_batch(data)
 
         return data
 
@@ -679,8 +684,11 @@ class ProteinSeqInterpolation(Task):
             data = HeteroData(
                 residue={
                     "res_mask": torch.ones(n, device=device).bool(),
+                    "noising_mask": torch.ones(n, device=device).bool(),
+                    "res_noising_mask": torch.ones(n, device=device).bool(),
                     "seq": torch.zeros(n, device=device).long(),
                     "seq_mask": torch.ones(n, device=device).bool(),
+                    "seq_noising_mask": torch.ones(n, device=device).bool(),
                     "num_nodes": n
                 }
             )
@@ -856,7 +864,7 @@ class ProteinSeqInterpolation(Task):
             pred_hs_vf = self.sidechain_noiser.train_vf(nodewise_t, seq_probs_t, pred_seq_probs)
             gt_hs_vf = self.sidechain_noiser.train_vf(nodewise_t, seq_probs_t, seq_probs_1)
             seq_vf_loss = torch.square(pred_hs_vf - gt_hs_vf).sum(dim=-1)
-            seq_vf_loss = _nodewise_to_graphwise(seq_vf_loss, res_data.batch, res_data.seq_mask)
+            seq_vf_loss = _nodewise_to_graphwise(seq_vf_loss, res_data.batch, res_data.seq_mask & res_data.seq_noising_mask)
             if self.sidechain_noiser.sample_sched == "linear":
                 seq_vf_loss = seq_vf_loss * 0.01
         else:
@@ -937,9 +945,6 @@ class ProteinSeqMultiChiInterpolation(Task):
         res_data['mlm_mask'] = ~diffuse_mask
         res_data['x'] = rigids_1.get_trans()  # for HeteroData's sake
         res_data['rigids_1'] = rigids_1.to_tensor_7()
-        ##  noise data
-        data = self.se3_noiser.corrupt_batch(data)
-        data = self.sidechain_noiser.corrupt_batch(data)
 
         # compute sidechain features
         ## generate data dict
@@ -957,13 +962,25 @@ class ProteinSeqMultiChiInterpolation(Task):
         diff_feats_t['bb'] = diff_feats_t['atom14_gt_positions'][..., :4, :]
         diff_feats_t['atom37'] = chain_feats['all_atom_positions']
         diff_feats_t['atom37_mask'] = chain_feats['all_atom_mask']
+        # redundant for convenience
+        diff_feats_t['atom14'] = chain_feats['atom14_gt_positions']
+        diff_feats_t['atom14_mask'] = chain_feats['atom14_gt_exists']
+
         diff_feats_t = tree.map_structure(
             lambda x: torch.as_tensor(x),
             diff_feats_t)
-        res_data.update(diff_feats_t)
 
+        res_data.update(diff_feats_t)
+        # noising masks
+        res_data['res_noising_mask'] = res_data['res_mask']
+        res_data['seq_noising_mask'] = res_data['seq_mask']
+        res_data['atom14_noising_mask'] = res_data['atom14_mask']
         res_data['chis_1'] = res_data['torsion_angles_sin_cos'][..., 3:, :].contiguous().float()
         res_data['chi_mask'] = res_data['torsion_angles_mask'][..., 3:].contiguous().bool()
+        res_data['chi_noising_mask'] = res_data['seq_mask']
+        ##  noise data
+        data = self.se3_noiser.corrupt_batch(data)
+        data = self.sidechain_noiser.corrupt_batch(data)
         data = self.chi_noiser.corrupt_batch(data)
 
         return data
@@ -1000,8 +1017,11 @@ class ProteinSeqMultiChiInterpolation(Task):
                 residue={
                     "res_mask": torch.ones(n, device=device).bool(),
                     "noising_mask": torch.ones(n, device=device).bool(),
+                    "res_noising_mask": torch.ones(n, device=device).bool(),
                     "seq": torch.zeros(n, device=device).long(),
                     "seq_mask": torch.ones(n, device=device).bool(),
+                    "seq_noising_mask": torch.ones(n, device=device).bool(),
+                    "chi_noising_mask": torch.ones(n, device=device).bool(),
                     "num_nodes": n
                 }
             )
@@ -1075,8 +1095,8 @@ class ProteinSeqMultiChiInterpolation(Task):
             trans_t_2 = self.se3_noiser._trans_euler_step(d_t, t_1, pred_trans_1, trans_t_1)
             rotmats_t_2 = self.se3_noiser._rots_euler_step(d_t, t_1, pred_rotmats_1, rotmats_t_1)
             seq_probs_t_2 = self.sidechain_noiser.euler_step(
-                d_t * self.sidechain_noiser.t_max,
-                t[res_data.batch] * self.sidechain_noiser.t_max,
+                d_t,
+                t[res_data.batch],
                 pred_seq_probs_1,
                 seq_probs_t_1,
                 res_data.batch)
@@ -1191,6 +1211,25 @@ class ProteinSeqMultiChiInterpolation(Task):
         else:
             fape = 0
 
+        if self.use_seq_vf_loss:
+            res_data = inputs['residue']
+            if "seq_probs" in outputs and outputs['seq_probs'] is not None:
+                pred_seq_probs = outputs['seq_probs']
+            else:
+                pred_seq_probs = F.softmax(outputs['decoded_seq_logits'], dim=-1)
+
+            seq_probs_t = res_data['seq_probs_t']
+            seq_probs_1 = res_data['seq_probs_1']
+            nodewise_t = inputs['t'][res_data.batch]
+            pred_hs_vf = self.sidechain_noiser.train_vf(nodewise_t, seq_probs_t, pred_seq_probs)
+            gt_hs_vf = self.sidechain_noiser.train_vf(nodewise_t, seq_probs_t, seq_probs_1)
+            seq_vf_loss = torch.square(pred_hs_vf - gt_hs_vf).sum(dim=-1)
+            seq_vf_loss = _nodewise_to_graphwise(seq_vf_loss, res_data.batch, res_data.seq_mask & res_data.seq_noising_mask)
+            if self.sidechain_noiser.sample_sched == "linear":
+                seq_vf_loss = seq_vf_loss * 0.01
+        else:
+            seq_vf_loss = autoenc_loss_dict["seq_loss"]
+
         loss = (
             bb_denoising_loss
             + 0.25 * bb_denoising_finegrain_loss
@@ -1202,7 +1241,11 @@ class ProteinSeqMultiChiInterpolation(Task):
             + fape
         ).mean()
 
-        loss_dict = {"loss": loss, "frameflow_loss": (bb_denoising_loss + 0.25 * bb_denoising_finegrain_loss).mean()}
+        loss_dict = {
+            "loss": loss,
+            "frameflow_loss": (bb_denoising_loss + 0.25 * bb_denoising_finegrain_loss).mean(),
+            "seq_vf_loss": seq_vf_loss
+        }
         if self.use_fape_loss:
             loss_dict["fape"] = fape
         loss_dict.update(bb_frame_diffusion_loss_dict)

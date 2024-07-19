@@ -38,17 +38,14 @@ class ChiUpdate(nn.Module):
         super().__init__()
         self.num_aa = num_aa
         self.num_chis = num_chis
-        self.chi_update = Linear(c_s, num_aa * num_chis, init='final')
+        self.chi_update = FeedForward(c_s, num_aa * num_chis)
 
-    def forward(self, node_features, chis):
-        y_update = self.chi_update(node_features)
-        chi_update = F.normalize(
-            torch.stack([
-                torch.ones_like(y_update),
-                y_update
-            ], dim=-1),
-            dim=-1
-        )
+    def forward(self, node_features, chis, chi_noising_mask):
+        angle_update = torch.tanh(self.chi_update(node_features)) * torch.pi
+        chi_update = torch.stack([
+            torch.cos(angle_update),
+            torch.sin(angle_update)
+        ], dim=-1)
         chi_update = chi_update.view(-1, self.num_aa, self.num_chis, 2)
         rot_col_2 = torch.stack(
             [
@@ -61,7 +58,76 @@ class ChiUpdate(nn.Module):
             [chi_update, rot_col_2],
             dim=-2
         )
-        return torch.einsum("...ij,...j->...i", rot_matrix, chis)
+        new_chis = torch.einsum("...ij,...j->...i", rot_matrix, chis)
+        new_chis = new_chis * chi_noising_mask[..., None, None, None] + chis * (~chi_noising_mask[..., None, None, None])
+        return new_chis
+
+
+class SeqProbsUpdate(nn.Module):
+    def __init__(self, c_s, num_aa, seq_matrix_updates=False):
+        super().__init__()
+        self.seq_matrix_updates = seq_matrix_updates
+        self.num_aa = num_aa
+        if seq_matrix_updates:
+            self.transition_matrix_layer = nn.Sequential(
+                Linear(c_s, c_s, init='relu'),
+                nn.ReLU(),
+                Linear(c_s, c_s, init='relu'),
+                nn.ReLU(),
+                Linear(c_s, num_aa ** 2, init='final')
+            )
+        else:
+            self.transition_trunk = nn.Sequential(
+                Linear(c_s, c_s, init='relu'),
+                nn.ReLU(),
+                Linear(c_s, c_s, init='relu'),
+                nn.ReLU(),
+            )
+            self.transition_out = Linear(c_s, num_aa, init='final')
+            self.transition_mix = Linear(c_s, 1, init='gating')
+
+
+    def forward(self, node_features, seq_probs, seq_noising_mask):
+        if self.seq_matrix_updates:
+            base = torch.eye(self.num_aa, device=node_features.device)[None]
+            transition_matrix = base + self.transition_matrix_layer(node_features).view(-1, self.num_aa, self.num_aa)
+            transition_matrix = torch.softmax(transition_matrix, dim=-1)
+            transition_matrix = transition_matrix * seq_noising_mask[..., None, None] + base * (~seq_noising_mask[..., None, None])
+            # transition_matrix[~seq_noising_mask] = base
+            seq_probs = torch.einsum("...i,...ij->...j", seq_probs, transition_matrix)
+            return seq_probs
+        else:
+            x = self.transition_trunk(node_features)
+            seq_update = torch.softmax(self.transition_out(x), dim=-1)
+            seq_mix = torch.sigmoid(self.transition_mix(x))
+            seq_new = seq_probs * seq_mix + seq_update * (1 - seq_mix)
+            assert (seq_new >= 0).all()
+            return seq_new * seq_noising_mask[..., None] + seq_probs * (~seq_noising_mask[..., None])
+
+
+class FeedForward(nn.Module):
+    def __init__(self, c_in, c_out, dropout=0.):
+        super().__init__()
+
+        self.linear_1 = Linear(c_in, c_out, init="relu")
+        self.linear_2 = Linear(c_out, c_out, init="relu")
+        self.linear_3 = Linear(c_out, c_out, init="final")
+        self.relu = nn.ReLU()
+        if dropout > 0:
+            self.dropout = nn.Dropout(dropout)
+        else:
+            self.dropout = None
+
+    def forward(self, s):
+        s = self.linear_1(s)
+        s = self.relu(s)
+        s = self.linear_2(s)
+        s = self.relu(s)
+        s = self.linear_3(s)
+        if self.dropout is not None:
+            s = self.dropout(s)
+
+        return s
 
 
 class GraphIpaFrameDenoisingLayer(nn.Module):
@@ -78,7 +144,8 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
                  num_rbf=64,
                  knn_k=20,
                  lrange_k=40,
-                 num_aa=20
+                 num_aa=20,
+                 seq_matrix_updates=True,
                  ):
         """
         Args
@@ -87,7 +154,7 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
         super().__init__()
         self.num_aa = num_aa
 
-        self.chis_to_node = Linear(c_s + num_aa*8, c_s, init='final')
+        self.seq_chi_to_node_update = FeedForward(num_aa + c_s + num_aa * 8, c_s)
         self.init_ln = nn.LayerNorm(c_s)
 
         self.edge_embed = nn.Sequential(
@@ -139,23 +206,34 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
         self.node_transition = StructureModuleTransition(
             c=c_s
         )
+        self.seq_probs_update = SeqProbsUpdate(
+            c_s=c_s, num_aa=num_aa, seq_matrix_updates=seq_matrix_updates
+        )
 
     def forward(
             self,
             node_features,
             rigids,
+            seq_probs,
+            chis,
             edge_features,
             edge_index,
             new_seq_edge_inputs,
             seq_edge_features,
             seq_edge_index,
-            chis,
             res_data,
     ):
-        res_mask = ~(res_data['res_mask'].bool())
-        noising_mask = res_data['noising_mask']
-        node_update = self.chis_to_node(
-            torch.cat([node_features, chis.view(-1, self.num_aa * 8)], dim=-1)
+        res_mask = res_data['res_mask'].bool()
+        seq_mask = res_data['seq_mask'].bool()
+        res_noising_mask = res_data['res_noising_mask']
+        seq_noising_mask = res_data['seq_noising_mask']
+        chi_noising_mask = res_data['chi_noising_mask']
+        node_update = self.seq_chi_to_node_update(
+            torch.cat([
+                node_features,
+                chis.view(-1, self.num_aa * 8),
+                seq_probs],
+            dim=-1)
         )
         node_features = self.init_ln(node_features + node_update * (~res_mask)[..., None])
 
@@ -183,7 +261,7 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
             r=rigids,
             mask=(~res_mask).float()
         )
-        node_s_update = node_s_update * (~res_mask)[..., None]
+        node_s_update = node_s_update * res_mask[..., None]
         node_features = self.ln_s1(node_features + node_s_update)
 
         node_s_update = self.attn_seq(
@@ -191,24 +269,30 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
             z=seq_edge_features,
             edge_index=seq_edge_index,
             r=rigids,
-            mask=(~res_mask).float()
+            mask=res_mask.float()
         )
-        node_s_update = node_s_update * (~res_mask)[..., None]
+        node_s_update = node_s_update * res_mask[..., None]
         node_features = self.ln_s2(node_features + node_s_update)
 
         node_features = self.node_transition(node_features)
-        node_features = node_features * (~res_mask)[..., None]
+        node_features = node_features * res_mask[..., None]
         rigids_update = self.bb_update(
-            node_features * noising_mask[..., None])
+            node_features * res_noising_mask[..., None])
 
         rigids = rigids.compose_q_update_vec(
-            rigids_update * noising_mask[..., None]
+            rigids_update * res_noising_mask[..., None]
         )
         seq_edge_features = self.seq_edge_transition(node_features, seq_edge_features, seq_edge_index)
 
-        chis = self.chi_update(node_features, chis)
+        # TODO: i should probably have a dedicated "do chis exist" mask rather than using seq_mask
+        chis = self.chi_update(node_features, chis, chi_noising_mask) * seq_mask[..., None, None, None]
+        seq_probs = self.seq_probs_update(
+            node_features,
+            seq_probs,
+            seq_noising_mask
+        ) * seq_mask[..., None]
 
-        return node_features, rigids, edge_features, seq_edge_features, chis
+        return node_features, rigids, seq_probs, chis, edge_features, seq_edge_features
 
 class IPMPUpdateLayer(nn.Module):
     """ Denoising layer on sidechain densities """
@@ -278,6 +362,7 @@ class DynamicGraphIpaFrameSeqMultiChiDenoiser(nn.Module):
                  use_seq_edge=True,
                  impute_oxy=False,
                  use_ipmp_trunk=False,
+                 seq_matrix_updates=False,
                  num_aa=20):
         super().__init__()
 
@@ -293,7 +378,7 @@ class DynamicGraphIpaFrameSeqMultiChiDenoiser(nn.Module):
         self.time_rbf = GaussianRandomFourierBasis(n_basis=h_time//2)
 
         # node_embedding + time_embedding + fixed_mask + self_conditioning
-        self.node_in = c_s + h_time + 1 + num_aa + 8 + self_conditioning * (c_s + 7 + num_aa + 8 * num_aa)
+        self.node_in = c_s + h_time + 1 + num_aa + 8 + self_conditioning * (7 + num_aa + 8 * num_aa)
 
         self.embed_node = nn.Sequential(
             nn.Linear(
@@ -328,6 +413,7 @@ class DynamicGraphIpaFrameSeqMultiChiDenoiser(nn.Module):
                  knn_k=knn_k,
                  lrange_k=lrange_k,
                  num_rbf=self.num_rbf,
+                 seq_matrix_updates=seq_matrix_updates,
                  num_aa=num_aa
             )
             for i in range(n_layers)
@@ -370,13 +456,12 @@ class DynamicGraphIpaFrameSeqMultiChiDenoiser(nn.Module):
 
 
     def _gen_spatial_edge_features(self, rigids, res_mask, batch, self_condition):
-        res_mask = ~res_mask
         # generate spatial edges
         X_ca = rigids.get_trans()
         masked_X_ca = X_ca.clone()
-        masked_X_ca[res_mask] = torch.inf
+        masked_X_ca[~res_mask] = torch.inf
         edge_index, knn_edge_select, lrange_edge_select = sample_inv_cubic_edges(
-            masked_X_ca, res_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k)
+            masked_X_ca, ~res_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k)
 
         # compute edge features
         edge_features, _ = gen_spatial_graph_features(rigids, edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=self.c_z//2)
@@ -467,7 +552,6 @@ class DynamicGraphIpaFrameSeqMultiChiDenoiser(nn.Module):
 
         if self.self_conditioning and self_condition is not None:
             self_cond_rigids = self_condition['final_rigids']
-            self_cond_nodes = self_condition['node_features']
             self_cond_seq_logits_1 = self_condition['decoded_seq_logits']
             self_cond_chis_1 = self_condition['decoded_chis_all']
 
@@ -482,7 +566,7 @@ class DynamicGraphIpaFrameSeqMultiChiDenoiser(nn.Module):
             t7_rel = torch.cat([quat_rel, trans_rel], dim=-1)
 
             node_input = torch.cat(
-                [node_input, self_cond_nodes, t7_rel, self_cond_seq_logits_1, self_cond_chis_1.view(-1, 8 * self.num_aa)],
+                [node_input, t7_rel, self_cond_seq_logits_1, self_cond_chis_1.view(-1, 8 * self.num_aa)],
                 dim=-1
             )
 
@@ -537,6 +621,7 @@ class DynamicGraphIpaFrameSeqMultiChiDenoiser(nn.Module):
         rigids_t = rigids_t.translate(-center)
 
         node_input, seq_edge_index = self._gen_inital_features(data, self_condition=self_condition)
+        seq_probs = res_data['seq_probs_t']
 
         # embed features
         node_features = self.embed_node(node_input)
@@ -561,15 +646,16 @@ class DynamicGraphIpaFrameSeqMultiChiDenoiser(nn.Module):
                 seq_edge_index,
                 self_condition)
 
-            node_features, rigids, edge_features, seq_edge_features, chis = layer(
+            node_features, rigids, seq_probs, chis, edge_features, seq_edge_features = layer(
                 node_features,
                 rigids,
+                seq_probs,
+                chis,
                 raw_edge_features,
                 edge_index,
                 new_seq_edge_inputs,
                 seq_edge_features,
                 seq_edge_index,
-                chis,
                 res_data,
             )
 
@@ -593,7 +679,7 @@ class DynamicGraphIpaFrameSeqMultiChiDenoiser(nn.Module):
                     res_data,
                 )
 
-        seq_logits = self.seq_logits(node_features)
+        seq_logits = seq_probs
 
         chis_gt_seq = _collect_from_seq(chis, res_data['seq'], res_data['seq_mask'])
         chis_pred_seq = _collect_from_seq(chis, seq_logits.argmax(dim=-1), res_data['seq_mask'])
@@ -625,6 +711,7 @@ class DynamicGraphIpaFrameSeqMultiChiDenoiser(nn.Module):
         ret['psi'] = psi
         ret['node_features'] = node_features
         ret['edge_index'] = edge_index
+        ret['seq_probs'] = seq_probs
 
         # some dummy variables for hacking smth into the framework rn
         ret['latent_mu'] = torch.zeros_like(seq_logits)
