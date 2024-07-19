@@ -9,7 +9,7 @@ import tqdm
 import pandas as pd
 from rdkit import Chem
 
-from ligbinddiff.data.datasets.featurize.molecule import conformer_props
+from proteinzen.data.datasets.featurize.molecule import conformer_props
 
 dihedral_pattern = Chem.MolFromSmarts('[*]~[*]~[*]~[*]')
 

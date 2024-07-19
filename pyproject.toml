@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta"
 # Self-descriptive entries which should always be present
 # https://packaging.python.org/en/latest/specifications/declaring-project-metadata/
 [project]
-name = "ligbinddiff"
-description = "Substrate-conditioned diffusion for ligand-binding protein generation"
+name = "proteinzen"
+description = "Substrate-conditioned flow-matching for ligand-binding protein generation"
 dynamic = ["version"]
 readme = "README.md"
 authors = [
@@ -26,8 +26,8 @@ requires-python = ">=3.8"
 
 # Update the urls once the hosting is set up.
 #[project.urls]
-#"Source" = "https://github.com/<username>/ligbinddiff/"
-#"Documentation" = "https://ligbinddiff.readthedocs.io/"
+#"Source" = "https://github.com/<username>/proteinzen/"
+#"Documentation" = "https://proteinzen.readthedocs.io/"
 
 [project.optional-dependencies]
 test = [
@@ -62,7 +62,7 @@ where = ["."]
 
 # Ref https://setuptools.pypa.io/en/latest/userguide/datafiles.html#package-data
 [tool.setuptools.package-data]
-ligbinddiff = [
+proteinzen = [
     "py.typed"
 ]
 
@@ -82,4 +82,4 @@ match = ["*"]
 default-tag = "1.0.0"
 
 [tool.versioningit.write]
-file = "ligbinddiff/_version.py"
+file = "proteinzen/_version.py"

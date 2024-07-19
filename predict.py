@@ -18,12 +18,12 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 
 import wandb
 
-from ligbinddiff.runtime.config import config_hydra_store, remove_zen_keys
-from ligbinddiff.tasks.task import single_task_sampler
-from ligbinddiff.data.io.atom91 import atom91_to_pdb, atom91_to_chain, chains_to_model, models_to_struct, save_struct
-from ligbinddiff.utils.atom_reps import atom14_to_atom91
-from ligbinddiff.data.openfold.residue_constants import restypes
-from ligbinddiff.runtime.lmod import BackboneModule
+from proteinzen.runtime.config import config_hydra_store, remove_zen_keys
+from proteinzen.tasks.task import single_task_sampler
+from proteinzen.data.io.atom91 import atom91_to_pdb, atom91_to_chain, chains_to_model, models_to_struct, save_struct
+from proteinzen.utils.atom_reps import atom14_to_atom91
+from proteinzen.data.openfold.residue_constants import restypes
+from proteinzen.runtime.lmod import BackboneModule
 
 
 # A logger for this file

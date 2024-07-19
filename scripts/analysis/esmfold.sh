@@ -14,9 +14,12 @@ export CUDA_VISIBLE_DEVICES=$SGE_GPU
 echo $SGE_GPU
 echo $CUDA_VISIBLE_DEVICES
 
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+source $SCRIPT_DIR/../../env_vars.sh
+
 module load Sali cuda
 
 fasta=$PWD/../seqs/
 outdir=$PWD
 cd /wynton
-apptainer exec --nv /wynton/group/kortemme/esmfold/esmfold_1128.sif python /wynton/home/kortemme/alexjli/projects/ligbinddiff/scripts/analysis/batched_esmfold_inference.py -i $fasta -o $outdir
+apptainer exec --nv /wynton/group/kortemme/esmfold/esmfold_1128.sif python ${REPO_ROOT}/scripts/analysis/batched_esmfold_inference.py -i $fasta -o $outdir

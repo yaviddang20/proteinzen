@@ -2,7 +2,7 @@ import json
 import tqdm
 import numpy as np
 
-from ligbinddiff.utils.atom_reps import atom37_atom_label, atom37_to_atom14, alphabet
+from proteinzen.utils.atom_reps import atom37_atom_label, atom37_to_atom14, alphabet
 
 def process_entry(line):
     entry = json.loads(line)

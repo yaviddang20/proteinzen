@@ -10,7 +10,7 @@ import requests
 import tqdm
 import time
 
-from ligbinddiff.data.io.mmcif import mmcif_loop_to_list
+from proteinzen.data.io.mmcif import mmcif_loop_to_list
 
 DB = "/wynton/group/kortemme/alexjli/databases/PDB/mmCIF"
 OUT_PATH = "/wynton/group/kortemme/alexjli/databases/ligandmpnn"

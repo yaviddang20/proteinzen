@@ -16,8 +16,9 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 
 import wandb
 
-from ligbinddiff.runtime.config import config_hydra_store, remove_zen_keys
-from ligbinddiff.tasks.task import single_task_sampler
+
+from proteinzen.runtime.config import config_hydra_store, remove_zen_keys
+from proteinzen.tasks.task import single_task_sampler
 
 
 # A logger for this file
@@ -128,6 +129,7 @@ def main(model,
 
 
 if __name__ == '__main__':
+
     config_hydra_store()
     torch.set_float32_matmul_precision("medium")
 

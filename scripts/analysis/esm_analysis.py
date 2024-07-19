@@ -9,7 +9,7 @@ from scipy.spatial.transform import Rotation
 import tqdm
 from Bio.PDB.Superimposer import Superimposer
 
-from ligbinddiff.data.io.atom91 import pdb_to_structure, struct_to_atom91
+from proteinzen.data.io.atom91 import pdb_to_structure, struct_to_atom91
 
 def parse_esm_log(lines, fold_original=False):
     ret = {}

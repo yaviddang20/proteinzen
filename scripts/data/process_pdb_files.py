@@ -16,8 +16,8 @@ import numpy as np
 import mdtraj as md
 
 
-from ligbinddiff.data.io import utils as du, parsers, errors
-from ligbinddiff.data.openfold import data_transforms
+from proteinzen.data.io import utils as du, parsers, errors
+from proteinzen.data.openfold import data_transforms
 
 
 # Define the parser

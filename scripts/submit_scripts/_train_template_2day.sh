@@ -10,8 +10,11 @@
 #$ -l h_rt=48:00:00
 #$ -l compute_cap=61,gpu_mem=40G
 
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+source $SCRIPT_DIR/../../env_vars.sh
+
 echo $JOB_ID
-conda activate proteinzen
+conda activate ${ENV_NAME}
 
 export CUDA_VISIBLE_DEVICES=$SGE_GPU
 export GEOMSTATS_BACKEND=pytorch
@@ -25,7 +28,7 @@ dcgmi stats -g $gpuprof -e
 dcgmi stats -g $gpuprof -s $JOB_ID
 
 ulimit -n 2048
-cd ~/projects/ligbinddiff
+cd ${REPO_ROOT}
 python train.py "$@" +job_id=${JOB_ID} +num_days=2
 # args = ARGS
 
