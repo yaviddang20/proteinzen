@@ -99,12 +99,16 @@ def main(model,
     os.chdir(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)
     log.info(f"Experiment started in folder: {os.getcwd()}")
 
+    # if hasattr(corrupter, "sidechain_noiser") and isinstance(corrupter.sidechain_noiser, torch.nn.Module):
+    #     model.add_module("sidechain_noiser", corrupter.sidechain_noiser.learned_sched)
+
     # datamodule and optim are all partial'd __init__s
     # so we instantiate instances of each
     model = lmodule(model, experiment['optim'])
     checkpointer = experiment['checkpointer']
     os.makedirs(model.val_dir, exist_ok=True)
     task_sampler = single_task_sampler(tasks(corrupter))
+
 
     # TODO: there's gotta be a nicer way of doing this
     if hasattr(model.model, "lrange_logn_scale") and model.model.lrange_logn_scale > 0:

@@ -24,7 +24,7 @@ from proteinzen.data.datasets.featurize.common import _edge_positional_embedding
 from proteinzen.model.modules.openfold.layers import BackboneUpdate, StructureModuleTransition
 from proteinzen.model.modules.layers.edge.embed import MLMPairwiseAtomicEmbedding, SelfConditionPairwiseAtomicEmbedding
 
-from proteinzen.model.utils.graph import sample_inv_cubic_edges, sequence_local_graph, gen_spatial_graph_features, batchwise_to_nodewise
+from proteinzen.model.utils.graph import sample_inv_cubic_edges, sequence_local_graph, gen_spatial_graph_features, batchwise_to_nodewise, get_data_lens
 
 from proteinzen.model.denoiser.bb.framediff import TorsionAngles
 from proteinzen.model.modules.openfold.layers import Linear
@@ -33,6 +33,8 @@ from proteinzen.runtime.loss.common import _collect_from_seq
 from proteinzen.data.openfold.data_transforms import make_atom14_masks
 
 from torch_geometric.utils import coalesce
+
+from proteinzen.stoch_interp.interpolate.fisher import LearnableSchedule
 
 
 class GraphIpaFrameDenoisingLayer(nn.Module):
@@ -233,7 +235,8 @@ class SeqProbsUpdate(nn.Module):
             seq_mix = torch.sigmoid(self.transition_mix(x))
             seq_new = seq_probs * seq_mix + seq_update * (1 - seq_mix)
             assert (seq_new >= 0).all()
-            return seq_new * (~seq_noising_mask[..., None]) + seq_probs * seq_noising_mask[..., None]
+            seq_probs = seq_new * seq_noising_mask[..., None] + seq_probs * ~seq_noising_mask[..., None]
+            return seq_probs
 
 
 class GraphIpaFrameSeqDenoisingLayer(nn.Module):
@@ -247,11 +250,9 @@ class GraphIpaFrameSeqDenoisingLayer(nn.Module):
                  num_v_pts,
                  self_conditioning=False,
                  use_seq_edge=True,
-                 num_rbf=64,
-                 knn_k=20,
-                 lrange_k=40,
                  num_aa=20,
-                 seq_matrix_updates=True
+                 seq_matrix_updates=True,
+                 use_transformer=False,
                  ):
         """
         Args
@@ -289,6 +290,7 @@ class GraphIpaFrameSeqDenoisingLayer(nn.Module):
         )
         self.ln_s1 = nn.LayerNorm(c_s)
 
+
         self.seq_edge_transition = EdgeTransition(
             node_embed_size=c_s,
             edge_embed_in=c_z,
@@ -314,6 +316,21 @@ class GraphIpaFrameSeqDenoisingLayer(nn.Module):
         self.seq_probs_update = SeqProbsUpdate(
             c_s=c_s, num_aa=num_aa, seq_matrix_updates=seq_matrix_updates
             )
+
+        self.use_transformer = use_transformer
+        if use_transformer:
+            tfmr_layer = torch.nn.TransformerEncoderLayer(
+                d_model=c_s,
+                nhead=4,
+                dim_feedforward=c_s,
+                batch_first=True,
+                dropout=0.2,
+                norm_first=False
+            )
+            self.seq_tfmr = torch.nn.TransformerEncoder(
+                tfmr_layer, 4, enable_nested_tensor=True)
+            self.post_tfmr = Linear(
+                c_s, c_s, init="final")
 
     def forward(
             self,
@@ -376,10 +393,34 @@ class GraphIpaFrameSeqDenoisingLayer(nn.Module):
         node_s_update = node_s_update * res_mask[..., None]
         node_features = self.ln_s2(node_features + node_s_update)
 
+        if self.use_transformer:
+            data_lens = get_data_lens(res_data)
+            split_node_features = node_features.split(data_lens, dim=0)
+
+            padded_node_features = nn.utils.rnn.pad_sequence(
+                split_node_features,
+                batch_first=True
+            )
+            split_mask = (~res_mask).split(data_lens, dim=0)
+            padded_mask = nn.utils.rnn.pad_sequence(
+                split_mask,
+                batch_first=True,
+                padding_value=True)
+            select_mask = nn.utils.rnn.pad_sequence(
+                [torch.ones_like(m).bool() for m in split_mask],
+                batch_first=True,
+                padding_value=False)
+            padded_node_updates = self.seq_tfmr(
+                padded_node_features,
+                src_key_padding_mask=padded_mask)
+            node_updates = self.post_tfmr(padded_node_updates[select_mask])
+            node_features = node_features + node_updates * res_mask[..., None]
+
         node_features = self.node_transition(node_features)
         node_features = node_features * res_mask[..., None]
-        rigids_update = self.bb_update(
-            node_features * (res_mask & res_noising_mask)[..., None])
+        # rigids_update = self.bb_update(
+        #     node_features * (res_mask & res_noising_mask)[..., None])
+        rigids_update = self.bb_update(node_features)
 
         rigids = rigids.compose_q_update_vec(
             rigids_update * (res_mask & res_noising_mask)[..., None]
@@ -420,9 +461,9 @@ class IPMPUpdateLayer(nn.Module):
         self.explicit_seq_probs = explicit_seq_probs
         self.seq_matrix_updates = seq_matrix_updates
         if explicit_seq_probs:
+            self.seq_ln = nn.LayerNorm(c_s)
+            self.seq_to_node = FeedForward(num_aa + c_s, c_s)
             if seq_matrix_updates:
-                self.seq_to_node = FeedForward(num_aa + c_s, c_s)
-                self.seq_ln = nn.LayerNorm(c_s)
                 self.seq_transition = Linear(c_s, num_aa**2, init='final')
             else:
                 self.transition_out = Linear(c_s, num_aa, init='final')
@@ -468,7 +509,7 @@ class IPMPUpdateLayer(nn.Module):
                 seq_mix = torch.sigmoid(self.transition_mix(node_features))
                 seq_new = seq_probs * seq_mix + seq_update * (1 - seq_mix)
                 assert (seq_new >= 0).all()
-                seq_probs = seq_new * (~seq_noising_mask[..., None]) + seq_probs * seq_noising_mask[..., None]
+                seq_probs = seq_new * seq_noising_mask[..., None] + seq_probs * ~seq_noising_mask[..., None]
             seq_probs = seq_probs * seq_mask[..., None]
 
         return node_features, edge_features, seq_probs
@@ -523,6 +564,8 @@ class DynamicGraphIpaFrameSeqDenoiser(nn.Module):
                  seq_matrix_updates=False,
                  use_ipmp_trunk=False,
                  ipmp_n_layers=4,
+                 use_transformer=False,
+                 learnable_sched=False,
                  num_aa=20):
         super().__init__()
 
@@ -588,11 +631,9 @@ class DynamicGraphIpaFrameSeqDenoiser(nn.Module):
                     num_v_pts,
                     self_conditioning=self_conditioning,
                     use_seq_edge=use_seq_edge,
-                    knn_k=knn_k,
-                    lrange_k=lrange_k,
-                    num_rbf=self.num_rbf,
                     num_aa=num_aa,
-                    seq_matrix_updates=seq_matrix_updates
+                    seq_matrix_updates=seq_matrix_updates,
+                    use_transformer=use_transformer,
                 )
                 for i in range(n_layers)
             ])
@@ -653,6 +694,10 @@ class DynamicGraphIpaFrameSeqDenoiser(nn.Module):
 
         self.torsion_angles = nn.Linear(c_s + num_aa, 81 * 2)
         self.seq_logits = nn.Linear(c_s, num_aa)
+
+        if learnable_sched:
+            self.sched = LearnableSchedule()
+
 
 
     def _gen_spatial_edge_features(self, rigids, res_mask, batch, self_condition):

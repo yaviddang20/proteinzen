@@ -24,7 +24,7 @@ for fasta_file in tqdm.tqdm(glob.glob("seqs/*")):
 y_true = np.concatenate(y_true)
 y_pred = np.concatenate(y_pred)
 
-fig = plt.figure(figsize=(20, 20))
+fig = plt.figure(figsize=(15, 15))
 cmd = ConfusionMatrixDisplay.from_predictions(y_true, y_pred, normalize="true", ax=fig.gca())
 # cmd.plot(ax=fig.gca())
 plt.savefig("confusion_matrix.png")

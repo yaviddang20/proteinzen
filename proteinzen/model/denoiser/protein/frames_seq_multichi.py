@@ -101,7 +101,7 @@ class SeqProbsUpdate(nn.Module):
             seq_update = torch.softmax(self.transition_out(x), dim=-1)
             seq_mix = torch.sigmoid(self.transition_mix(x))
             seq_new = seq_probs * seq_mix + seq_update * (1 - seq_mix)
-            assert (seq_new >= 0).all()
+            assert (seq_new >= 0).all(), seq_new
             return seq_new * seq_noising_mask[..., None] + seq_probs * (~seq_noising_mask[..., None])
 
 
@@ -358,7 +358,7 @@ class DynamicGraphIpaFrameSeqMultiChiDenoiser(nn.Module):
                  n_layers=8,
                  knn_k=20,
                  lrange_k=40,
-                 self_conditioning=False,
+                 self_conditioning=True,
                  use_seq_edge=True,
                  impute_oxy=False,
                  use_ipmp_trunk=False,

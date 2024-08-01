@@ -388,6 +388,13 @@ class ProteinAtomicEmbedder(nn.Module):
             with torch.device(rigids_quat.device):
                 wigner_D = self.final_irreps.D_from_quaternion(rigids_quat)
             inv_wigner_D = wigner_D.transpose(-1, -2).contiguous()
+
+            rigids_1 = ru.Rigid.from_tensor_7(data['residue']['rigids_1'])
+            rigids_inv_quat = rigids_1.get_rots().invert().get_quats()
+            with torch.device(rigids_quat.device):
+                inv_wigner_D_2 = self.final_irreps.D_from_quaternion(rigids_inv_quat)
+            assert torch.isclose(inv_wigner_D, inv_wigner_D_2)
+
             final_res_features = torch.einsum("...ij,...j->...i", inv_wigner_D, final_res_features)
             final_res_features = self.out_ln(self.to_frame_scalars(final_res_features))
 

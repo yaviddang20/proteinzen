@@ -32,8 +32,11 @@ requires-python = ">=3.8"
 [project.optional-dependencies]
 test = [
   "pytest>=6.1.2",
-  "pytest-runner"
 ]
+# [tool.pytest.ini_options]
+# addopts = [
+#     "--import-mode=importlib",
+# ]
 
 [tool.setuptools]
 # This subkey is a beta stage development and keys may change in the future, see https://setuptools.pypa.io/en/latest/userguide/pyproject_config.html for more details

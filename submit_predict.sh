@@ -15,8 +15,9 @@ export GEOMSTATS_BACKEND=pytorch
 echo $SGE_GPU
 echo $CUDA_VISIBLE_DEVICES
 
-SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-source $SCRIPT_DIR/env_vars.sh
+# SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+# source $SCRIPT_DIR/env_vars.sh
+source /wynton/home/kortemme/alexjli/projects/proteinzen/env_vars.sh
 
 ROOT_DIR=$PWD
 cd $1

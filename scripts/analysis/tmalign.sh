@@ -7,8 +7,7 @@
 #$ -l mem_free=2G
 #$ -l h_rt=2:00:00
 
-SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-source $SCRIPT_DIR/../../env_vars.sh
+source /wynton/home/kortemme/alexjli/projects/proteinzen/env_vars.sh
 
 cd $1/designable_samples/
 ls *.pdb > usalign.list

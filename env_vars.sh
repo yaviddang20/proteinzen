@@ -1,3 +1,3 @@
 GEOMSTATS_BACKEND="pytorch"
-REPO_ROOT="~/projects/proteinzen"
+REPO_ROOT="$HOME/projects/proteinzen"
 ENV_NAME="proteinzen-refactor"

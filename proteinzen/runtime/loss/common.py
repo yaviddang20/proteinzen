@@ -21,7 +21,7 @@ def seq_cce_loss(ref_seq,
     if logits_as_probs:
         assert label_smoothing == 0, "Label smoothing not implemented for CCE with probs"
         seq_probs = torch.gather(seq_logits, 1, (ref_seq * mask)[..., None])
-        cce = -torch.log(seq_probs)
+        cce = -torch.log(seq_probs.clip(min=1e-6, max=1-1e-6))
         cce = cce.squeeze(-1)
     else:
         cce = F.cross_entropy(seq_logits, ref_seq * mask, reduction='none', label_smoothing=label_smoothing)

@@ -69,7 +69,7 @@ class DirichletConditionalFlow:
 
         return xt, seq_one_hot
 
-    def corrupt_batch(self, batch):
+    def corrupt_batch(self, model, batch):
         res_data = batch["residue"]
         t = batch['t'] * self.t_max
         nodewise_t = t[res_data.batch]
@@ -93,9 +93,11 @@ class DirichletConditionalFlow:
     def get_normalized_t(self, t):
         return torch.clip(t / self.t_max, max=1.0)
 
-    def euler_step(self, d_t, t, seq_probs_t, seq_probs_1, batch):
+    def euler_step(self, d_t, t, seq_probs_1, seq_probs_t, batch):
+        t = t * self.t_max
+        d_t = d_t * self.t_max
         c_factor = self.c_factor(seq_probs_t, t, batch, use_torch=True)
         eye = torch.eye(self.K, device=c_factor.device).view(1, self.K, self.K)
         u_i = c_factor[..., None, :] * (eye - seq_probs_t[..., None])
         u = torch.sum(seq_probs_1[..., None, :] * u_i, dim=-1)
-        return F.normalize(seq_probs_t + u * d_t, dim=-1).float()
+        return seq_probs_t + u * d_t

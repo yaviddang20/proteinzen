@@ -79,6 +79,7 @@ if __name__ == '__main__':
         lines = fp.readlines()
     parse_dict = parse_esm_log(lines, fold_original=args.fold_original)
     df = parse_dict_to_df(parse_dict)
+    # df = df[~df['name'].str.contains("clean_traj")]
     print(df)
 
     rmsds = []

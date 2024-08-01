@@ -68,6 +68,7 @@ class BackboneFrameInterpolation(Task):
         # compute noising mask
         diffuse_mask = self.gen_diffuse_mask(res_data)
         res_data['noising_mask'] = diffuse_mask
+        res_data['res_noising_mask'] = diffuse_mask
         res_data['x'] = rigids_1.get_trans()  # for HeteroData's sake
         res_data['rigids_1'] = rigids_1.to_tensor_7()
         res_data['noising_mask'] = diffuse_mask

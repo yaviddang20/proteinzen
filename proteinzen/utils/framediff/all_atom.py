@@ -327,6 +327,53 @@ def vector_projection(R_ab, P_n):
     return R_ab - (a_x_b / b_x_b)[:, None] * P_n
 
 
+def transrot_to_atom37(transrot_traj, res_mask):
+    atom37_traj = []
+    for trans, rots in transrot_traj:
+        rigids = Rigid(
+            rots=Rotation(rot_mats=rots),
+            trans=trans
+        )
+        atom37 = compute_backbone(
+            rigids.unsqueeze(0),
+            torch.zeros(
+                1,
+                trans.shape[0],
+                2,
+                device=trans.device
+            )
+        )[0].squeeze(0)
+        atom37 = atom37.detach().cpu()
+        atom37 = adjust_oxygen_pos(atom37, res_mask)
+        atom37_traj.append(atom37)
+    return atom37_traj
+
+
+def transrot_to_atom14(transrot_traj, res_mask):
+    atom14_traj = []
+    res_mask = res_mask.cpu()
+    for trans, rots in transrot_traj:
+        rigids = Rigid(
+            rots=Rotation(rot_mats=rots),
+            trans=trans
+        )
+        atom37, _, _, atom14 = compute_backbone(
+            rigids.unsqueeze(0),
+            torch.zeros(
+                1,
+                trans.shape[0],
+                2,
+                device=trans.device
+            )
+        )
+        atom37 = atom37.squeeze(0).detach().cpu()
+        atom14 = atom14.squeeze(0).detach().cpu()
+        atom37 = adjust_oxygen_pos(atom37, res_mask)
+        atom14[:, 3, :] = atom37[:, 4, :]
+        atom14[:, 3, :] = atom37[:, 4, :]
+        atom14_traj.append(atom14)
+    return atom14_traj
+
 
 ### modded from FrameFlow
 def transrotpsi_to_atom37(transrotpsi_traj, res_mask, impute_oxy=True):

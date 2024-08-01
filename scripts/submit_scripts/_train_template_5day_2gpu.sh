@@ -10,8 +10,7 @@
 #$ -l h_rt=120:00:00
 #$ -l compute_cap=61,gpu_mem=40G
 
-SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-source $SCRIPT_DIR/../../env_vars.sh
+source REPOROOT/env_vars.sh
 
 echo $JOB_ID
 conda activate ${ENV_NAME}

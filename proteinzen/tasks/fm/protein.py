@@ -83,11 +83,11 @@ class ProteinInterpolation(Task):
         # compute bb frame features
         diffuse_mask = self._gen_diffuse_mask(res_data)
         res_data['noising_mask'] = diffuse_mask
+        res_data['res_noising_mask'] = diffuse_mask
         res_data['mlm_mask'] = ~diffuse_mask
         res_data['x'] = rigids_1.get_trans()  # for HeteroData's sake
         res_data['rigids_1'] = rigids_1.to_tensor_7()
         ##  noise data
-        data = self.se3_noiser.corrupt_batch(data)
 
         # compute sidechain features
         ## generate data dict
@@ -109,6 +109,7 @@ class ProteinInterpolation(Task):
             lambda x: torch.as_tensor(x),
             diff_feats_t)
         res_data.update(diff_feats_t)
+        data = self.se3_noiser.corrupt_batch(data)
 
         return data
 
@@ -573,7 +574,11 @@ class ProteinSeqInterpolation(Task):
         self.sidechain_noiser = protein_noiser.sidechain_noiser
         self.aux_loss_t_min = aux_loss_t_min
         self.use_clash_loss = use_clash_loss
+
+        if isinstance(protein_noiser, ProteinDirichletInterpolant):
+            use_seq_vf_loss = False
         self.use_seq_vf_loss = use_seq_vf_loss
+
         self.label_smoothing = label_smoothing
         self.logit_norm_loss = logit_norm_loss
         self.cond_atomic = cond_atomic
@@ -642,7 +647,7 @@ class ProteinSeqInterpolation(Task):
         res_data['atom14_noising_mask'] = res_data['atom14_mask']
         ##  noise data
         data = self.se3_noiser.corrupt_batch(data)
-        data = self.sidechain_noiser.corrupt_batch(data)
+        # data = self.sidechain_noiser.corrupt_batch(data)
 
         return data
 
@@ -652,6 +657,9 @@ class ProteinSeqInterpolation(Task):
 
     def run_eval(self, model, inputs):
         device = inputs['residue']['x'].device
+        if isinstance(self.sidechain_noiser, torch.nn.Module):
+            self.sidechain_noiser.to(device)
+        inputs = self.sidechain_noiser.corrupt_batch(model, inputs)
         self.se3_noiser.set_device(device)
         if self.cond_atomic:
             gt_condition = (np.random.uniform() > 0.5)
@@ -703,7 +711,7 @@ class ProteinSeqInterpolation(Task):
         rotmats_0 = _uniform_so3(total_num_res, device)
         # alphas = torch.ones((total_num_res, self.sidechain_noiser.D), device=device)
         # seq_probs_0 = torch.distributions.Dirichlet(alphas).sample()
-        seq_probs_0 = self.sidechain_noiser.sample_prior(total_num_res).to(device)
+        seq_probs_0 = self.sidechain_noiser.sample_prior(total_num_res, device=device)
 
         # Set-up time
         ts = torch.linspace(self.se3_noiser._cfg.min_t, 1.0, self.se3_noiser._sample_cfg.num_timesteps)
@@ -738,7 +746,8 @@ class ProteinSeqInterpolation(Task):
                 pred_trans_1 = pred_rigids.get_trans()
                 pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
                 pred_seq_logits = denoiser_out["decoded_seq_logits"]
-                pred_seq_probs_1 = torch.softmax(pred_seq_logits, dim=-1)
+                # pred_seq_probs_1 = torch.softmax(pred_seq_logits, dim=-1)
+                pred_seq_probs_1 = denoiser_out["seq_probs"]
 
                 clean_traj.append(
                     (
@@ -792,7 +801,8 @@ class ProteinSeqInterpolation(Task):
             pred_trans_1 = pred_rigids.get_trans()
             pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
             pred_seq_logits = denoiser_out["decoded_seq_logits"]
-            pred_seq_probs_1 = torch.softmax(pred_seq_logits, dim=-1)
+            pred_seq_probs_1 = denoiser_out["seq_probs"]
+            # pred_seq_probs_1 = torch.softmax(pred_seq_logits, dim=-1)
 
         argmax_seq = pred_seq_logits.argmax(dim=-1)
         decoded_struct = denoiser_out['decoded_atom14']
@@ -801,10 +811,13 @@ class ProteinSeqInterpolation(Task):
 
         # # Convert trajectories to atom37.
         # atom37_traj = all_atom.transrotpsi_to_atom37(prot_traj, res_data.res_mask)
-        # clean_atom37_traj = all_atom.transrotpsi_to_atom37(clean_traj, res_data.res_mask)
-        clean_trajs = zip(*[traj[-1].split(num_res) for traj in clean_traj])
-        clean_traj_seqs = zip(*[traj[-2].split(num_res) for traj in clean_traj])
-        prot_trajs = zip(*[traj[-1].split(num_res) for traj in prot_traj])
+        clean_trajs = list(zip(*[traj[-1].split(num_res) for traj in clean_traj]))
+        clean_traj_seqs = list(zip(*[traj[-2].split(num_res) for traj in clean_traj]))
+        prot_traj_seqs = list(zip(*[traj[-1].split(num_res) for traj in prot_traj]))
+        prot_traj = all_atom.transrot_to_atom14(
+            [data[:2] for data in prot_traj], res_data.res_mask
+        )
+        prot_trajs = list(zip(*[traj.split(num_res) for traj in prot_traj]))
 
         return {
             "samples": decoded_struct.split(num_res),
@@ -812,6 +825,7 @@ class ProteinSeqInterpolation(Task):
             "clean_trajs": clean_trajs,
             "clean_traj_seqs": clean_traj_seqs,
             "prot_trajs": prot_trajs,
+            "prot_traj_seqs": prot_traj_seqs,
             "inputs": inputs
         }
 
@@ -865,10 +879,24 @@ class ProteinSeqInterpolation(Task):
             gt_hs_vf = self.sidechain_noiser.train_vf(nodewise_t, seq_probs_t, seq_probs_1)
             seq_vf_loss = torch.square(pred_hs_vf - gt_hs_vf).sum(dim=-1)
             seq_vf_loss = _nodewise_to_graphwise(seq_vf_loss, res_data.batch, res_data.seq_mask & res_data.seq_noising_mask)
-            if self.sidechain_noiser.sample_sched == "linear":
-                seq_vf_loss = seq_vf_loss * 0.01
+            if self.sidechain_noiser.train_sched == "learned":
+                kappa = inputs['kappa_t']
+                dkappa = inputs['dkappa_t']
+                scale = 2 * kappa / ((1 - kappa) * 3) * dkappa
+                kappa, dkappa = self.sidechain_noiser.kappa(
+                    torch.linspace(0., 1., 11, device=kappa.device)[..., None]
+                    )
+                print(kappa, dkappa)
+                # print(seq_vf_loss, scale, inputs['t'])
+                # seq_vf_loss = seq_vf_loss * scale
         else:
             seq_vf_loss = autoenc_loss_dict["seq_loss"]
+
+        # kappa, dkappa = self.sidechain_noiser.kappa(inputs['t'])
+        # loss = kappa.sum()
+        # loss.backward()
+        # for name, param in self.sidechain_noiser.named_parameters():
+        #     print(name, param.grad)
 
         loss = (
             bb_denoising_loss
@@ -907,6 +935,7 @@ class ProteinSeqMultiChiInterpolation(Task):
                  aux_loss_t_min=0.25,
                  use_clash_loss=False,
                  use_fape_loss=False,
+                 use_seq_vf_loss=True,
                  label_smoothing=0.0):
         super().__init__()
         self.se3_noiser = protein_noiser.se3_noiser
@@ -916,6 +945,9 @@ class ProteinSeqMultiChiInterpolation(Task):
         self.use_clash_loss = use_clash_loss
         self.use_fape_loss = use_fape_loss
         self.label_smoothing = label_smoothing
+        if isinstance(protein_noiser, ProteinDirichletMultiChiInterpolant):
+            use_seq_vf_loss = False
+        self.use_seq_vf_loss = use_seq_vf_loss
         self.rng = np.random.default_rng()
 
     def _gen_diffuse_mask(self, data: HeteroData):
@@ -1034,7 +1066,7 @@ class ProteinSeqMultiChiInterpolation(Task):
             _centered_gaussian(res_data.batch, device) * du.NM_TO_ANG_SCALE
         )
         rotmats_0 = _uniform_so3(total_num_res, device)
-        seq_probs_0 = self.sidechain_noiser.sample_prior(total_num_res).to(device)
+        seq_probs_0 = self.sidechain_noiser.sample_prior(total_num_res, device)
         angles_0 = torch.rand((total_num_res, 4), device=device) * 2 * torch.pi
         chis_0 = torch.stack(
             [torch.cos(angles_0), torch.sin(angles_0)],
