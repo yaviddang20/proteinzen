@@ -70,6 +70,7 @@ class FisherFlow(nn.Module):
                  train_c=1,
                  sample_sched="linear",
                  sample_c=1,
+                 dirichlet_bridge_conc=None
         ):
         super().__init__()
         self.D = D
@@ -88,6 +89,7 @@ class FisherFlow(nn.Module):
         self.train_c = train_c
         self.sample_sched = train_sched
         self.sample_c = sample_c
+        self.dirichlet_bridge_conc = dirichlet_bridge_conc
 
     def kappa(self, t: torch.Tensor):
         assert self.learned_sched is not None
@@ -195,6 +197,20 @@ class FisherFlow(nn.Module):
                 x1_hs
             )
         xt_simplex = torch.square(xt_hs)
+
+        if self.dirichlet_bridge_conc is not None:
+            assert (x1_simplex.bool().sum(dim=-1) == 1).all()
+            # a_t_i = (xt_simplex * x1_simplex).sum(dim=-1)
+            # var = self.dirichlet_bridge_var * t * (1-t)
+            # conc_scaling = (
+            #     a_t_i - var + torch.sqrt(
+            #         (var - a_t_i)**2 - 4 * var * torch.square(a_t_i)
+            #     )
+            # ) / 2 * torch.square(a_t_i)
+            # var = self.dirichlet_bridge_var * t * (1-t)
+            scaling_factor, _ = xt_simplex.min(dim=-1)
+            xt_simplex = torch.distributions.Dirichlet(xt_simplex.clip(min=1e-8) / scaling_factor[..., None].clip(min=0.01) * self.dirichlet_bridge_conc).rsample()
+
         return xt_simplex
 
     def _corrupt_seq(self, seq, t):
@@ -253,4 +269,9 @@ class FisherFlow(nn.Module):
             scaling = self.vf_scale(t, self.sample_c, self.sample_sched).to(hs_vf.device)
             seq_t_1_hs = self.sphere.metric.exp(scaling[..., None] * d_t * hs_vf, seq_t_hs)
         seq_t_1 = seq_t_1_hs.square()
+
+        if self.dirichlet_bridge_conc is not None:
+            scaling_factor, _ = seq_t_1_hs.min(dim=-1)
+            seq_t_1 = torch.distributions.Dirichlet(seq_t_1.clip(min=1e-8) / scaling_factor[..., None].clip(min=0.01) * self.dirichlet_bridge_conc).rsample()
+
         return seq_t_1

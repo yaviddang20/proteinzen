@@ -16,21 +16,18 @@ from proteinzen.utils.framediff.all_atom import compute_backbone, compute_atom14
 from proteinzen.utils.openfold.feats import atom14_to_atom37
 
 from proteinzen.data.datasets.featurize.common import _node_positional_embeddings
-from proteinzen.data.datasets.featurize.sidechain import _dihedrals, _ideal_virtual_Cb
 from proteinzen.data.datasets.featurize.common import _edge_positional_embeddings, _rbf
+from proteinzen.data.openfold.residue_constants import restype_atom14_mask, restype_order
 
 from proteinzen.model.modules.openfold.layers import BackboneUpdate, StructureModuleTransition
-from proteinzen.model.modules.layers.edge.embed import MLMPairwiseAtomicEmbedding, SelfConditionPairwiseAtomicEmbedding
 
 from proteinzen.model.utils.graph import sample_inv_cubic_edges, sequence_local_graph, gen_spatial_graph_features, batchwise_to_nodewise
 
-from proteinzen.model.denoiser.bb.framediff import TorsionAngles
 from proteinzen.model.modules.openfold.layers import Linear
 
 from proteinzen.runtime.loss.common import _collect_from_seq
 from proteinzen.data.openfold.data_transforms import make_atom14_masks
 
-from torch_geometric.utils import coalesce
 
 
 class ChiUpdate(nn.Module):
@@ -129,6 +126,57 @@ class FeedForward(nn.Module):
 
         return s
 
+def all_atom14_to_atom73(all_atom14):
+    num_res = all_atom14.shape[0]
+    restype_atom14_mask_ = torch.as_tensor(restype_atom14_mask, device=all_atom14.device, dtype=bool)
+    # we chop off the last one which is X
+    restype_atom14_mask_ = restype_atom14_mask_[:20]
+    # we count CB as "backbone" here
+    restype_atom14_sidechain_mask = restype_atom14_mask_[:, 5:]
+    sidechain_atoms = all_atom14[..., 5:, :][:, restype_atom14_sidechain_mask]
+    bb_atoms = all_atom14[:, restype_order['A'], :5]  # we can take ALA which has N CA C O CB
+    return torch.cat([bb_atoms, sidechain_atoms], dim=1)
+
+
+class SeqChiAtomicUpdate(nn.Module):
+    def __init__(self, seq_in, num_chi_in, c_s, c_out, dropout=0.):
+        super().__init__()
+        self.c_in = seq_in + num_chi_in * 2 + c_s + 73 * 3
+        self.c_out = c_out
+        self.ffn = FeedForward(self.c_in, self.c_out, dropout=dropout)
+
+    def _default_rigid(self, num_res, device):
+        ident_trans = torch.tensor([[0., 0., 0.]], device=device).expand(num_res, -1)
+        default_rigid = ru.Rigid(
+            rots=None,
+            trans=ident_trans
+        )
+        return default_rigid
+
+    def forward(self,
+                node_features,
+                seq_probs_t,
+                chis_t):
+        num_nodes = node_features.shape[0]
+        device = node_features.device
+        rigids = self._default_rigid(num_nodes, device)
+        dummy_psi = torch.tensor(
+            [[[1, 0]]], device=device
+        ).expand(num_nodes, -1, -1)
+        all_atom14 = compute_all_atom14(
+            bb_rigids=rigids,
+            psi_torsions=dummy_psi,
+            sidechain_torsions=chis_t
+        )
+        atom73 = all_atom14_to_atom73(all_atom14)
+        in_features = torch.cat([
+            node_features,
+            atom73.view(num_nodes, -1),
+            seq_probs_t,
+            chis_t.view(num_nodes, -1)
+        ], dim=-1)
+        return self.ffn(in_features)
+
 
 class GraphIpaFrameDenoisingLayer(nn.Module):
     """ Denoising layer on sidechain densities """
@@ -146,6 +194,7 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
                  lrange_k=40,
                  num_aa=20,
                  seq_matrix_updates=True,
+                 embed_atom73=False
                  ):
         """
         Args
@@ -154,7 +203,17 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
         super().__init__()
         self.num_aa = num_aa
 
-        self.seq_chi_to_node_update = FeedForward(num_aa + c_s + num_aa * 8, c_s)
+        self.embed_atom73 = embed_atom73
+
+        if embed_atom73:
+            self.seq_chi_to_node_update = SeqChiAtomicUpdate(
+                seq_in=num_aa,
+                num_chi_in=num_aa*4,
+                c_s=c_s,
+                c_out=c_s
+            )
+        else:
+            self.seq_chi_to_node_update = FeedForward(num_aa + c_s + num_aa * 8, c_s)
         self.init_ln = nn.LayerNorm(c_s)
 
         self.edge_embed = nn.Sequential(
@@ -228,13 +287,20 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
         res_noising_mask = res_data['res_noising_mask']
         seq_noising_mask = res_data['seq_noising_mask']
         chi_noising_mask = res_data['chi_noising_mask']
-        node_update = self.seq_chi_to_node_update(
-            torch.cat([
-                node_features,
-                chis.view(-1, self.num_aa * 8),
-                seq_probs],
-            dim=-1)
-        )
+        if self.embed_atom73:
+            node_update = self.seq_chi_to_node_update(
+                node_features=node_features,
+                seq_probs_t=seq_probs,
+                chis_t=chis
+            )
+        else:
+            node_update = self.seq_chi_to_node_update(
+                torch.cat([
+                    node_features,
+                    chis.view(-1, self.num_aa * 8),
+                    seq_probs],
+                dim=-1)
+            )
         node_features = self.init_ln(node_features + node_update * (~res_mask)[..., None])
 
         edge_inputs = torch.cat([
@@ -293,6 +359,7 @@ class GraphIpaFrameDenoisingLayer(nn.Module):
         ) * seq_mask[..., None]
 
         return node_features, rigids, seq_probs, chis, edge_features, seq_edge_features
+
 
 class IPMPUpdateLayer(nn.Module):
     """ Denoising layer on sidechain densities """
@@ -362,7 +429,8 @@ class DynamicGraphIpaFrameSeqMultiChiDenoiser(nn.Module):
                  use_seq_edge=True,
                  impute_oxy=False,
                  use_ipmp_trunk=False,
-                 seq_matrix_updates=False,
+                 seq_matrix_updates=True,
+                 embed_atom73=False,
                  num_aa=20):
         super().__init__()
 
@@ -414,7 +482,8 @@ class DynamicGraphIpaFrameSeqMultiChiDenoiser(nn.Module):
                  lrange_k=lrange_k,
                  num_rbf=self.num_rbf,
                  seq_matrix_updates=seq_matrix_updates,
-                 num_aa=num_aa
+                 num_aa=num_aa,
+                 embed_atom73=embed_atom73
             )
             for i in range(n_layers)
         ])

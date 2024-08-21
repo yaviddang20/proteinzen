@@ -122,3 +122,4 @@ _debug/
 prelim_experiments/
 analysis/esmfold/pdbs
 analysis/esmfold_designability/esmfold
+lightning_logs/

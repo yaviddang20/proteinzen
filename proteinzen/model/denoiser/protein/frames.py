@@ -29,6 +29,7 @@ from proteinzen.model.modules.openfold.layers import Linear
 
 from torch_geometric.utils import coalesce
 
+
 class FeedForward(nn.Module):
     def __init__(self, c_in, c_out, dropout=0.):
         super().__init__()
@@ -53,6 +54,56 @@ class FeedForward(nn.Module):
 
         return s
 
+
+class EdgeEmbed(nn.Module):
+    def __init__(self,
+                 edge_in,
+                 edge_hidden,
+                 edge_out,
+                 n_layers=3,
+                 gate_edge=False,
+                 skip_conn=False,
+    ):
+        super().__init__()
+        assert n_layers > 1
+        layers = [Linear(edge_in, edge_hidden), nn.ReLU()]
+        for _ in range(n_layers-2):
+            layers.append(Linear(edge_hidden, edge_hidden))
+            layers.append(nn.ReLU())
+        self.last = Linear(edge_hidden, edge_out)
+
+        self.mlp = nn.Sequential(*layers)
+        self.ln = nn.LayerNorm(edge_out)
+
+        if gate_edge:
+            self.gate = Linear(edge_hidden, edge_out)
+        else:
+            self.gate = None
+
+        if skip_conn:
+            self.skip = Linear(edge_in, edge_out)
+        else:
+            self.skip = None
+
+    def forward(self, edge_embed):
+        x = edge_embed
+        x = self.mlp(x)
+
+        if self.gate is not None:
+            gate = self.gate(x)
+            x = self.last(x)
+            x = torch.sigmoid(gate) * x
+        else:
+            x = self.last(x)
+
+        if self.skip is not None:
+            x = x + self.skip(edge_embed)
+
+        x = self.ln(x)
+
+        return x
+
+
 class BackboneDenoisingLayer(nn.Module):
     """ Denoising layer on sidechain densities """
     def __init__(self,
@@ -64,6 +115,9 @@ class BackboneDenoisingLayer(nn.Module):
                  num_qk_pts,
                  num_v_pts,
                  self_conditioning=False,
+                 gate_spatial_edges=True,
+                 skip_conn_spatial_edges=False,
+                 sc_edge_unit_vecs=True
                  ):
         """
         Args
@@ -71,16 +125,16 @@ class BackboneDenoisingLayer(nn.Module):
         """
         super().__init__()
 
-        self.edge_embed = nn.Sequential(
-            nn.Linear(c_s*2 + c_z + 4 + self_conditioning * (c_z//2 + 4), c_z),
-            nn.ReLU(),
-            nn.Linear(c_z, c_z),
-            nn.ReLU(),
-            nn.Linear(c_z, c_z),
-            nn.LayerNorm(c_z)
+        edge_in = c_s*2 + c_latent*2 + c_z + 4 + self_conditioning * (c_z//2 + 4 + 3 * sc_edge_unit_vecs)
+        self.edge_embed = EdgeEmbed(
+            edge_in=edge_in,
+            edge_hidden=c_z,
+            edge_out=c_z,
+            gate_edge=gate_spatial_edges,
+            skip_conn=skip_conn_spatial_edges
         )
         self.seq_edge_update = nn.Sequential(
-            nn.Linear(c_s*2 + c_z + 4 + self_conditioning * (c_z//2 + 4), c_z),
+            nn.Linear(edge_in, c_z),
             nn.ReLU(),
             nn.Linear(c_z, c_z),
             nn.ReLU(),
@@ -137,41 +191,45 @@ class BackboneDenoisingLayer(nn.Module):
             seq_edge_index,
             res_data,
     ):
+        res_mask = res_data['res_mask'].bool()
+        seq_mask = res_data['seq_mask'].bool()
+        res_noising_mask = res_data['res_noising_mask']
+        seq_noising_mask = res_data['seq_noising_mask']
+
         edge_inputs = torch.cat([
             edge_features,
             node_features[edge_index[0]],
-            node_features[edge_index[1]]
+            node_features[edge_index[1]],
+            latent_features[edge_index[0]],
+            latent_features[edge_index[1]]
         ], dim=-1)
         edge_features = self.edge_embed(edge_inputs)
 
         seq_edge_inputs = torch.cat([
             new_seq_edge_inputs,
             node_features[seq_edge_index[0]],
-            node_features[seq_edge_index[1]]
+            node_features[seq_edge_index[1]],
+            latent_features[seq_edge_index[0]],
+            latent_features[seq_edge_index[1]]
         ], dim=-1)
         seq_edge_features = self.seq_edge_ln(
             seq_edge_features +
             self.seq_edge_update(seq_edge_inputs)
         )
 
-        res_mask = ~(res_data['res_mask'].bool())
-        noising_mask = res_data['noising_mask']
-
-        node_features = self.ln_s0(
-            node_features
-            + self.latent_to_node_update(
-                torch.cat([latent_features, node_features], dim=-1)
-            )
+        latent_to_node_update = self.latent_to_node_update(
+            torch.cat([latent_features, node_features], dim=-1)
         )
+        node_features = self.ln_s0(node_features + latent_to_node_update * seq_mask[..., None])
 
         node_s_update = self.attn_spatial(
             s=node_features,
             z=edge_features,
             edge_index=edge_index,
             r=rigids,
-            mask=(~res_mask).float()
+            mask=res_mask.float()
         )
-        node_s_update = node_s_update * (~res_mask)[..., None]
+        node_s_update = node_s_update * res_mask[..., None]
         node_features = self.ln_s1(node_features + node_s_update)
 
         node_s_update = self.attn_seq(
@@ -179,23 +237,23 @@ class BackboneDenoisingLayer(nn.Module):
             z=seq_edge_features,
             edge_index=seq_edge_index,
             r=rigids,
-            mask=(~res_mask).float()
+            mask=res_mask.float()
         )
-        node_s_update = node_s_update * (~res_mask)[..., None]
+        node_s_update = node_s_update * res_mask[..., None]
         node_features = self.ln_s2(node_features + node_s_update)
 
         node_features = self.node_transition(node_features)
-        node_features = node_features * (~res_mask)[..., None]
+        node_features = node_features * res_mask[..., None]
         rigids_update = self.bb_update(
-            node_features * noising_mask[..., None])
+            node_features * res_noising_mask[..., None])
 
         rigids = rigids.compose_q_update_vec(
-            rigids_update * noising_mask[..., None]
+            rigids_update * res_noising_mask[..., None]
         )
         seq_edge_features = self.seq_edge_transition(node_features, seq_edge_features, seq_edge_index)
         latent_features = latent_features + self.node_to_latent_update(
-            torch.cat([latent_features, node_features], dim=-1)
-        )
+            torch.cat([latent_features, node_features], dim=-1) * seq_mask[..., None]
+        ) * seq_noising_mask[..., None]
 
         return node_features, rigids, edge_features, seq_edge_features, latent_features
 
@@ -215,6 +273,9 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  knn_k=20,
                  lrange_k=40,
                  self_conditioning=True,
+                 gate_spatial_edges=True,
+                 skip_conn_spatial_edges=False,
+                 sc_edge_unit_vecs=True,
                  impute_oxy=False,
                  num_aa=20):
         super().__init__()
@@ -226,6 +287,7 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         self.self_conditioning = self_conditioning
         self.n_layers = n_layers
         self.impute_oxy = impute_oxy
+        self.sc_edge_unit_vecs = sc_edge_unit_vecs
 
         self.h_time = h_time
         self.time_rbf = GaussianRandomFourierBasis(n_basis=h_time//2)
@@ -263,6 +325,9 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  num_qk_pts,
                  num_v_pts,
                  self_conditioning=self_conditioning,
+                 gate_spatial_edges=gate_spatial_edges,
+                 skip_conn_spatial_edges=skip_conn_spatial_edges,
+                 sc_edge_unit_vecs=sc_edge_unit_vecs
             )
             for i in range(n_layers)
         ])
@@ -280,11 +345,20 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
             masked_X_ca, res_mask, batch, knn_k=self.knn_k, inv_cube_k=self.lrange_k)
 
         # compute edge features
-        edge_features, _ = gen_spatial_graph_features(rigids, edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=self.c_z//2)
+        edge_features, _ = gen_spatial_graph_features(
+            rigids,
+            edge_index,
+            num_rbf_embed=self.c_z//2,
+            num_pos_embed=self.c_z//2)
 
         if self.self_conditioning and self_condition is not None:
             self_cond_rigids = self_condition['final_rigids']
-            self_cond_edge_features, _ = gen_spatial_graph_features(self_cond_rigids, edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=0)
+            self_cond_edge_features, _ = gen_spatial_graph_features(
+                self_cond_rigids,
+                edge_index,
+                num_rbf_embed=self.c_z//2,
+                num_pos_embed=0,
+                use_unit_vec=self.sc_edge_unit_vecs)
             edge_features = torch.cat(
                 [edge_features, self_cond_edge_features],
                 dim=-1
@@ -292,7 +366,7 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         elif self.self_conditioning:
             edge_features = F.pad(
                 edge_features,
-                (0, self.c_z//2 + 4)
+                (0, self.c_z//2 + 4 + 3 * self.sc_edge_unit_vecs)
             )
 
         return edge_features, edge_index
@@ -304,7 +378,12 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
 
         if self.self_conditioning and self_condition is not None:
             self_cond_rigids = self_condition['final_rigids']
-            self_cond_edge_features, _ = gen_spatial_graph_features(self_cond_rigids, seq_edge_index, num_rbf_embed=self.c_z//2, num_pos_embed=0)
+            self_cond_edge_features, _ = gen_spatial_graph_features(
+                self_cond_rigids,
+                seq_edge_index,
+                num_rbf_embed=self.c_z//2,
+                num_pos_embed=0,
+                use_unit_vec=self.sc_edge_unit_vecs)
             edge_features = torch.cat(
                 [edge_features, self_cond_edge_features],
                 dim=-1
@@ -312,7 +391,7 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         elif self.self_conditioning:
             edge_features = F.pad(
                 edge_features,
-                (0, self.c_z//2 + 4)
+                (0, self.c_z//2 + 4 + 3 * self.sc_edge_unit_vecs)
             )
         return edge_features
 

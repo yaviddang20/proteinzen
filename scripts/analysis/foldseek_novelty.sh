@@ -18,6 +18,17 @@ mkdir $OUTPUTDIR
 
 # i think i also got this from jason yim, need to double check
 foldseek easy-search $DESIGNABLE_DIR \
+    /wynton/group/kortemme/alexjli/databases/foldseek/frameflow/frameflow_db \
+    $OUTPUTDIR/aln_frameflow.tsv \
+    $OUTPUTDIR/tmpFolder \
+    --alignment-type 1 \
+    --format-output query,target,alntmscore,lddt \
+    --tmscore-threshold 0.0 \
+    --exhaustive-search \
+    --max-seqs 10000000000  | tee -a frameflow_novelty.out
+
+# i think i also got this from jason yim, need to double check
+foldseek easy-search $DESIGNABLE_DIR \
     /wynton/group/kortemme/alexjli/databases/foldseek/framediff_monomers/framediff_db \
     $OUTPUTDIR/aln_framediff.tsv \
     $OUTPUTDIR/tmpFolder \
@@ -38,5 +49,7 @@ foldseek easy-search $DESIGNABLE_DIR \
     --exhaustive-search \
     --max-seqs 10000000000  | tee -a foldseek_novelty.out
 
-conda activate ${ENV_NAME}
-python ${REPO_ROOT}/scripts/analysis/summarize_foldseek.py
+# conda activate ${ENV_NAME}
+# python ${REPO_ROOT}/scripts/analysis/summarize_foldseek.py
+conda activate proteinzen
+python ~/projects/proteinzen/scripts/analysis/summarize_foldseek.py

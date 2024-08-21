@@ -158,7 +158,9 @@ class SidechainMultiTorsionInterpolant:
             angle_diff_ccw,
             -angle_diff_cw
         )
-        multi_omega = (angle_min_disp) / (1-t)  # [..., 20, 4]
+        # multi_omega = (angle_min_disp) / (1-t)  # [..., 20, 4]
+        c = 10
+        multi_omega = (angle_min_disp) * c  # [..., 20, 4]
         omega = torch.sum(multi_omega * seq_probs_1[..., None], dim=-2)  # [..., 4]
 
         angle_tp1 = angle_t + omega * d_t

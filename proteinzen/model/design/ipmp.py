@@ -210,6 +210,7 @@ class IPMPEncoder(nn.Module):
 class IPMPDecoder(nn.Module):
     def __init__(self,
                  c_s=256,
+                 c_latent=128,
                  c_z=128,
                  c_hidden=256,
                  c_s_in=6,
@@ -235,7 +236,7 @@ class IPMPDecoder(nn.Module):
         self.embed_time = GaussianRandomFourierBasis(h_time)
 
         self.embed_node = nn.Sequential(
-            nn.Linear(c_s + h_time*2, 2*c_s),
+            nn.Linear(c_latent + h_time*2, 2*c_s),
             nn.ReLU(),
             nn.Linear(2*c_s, c_s),
         )
@@ -347,7 +348,8 @@ class IPMPDecoder(nn.Module):
         node_update = self.embed_node(
             torch.cat([timestep_embed, node_features], dim=-1)
         )
-        node_features = self.node_ln(node_features + node_update * res_mask[..., None])
+        # node_features = self.node_ln(node_features + node_update * res_mask[..., None])
+        node_features = self.node_ln(node_update * res_mask[..., None])
         edge_features = self.embed_edge(edge_features)
 
         for layer in self.update:

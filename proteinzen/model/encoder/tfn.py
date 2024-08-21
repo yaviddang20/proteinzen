@@ -14,6 +14,8 @@ from e3nn import o3
 
 from proteinzen.model.modules.layers.node.tfn import TensorProductConvLayer, TensorProductAggLayer
 from proteinzen.model.modules.common import GaussianRandomFourierBasis
+from proteinzen.model.modules.openfold.layers import StructureModuleTransition, Linear
+from proteinzen.model.utils.graph import sample_inv_cubic_edges
 from proteinzen.model.utils.atomic import gen_bond_graph
 from proteinzen.data.constants.atom14 import atom14_atom_props, atom14_bond_props
 from proteinzen.data.datasets.featurize.common import _edge_positional_embeddings, _rbf
@@ -92,8 +94,6 @@ class JointConvLayer(nn.Module):
         return atom_features, res_features
 
 
-
-
 class ProteinAtomicEmbedder(nn.Module):
     def __init__(
         self,
@@ -115,7 +115,8 @@ class ProteinAtomicEmbedder(nn.Module):
         res_D_max=22,
         knn_k=30,
         reduce_pseudoscalars=False,
-        dropout=0.0
+        dropout=0.0,
+        lrange_graph=False,
     ):
         super().__init__()
         assert n_layers > 4
@@ -133,6 +134,7 @@ class ProteinAtomicEmbedder(nn.Module):
         self.num_timestep = num_timestep
         self.num_pos_embed = num_pos_embed
         self.num_aa = num_aa
+        self.lrange_graph = lrange_graph
 
         self.atomic_r = atomic_r
         self.agg_r = agg_r
@@ -219,6 +221,9 @@ class ProteinAtomicEmbedder(nn.Module):
                 h_frame
             )
             self.out_ln = nn.LayerNorm(h_frame)
+            self.transition = StructureModuleTransition(h_frame)
+            self.latent_mu = Linear(h_frame, h_frame, init='final')
+            self.latent_logvar = Linear(h_frame, h_frame)
         else:
             self.to_frame_scalars = None
 
@@ -248,6 +253,8 @@ class ProteinAtomicEmbedder(nn.Module):
         res_data = data['residue']
         atom14 = res_data['atom14_gt_positions'].float()
         atom14_mask = res_data['atom14_gt_exists'].bool()
+        seq_mask = res_data['seq_mask'].bool()
+        atom14_mask[seq_mask, 4:] = False
         if apply_noising_masks:
             atom14_mask = atom14_mask & ~res_data['atom14_noising_mask']
         atom_coords = atom14[atom14_mask]
@@ -271,7 +278,16 @@ class ProteinAtomicEmbedder(nn.Module):
         ]
         res_features = torch.cat(res_features, dim=-1)
 
-        res_edge_index = knn_graph(X_ca_copy, self.knn_k, res_data.batch)
+        if self.lrange_graph:
+            res_edge_index, _, _ = sample_inv_cubic_edges(
+                batched_X_ca=X_ca_copy,
+                batched_x_mask=~res_data['res_mask'],
+                batch=res_data.batch,
+                knn_k=self.knn_k,
+                inv_cube_k=self.knn_k*2,
+            )
+        else:
+            res_edge_index = knn_graph(X_ca_copy, self.knn_k, res_data.batch)
         res_rbf_features, res_edge_sh = self._edge_rbf_features(
             X_ca,
             res_edge_index,
@@ -384,19 +400,17 @@ class ProteinAtomicEmbedder(nn.Module):
         final_res_features = data_dict["res_features"]
 
         if self.to_frame_scalars is not None:
-            rigids_quat = data['residue']['rigids_1'][..., :4]
-            with torch.device(rigids_quat.device):
-                wigner_D = self.final_irreps.D_from_quaternion(rigids_quat)
-            inv_wigner_D = wigner_D.transpose(-1, -2).contiguous()
-
             rigids_1 = ru.Rigid.from_tensor_7(data['residue']['rigids_1'])
             rigids_inv_quat = rigids_1.get_rots().invert().get_quats()
-            with torch.device(rigids_quat.device):
-                inv_wigner_D_2 = self.final_irreps.D_from_quaternion(rigids_inv_quat)
-            assert torch.isclose(inv_wigner_D, inv_wigner_D_2)
+            with torch.device(rigids_inv_quat.device):
+                inv_wigner_D = self.final_irreps.D_from_quaternion(rigids_inv_quat)
 
             final_res_features = torch.einsum("...ij,...j->...i", inv_wigner_D, final_res_features)
             final_res_features = self.out_ln(self.to_frame_scalars(final_res_features))
-
+            final_res_features = self.transition(final_res_features)
+            final_res_features = {
+                'latent_mu': self.latent_mu(final_res_features),
+                'latent_logvar': self.latent_logvar(final_res_features),
+            }
 
         return final_res_features

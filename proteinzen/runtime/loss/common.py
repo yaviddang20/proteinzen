@@ -6,7 +6,7 @@ from proteinzen.data.openfold.residue_constants import restype_order_with_x
 
 from .utils import _nodewise_to_graphwise
 from .atomic.atom14 import atom14_mse_loss, chi_loss
-from .atomic.atomic import residue_knn_neighborhood_atomic_dist_loss, local_atomic_context_loss
+from .atomic.atomic import residue_knn_neighborhood_atomic_dist_loss, local_atomic_context_loss, smooth_lddt_loss
 from .atomic.interresidue import intersidechain_clash_loss
 from .latent import so3_embedding_kl, scalars_kl_div
 
@@ -54,7 +54,8 @@ def _collect_from_seq(tensor, seq, seq_mask):
 def autoencoder_losses(batch,
                        model_outputs,
                        label_smoothing=0.0,
-                       logit_norm_loss=0.0):
+                       logit_norm_loss=0.0,
+                       use_smooth_lddt=False):
     res_data = batch['residue']
 
     gt_atom14 = res_data['atom14_gt_positions']
@@ -137,6 +138,17 @@ def autoencoder_losses(batch,
     scaled_local_atomic_dist_loss = local_atomic_dist_loss / (norm_scale**2) * 0.01
     scaled_atom14_mse = atom14_mse / (norm_scale**2) * 0.01
 
+    if use_smooth_lddt:
+        smooth_lddt = smooth_lddt_loss(
+            pred_atom14=pred_atom14_gt_seq,
+            gt_atom14=gt_atom14,
+            alt_atom14=alt_atom14,
+            batch=res_data.batch,
+            atom14_mask=atom14_gt_mask.bool()
+        )
+    else:
+        smooth_lddt = torch.zeros_like(t)
+
     sidechain_chi_loss = chi_loss(
         gt_torsions[..., 3:, :],
         alt_torsions[..., 3:, :],
@@ -171,6 +183,7 @@ def autoencoder_losses(batch,
         "scaled_local_atomic_dist_loss": scaled_local_atomic_dist_loss,
         "scaled_atom14_mse": scaled_atom14_mse,
         "pred_sidechain_clash_loss": pred_atom14_clash_loss,
+        "smooth_lddt": smooth_lddt,
         # "bond_length_mse": bond_length_mse,
         # "bond_angle_loss": bond_angle_loss,
         "chi_loss": sidechain_chi_loss,
@@ -325,7 +338,8 @@ def latent_scalar_sidechain_diffusion_loss(batch,
 
 def latent_scalar_sidechain_fm_loss(batch,
                                     latent_outputs,
-                                    t_norm_clip=0.9):
+                                    t_norm_clip=0.9,
+                                    scale=0.01):
     res_data = batch['residue']
     x_mask = res_data['res_mask']
     noising_mask = res_data['noising_mask']
@@ -343,7 +357,7 @@ def latent_scalar_sidechain_fm_loss(batch,
     norm_scale = 1 - torch.min(
         t, torch.as_tensor(t_norm_clip)
     )
-    latent_fm_loss = latent_denoising_loss / (norm_scale ** 2) * 0.01
+    latent_fm_loss = latent_denoising_loss / (norm_scale ** 2) * scale
 
     latent_ref_noise = torch.square(noised_latent - latent).sum(dim=-1) * total_mask
     latent_ref_noise = _nodewise_to_graphwise(latent_ref_noise, res_data.batch, total_mask)

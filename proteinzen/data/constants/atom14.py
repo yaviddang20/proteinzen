@@ -3,7 +3,7 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
-from proteinzen.data.openfold.residue_constants import restype_name_to_atom14_names, restype_order, restype_1to3
+from proteinzen.data.openfold.residue_constants import restype_name_to_atom14_names, restype_order, restype_order_with_x, restype_1to3
 from proteinzen.data.datasets.featurize.molecule import featurize_props, mol_props, prop_featurization
 
 
@@ -140,14 +140,14 @@ def _gen_props_stores(atom_keys, bond_keys):
     bond_props_list = []
     bond_props_mask = np.zeros(
         (
-            len(restype_order),
+            len(restype_order_with_x),
             max([len(bonds) for bonds in residue_bonds.values()]) * 2,
         ),
         dtype=bool
     )
     bond_edge_index_store = np.zeros(
         (
-            len(restype_order),
+            len(restype_order_with_x),
             max([len(bonds) for bonds in residue_bonds.values()]) * 2,
             2
         ),
@@ -160,7 +160,8 @@ def _gen_props_stores(atom_keys, bond_keys):
     peptide_bond_idx = None
     peptide_bond_features = None
 
-    for i, res_1lt in enumerate(restype_order):
+    for res_1lt in restype_order:
+        i = restype_order[res_1lt]
         res_3lt = restype_1to3[res_1lt]
         res_smiles = amino_acid_smiles[res_3lt]
         res_mol = Chem.MolFromSmiles(res_smiles)
@@ -223,10 +224,10 @@ def _gen_props_stores(atom_keys, bond_keys):
 
     num_atom_features = max([t.shape[-1] for t in atom_props_list])
     num_bond_features = max([t.shape[-1] for t in bond_props_list])
-    atom_props_store = np.zeros((len(restype_order), 14, num_atom_features))
+    atom_props_store = np.zeros((len(restype_order_with_x), 14, num_atom_features))
     bond_props_store = np.zeros(
         (
-            len(restype_order),
+            len(restype_order_with_x),
             max([len(bonds) for bonds in residue_bonds.values()])*2,
             num_bond_features
         )

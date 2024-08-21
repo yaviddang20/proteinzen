@@ -28,7 +28,7 @@ from proteinzen.model.denoiser.molecule.torsional import MoleculeTorsionDenoiser
 from proteinzen.model.design.ipmp import IPMPEncoder, IPMPDecoder
 from proteinzen.model.design.ipmp_seq_only import IPMPDenoiser as DirichletIPMPDenoiser
 from proteinzen.model.wrappers.sidechain import IPMPLatentSidechainWrapper
-from proteinzen.model.wrappers.protein import IPMPLatentWrapper
+from proteinzen.model.wrappers.protein import IPMPLatentWrapper, TFNLatentWrapper, IPMPDenseLatentWrapper, TFNDenseLatentWrapper
 
 from proteinzen.tasks.fm.bb import BackboneFrameInterpolation
 from proteinzen.tasks.fm.protein import ProteinInterpolation, ProteinSeqInterpolation, ProteinSeqMultiChiInterpolation
@@ -75,6 +75,7 @@ def config_hydra_store():
     paradigm_store = store(group="paradigm")
     paradigm_store({"paradigm": "diffusion"}, name="diffusion")
     paradigm_store({"paradigm": "fm"}, name="fm")
+    paradigm_store({"paradigm": "densefm"}, name="densefm")
     paradigm_store({"paradigm": "dirichlet"}, name="dirichlet")
     paradigm_store({"paradigm": "fisher"}, name="fisher")
     paradigm_store({"paradigm": "catflow"}, name="catflow")
@@ -95,6 +96,10 @@ def config_hydra_store():
         ProteinInterpolant,
         se3_cfg=builds(SE3InterpolantConfig),
         name="fm_protein")
+    corruption_store(
+        ProteinInterpolant,
+        se3_cfg=builds(SE3InterpolantConfig),
+        name="densefm_protein")
     corruption_store(
         ProteinDirichletInterpolant,
         se3_cfg=builds(SE3InterpolantConfig),
@@ -191,6 +196,9 @@ def config_hydra_store():
     model_store(DynamicGraphIpaFrameDenoiser, name="fm_bb")
     # model_store(IpaScoreWrapper, name="fm_bb")
     model_store(IPMPLatentWrapper, name="fm_protein")
+    # model_store(TFNLatentWrapper, name="fm_protein")
+    model_store(IPMPDenseLatentWrapper, name="densefm_protein")
+    # model_store(TFNDenseLatentWrapper, name="fm_protein")
     model_store(DynamicGraphIpaFrameSeqDenoiser, name="dirichlet_protein")
     model_store(DynamicGraphIpaFrameSeqDenoiser, name="fisher_protein")
     model_store(DynamicGraphIpaFrameSeqDenoiser, name="catflow_protein")
@@ -219,6 +227,7 @@ def config_hydra_store():
     task_store(pbuilds(DirichletFlowMatching), name="dirichlet_sidechain")
     task_store(pbuilds(BackboneFrameInterpolation), name="fm_bb")
     task_store(pbuilds(ProteinInterpolation), name="fm_protein")
+    task_store(pbuilds(ProteinInterpolation), name="densefm_protein")
     task_store(pbuilds(ProteinSeqInterpolation), name="dirichlet_protein")
     task_store(pbuilds(ProteinSeqInterpolation), name="fisher_protein")
     # task_store(pbuilds(ProteinDirichletChiInterpolation), name="dirichlet_protein")

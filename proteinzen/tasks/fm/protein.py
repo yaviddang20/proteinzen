@@ -41,8 +41,9 @@ class ProteinInterpolation(Task):
                  aux_loss_t_min=0.25,
                  compute_passthrough=True,
                  pt_clash_loss_t=1.1,
-                 kl_strength=1e-6,
-                 rescale_kl_noise=False):
+                 kl_strength=0,#1e-6,
+                 rescale_kl_noise=False,
+                 use_smooth_lddt=False):
         super().__init__()
         self.se3_noiser = protein_noiser.se3_noiser
         self.sidechain_noiser = protein_noiser.sidechain_noiser
@@ -52,6 +53,7 @@ class ProteinInterpolation(Task):
         self.rng = np.random.default_rng()
         self.kl_strength = kl_strength
         self.rescale_kl_noise = rescale_kl_noise
+        self.use_smooth_lddt = use_smooth_lddt
 
     def _gen_diffuse_mask(self, data: HeteroData):
         return torch.ones_like(data['res_mask']).bool()
@@ -84,6 +86,7 @@ class ProteinInterpolation(Task):
         diffuse_mask = self._gen_diffuse_mask(res_data)
         res_data['noising_mask'] = diffuse_mask
         res_data['res_noising_mask'] = diffuse_mask
+        res_data['seq_noising_mask'] = diffuse_mask
         res_data['mlm_mask'] = ~diffuse_mask
         res_data['x'] = rigids_1.get_trans()  # for HeteroData's sake
         res_data['rigids_1'] = rigids_1.to_tensor_7()
@@ -120,8 +123,16 @@ class ProteinInterpolation(Task):
     def _run_model(self, model, inputs, self_conditioning=None, pt_use_gt_seq=True):
         # generate latent sidechains
         latent_data = model.encoder(inputs)
+
         ## sample only if we're training
-        if model.training:
+        if not isinstance(latent_data, dict):
+            latent_data = {
+                self.sidechain_x_1_key: latent_data,
+                'latent_mu': latent_data,
+                'latent_logvar': torch.zeros_like(latent_data)
+
+            }
+        elif model.training:
             latent_sigma = torch.exp(
                 latent_data['latent_logvar'] * 0.5
             )
@@ -130,37 +141,36 @@ class ProteinInterpolation(Task):
         else:
             latent_data[self.sidechain_x_1_key] = latent_data['latent_mu']
 
-        res_data = inputs['residue']
-        latent_sidechains = latent_data[self.sidechain_x_1_key]
-        sidechain_centers = pygu.scatter(
-            latent_sidechains[res_data.res_mask],
-            res_data.batch[res_data.res_mask],
-            dim=0,
-            reduce='mean'
-        )
-        sidechain_var = pygu.scatter(
-            (latent_sidechains[res_data.res_mask] - sidechain_centers[res_data.batch[res_data.res_mask]])**2,
-            res_data.batch[res_data.res_mask],
-            dim=0,
-        )
-        sidechain_count = pygu.scatter(
-            torch.ones_like(res_data.res_mask).float()[res_data.res_mask],
-            res_data.batch[res_data.res_mask],
-            dim=0,
-        )
-        sidechain_count[sidechain_count < 2] = 2
-        sidechain_std = torch.sqrt(sidechain_var / (sidechain_count-1)[..., None])
+        # res_data = inputs['residue']
+        # latent_sidechains = latent_data[self.sidechain_x_1_key]
+        # sidechain_centers = pygu.scatter(
+        #     latent_sidechains[res_data.res_mask],
+        #     res_data.batch[res_data.res_mask],
+        #     dim=0,
+        #     reduce='mean'
+        # )
+        # sidechain_var = pygu.scatter(
+        #     (latent_sidechains[res_data.res_mask] - sidechain_centers[res_data.batch[res_data.res_mask]])**2,
+        #     res_data.batch[res_data.res_mask],
+        #     dim=0,
+        # )
+        # sidechain_count = pygu.scatter(
+        #     torch.ones_like(res_data.res_mask).float()[res_data.res_mask],
+        #     res_data.batch[res_data.res_mask],
+        #     dim=0,
+        # )
+        # sidechain_count[sidechain_count < 2] = 2
+        # sidechain_std = torch.sqrt(sidechain_var / (sidechain_count-1)[..., None])
 
-        latent_sidechains = (latent_sidechains - sidechain_centers[res_data.batch]) / sidechain_std[res_data.batch]
-        latent_data[self.sidechain_x_1_key] = latent_sidechains
+        # latent_sidechains = (latent_sidechains - sidechain_centers[res_data.batch]) / sidechain_std[res_data.batch]
+        # latent_data[self.sidechain_x_1_key] = latent_sidechains
 
-        if self.rescale_kl_noise:
-            latent_sigma = torch.exp(
-                latent_data['latent_logvar'] * 0.5
-            )
-            latent_sigma = latent_sigma / torch.maximum(sidechain_std[res_data.batch], torch.tensor(1e-8, device=latent_sigma.device))
-            latent_data['latent_logvar'] = torch.log(2 * latent_sigma)
-
+        # if self.rescale_kl_noise:
+        #     latent_sigma = torch.exp(
+        #         latent_data['latent_logvar'] * 0.5
+        #     )
+        #     latent_sigma = latent_sigma / torch.maximum(sidechain_std[res_data.batch], torch.tensor(1e-8, device=latent_sigma.device))
+        #     latent_data['latent_logvar'] = torch.log(2 * latent_sigma)
 
         # decoder
         decoder_outputs = model.decoder(inputs, latent_data)
@@ -228,7 +238,10 @@ class ProteinInterpolation(Task):
             data = HeteroData(
                 residue={
                     "res_mask": torch.ones(n, device=device).bool(),
+                    "seq_mask": torch.ones(n, device=device).bool(),
                     "noising_mask": torch.ones(n, device=device).bool(),
+                    "res_noising_mask": torch.ones(n, device=device).bool(),
+                    "seq_noising_mask": torch.ones(n, device=device).bool(),
                     "atom14_gt_positions": torch.zeros((n, 14, 3), device=device).float(),
                     "seq": torch.ones(n, device=device).long() * 20,  # should be X
                     "num_nodes": n
@@ -308,7 +321,10 @@ class ProteinInterpolation(Task):
                     data = HeteroData(
                         residue={
                             "res_mask": torch.ones(n, device=device).bool(),
+                            "seq_mask": torch.ones(n, device=device).bool(),
                             "noising_mask": torch.ones(n, device=device).bool(),
+                            "res_noising_mask": torch.ones(n, device=device).bool(),
+                            "seq_noising_mask": torch.ones(n, device=device).bool(),
                             "atom14_gt_positions": torch.zeros((n, 14, 3), device=device).float(),
                             "seq": torch.ones(n, device=device).long() * 20,  # should be X
                             "num_nodes": n
@@ -473,9 +489,13 @@ class ProteinInterpolation(Task):
         bb_frame_diffusion_loss_dict = bb_frame_fm_loss(
             inputs, outputs, sep_rot_loss=True)
         autoenc_loss_dict = autoencoder_losses(
-            inputs, outputs
+            inputs, outputs, use_smooth_lddt=self.use_smooth_lddt
         )
-        latent_loss_dict = latent_scalar_sidechain_fm_loss(inputs, outputs)
+        latent_loss_dict = latent_scalar_sidechain_fm_loss(
+            inputs,
+            outputs,
+            scale=1 #0.1
+        )
 
         # outputs["decoded_atom14_gt_seq"] = inputs["residue"]["atom14_gt_positions"]
         # autoenc_loss_dict = autoencoder_losses(
@@ -500,6 +520,7 @@ class ProteinInterpolation(Task):
             + autoenc_loss_dict["seq_loss"]
             + autoenc_loss_dict["chi_loss"]
             + autoenc_loss_dict["kl_div"] * self.kl_strength
+            + autoenc_loss_dict["smooth_lddt"]
         )
         latent_denoising_loss = latent_loss_dict["latent_fm_loss"]
         # latent_denoising_loss = latent_loss_dict["latent_denoising_loss"] * 0.01
@@ -508,12 +529,13 @@ class ProteinInterpolation(Task):
             pt_outputs = outputs["pt_outputs"]
             assert pt_outputs is not None
             pt_loss_dict = autoencoder_losses(
-                inputs, pt_outputs
+                inputs, pt_outputs, use_smooth_lddt=self.use_smooth_lddt
             )
             norm = 1 - torch.min(inputs['t'], torch.as_tensor(t_clip_max))
             pt_abs_pos_loss = (
                 pt_loss_dict["atom14_mse"]
                 + pt_loss_dict["sidechain_dists_mse"]
+                + pt_loss_dict["smooth_lddt"]
                 # + pt_loss_dict["chi_loss"]
                 # + pt_loss_dict["seq_loss"]
             ) * (inputs['t'] > self.aux_loss_t_min)
@@ -522,7 +544,7 @@ class ProteinInterpolation(Task):
                 # + pt_loss_dict["sidechain_dists_mse"]
                 + pt_loss_dict["chi_loss"]
                 + pt_loss_dict["seq_loss"]
-            ) * (inputs['t'] > self.aux_loss_t_min)
+            )
             pt_loss = (
                 pt_abs_pos_loss * 0.01 / (norm ** 2)
                 + pt_rel_pos_loss
@@ -712,6 +734,7 @@ class ProteinSeqInterpolation(Task):
         # alphas = torch.ones((total_num_res, self.sidechain_noiser.D), device=device)
         # seq_probs_0 = torch.distributions.Dirichlet(alphas).sample()
         seq_probs_0 = self.sidechain_noiser.sample_prior(total_num_res, device=device)
+        # seq_probs_0 = torch.full_like(seq_probs_0, 0.05)
 
         # Set-up time
         ts = torch.linspace(self.se3_noiser._cfg.min_t, 1.0, self.se3_noiser._sample_cfg.num_timesteps)
@@ -1012,7 +1035,6 @@ class ProteinSeqMultiChiInterpolation(Task):
         res_data['chi_noising_mask'] = res_data['seq_mask']
         ##  noise data
         data = self.se3_noiser.corrupt_batch(data)
-        data = self.sidechain_noiser.corrupt_batch(data)
         data = self.chi_noiser.corrupt_batch(data)
 
         return data
@@ -1024,6 +1046,7 @@ class ProteinSeqMultiChiInterpolation(Task):
     def run_eval(self, model, inputs):
         device = inputs['residue']['x'].device
         self.se3_noiser.set_device(device)
+        inputs = self.sidechain_noiser.corrupt_batch(model, inputs)
         # TODO: should this be a separate flag?
         if model.self_conditioning and np.random.uniform() > 0.5:
             with torch.no_grad():
@@ -1107,8 +1130,9 @@ class ProteinSeqMultiChiInterpolation(Task):
                 pred_rigids = denoiser_out['final_rigids']
                 pred_trans_1 = pred_rigids.get_trans()
                 pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
-                pred_seq_logits = denoiser_out["decoded_seq_logits"]
-                pred_seq_probs_1 = torch.softmax(pred_seq_logits, dim=-1)
+                # pred_seq_logits = denoiser_out["decoded_seq_logits"]
+                # pred_seq_probs_1 = torch.softmax(pred_seq_logits, dim=-1)
+                pred_seq_probs_1 = denoiser_out["seq_probs"]
                 pred_chis_1 = denoiser_out["decoded_chis"]
                 pred_atom14_1 = denoiser_out["decoded_atom14"]
 
@@ -1132,7 +1156,13 @@ class ProteinSeqMultiChiInterpolation(Task):
                 pred_seq_probs_1,
                 seq_probs_t_1,
                 res_data.batch)
-            chis_t_2 = self.chi_noiser.euler_step(d_t, t_1, denoiser_out["decoded_chis_all"], chis_t_1, pred_seq_probs_1)
+            chis_t_2 = self.chi_noiser.euler_step(
+                d_t,
+                t_1,
+                denoiser_out["decoded_chis_all"],
+                chis_t_1,
+                pred_seq_probs_1
+            )
 
             prot_traj.append(
                 (trans_t_2,
@@ -1167,7 +1197,8 @@ class ProteinSeqMultiChiInterpolation(Task):
             pred_trans_1 = pred_rigids.get_trans()
             pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
             pred_seq_logits = denoiser_out["decoded_seq_logits"]
-            pred_seq_probs_1 = torch.softmax(pred_seq_logits, dim=-1)
+            # pred_seq_probs_1 = torch.softmax(pred_seq_logits, dim=-1)
+            pred_seq_probs_1 = denoiser_out["seq_probs"]
             pred_chis_1 = denoiser_out["decoded_chis"]
 
         argmax_seq = pred_seq_logits.argmax(dim=-1)
@@ -1257,8 +1288,6 @@ class ProteinSeqMultiChiInterpolation(Task):
             gt_hs_vf = self.sidechain_noiser.train_vf(nodewise_t, seq_probs_t, seq_probs_1)
             seq_vf_loss = torch.square(pred_hs_vf - gt_hs_vf).sum(dim=-1)
             seq_vf_loss = _nodewise_to_graphwise(seq_vf_loss, res_data.batch, res_data.seq_mask & res_data.seq_noising_mask)
-            if self.sidechain_noiser.sample_sched == "linear":
-                seq_vf_loss = seq_vf_loss * 0.01
         else:
             seq_vf_loss = autoenc_loss_dict["seq_loss"]
 

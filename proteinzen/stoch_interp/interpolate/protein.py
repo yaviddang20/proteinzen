@@ -87,7 +87,8 @@ class ProteinFisherInterpolant:
                  train_sched="linear",
                  train_c=1,
                  sample_sched="linear",
-                 sample_c=1):
+                 sample_c=1,
+                 dirichlet_bridge_concentration=None):
         self._cfg = se3_cfg
         self.se3_noiser = SE3Interpolant(
             se3_cfg,
@@ -97,8 +98,10 @@ class ProteinFisherInterpolant:
             train_sched=train_sched,
             train_c=train_c,
             sample_sched=sample_sched,
-            sample_c=sample_c
+            sample_c=sample_c,
+            dirichlet_bridge_conc=dirichlet_bridge_concentration
         )
+
 
 class ProteinFisherMultiChiInterpolant:
     """ Wrapper for SE3Interpolant and DirichletInterpolant """

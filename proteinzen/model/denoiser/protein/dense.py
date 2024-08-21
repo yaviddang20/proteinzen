@@ -1,0 +1,567 @@
+import torch
+import math
+import torch.nn as nn
+import torch.nn.functional as F
+
+import functools as fn
+
+from proteinzen.data.datasets.featurize.common import _rbf
+from proteinzen.model.modules.openfold.layers import Linear, InvariantPointAttention, StructureModuleTransition, BackboneUpdate
+from proteinzen.model.modules.openfold.layers import LocalTriangleAttentionNew
+import proteinzen.utils.openfold.rigid_utils as ru
+from proteinzen.utils.openfold.rigid_utils import Rigid, batchwise_center
+from proteinzen.utils.framediff.all_atom import compute_backbone
+
+def get_index_embedding(indices, embed_size, max_len=2056):
+    """Creates sine / cosine positional embeddings from a prespecified indices.
+
+    Args:
+        indices: offsets of size [..., N_edges] of type integer
+        max_len: maximum length.
+        embed_size: dimension of the embeddings to create
+
+    Returns:
+        positional embedding of shape [N, embed_size]
+    """
+    K = torch.arange(embed_size//2, device=indices.device)
+    pos_embedding_sin = torch.sin(
+        indices[..., None] * math.pi / (max_len**(2*K[None]/embed_size))).to(indices.device)
+    pos_embedding_cos = torch.cos(
+        indices[..., None] * math.pi / (max_len**(2*K[None]/embed_size))).to(indices.device)
+    pos_embedding = torch.cat([
+        pos_embedding_sin, pos_embedding_cos], axis=-1)
+    return pos_embedding
+
+
+def get_timestep_embedding(timesteps, embedding_dim, max_positions=10000):
+    # Code from https://github.com/hojonathanho/diffusion/blob/master/diffusion_tf/nn.py
+    assert len(timesteps.shape) == 1
+    timesteps = timesteps * max_positions
+    half_dim = embedding_dim // 2
+    emb = math.log(max_positions) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32, device=timesteps.device) * -emb)
+    emb = timesteps.float()[:, None] * emb[None, :]
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+    if embedding_dim % 2 == 1:  # zero pad
+        emb = F.pad(emb, (0, 1), mode='constant')
+    assert emb.shape == (timesteps.shape[0], embedding_dim)
+    return emb
+
+
+def calc_distogram(pos, min_bin, max_bin, num_bins):
+    dists_2d = torch.linalg.norm(
+        pos[:, :, None, :] - pos[:, None, :, :], axis=-1)[..., None]
+    lower = torch.linspace(
+        min_bin,
+        max_bin,
+        num_bins,
+        device=pos.device)
+    upper = torch.cat([lower[1:], lower.new_tensor([1e8])], dim=-1)
+    dgram = ((dists_2d > lower) * (dists_2d < upper)).type(pos.dtype)
+    return dgram
+
+
+class EdgeTransition(nn.Module):
+    def __init__(
+            self,
+            *,
+            node_embed_size,
+            edge_embed_in,
+            edge_embed_out,
+            num_layers=2,
+            node_dilation=2
+        ):
+        super(EdgeTransition, self).__init__()
+
+        bias_embed_size = node_embed_size // node_dilation
+        self.initial_embed = Linear(
+            node_embed_size, bias_embed_size, init="relu")
+        hidden_size = bias_embed_size * 2 + edge_embed_in
+        trunk_layers = []
+        for _ in range(num_layers):
+            trunk_layers.append(Linear(hidden_size, hidden_size, init="relu"))
+            trunk_layers.append(nn.ReLU())
+        self.trunk = nn.Sequential(*trunk_layers)
+        self.final_layer = Linear(hidden_size, edge_embed_out, init="final")
+        self.layer_norm = nn.LayerNorm(edge_embed_out)
+
+    def forward(self, node_embed, edge_embed):
+        node_embed = self.initial_embed(node_embed)
+        batch_size, num_res, _ = node_embed.shape
+        edge_bias = torch.cat([
+            torch.tile(node_embed[:, :, None, :], (1, 1, num_res, 1)),
+            torch.tile(node_embed[:, None, :, :], (1, num_res, 1, 1)),
+        ], axis=-1)
+        edge_embed = torch.cat(
+            [edge_embed, edge_bias], axis=-1).reshape(
+                batch_size * num_res**2, -1)
+        edge_embed = self.final_layer(self.trunk(edge_embed) + edge_embed)
+        edge_embed = self.layer_norm(edge_embed)
+        edge_embed = edge_embed.reshape(
+            batch_size, num_res, num_res, -1
+        )
+        return edge_embed
+
+
+class TorsionAngles(nn.Module):
+    def __init__(self, c, num_torsions, eps=1e-8):
+        super(TorsionAngles, self).__init__()
+
+        self.c = c
+        self.eps = eps
+        self.num_torsions = num_torsions
+
+        self.linear_1 = Linear(self.c, self.c, init="relu")
+        self.linear_2 = Linear(self.c, self.c, init="relu")
+        # TODO: Remove after published checkpoint is updated without these weights.
+        self.linear_3 = Linear(self.c, self.c, init="final")
+        self.linear_final = Linear(
+            self.c, self.num_torsions * 2, init="final")
+
+        self.relu = nn.ReLU()
+
+    def forward(self, s):
+        s_initial = s
+        s = self.linear_1(s)
+        s = self.relu(s)
+        s = self.linear_2(s)
+
+        s = s + s_initial
+        unnormalized_s = self.linear_final(s)
+        norm_denom = torch.sqrt(
+            torch.clamp(
+                torch.sum(unnormalized_s ** 2, dim=-1, keepdim=True),
+                min=self.eps,
+            )
+        )
+        normalized_s = unnormalized_s / norm_denom
+
+        return unnormalized_s, normalized_s
+
+
+class Embedder(nn.Module):
+
+    def __init__(self,
+                 c_s,
+                 c_latent,
+                 c_z,
+                 index_embed_size=32,
+                 use_init_distogram=False):
+        super(Embedder, self).__init__()
+
+        # Time step embedding
+        t_embed_size = index_embed_size
+        node_embed_dims = t_embed_size + 1 + c_latent
+        edge_in = (t_embed_size + c_latent + 1) * 2
+
+        # Sequence index embedding
+        node_embed_dims += index_embed_size
+        edge_in += index_embed_size
+        edge_in += 22
+
+        self.use_init_distogram = use_init_distogram
+        if use_init_distogram:
+            edge_in += 22
+
+
+        node_embed_size = c_s
+        self.node_embedder = nn.Sequential(
+            nn.Linear(node_embed_dims, node_embed_size),
+            nn.ReLU(),
+            nn.Linear(node_embed_size, node_embed_size),
+            nn.ReLU(),
+            nn.Linear(node_embed_size, node_embed_size),
+            nn.LayerNorm(node_embed_size),
+        )
+
+        edge_embed_size = c_z
+        self.edge_embedder = nn.Sequential(
+            nn.Linear(edge_in, edge_embed_size),
+            nn.ReLU(),
+            nn.Linear(edge_embed_size, edge_embed_size),
+            nn.ReLU(),
+            nn.Linear(edge_embed_size, edge_embed_size),
+            nn.LayerNorm(edge_embed_size),
+        )
+
+        self.timestep_embedder = fn.partial(
+            get_timestep_embedding,
+            embedding_dim=index_embed_size
+        )
+        self.index_embedder = fn.partial(
+            get_index_embedding,
+            embed_size=index_embed_size
+        )
+
+    def _cross_concat(self, feats_1d, num_batch, num_res):
+        return torch.cat([
+            torch.tile(feats_1d[:, :, None, :], (1, 1, num_res, 1)),
+            torch.tile(feats_1d[:, None, :, :], (1, num_res, 1, 1)),
+        ], dim=-1).float().reshape([num_batch, num_res**2, -1])
+
+    def forward(
+            self,
+            *,
+            latent_features,
+            seq_idx,
+            t,
+            fixed_mask,
+            self_conditioning_ca,
+            init_ca=None
+        ):
+        """Embeds a set of inputs
+
+        Args:
+            seq_idx: [..., N] Positional sequence index for each residue.
+            t: Sampled t in [0, 1].
+            fixed_mask: mask of fixed (motif) residues.
+            self_conditioning_ca: [..., N, 3] Ca positions of self-conditioning
+                input.
+
+        Returns:
+            node_embed: [B, N, D_node]
+            edge_embed: [B, N, N, D_edge]
+        """
+        num_batch, num_res = seq_idx.shape
+        node_feats = []
+
+        # Set time step to epsilon=1e-5 for fixed residues.
+        fixed_mask = fixed_mask[..., None]
+        prot_t_embed = torch.tile(
+            self.timestep_embedder(t)[:, None, :], (1, num_res, 1))
+        prot_t_embed = torch.cat([
+            prot_t_embed,
+            fixed_mask,
+            latent_features,
+        ], dim=-1)
+        node_feats = [prot_t_embed]
+        pair_feats = [self._cross_concat(prot_t_embed, num_batch, num_res)]
+
+        # Positional index features.
+        node_feats.append(self.index_embedder(seq_idx))
+        rel_seq_offset = seq_idx[:, :, None] - seq_idx[:, None, :]
+        rel_seq_offset = rel_seq_offset.reshape([num_batch, num_res**2])
+        pair_feats.append(self.index_embedder(rel_seq_offset))
+
+        sc_dgram = calc_distogram(
+            self_conditioning_ca,
+            1e-5,
+            20,
+            22
+        )
+        pair_feats.append(sc_dgram.reshape([num_batch, num_res**2, -1]))
+        if self.use_init_distogram:
+            init_dgram = calc_distogram(
+                init_ca,
+                1e-5,
+                20,
+                22
+            )
+            pair_feats.append(init_dgram.reshape([num_batch, num_res**2, -1]))
+
+
+        node_embed = self.node_embedder(torch.cat(node_feats, dim=-1).float())
+        edge_embed = self.edge_embedder(torch.cat(pair_feats, dim=-1).float())
+        edge_embed = edge_embed.reshape([num_batch, num_res, num_res, -1])
+        return node_embed, edge_embed
+
+
+class IpaScore(nn.Module):
+
+    def __init__(self,
+                 #diffuser,
+                 c_s=256,
+                 c_latent=128,
+                 c_z=128,
+                 c_skip=64,
+                 c_hidden=256,
+                 num_heads=8,
+                 num_qk_points=8,
+                 num_v_points=12,
+                 num_blocks=4,
+                 coordinate_scaling=0.1,
+                 update_edges_with_dist=False,
+                 use_proteus_edge_transition=False,
+                 ):
+        super(IpaScore, self).__init__()
+        # self.diffuser = diffuser
+        self.update_edges_with_dist = update_edges_with_dist
+        self.use_proteus_edge_transition = use_proteus_edge_transition
+
+        self.scale_pos = lambda x: x * coordinate_scaling
+        self.scale_rigids = lambda x: x.apply_trans_fn(self.scale_pos)
+
+        self.unscale_pos = lambda x: x / coordinate_scaling
+        self.unscale_rigids = lambda x: x.apply_trans_fn(self.unscale_pos)
+        self.trunk = nn.ModuleDict()
+
+        self.num_blocks = num_blocks
+
+        for b in range(num_blocks):
+            self.trunk[f'latent_to_node_{b}'] = nn.Sequential(
+                Linear(c_s + c_latent, c_s, init='relu'),
+                nn.ReLU(),
+                Linear(c_s, c_s, init='relu'),
+                nn.ReLU(),
+                Linear(c_s, c_s, init='final'),
+            )
+            self.trunk[f'latent_to_node_ln_{b}'] = nn.LayerNorm(c_s)
+
+            self.trunk[f'ipa_{b}'] = InvariantPointAttention(
+                 c_s=c_s,
+                 c_z=c_z,
+                 c_hidden=c_hidden,
+                 num_heads=num_heads,
+                 num_qk_points=num_qk_points,
+                 num_v_points=num_v_points,
+            )
+            self.trunk[f'ipa_ln_{b}'] = nn.LayerNorm(c_s)
+            self.trunk[f'skip_embed_{b}'] = Linear(
+                c_s,
+                c_skip,
+                init="final"
+            )
+            tfmr_in = c_s + c_skip
+            tfmr_layer = torch.nn.TransformerEncoderLayer(
+                d_model=tfmr_in,
+                nhead=4,
+                dim_feedforward=tfmr_in,
+                batch_first=True,
+                dropout=0.0,
+                norm_first=False
+            )
+            self.trunk[f'seq_tfmr_{b}'] = torch.nn.TransformerEncoder(
+                tfmr_layer, 2)
+            self.trunk[f'post_tfmr_{b}'] = Linear(
+                tfmr_in, c_s, init="final")
+            self.trunk[f'node_transition_{b}'] = StructureModuleTransition(
+                c=c_s)
+            self.trunk[f'bb_update_{b}'] = BackboneUpdate(c_s)
+
+            self.trunk[f'node_to_latent_{b}'] = nn.Sequential(
+                Linear(c_s + c_latent, c_latent, init='relu'),
+                nn.ReLU(),
+                Linear(c_latent, c_latent, init='relu'),
+                nn.ReLU(),
+                Linear(c_latent, c_latent, init='final'),
+            )
+
+            if b < num_blocks-1:
+                # No edge update on the last block.
+                if update_edges_with_dist:
+                    edge_in = c_z + 22
+                else:
+                    edge_in = c_z
+                if self.use_proteus_edge_transition:
+                    self.trunk[f'edge_transition_{b}'] = LocalTriangleAttentionNew(
+                        c_s=c_s,
+                        c_z=c_z,
+                        c_rbf=64,
+                        c_gate_s=16,
+                        c_hidden=128,
+                        c_hidden_mul=128,
+                        no_heads=4,
+                        transition_n=2,
+                        k_neighbour=32,
+                        k_linear=0,
+                        inf=1e9,
+                        pair_dropout=0.25
+                    )
+                else:
+                    self.trunk[f'edge_transition_{b}'] = EdgeTransition(
+                        node_embed_size=c_s,
+                        edge_embed_in=edge_in,
+                        edge_embed_out=c_z,
+                    )
+
+        self.torsion_pred = TorsionAngles(c_s, 1)
+
+    def forward(self, init_node_embed, edge_embed, input_feats):
+        node_mask = input_feats['res_mask'].type(torch.float32)
+        diffuse_mask = (1 - input_feats['fixed_mask'].type(torch.float32)) * node_mask
+        edge_mask = node_mask[..., None] * node_mask[..., None, :]
+        init_frames = input_feats['rigids_t'].type(torch.float32)
+        latent_features = input_feats['noised_latent_features']
+
+        curr_rigids = Rigid.from_tensor_7(torch.clone(init_frames))
+
+        # Main trunk
+        curr_rigids = self.scale_rigids(curr_rigids)
+        init_node_embed = init_node_embed * node_mask[..., None]
+        node_embed = init_node_embed * node_mask[..., None]
+        for b in range(self.num_blocks):
+            latent_embed = self.trunk[f'latent_to_node_{b}'](
+                torch.cat([node_embed, latent_features], dim=-1)
+            )
+            node_embed = self.trunk[f'latent_to_node_ln_{b}'](
+                (latent_embed + node_embed) * node_mask[..., None]
+            )
+
+            ipa_embed = self.trunk[f'ipa_{b}'](
+                node_embed,
+                edge_embed,
+                curr_rigids,
+                node_mask)
+            ipa_embed *= node_mask[..., None]
+            node_embed = self.trunk[f'ipa_ln_{b}'](node_embed + ipa_embed)
+            seq_tfmr_in = torch.cat([
+                node_embed, self.trunk[f'skip_embed_{b}'](init_node_embed)
+            ], dim=-1)
+            seq_tfmr_out = self.trunk[f'seq_tfmr_{b}'](
+                seq_tfmr_in, src_key_padding_mask=1 - node_mask)
+            node_embed = node_embed + self.trunk[f'post_tfmr_{b}'](seq_tfmr_out)
+            node_embed = self.trunk[f'node_transition_{b}'](node_embed)
+            node_embed = node_embed * node_mask[..., None]
+            rigid_update = self.trunk[f'bb_update_{b}'](
+                node_embed * diffuse_mask[..., None])
+            curr_rigids = curr_rigids.compose_q_update_vec(
+                rigid_update * diffuse_mask[..., None])
+
+            latent_update = self.trunk[f'node_to_latent_{b}'](
+                torch.cat([node_embed, latent_features], dim=-1)
+            )
+            latent_features = (latent_update + latent_features) * node_mask[..., None]
+
+            if b < self.num_blocks-1:
+                if self.update_edges_with_dist:
+                    pos = curr_rigids.get_trans()
+                    dists_2d = torch.linalg.norm(
+                        pos[:, :, None, :] - pos[:, None, :, :], axis=-1)
+                    curr_dgram = _rbf(dists_2d, 1e-5, 20, D_count=22, device=dists_2d.device)
+                    edge_embed_in = torch.cat(
+                        [edge_embed, curr_dgram],
+                        dim=-1
+                    )
+                else:
+                    edge_embed_in = edge_embed
+
+                if self.use_proteus_edge_transition:
+                    edge_embed = self.trunk[f'edge_transition_{b}'](
+                        node_embed, edge_embed, curr_rigids, edge_mask)
+                else:
+                    edge_embed = self.trunk[f'edge_transition_{b}'](
+                        node_embed, edge_embed_in)
+                edge_embed *= edge_mask[..., None]
+
+        curr_rigids = self.unscale_rigids(curr_rigids)
+        _, psi_pred = self.torsion_pred(node_embed)
+        model_out = {
+            'psi': psi_pred,
+            'final_rigids': curr_rigids,
+            'final_latent': latent_features,
+            'node_embed': node_embed
+        }
+        return model_out
+
+
+class IpaDenoiser(nn.Module):
+    def __init__(self,
+                 # diffuser,
+                 c_s=256,
+                 c_latent=128,
+                 c_z=128,
+                 c_skip=64,
+                 c_hidden=256,
+                 num_heads=8,
+                 num_qk_points=8,
+                 num_v_points=12,
+                 num_blocks=4,
+                 use_init_dgram=False,
+                 update_edges_with_dgram=False,
+                 use_proteus_transition=False,
+                 ):
+        super().__init__()
+        # some compatibility code
+        self.self_conditioning = True
+        self.lrange_k = 10000
+        self.knn_k = 10000
+        self.lrange_logn_scale = 10000
+        self.lrange_logn_offset = 10000
+        self.c_latent = c_latent
+
+        self.ipa_score = IpaScore(
+            # diffuser,
+            c_s=c_s,
+            c_latent=c_latent,
+            c_z=c_z,
+            c_skip=c_skip,
+            c_hidden=c_hidden,
+            num_heads=num_heads,
+            num_qk_points=num_qk_points,
+            num_v_points=num_v_points,
+            num_blocks=num_blocks,
+            update_edges_with_dist=update_edges_with_dgram,
+            use_proteus_edge_transition=use_proteus_transition
+        )
+        self.embedder = Embedder(
+            c_s=c_s,
+            c_latent=c_latent,
+            c_z=c_z,
+            use_init_distogram=use_init_dgram
+        )
+
+    def forward(self, data, intermediates, self_condition=None):
+        res_data = data['residue']
+        res_mask = (res_data['res_mask']).bool()
+
+        rigids_t = ru.Rigid.from_tensor_7(res_data['rigids_t'])
+        # center the training example at the mean of the x_cas
+        center = ru.batchwise_center(rigids_t, res_data.batch, res_data['res_mask'].bool())
+        rigids_t = rigids_t.translate(-center)
+
+        data_list = data.to_data_list()
+        for d in data_list:
+            assert d.num_nodes == data_list[0].num_nodes
+
+        seq_idx = [torch.arange(data_list[0].num_nodes, device=center.device) for _ in data_list]
+        seq_idx = torch.stack(seq_idx)
+        t = data['t']
+        batch_size = t.shape[0]
+        fixed_mask = torch.zeros_like(res_mask).view(batch_size, -1)
+
+        if self_condition is not None:
+            self_conditioning_ca = self_condition['final_rigids'].get_trans().view(batch_size, -1, 3)
+        else:
+            self_conditioning_ca = torch.zeros_like(rigids_t.get_trans().view(batch_size, -1, 3))
+
+        # center the training example at the mean of the x_cas
+        rigids_t = Rigid.from_tensor_7(res_data['rigids_t'])
+        center = batchwise_center(rigids_t, res_data.batch, res_mask)
+        rigids_t = rigids_t.translate(-center)
+        rigids_t = rigids_t.view([t.shape[0], -1])
+        latent_sidechain_t = intermediates['noised_latent_sidechain'].view(batch_size, -1, self.c_latent)
+
+        node_embed, edge_embed = self.embedder(
+            latent_features=latent_sidechain_t,
+            seq_idx=seq_idx,
+            t=t,
+            fixed_mask=fixed_mask,
+            self_conditioning_ca=self_conditioning_ca,
+            init_ca=rigids_t.get_trans()
+        )
+
+        input_feats = {
+            'fixed_mask': fixed_mask,
+            'res_mask': res_mask.view(batch_size, -1),
+            'rigids_t': rigids_t.to_tensor_7(),
+            't': t,
+            'noised_latent_features': latent_sidechain_t
+        }
+
+        score_dict = self.ipa_score(node_embed, edge_embed, input_feats)
+        rigids = score_dict['final_rigids'].view(-1)
+        rigids = rigids.translate(center)
+
+        psi = score_dict['psi'].view(-1, 2)
+
+        ret = {}
+        ret['denoised_frames'] = rigids
+        ret['final_rigids'] = rigids
+        denoised_bb_items = compute_backbone(rigids.unsqueeze(0), psi.unsqueeze(0))
+        denoised_bb = denoised_bb_items[-1].squeeze(0)[:, :5]
+        ret['denoised_bb'] = denoised_bb
+        # ret['node_features'] = score_dict['node_embed']
+        ret['psi'] = psi
+        ret['pred_latent_sidechain'] = score_dict['final_latent'].view(-1, self.c_latent)
+
+        return ret

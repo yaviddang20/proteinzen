@@ -227,6 +227,7 @@ class TensorProductConvLayer(torch.nn.Module):
             if faster:
                 print("Faster Tensor Product")
                 self.tp = FasterTensorProduct(in_irreps, sh_irreps, out_irreps)
+                # self.tp = torch.compile(self.tp)
             else:
                 self.tp = o3.FullyConnectedTensorProduct(in_irreps, sh_irreps, out_irreps, shared_weights=False)
 

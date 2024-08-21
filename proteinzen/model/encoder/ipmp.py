@@ -8,8 +8,8 @@ from proteinzen.model.modules.layers.node.mpnn import IPMP
 from proteinzen.model.modules.layers.edge.embed import PairwiseAtomicEmbedding
 from proteinzen.data.datasets.featurize.sidechain import _dihedrals, _ideal_virtual_Cb
 from proteinzen.data.datasets.featurize.common import _edge_positional_embeddings, _rbf
-
 from proteinzen.utils.openfold import rigid_utils as ru
+from proteinzen.model.modules.openfold.layers import Linear
 
 
 class IPMPUpdateLayer(nn.Module):
@@ -72,6 +72,7 @@ class IPMPEncoder(nn.Module):
                  c_z=128,
                  c_hidden=256,
                  c_s_in=6,
+                 c_s_out=128,
                  num_rbf=16,
                  num_pos_embed=16,
                  num_layers=4,
@@ -133,8 +134,10 @@ class IPMPEncoder(nn.Module):
             )
             for _ in range(num_layers)
         ])
-        self.output_mu = nn.Linear(c_s, c_s)
-        self.output_logvar = nn.Linear(c_s, c_s)
+        # self.output_mu = nn.Linear(c_s, c_s_out)
+        self.output_mu = Linear(c_s, c_s_out, init='final')
+        # self.output_logvar = nn.Linear(c_s, c_s_out)
+        self.output_logvar = nn.Linear(c_s, c_s_out)
 
         self.k = k
 

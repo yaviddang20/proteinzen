@@ -181,3 +181,67 @@ def residue_knn_neighborhood_atomic_dist_loss(gt_ref_atom14,
     )
 
     return batchwise_dist_ses / norm
+
+
+def smooth_lddt_loss(
+    pred_atom14,
+    gt_atom14,
+    alt_atom14,
+    batch,
+    atom14_mask,
+    eps=1e-8,
+):
+    """ smooth_lddt_loss from AlphaFold3
+
+    Args:
+        pred_atom14 (_type_): _description_
+        gt_atom14 (_type_): _description_
+        alt_atom14 (_type_): _description_
+        batch (_type_): _description_
+        atom14_mask (_type_): _description_
+        r (int, optional): _description_. Defaults to 6.
+        eps (_type_, optional): _description_. Defaults to 1e-6.
+        max_num_neighbors (int, optional): _description_. Defaults to 100.
+
+    Returns:
+        _type_: _description_
+    """
+    res_mask = atom14_mask[:, 1]
+    # re: ambiguous atom14 naming
+    # im gonna use a heuristic for the ref atom14
+    # where we'll just take the ref residue atom ordering
+    # as the one which is lowest in rmsd to the predicted structure
+    # in a lot of cases this probably won't hold but it will at least work
+    # in low rmsd regimes i think
+    with torch.no_grad():
+        pred_gt_diff = torch.square(pred_atom14 - gt_atom14).sum(dim=-1)
+        pred_alt_diff = torch.square(pred_atom14 - alt_atom14).sum(dim=-1)
+        pred_gt_mse = torch.sum(pred_gt_diff * atom14_mask, dim=-1)
+        pred_alt_mse = torch.sum(pred_alt_diff * atom14_mask, dim=-1)
+
+        gt_over_alt = pred_gt_mse < pred_alt_mse
+        ref_atom14 = gt_atom14 * gt_over_alt[..., None, None] + alt_atom14 * ~gt_over_alt[..., None, None]
+
+    flat_ref_atom14 = ref_atom14[atom14_mask]
+    flat_pred_atom14 = pred_atom14[atom14_mask]
+    batch_expand = batch[..., None].expand(-1, atom14_mask.shape[-1])[atom14_mask]
+    smooth_lddt = []
+    for i in range(batch_expand.max()+1):
+        select = (batch_expand == i)
+        ref_atom14_i = flat_ref_atom14[select]
+        pred_atom14_i = flat_pred_atom14[select]
+        pred_atom14_dists = torch.cdist(pred_atom14_i[None], pred_atom14_i[None], p=2).squeeze(0)
+        ref_atom14_dists = torch.cdist(ref_atom14_i[None], ref_atom14_i[None], p=2).squeeze(0)
+        abs_dev = torch.abs(pred_atom14_dists - ref_atom14_dists + eps)
+        lddt = 0.25 * (
+            torch.sigmoid(0.5 - abs_dev)
+            + torch.sigmoid(1 - abs_dev)
+            + torch.sigmoid(2 - abs_dev)
+            + torch.sigmoid(4 - abs_dev)
+        )
+        mask = 1 - torch.eye(lddt.shape[0], device=lddt.device)
+        radius_mask = (ref_atom14_dists < 15)
+        smooth_lddt.append(
+            torch.sum(lddt * mask * radius_mask) / torch.sum(mask)
+        )
+    return 1 - torch.stack(smooth_lddt)
