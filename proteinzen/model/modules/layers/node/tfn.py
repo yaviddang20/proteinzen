@@ -384,6 +384,114 @@ class TensorProductAggLayer(torch.nn.Module):
         return out
 
 
+class TensorProductBroadcastLayer(torch.nn.Module):
+    def __init__(self,
+                 in_irreps,
+                 sh_irreps,
+                 out_irreps,
+                 n_edge_features,
+                 residual=True,
+                 batch_norm=True,
+                 dropout=0.0,
+                 hidden_features=None,
+                 faster=False,
+                 tp_weights_layers=2,
+                 activation='relu',
+                 depthwise=False):
+        super(TensorProductBroadcastLayer, self).__init__()
+        self.in_irreps = in_irreps
+        self.out_irreps = out_irreps
+        self.sh_irreps = sh_irreps
+        self.residual = residual
+        self.out_size = irrep_to_size(out_irreps)
+        self.depthwise = depthwise
+        if hidden_features is None:
+            hidden_features = n_edge_features
+
+        if depthwise:
+            in_irreps = o3.Irreps(in_irreps)
+            sh_irreps = o3.Irreps(sh_irreps)
+            out_irreps = o3.Irreps(out_irreps)
+
+            irreps_mid = []
+            instructions = []
+            for i, (mul, ir_in) in enumerate(in_irreps):
+                for j, (_, ir_edge) in enumerate(sh_irreps):
+                    for ir_out in ir_in * ir_edge:
+                        if ir_out in out_irreps:
+                            k = len(irreps_mid)
+                            irreps_mid.append((mul, ir_out))
+                            instructions.append((i, j, k, "uvu", True))
+
+            # We sort the output irreps of the tensor product so that we can simplify them
+            # when they are provided to the second o3.Linear
+            irreps_mid = o3.Irreps(irreps_mid)
+            irreps_mid, p, _ = irreps_mid.sort()
+
+            # Permute the output indexes of the instructions to match the sorted irreps:
+            instructions = [
+                (i_in1, i_in2, p[i_out], mode, train)
+                for i_in1, i_in2, i_out, mode, train in instructions
+            ]
+
+            self.tp = o3.TensorProduct(
+                in_irreps,
+                sh_irreps,
+                irreps_mid,
+                instructions,
+                shared_weights=False,
+                internal_weights=False,
+            )
+
+            self.linear_2 = o3.Linear(
+                # irreps_mid has uncoallesed irreps because of the uvu instructions,
+                # but there's no reason to treat them seperately for the Linear
+                # Note that normalization of o3.Linear changes if irreps are coallesed
+                # (likely for the better)
+                irreps_in=irreps_mid.simplify(),
+                irreps_out=out_irreps,
+                internal_weights=True,
+                shared_weights=True,
+            )
+
+        else:
+            if faster:
+                print("Faster Tensor Product")
+                self.tp = FasterTensorProduct(in_irreps, sh_irreps, out_irreps)
+            else:
+                self.tp = o3.FullyConnectedTensorProduct(in_irreps, sh_irreps, out_irreps, shared_weights=False)
+
+        self.fc = FCBlock(n_edge_features, hidden_features, self.tp.weight_numel, tp_weights_layers, dropout, activation)
+        self.batch_norm = BatchNorm(out_irreps) if batch_norm else None
+
+
+    def forward(self,
+                src_node_attr,
+                bcast_node_attr,
+                bcast_index,
+                edge_attr,
+                edge_sh,
+                edge_weight=1.0):
+        _device = src_node_attr.device
+        _dtype = src_node_attr.dtype
+        out_irreps = self.fc(edge_attr).to(_device).to(_dtype)
+        out_irreps.mul_(edge_weight)
+        out = self.tp(src_node_attr[bcast_index], edge_sh, out_irreps)
+
+        if self.depthwise:
+            out = self.linear_2(out)
+
+        if self.batch_norm:
+            out = self.batch_norm(out)
+
+        if self.residual:
+            padded = F.pad(bcast_node_attr, (0, out.shape[-1] - bcast_node_attr.shape[-1]))
+            out = out + padded
+
+        out = out.to(_dtype)
+        return out
+
+
 
 # class SeparableS2Activation(nn.Module):
 #     def __init__(self, irreps, grid_res=10):

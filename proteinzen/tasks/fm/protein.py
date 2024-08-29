@@ -43,7 +43,14 @@ class ProteinInterpolation(Task):
                  pt_clash_loss_t=1.1,
                  kl_strength=0,#1e-6,
                  rescale_kl_noise=False,
-                 use_smooth_lddt=False):
+                 use_smooth_lddt=False,
+                 t_clip_se3=0.9,
+                 t_clip_aa=0.9,
+                 disable_bb_aux_loss=False,
+                 vae_seq_masking=False,
+                 vae_loss=True,
+                 vae_seq_loss=True,
+                 train_vae_only=False):
         super().__init__()
         self.se3_noiser = protein_noiser.se3_noiser
         self.sidechain_noiser = protein_noiser.sidechain_noiser
@@ -54,14 +61,28 @@ class ProteinInterpolation(Task):
         self.kl_strength = kl_strength
         self.rescale_kl_noise = rescale_kl_noise
         self.use_smooth_lddt = use_smooth_lddt
+        self.t_clip_se3 = t_clip_se3
+        self.t_clip_aa = t_clip_aa
+        self.disable_bb_aux_loss = disable_bb_aux_loss
+        self.vae_seq_masking = vae_seq_masking
+        self.vae_loss = vae_loss
+        self.vae_seq_loss = vae_seq_loss
+
+        self.train_vae_only = train_vae_only
 
     def _gen_diffuse_mask(self, data: HeteroData):
         return torch.ones_like(data['res_mask']).bool()
-        # if self.rng.random() > 0.25:
-        #     return torch.ones_like(data['res_mask']).bool()
-        # else:
-        #     percent = self.rng.random()
-        #     return torch.rand(data['res_mask'].shape, device=data['res_mask'].device) > percent
+
+    def _gen_seq_noising_mask(self, data: HeteroData):
+        # return torch.zeros_like(data['res_mask']).bool()
+        select_noising_scheme = self.rng.random()
+        if select_noising_scheme < 0.25:
+            return torch.ones_like(data['res_mask']).bool()
+        elif select_noising_scheme > 0.75:
+            return torch.zeros_like(data['res_mask']).bool()
+        else:
+            percent = self.rng.random()
+            return torch.rand(data['res_mask'].shape, device=data['res_mask'].device) > percent
 
     def process_input(self, data: HeteroData):
         data = copy.deepcopy(data)
@@ -86,11 +107,13 @@ class ProteinInterpolation(Task):
         diffuse_mask = self._gen_diffuse_mask(res_data)
         res_data['noising_mask'] = diffuse_mask
         res_data['res_noising_mask'] = diffuse_mask
-        res_data['seq_noising_mask'] = diffuse_mask
+        if self.vae_seq_masking:
+            res_data['seq_noising_mask'] = self._gen_seq_noising_mask(res_data)
+        else:
+            res_data['seq_noising_mask'] = diffuse_mask
         res_data['mlm_mask'] = ~diffuse_mask
         res_data['x'] = rigids_1.get_trans()  # for HeteroData's sake
         res_data['rigids_1'] = rigids_1.to_tensor_7()
-        ##  noise data
 
         # compute sidechain features
         ## generate data dict
@@ -111,7 +134,15 @@ class ProteinInterpolation(Task):
         diff_feats_t = tree.map_structure(
             lambda x: torch.as_tensor(x),
             diff_feats_t)
+
+        # redundant for convenience
+        diff_feats_t['atom14'] = chain_feats['atom14_gt_positions']
+        diff_feats_t['atom14_mask'] = chain_feats['atom14_gt_exists']
         res_data.update(diff_feats_t)
+
+        # noising masks
+        res_data['atom14_noising_mask'] = res_data['atom14_mask']
+
         data = self.se3_noiser.corrupt_batch(data)
 
         return data
@@ -122,7 +153,7 @@ class ProteinInterpolation(Task):
 
     def _run_model(self, model, inputs, self_conditioning=None, pt_use_gt_seq=True):
         # generate latent sidechains
-        latent_data = model.encoder(inputs)
+        latent_data = model.encoder(inputs, apply_noising_masks=self.vae_seq_masking)
 
         ## sample only if we're training
         if not isinstance(latent_data, dict):
@@ -175,35 +206,39 @@ class ProteinInterpolation(Task):
         # decoder
         decoder_outputs = model.decoder(inputs, latent_data)
 
-        # fm
-        noised_latent_data = self.sidechain_noiser.corrupt_batch(
-            inputs,
-            latent_data,
-        )
-        latent_outputs = model.denoiser(inputs, noised_latent_data, self_condition=self_conditioning)
-
-        if self.compute_passthrough:
-            # compute passthrough outputs
-            passthrough_inputs = copy.copy(inputs)
-            passthrough_inputs['residue']['rigids_1'] = latent_outputs['final_rigids'].to_tensor_7()
-            passthrough_inputs['residue']['x'] = latent_outputs['final_rigids'].get_trans()
-            passthrough_inputs['residue']['bb'] = latent_outputs['denoised_bb'][:, :4]
-            passthrough_latent = {
-                self.sidechain_x_1_key: latent_outputs[self.sidechain_x_1_pred_key]
-            }
-            passthrough_outputs = model.decoder(
-                passthrough_inputs,
-                passthrough_latent,
-                t=inputs['t'],
-                use_gt_seq=pt_use_gt_seq)
-            passthrough_outputs.update(noised_latent_data)
-            passthrough_outputs.update(latent_data)
-        else:
+        if self.train_vae_only:
+            latent_outputs = latent_data
             passthrough_outputs = None
+        else:
+            # fm
+            noised_latent_data = self.sidechain_noiser.corrupt_batch(
+                inputs,
+                latent_data,
+            )
+            latent_outputs = model.denoiser(inputs, noised_latent_data, self_condition=self_conditioning)
 
-        # update outputs for loss calculation
-        latent_outputs.update(noised_latent_data)
-        latent_outputs.update(latent_data)
+            if self.compute_passthrough:
+                # compute passthrough outputs
+                passthrough_inputs = copy.copy(inputs)
+                passthrough_inputs['residue']['rigids_1'] = latent_outputs['final_rigids'].to_tensor_7()
+                passthrough_inputs['residue']['x'] = latent_outputs['final_rigids'].get_trans()
+                passthrough_inputs['residue']['bb'] = latent_outputs['denoised_bb'][:, :4]
+                passthrough_latent = {
+                    self.sidechain_x_1_key: latent_outputs[self.sidechain_x_1_pred_key]
+                }
+                passthrough_outputs = model.decoder(
+                    passthrough_inputs,
+                    passthrough_latent,
+                    t=inputs['t'],
+                    use_gt_seq=pt_use_gt_seq)
+                passthrough_outputs.update(noised_latent_data)
+                passthrough_outputs.update(latent_data)
+            else:
+                passthrough_outputs = None
+
+            # update outputs for loss calculation
+            latent_outputs.update(noised_latent_data)
+            latent_outputs.update(latent_data)
 
         return latent_outputs, decoder_outputs, passthrough_outputs
 
@@ -212,12 +247,13 @@ class ProteinInterpolation(Task):
         self.se3_noiser.set_device(device)
         self.sidechain_noiser.set_device(device)
         # TODO: should this be a separate flag?
-        if model.self_conditioning and np.random.uniform() > 0.5:
+        if not self.train_vae_only and model.self_conditioning and np.random.uniform() > 0.5:
             with torch.no_grad():
                 self_conditioning, _, sc_pt_outputs = self._run_model(model, inputs, pt_use_gt_seq=False)
                 self_conditioning.update(sc_pt_outputs)
         else:
             self_conditioning = None
+
         denoiser_output, design_output, pt_outputs = self._run_model(model, inputs, self_conditioning)
         denoiser_output.update(design_output)
         denoiser_output["pt_outputs"] = pt_outputs
@@ -311,7 +347,11 @@ class ProteinInterpolation(Task):
                 pred_trans_1 = pred_rigids.get_trans()
                 pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
                 pred_psis = denoiser_out['psi'].detach().cpu()
+
+                # denoiser_out[self.sidechain_x_1_pred_key] = torch.zeros_like(denoiser_out[self.sidechain_x_1_pred_key])
+
                 pred_latent_sidechain = denoiser_out[self.sidechain_x_1_pred_key].detach()
+
 
                 latent_output = {
                     self.sidechain_x_1_key: pred_latent_sidechain
@@ -374,6 +414,8 @@ class ProteinInterpolation(Task):
             trans_t_2 = self.se3_noiser._trans_euler_step(d_t, t_1, pred_trans_1, trans_t_1)
             rotmats_t_2 = self.se3_noiser._rots_euler_step(d_t, t_1, pred_rotmats_1, rotmats_t_1)
             sidechain_t_2 = self.sidechain_noiser._euler_step(d_t, t_1, pred_latent_sidechain, sidechain_t_1)
+
+            # sidechain_t_2 = torch.randn_like(sidechain_t_2) * 10
 
             atom14_t_2 = all_atom.compute_backbone(
                 ru.Rigid(
@@ -485,57 +527,79 @@ class ProteinInterpolation(Task):
 
 
     def compute_loss(self, inputs, outputs: Dict):
-        t_clip_max = 0.9
-        bb_frame_diffusion_loss_dict = bb_frame_fm_loss(
-            inputs, outputs, sep_rot_loss=True)
+        if not self.train_vae_only:
+            bb_frame_diffusion_loss_dict = bb_frame_fm_loss(
+                inputs, outputs, sep_rot_loss=True,
+                t_norm_clip=self.t_clip_se3)
+            latent_loss_dict = latent_scalar_sidechain_fm_loss(
+                inputs,
+                outputs,
+                scale=1 #0.1
+            )
+            bb_denoising_loss = (
+                bb_frame_diffusion_loss_dict["trans_vf_loss"] +
+                bb_frame_diffusion_loss_dict["rot_vf_loss"]
+            )
+            bb_denoising_finegrain_loss = (
+                bb_frame_diffusion_loss_dict["scaled_pred_bb_mse"]
+                + bb_frame_diffusion_loss_dict["scaled_dist_mat_loss"]
+            ) * (inputs['t'] > self.aux_loss_t_min)
+            bb_denoising_finegrain_loss = bb_denoising_finegrain_loss * (not self.disable_bb_aux_loss)
+
+            latent_denoising_loss = latent_loss_dict["latent_fm_loss"]
+
+            with torch.no_grad():
+                frameflow_bb_frame_diffusion_loss_dict = bb_frame_fm_loss(
+                    inputs, outputs, sep_rot_loss=True,
+                    t_norm_clip=0.9)
+                frameflow_bb_denoising_loss = (
+                    frameflow_bb_frame_diffusion_loss_dict["trans_vf_loss"] +
+                    frameflow_bb_frame_diffusion_loss_dict["rot_vf_loss"]
+                )
+                frameflow_bb_denoising_finegrain_loss = (
+                    frameflow_bb_frame_diffusion_loss_dict["scaled_pred_bb_mse"]
+                    + frameflow_bb_frame_diffusion_loss_dict["scaled_dist_mat_loss"]
+                ) * (inputs['t'] > self.aux_loss_t_min)
+                frameflow_loss = (frameflow_bb_denoising_loss + 0.25 * frameflow_bb_denoising_finegrain_loss).mean()
+        else:
+            bb_frame_diffusion_loss_dict = {}
+            latent_loss_dict = {}
+            bb_denoising_loss = 0
+            bb_denoising_finegrain_loss = 0
+            latent_denoising_loss = 0
+            frameflow_loss = 0
+
+
         autoenc_loss_dict = autoencoder_losses(
-            inputs, outputs, use_smooth_lddt=self.use_smooth_lddt
+            inputs, outputs, use_smooth_lddt=self.use_smooth_lddt,
+            t_norm_clip=self.t_clip_aa,
+            apply_seq_noising_mask=self.vae_seq_masking
         )
-        latent_loss_dict = latent_scalar_sidechain_fm_loss(
-            inputs,
-            outputs,
-            scale=1 #0.1
-        )
-
-        # outputs["decoded_atom14_gt_seq"] = inputs["residue"]["atom14_gt_positions"]
-        # autoenc_loss_dict = autoencoder_losses(
-        #     inputs, outputs
-        # )
-        # print(autoenc_loss_dict)
-        # exit()
-
-        bb_denoising_loss = (
-            bb_frame_diffusion_loss_dict["trans_vf_loss"] +
-            bb_frame_diffusion_loss_dict["rot_vf_loss"]
-        )
-        bb_denoising_finegrain_loss = (
-            bb_frame_diffusion_loss_dict["scaled_pred_bb_mse"]
-            + bb_frame_diffusion_loss_dict["scaled_dist_mat_loss"]
-        ) * (inputs['t'] > self.aux_loss_t_min)
 
         vae_loss = (
             autoenc_loss_dict["atom14_mse"]
-            + autoenc_loss_dict["sidechain_dists_mse"]
+            + autoenc_loss_dict["sidechain_dists_mse"] * (not self.use_smooth_lddt)
             # + autoenc_loss_dict["pred_sidechain_clash_loss"]
-            + autoenc_loss_dict["seq_loss"]
+            + autoenc_loss_dict["seq_loss"] * self.vae_seq_loss
             + autoenc_loss_dict["chi_loss"]
             + autoenc_loss_dict["kl_div"] * self.kl_strength
             + autoenc_loss_dict["smooth_lddt"]
         )
-        latent_denoising_loss = latent_loss_dict["latent_fm_loss"]
         # latent_denoising_loss = latent_loss_dict["latent_denoising_loss"] * 0.01
 
-        if self.compute_passthrough:
+        if not self.train_vae_only and self.compute_passthrough:
             pt_outputs = outputs["pt_outputs"]
             assert pt_outputs is not None
             pt_loss_dict = autoencoder_losses(
-                inputs, pt_outputs, use_smooth_lddt=self.use_smooth_lddt
+                inputs, pt_outputs, use_smooth_lddt=self.use_smooth_lddt,
+                t_norm_clip=self.t_clip_aa,
+                apply_seq_noising_mask=False
             )
-            norm = 1 - torch.min(inputs['t'], torch.as_tensor(t_clip_max))
+            norm = 1 - torch.min(inputs['t'], torch.as_tensor(self.t_clip_aa))
             pt_abs_pos_loss = (
-                pt_loss_dict["atom14_mse"]
-                + pt_loss_dict["sidechain_dists_mse"]
-                + pt_loss_dict["smooth_lddt"]
+                pt_loss_dict["scaled_atom14_mse"]
+                + pt_loss_dict["sidechain_dists_mse"] * (not self.use_smooth_lddt)
+                + pt_loss_dict["smooth_lddt"] / (norm ** 2)
                 # + pt_loss_dict["chi_loss"]
                 # + pt_loss_dict["seq_loss"]
             ) * (inputs['t'] > self.aux_loss_t_min)
@@ -546,7 +610,7 @@ class ProteinInterpolation(Task):
                 + pt_loss_dict["seq_loss"]
             )
             pt_loss = (
-                pt_abs_pos_loss * 0.01 / (norm ** 2)
+                pt_abs_pos_loss
                 + pt_rel_pos_loss
                 + (inputs['t'] > self.pt_clash_loss_t) * pt_loss_dict['pred_sidechain_clash_loss']
             )
@@ -560,11 +624,11 @@ class ProteinInterpolation(Task):
             bb_denoising_loss
             + latent_denoising_loss
             + 0.25 * bb_denoising_finegrain_loss
-            + vae_loss
+            + vae_loss * self.vae_loss
             + pt_loss
         ).mean()
 
-        loss_dict = {"loss": loss, "frameflow_loss": (bb_denoising_loss + 0.25 * bb_denoising_finegrain_loss).mean()}
+        loss_dict = {"loss": loss, "frameflow_loss": frameflow_loss}
         loss_dict.update(bb_frame_diffusion_loss_dict)
         loss_dict.update(autoenc_loss_dict)
         loss_dict.update(latent_loss_dict)
@@ -788,9 +852,9 @@ class ProteinSeqInterpolation(Task):
             seq_probs_t_2 = self.sidechain_noiser.euler_step(
                 d_t,
                 t[res_data.batch],
-                pred_seq_probs_1,
-                seq_probs_t_1,
-                res_data.batch)
+                seq_probs_1=pred_seq_probs_1,
+                seq_probs_t=seq_probs_t_1,
+                batch=res_data.batch)
 
             prot_traj.append(
                 (trans_t_2,

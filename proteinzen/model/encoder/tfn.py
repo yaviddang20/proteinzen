@@ -12,11 +12,12 @@ import e3nn
 from e3nn import o3
 
 
-from proteinzen.model.modules.layers.node.tfn import TensorProductConvLayer, TensorProductAggLayer
+from proteinzen.model.modules.layers.node.tfn import TensorProductConvLayer, TensorProductAggLayer, TensorProductBroadcastLayer
 from proteinzen.model.modules.common import GaussianRandomFourierBasis
 from proteinzen.model.modules.openfold.layers import StructureModuleTransition, Linear
 from proteinzen.model.utils.graph import sample_inv_cubic_edges
 from proteinzen.model.utils.atomic import gen_bond_graph
+from proteinzen.data.openfold.residue_constants import resname_to_idx
 from proteinzen.data.constants.atom14 import atom14_atom_props, atom14_bond_props
 from proteinzen.data.datasets.featurize.common import _edge_positional_embeddings, _rbf
 from proteinzen.data.datasets.featurize.sidechain import _dihedrals, _ideal_virtual_Cb
@@ -41,7 +42,8 @@ class JointConvLayer(nn.Module):
                  atom_out_irreps,
                  res_out_irreps,
                  h_edge,
-                 res_h_mult_factor):
+                 res_h_mult_factor,
+                 broadcast=False):
         super().__init__()
         res_h_edge = h_edge * res_h_mult_factor
 
@@ -67,6 +69,15 @@ class JointConvLayer(nn.Module):
             res_h_edge,
             faster=True
         )
+        self.broadcast = broadcast
+        if self.broadcast:
+            self.bcast_conv = TensorProductBroadcastLayer(
+                res_out_irreps,
+                sh_irreps,
+                atom_out_irreps,
+                h_edge,
+                faster=True
+            )
 
     def forward(self, data_dict):
         atom_features = self.atom_conv(
@@ -91,6 +102,14 @@ class JointConvLayer(nn.Module):
             edge_attr=data_dict['res_edge_features'],
             edge_sh=data_dict['res_edge_sh']
         )
+        if self.broadcast:
+            atom_features = self.bcast_conv(
+                src_node_attr=res_features,
+                bcast_node_attr=atom_features,
+                bcast_index=data_dict['atom_res_batch'],
+                edge_attr=data_dict['bcast_edge_features'],
+                edge_sh=data_dict['bcast_edge_sh']
+            )
         return atom_features, res_features
 
 
@@ -117,6 +136,9 @@ class ProteinAtomicEmbedder(nn.Module):
         reduce_pseudoscalars=False,
         dropout=0.0,
         lrange_graph=False,
+        broadcast_to_atoms=False,
+        smooth_nodewise=False,
+        use_masking_features=False,
     ):
         super().__init__()
         assert n_layers > 4
@@ -140,6 +162,9 @@ class ProteinAtomicEmbedder(nn.Module):
         self.agg_r = agg_r
         self.knn_k = knn_k
         self.res_D_max = res_D_max
+        self.use_masking_features = use_masking_features
+        if use_masking_features:
+            atom_in = atom_in + 1
 
         self.time_embed = GaussianRandomFourierBasis(n_basis=num_timestep//2)
 
@@ -184,6 +209,8 @@ class ProteinAtomicEmbedder(nn.Module):
         self.res_nv = res_nv
 
         res_in = num_aa + num_timestep
+        if use_masking_features:
+            res_in = res_in + 1
         self.res_embed = nn.Sequential(
             nn.Linear(res_in, res_ns),
             nn.ReLU(),
@@ -209,11 +236,24 @@ class ProteinAtomicEmbedder(nn.Module):
                     atom_out_irreps=atom_irrep_seq[i+1],
                     res_out_irreps=res_irrep_seq[i+1],
                     h_edge=h_edge,
-                    res_h_mult_factor=res_h_mult_factor
+                    res_h_mult_factor=res_h_mult_factor,
+                    broadcast=broadcast_to_atoms
                 )
                 for i in range(len(atom_irrep_seq)-1)
             ]
         )
+
+        if smooth_nodewise:
+            self.smooth = TensorProductConvLayer(
+                in_irreps=res_irrep_seq[-1],
+                sh_irreps=self.sh_irreps,
+                out_irreps=res_irrep_seq[-1],
+                n_edge_features=res_h_mult_factor * h_edge,
+                faster=True,
+                residual=False
+            )
+        else:
+            self.smooth = None
 
         if h_frame is not None:
             self.to_frame_scalars = nn.Linear(
@@ -241,7 +281,8 @@ class ProteinAtomicEmbedder(nn.Module):
         edge_dist = torch.linalg.vector_norm(edge_vecs + eps, dim=-1)
         edge_rbf = _rbf(edge_dist, D_max=self.agg_r, D_count=self.atomic_num_rbf, device=edge_dist.device)
         edge_sh = o3.spherical_harmonics(self.sh_irreps, edge_vecs, normalize=True, normalization='component')
-        return edge_rbf, edge_sh
+        rev_edge_sh = o3.spherical_harmonics(self.sh_irreps, -edge_vecs, normalize=True, normalization='component')
+        return edge_rbf, edge_sh, rev_edge_sh
 
     def _gen_initial_features(self,
                               data,
@@ -252,11 +293,15 @@ class ProteinAtomicEmbedder(nn.Module):
 
         res_data = data['residue']
         atom14 = res_data['atom14_gt_positions'].float()
+        atom14 = atom14.clone()
+        # atom14[:, 4:] = 0
         atom14_mask = res_data['atom14_gt_exists'].bool()
         seq_mask = res_data['seq_mask'].bool()
         atom14_mask[seq_mask, 4:] = False
         if apply_noising_masks:
-            atom14_mask = atom14_mask & ~res_data['atom14_noising_mask']
+            atom14_noising_mask = res_data['atom14_noising_mask'].clone().bool()
+            atom14_noising_mask[:, 5:] &= res_data['seq_noising_mask'][..., None]
+            atom14_mask = atom14_mask & atom14_noising_mask & res_data['res_noising_mask'][..., None]
         atom_coords = atom14[atom14_mask]
         seq = res_data['seq']
         t = data['t']
@@ -271,11 +316,14 @@ class ProteinAtomicEmbedder(nn.Module):
         seq_one_hot = F.one_hot(seq, num_classes=self.num_aa) * res_data['seq_mask'][..., None]
         if apply_noising_masks:
             seq_one_hot = seq_one_hot * res_data['seq_noising_mask'][..., None]
+            # print(seq_one_hot.sum(dim=-1))
 
         res_features = [
             seq_one_hot,
             self.time_embed(reswise_t[..., None]) * ablate_timestep
         ]
+        if self.use_masking_features:
+            res_features.append(res_data['seq_noising_mask'][..., None])
         res_features = torch.cat(res_features, dim=-1)
 
         if self.lrange_graph:
@@ -305,14 +353,26 @@ class ProteinAtomicEmbedder(nn.Module):
         )
         res_features = self.res_embed(res_features)
 
-        bond_graph = gen_bond_graph(seq, atom14_mask, res_data.batch)
+        # we do this so we don't give away
+        # whether or not the masked residue is a gly or not
+        # (the C-alpha atomic embedding changes which can be picked up on by the network)
+        all_ala = torch.full_like(seq, resname_to_idx['ALA'])
+        ala_masked_seq = all_ala * (~res_data['seq_noising_mask']) + seq * res_data['seq_noising_mask']
+
+        bond_graph = gen_bond_graph(ala_masked_seq, atom14_mask, res_data.batch)
         atom_features = bond_graph['atom_props'].float()
+        if self.use_masking_features:
+            seq_noising_mask = res_data['seq_noising_mask']
+            atom_noising_mask = seq_noising_mask[bond_graph['atom_res_batch']]
+            atom_features = torch.cat([
+                atom_features, atom_noising_mask[..., None]
+            ], dim=-1)
         bond_features = bond_graph['bond_props'].float()
         bond_edge_index = bond_graph["bond_edge_index"]
         radius_edge_index = radius_graph(atom_coords, self.atomic_r, bond_graph['atom_batch'])
         atom_res_batch = bond_graph['atom_res_batch']
 
-        agg_rbf_features, agg_edge_sh = self._agg_edge_rbf_features(atom_coords, X_ca, atom_res_batch)
+        agg_rbf_features, agg_edge_sh, bcast_edge_sh = self._agg_edge_rbf_features(atom_coords, X_ca, atom_res_batch)
         radius_rbf_features, radius_edge_sh = self._edge_rbf_features(
             atom_coords,
             radius_edge_index,
@@ -366,6 +426,7 @@ class ProteinAtomicEmbedder(nn.Module):
             "bond_features": bond_features,
             "radius_edge_features": radius_edge_features,
             "agg_edge_features": agg_edge_features,
+            "bcast_edge_features": agg_edge_features,
             "res_edge_features": res_edge_features,
             "bond_edge_index": bond_edge_index,
             "radius_edge_index": radius_edge_index,
@@ -373,6 +434,7 @@ class ProteinAtomicEmbedder(nn.Module):
             "res_edge_index": res_edge_index,
             "atom_res_batch": atom_res_batch,
             "agg_edge_sh": agg_edge_sh,
+            "bcast_edge_sh": bcast_edge_sh,
             "radius_edge_sh": radius_edge_sh,
             "bond_sh": bond_sh,
             "atom_edge_sh": atom_edge_sh,
@@ -386,15 +448,33 @@ class ProteinAtomicEmbedder(nn.Module):
                 zero_timestep=False,
                 apply_noising_masks=False,
     ):
+        if apply_noising_masks:
+            assert self.use_masking_features
         data_dict = self._gen_initial_features(
             data,
             ablate_timestep=ablate_timestep,
             zero_timestep=zero_timestep,
-            apply_noising_masks=False,
+            apply_noising_masks=apply_noising_masks,
         )
+        # print(
+        #     data_dict['atom_coords'].shape,
+        #     data_dict['atom_features'].shape,
+        #     data_dict['res_features'].shape,
+        #     data_dict['bond_features'].shape,
+        #     data['residue']['seq_noising_mask'].float().mean()
+        # )
         for layer in self.embedding_layers:
             atom_features, res_features = layer(data_dict)
             data_dict["atom_features"] = atom_features
+            data_dict["res_features"] = res_features
+
+        if self.smooth is not None:
+            res_features = self.smooth(
+                node_attr=data_dict["res_features"],
+                edge_index=data_dict['res_edge_index'],
+                edge_attr=data_dict['res_edge_features'],
+                edge_sh=data_dict['res_edge_sh']
+            )
             data_dict["res_features"] = res_features
 
         final_res_features = data_dict["res_features"]

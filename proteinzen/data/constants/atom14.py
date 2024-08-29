@@ -170,7 +170,7 @@ def _gen_props_stores(atom_keys, bond_keys):
         props['atom_pos'] = np.zeros((res_mol.GetNumAtoms(), 3))
         pyg_graph = featurize_props(props)
         res_atom14_to_rdkit_idx = atom14_idx_to_rdkit_idx[res_3lt]
-        gather_atoms = [i for (i, _) in sorted(res_atom14_to_rdkit_idx.items(), key=lambda x: x[0])]
+        gather_atoms = [i for (_, i) in sorted(res_atom14_to_rdkit_idx.items(), key=lambda x: x[0])]
 
         atom_features = [
             pyg_graph['ligand'][key].numpy(force=True)

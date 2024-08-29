@@ -26,13 +26,15 @@ class ProteinDirichletInterpolant:
     def __init__(self,
                  se3_cfg: SE3InterpolantConfig,
                  use_batch_ot=False,
-                 dirichlet_t_max=8):
+                 dirichlet_t_max=8,
+                 dirichlet_polyn_coeff=1):
         self._cfg = se3_cfg
         self.se3_noiser = SE3Interpolant(
             se3_cfg,
             use_batch_ot=use_batch_ot)
         self.sidechain_noiser = DirichletConditionalFlow(
-            t_max=dirichlet_t_max
+            t_max=dirichlet_t_max,
+            polyn_sched_coeff=dirichlet_polyn_coeff
         )
 
 

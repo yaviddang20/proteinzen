@@ -31,9 +31,9 @@ class BackboneFrameInterpolation(Task):
                  se3_noiser: SE3Interpolant,
                  aux_loss_t_min=0.25,
                  rigid_traj_loss=False,
-                 sep_rot_loss=False,
+                 sep_rot_loss=True,
                  local_atomic_dist_r=6,
-                 trans_loss_rescale=1,
+                 trans_loss_rescale=0.5,
                  use_hbond_loss=False,
                  use_plddt_loss=False,
                  square_aux_loss_time_factor=False):

@@ -215,7 +215,7 @@ class IPMPEncoder(nn.Module):
         return node_features, edge_features, edge_index
 
 
-    def forward(self, graph, eps=1e-8):
+    def forward(self, graph, eps=1e-8, apply_noising_masks=False):
         ## prep features
         res_data = graph['residue']
         res_mask = res_data['res_mask']

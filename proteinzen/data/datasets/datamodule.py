@@ -47,16 +47,21 @@ class ProteinDataModule(L.LightningDataModule):
         # csv = "mini_metadata.csv"
         self.train_dataset = PdbDataset(
             os.path.join(self.data_dir, csv),
-            split='train'
+            split='train',
+            min_percent_ordered=0.0
         )
         self.val_dataset = PdbDataset(
             os.path.join(self.data_dir, csv),
-            split='val'
+            split='val',
+            min_percent_ordered=0.0
+
         )
 
         self.test_dataset = PdbDataset(
             os.path.join(self.data_dir, csv),
-            split='test'
+            split='test',
+            min_percent_ordered=0.0
+
         )
 
     def build_dataloader(self, x):

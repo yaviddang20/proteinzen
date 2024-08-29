@@ -55,7 +55,9 @@ def autoencoder_losses(batch,
                        model_outputs,
                        label_smoothing=0.0,
                        logit_norm_loss=0.0,
-                       use_smooth_lddt=False):
+                       use_smooth_lddt=False,
+                       t_norm_clip=0.9,
+                       apply_seq_noising_mask=False):
     res_data = batch['residue']
 
     gt_atom14 = res_data['atom14_gt_positions']
@@ -95,12 +97,17 @@ def autoencoder_losses(batch,
         atom14_alt_gt_mask,
         minimal_mask,
         no_bb=False)
+    if apply_seq_noising_mask:
+        seq_noising_mask = res_data['seq_noising_mask']
+    else:
+        seq_noising_mask = res_data['seq_mask']
+
     if "seq_probs" in model_outputs and model_outputs["seq_probs"] is not None:
         seq_loss = seq_cce_loss(
             seq,
             model_outputs["seq_probs"],
             res_data.batch,
-            denoiser_mask,
+            ~seq_noising_mask & seq_mask,
             label_smoothing=label_smoothing,
             logits_as_probs=True)
     else:
@@ -108,7 +115,7 @@ def autoencoder_losses(batch,
             seq,
             seq_logits,
             res_data.batch,
-            denoiser_mask,
+            ~seq_noising_mask & seq_mask,
             label_smoothing=label_smoothing)
     per_seq_recov = seq_recov(
         seq,
@@ -133,7 +140,7 @@ def autoencoder_losses(batch,
     )
     t = batch['t']
     norm_scale = 1 - torch.min(
-        t, torch.as_tensor(0.9)
+        t, torch.as_tensor(t_norm_clip)
     )
     scaled_local_atomic_dist_loss = local_atomic_dist_loss / (norm_scale**2) * 0.01
     scaled_atom14_mse = atom14_mse / (norm_scale**2) * 0.01
@@ -190,9 +197,9 @@ def autoencoder_losses(batch,
         "kl_div": kl_div,
         "logit_norm_loss": logit_norm_loss,
         "percent_masked": _nodewise_to_graphwise(
-            denoiser_mask.float(),
+            (~seq_noising_mask).float(),
             res_data.batch,
-            torch.ones_like(mlm_mask))
+            torch.ones_like(mlm_mask)),
         #  "kl_div_l1": kl_div[1],
     }
 

@@ -89,6 +89,10 @@ def config_hydra_store():
 
     corruption_store = store(group="corrupter")
     corruption_store(
+        ProteinInterpolant,
+        se3_cfg=builds(SE3InterpolantConfig),
+        name="fm_sidechain")
+    corruption_store(
         SE3Interpolant,
         cfg=builds(SE3InterpolantConfig),
         name="fm_bb")
@@ -161,6 +165,14 @@ def config_hydra_store():
         name="frameflow")
     datamodule_store(
         pbuilds(
+            FramediffDataModule,
+            data_dir=f"{os.environ.get('REPO_ROOT')}/data/afdb_128",
+            batch_size=3000,
+            num_workers=4
+        ),
+        name="afdb_128")
+    datamodule_store(
+        pbuilds(
             GeomDataModule,
             data_dir=f"{os.environ.get('REPO_ROOT')}/data/geom_drugs",
             batch_size=3000,
@@ -191,12 +203,13 @@ def config_hydra_store():
     )
 
     model_store = store(group="model")
+    model_store(TFNLatentWrapper, name="fm_sidechain")
     model_store(GraphIpaFrameDenoiser, name="diffusion_bb")
     # model_store(GraphIpaFrameDenoiser, name="fm_bb")
     model_store(DynamicGraphIpaFrameDenoiser, name="fm_bb")
     # model_store(IpaScoreWrapper, name="fm_bb")
-    model_store(IPMPLatentWrapper, name="fm_protein")
-    # model_store(TFNLatentWrapper, name="fm_protein")
+    # model_store(IPMPLatentWrapper, name="fm_protein")
+    model_store(TFNLatentWrapper, name="fm_protein")
     model_store(IPMPDenseLatentWrapper, name="densefm_protein")
     # model_store(TFNDenseLatentWrapper, name="fm_protein")
     model_store(DynamicGraphIpaFrameSeqDenoiser, name="dirichlet_protein")
@@ -225,6 +238,7 @@ def config_hydra_store():
 
     task_store = store(group="tasks")
     task_store(pbuilds(DirichletFlowMatching), name="dirichlet_sidechain")
+    task_store(pbuilds(ProteinInterpolation), name="fm_sidechain")
     task_store(pbuilds(BackboneFrameInterpolation), name="fm_bb")
     task_store(pbuilds(ProteinInterpolation), name="fm_protein")
     task_store(pbuilds(ProteinInterpolation), name="densefm_protein")
@@ -249,6 +263,7 @@ def config_hydra_store():
             check_val_every_n_epoch=1,
             log_every_n_steps=50,
             use_distributed_sampler=False,
+            gradient_clip_val=1.0,
         ), name="default")
 
     optim_store = exp_store(group="experiment/optim")
@@ -264,16 +279,11 @@ def config_hydra_store():
         group="experiment/checkpointer",
         name="bb")
     exp_store(
-        pbuilds(
-            ModelCheckpoint,
-            dirpath="ckpt",
-            every_n_epochs=1,
-            save_on_train_epoch_end=True,
-            save_last=True,
-            save_top_k=3,
-            monitor="valid/non_coil_percent",
-            mode="max"
-        ),
+        ModelCheckpoint,
+        save_top_k=-1,
+        save_on_train_epoch_end=True,
+        save_last=True,
+        train_time_interval=timedelta(hours=4),
         group="experiment/checkpointer",
         name="sidechain")
     exp_store(

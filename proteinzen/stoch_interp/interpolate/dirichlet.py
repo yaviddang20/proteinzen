@@ -8,7 +8,7 @@ import warnings
 
 # adapted from https://github.com/HannesStark/dirichlet-flow-matching/blob/main/utils/flow_utils.py
 class DirichletConditionalFlow:
-    def __init__(self, K=20, alpha_min=1, alpha_max=100, alpha_spacing=0.01, t_max=8):
+    def __init__(self, K=20, alpha_min=1, alpha_max=100, alpha_spacing=0.01, t_max=8, polyn_sched_coeff=1):
         self.t_max = t_max
 
         # if not exp_t and t_scale < 8:
@@ -22,8 +22,9 @@ class DirichletConditionalFlow:
         self.beta_cdfs = np.array(self.beta_cdfs)
         self.beta_cdfs_derivative = np.diff(self.beta_cdfs, axis=0) / alpha_spacing
         self.K = K
+        self.polyn_schedule_coeff = polyn_sched_coeff
 
-    def c_factor(self, probs, t, batch, use_torch=False):
+    def c_factor(self, probs, t, batch, use_torch=False, eps=1e-4):
         # we need double precision for this, floats will have overflow
         if use_torch:
             device = probs.device
@@ -33,8 +34,8 @@ class DirichletConditionalFlow:
         alpha = t + 1
         alpha_expand = np.tile(alpha[:, None], (1, self.K))
         out1 = scipy.special.beta(alpha_expand, self.K - 1)
-        out2 = np.where(probs < 1, out1 / ((1 - probs) ** (self.K - 1)), 0)
-        out = np.where(probs > 0, out2 / (probs ** (alpha_expand - 1)), 0)
+        out2 = np.where(probs < 1 - eps, out1 / ((1 - probs) ** (self.K - 1)), 0)
+        out = np.where(probs > 0 + eps, out2 / (probs ** (alpha_expand - 1)), 0)
 
         interp = []
         for i in range(batch.max().item() + 1):
@@ -69,9 +70,15 @@ class DirichletConditionalFlow:
 
         return xt, seq_one_hot
 
+    def kappa_t(self, t):
+        return (t ** self.polyn_schedule_coeff) * self.t_max
+
+    def dkappa_t(self, t, dt):
+        return self.kappa_t(t + dt)  - self.kappa_t(t)
+
     def corrupt_batch(self, model, batch):
         res_data = batch["residue"]
-        t = batch['t'] * self.t_max
+        t = self.kappa_t(batch['t'])
         nodewise_t = t[res_data.batch]
 
         # [N]
@@ -94,10 +101,10 @@ class DirichletConditionalFlow:
         return torch.clip(t / self.t_max, max=1.0)
 
     def euler_step(self, d_t, t, seq_probs_1, seq_probs_t, batch):
-        t = t * self.t_max
-        d_t = d_t * self.t_max
+        t = self.kappa_t(t)
+        d_t = self.dkappa_t(t, d_t)
         c_factor = self.c_factor(seq_probs_t, t, batch, use_torch=True)
         eye = torch.eye(self.K, device=c_factor.device).view(1, self.K, self.K)
         u_i = c_factor[..., None, :] * (eye - seq_probs_t[..., None])
         u = torch.sum(seq_probs_1[..., None, :] * u_i, dim=-1)
-        return seq_probs_t + u * d_t
+        return seq_probs_t + u * d_t[..., None]

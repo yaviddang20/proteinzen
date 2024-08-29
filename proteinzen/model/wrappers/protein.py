@@ -2,6 +2,7 @@ import torch
 from torch import nn
 
 from proteinzen.model.design.ipmp import IPMPDecoder as DesignIPMPDecoder
+from proteinzen.model.design.mlp import MLPDecoder
 from proteinzen.model.encoder.ipmp import IPMPEncoder as MLMIPMPEncoder
 from proteinzen.model.encoder.tfn import ProteinAtomicEmbedder
 from proteinzen.model.denoiser.protein.frames import DynamicGraphIpaFrameDenoiser
@@ -25,6 +26,7 @@ class IPMPLatentWrapper(nn.Module):
                  knn_k=20,
                  lrange_k=40,
                  self_conditioning=True,
+                 mlp_decoder=False
                  ):
         super().__init__()
         self.encoder = MLMIPMPEncoder(
@@ -34,19 +36,25 @@ class IPMPLatentWrapper(nn.Module):
             c_s_out=c_latent,
             c_s_in=c_s_in,
             num_rbf=num_rbf,
-            num_layers=num_layers,
+            num_layers=num_layers * (2 if mlp_decoder else 1),
             k=sidechain_k,
         )
-        self.decoder = DesignIPMPDecoder(
-            c_s=c_s//2,
-            c_z=c_z,
-            c_latent=c_latent,
-            c_hidden=c_s//2,
-            c_s_in=c_s_in,
-            num_rbf=num_rbf,
-            num_layers=num_layers,
-            k=sidechain_k,
-        )
+        if mlp_decoder:
+            self.decoder = MLPDecoder(
+                c_s=c_s//2,
+                c_latent=c_latent,
+            )
+        else:
+            self.decoder = DesignIPMPDecoder(
+                c_s=c_s//2,
+                c_z=c_z,
+                c_latent=c_latent,
+                c_hidden=c_s//2,
+                c_s_in=c_s_in,
+                num_rbf=num_rbf,
+                num_layers=num_layers,
+                k=sidechain_k,
+            )
         self.denoiser = DynamicGraphIpaFrameDenoiser(
             c_s=c_s,
             c_latent=c_latent,
@@ -87,23 +95,38 @@ class TFNLatentWrapper(nn.Module):
                  knn_k=20,
                  lrange_k=40,
                  self_conditioning=True,
+                 broadcast_to_atoms=False,
+                 lrange_embedding=False,
+                 smooth_embedding=False,
+                 mlp_decoder=False,
+                 use_masking_features=False,
                  ):
         super().__init__()
         self.encoder = ProteinAtomicEmbedder(
             h_frame=c_latent,
             res_num_rbf=num_rbf,
             knn_k=sidechain_k,
+            broadcast_to_atoms=broadcast_to_atoms,
+            lrange_graph=lrange_embedding,
+            smooth_nodewise=smooth_embedding,
+            use_masking_features=use_masking_features
         )
-        self.decoder = DesignIPMPDecoder(
-            c_s=c_s//2,
-            c_z=c_z,
-            c_latent=c_latent,
-            c_hidden=c_s//2,
-            c_s_in=c_s_in,
-            num_rbf=num_rbf,
-            num_layers=num_layers,
-            k=sidechain_k,
-        )
+        if mlp_decoder:
+            self.decoder = MLPDecoder(
+                c_s=c_s//2,
+                c_latent=c_latent,
+            )
+        else:
+            self.decoder = DesignIPMPDecoder(
+                c_s=c_s//2,
+                c_z=c_z,
+                c_latent=c_latent,
+                c_hidden=c_s//2,
+                c_s_in=c_s_in,
+                num_rbf=num_rbf,
+                num_layers=num_layers,
+                k=sidechain_k,
+            )
         self.denoiser = DynamicGraphIpaFrameDenoiser(
             c_s=c_s,
             c_latent=c_latent,

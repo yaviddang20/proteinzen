@@ -239,6 +239,38 @@ class SidechainModule(L.LightningModule):
             sorted(log_dict.items(), key = lambda x: x[0])
         }
 
+        if 'train/percent_masked' in log_dict and 'train/per_seq_recov' in log_dict:
+            if log_dict['train/percent_masked'] == 1.0:
+                loss_name = "train/per_seq_recov_mask_all"
+                pt_loss_name = "train/pt_per_seq_recov_mask_all"
+            elif log_dict['train/percent_masked'] == 0.0:
+                loss_name = "train/per_seq_recov_mask_none"
+                pt_loss_name = "train/pt_per_seq_recov_mask_none"
+            else:
+                loss_name = "train/per_seq_recov_mask_partial"
+                pt_loss_name = "train/pt_per_seq_recov_mask_partial"
+            self.log(
+                loss_name,
+                log_dict['train/per_seq_recov'],
+                prog_bar=False,
+                logger=True,
+                on_step=None,
+                on_epoch=True,
+                batch_size=batch.num_graphs,
+                sync_dist=False
+            )
+            if 'train/pt_per_seq_recov' in log_dict:
+                self.log(
+                    pt_loss_name,
+                    log_dict['train/pt_per_seq_recov'],
+                    prog_bar=False,
+                    logger=True,
+                    on_step=None,
+                    on_epoch=True,
+                    batch_size=batch.num_graphs,
+                    sync_dist=False
+                )
+
         self.log_dict(
             log_dict,
             on_step=None,
@@ -279,8 +311,26 @@ class SidechainModule(L.LightningModule):
         # self._log.info(gen_pbar_str(loss_dict))
 
         batch = copy.copy(batch)
-        batch['residue']['noising_mask'] = torch.ones_like(batch['residue']['noising_mask'])
-        batch['residue']['mlm_mask'] = torch.zeros_like(batch['residue']['mlm_mask'])
+        batch['residue']['res_noising_mask'] = torch.ones_like(batch['residue']['noising_mask'])
+        batch['residue']['seq_noising_mask'] = torch.ones_like(batch['residue']['noising_mask'])
+        outputs = task.run_evals(self.model, batch)
+        loss_dict = task.compile_task_losses(batch, outputs)
+
+        log_dict = tree.map_structure(
+            lambda x: torch.mean(x) if torch.is_tensor(x) else x,
+            loss_dict
+        )
+        log_dict = {"val_no_mask_" + k: v for k,v in log_dict.items()}
+
+        self.log_dict(
+            log_dict,
+            logger=True,
+            batch_size=batch.num_graphs,
+            sync_dist=True)
+
+        batch = copy.copy(batch)
+        batch['residue']['res_noising_mask'] = torch.ones_like(batch['residue']['noising_mask'])
+        batch['residue']['seq_noising_mask'] = torch.zeros_like(batch['residue']['noising_mask'])
         outputs = task.run_evals(self.model, batch)
         loss_dict = task.compile_task_losses(batch, outputs)
 
@@ -297,19 +347,19 @@ class SidechainModule(L.LightningModule):
             sync_dist=True)
         # self._log.info(gen_pbar_str(loss_dict))
 
-        sample_outputs = task.run_predicts(self.model, batch)
-        sample_loss_dict = task.compile_task_losses(batch, sample_outputs)
-        sample_log_dict = tree.map_structure(
-            lambda x: torch.mean(x) if torch.is_tensor(x) else x,
-            sample_loss_dict
-        )
-        sample_log_dict = {"sample_" + k: v for k,v in sample_log_dict.items()}
-        self.log_dict(
-            sample_log_dict,
-            logger=True,
-            batch_size=batch.num_graphs,
-            sync_dist=True)
-        sample_loss_dict = {"sample_" + k: v for k,v in sample_loss_dict.items()}
+        # sample_outputs = task.run_evals(self.model, batch)
+        # sample_loss_dict = task.compile_task_losses(batch, sample_outputs)
+        # sample_log_dict = tree.map_structure(
+        #     lambda x: torch.mean(x) if torch.is_tensor(x) else x,
+        #     sample_loss_dict
+        # )
+        # sample_log_dict = {"sample_" + k: v for k,v in sample_log_dict.items()}
+        # self.log_dict(
+        #     sample_log_dict,
+        #     logger=True,
+        #     batch_size=batch.num_graphs,
+        #     sync_dist=True)
+        # sample_loss_dict = {"sample_" + k: v for k,v in sample_loss_dict.items()}
         # self._log.info(gen_pbar_str(sample_loss_dict))
         return loss_dict
 
@@ -329,25 +379,25 @@ class SidechainModule(L.LightningModule):
         self.log("median_seq_recov", self.one_shot_median_metric, on_step=False, on_epoch=True)
         # self._log.info(gen_pbar_str(loss_dict))
 
-        sample_outputs = task.run_predicts(self.model, batch)
-        sample_loss_dict = task.compile_task_losses(batch, sample_outputs)
-        sample_log_dict = tree.map_structure(
-            lambda x: torch.mean(x) if torch.is_tensor(x) else x,
-            sample_loss_dict
-        )
-        sample_log_dict = {"sample_" + k: v for k,v in sample_log_dict.items()}
+        # sample_outputs = task.run_predicts(self.model, batch)
+        # sample_loss_dict = task.compile_task_losses(batch, sample_outputs)
+        # sample_log_dict = tree.map_structure(
+        #     lambda x: torch.mean(x) if torch.is_tensor(x) else x,
+        #     sample_loss_dict
+        # )
+        # sample_log_dict = {"sample_" + k: v for k,v in sample_log_dict.items()}
 
 
-        self.log_dict(
-            sample_log_dict,
-            logger=True,
-            batch_size=batch.num_graphs,
-            sync_dist=True)
+        # self.log_dict(
+        #     sample_log_dict,
+        #     logger=True,
+        #     batch_size=batch.num_graphs,
+        #     sync_dist=True)
 
-        self.sample_median_metric.update(sample_loss_dict['per_seq_recov'])
-        self.log("sample_median_seq_recov", self.sample_median_metric, on_step=False, on_epoch=True)
+        # self.sample_median_metric.update(sample_loss_dict['per_seq_recov'])
+        # self.log("sample_median_seq_recov", self.sample_median_metric, on_step=False, on_epoch=True)
         # self._log.info(gen_pbar_str(sample_loss_dict))
-        return sample_loss_dict
+        return loss_dict
 
     def predict_step(self, batch, batch_idx):
         task: TaskList = batch['task']
@@ -637,12 +687,15 @@ class MoleculeModule(L.LightningModule):
 
 
 class ProteinModule(L.LightningModule):
-    def __init__(self, model, optim, val_dir="validation"):
+    def __init__(self, model, optim, val_dir="validation", freeze_encoder=False, freeze_decoder=False):
         super().__init__()
         self._log = logging.getLogger(__name__)
         self.model = model
         self.optim = optim
         self.val_dir = val_dir
+
+        self.freeze_encoder = freeze_encoder
+        self.freeze_decoder = freeze_decoder
 
         self.median_metric = MedianMetric()
 
@@ -668,6 +721,60 @@ class ProteinModule(L.LightningModule):
             lambda x: torch.mean(x) if torch.is_tensor(x) else x,
             loss_dict
         )
+        log_dict = {
+            ("train/" + key): value
+            for key, value in
+            sorted(log_dict.items(), key = lambda x: x[0])
+        }
+        t = batch['t']
+        for loss_name, loss_list in loss_dict.items():
+            if loss_name in ['loss', 'frameflow_loss']:
+                continue
+            if not loss_name.startswith("pt_"):
+                continue
+            stratified_losses = t_stratified_loss(
+                t, loss_list, loss_name=loss_name)
+            stratified_losses = {f"train/{k}": torch.as_tensor(v, device=log_dict['train/loss'].device) for k,v in stratified_losses.items()}
+            self.log_dict(
+                stratified_losses,
+                prog_bar=False,
+                logger=True,
+                on_step=None,
+                on_epoch=True,
+                batch_size=batch.num_graphs,
+                sync_dist=False)
+
+        if 'train/percent_masked' in log_dict and 'train/per_seq_recov' in log_dict:
+            if log_dict['train/percent_masked'] == 1.0:
+                loss_name = "train/per_seq_recov_mask_all"
+                pt_loss_name = "train/pt_per_seq_recov_mask_all"
+            elif log_dict['train/percent_masked'] == 0.0:
+                loss_name = "train/per_seq_recov_mask_none"
+                pt_loss_name = "train/pt_per_seq_recov_mask_none"
+            else:
+                loss_name = "train/per_seq_recov_mask_partial"
+                pt_loss_name = "train/pt_per_seq_recov_mask_partial"
+            self.log(
+                loss_name,
+                log_dict['train/per_seq_recov'],
+                prog_bar=False,
+                logger=True,
+                on_step=None,
+                on_epoch=True,
+                batch_size=batch.num_graphs,
+                sync_dist=False
+            )
+            if 'train/pt_per_seq_recov' in log_dict:
+                self.log(
+                    pt_loss_name,
+                    log_dict['train/pt_per_seq_recov'],
+                    prog_bar=False,
+                    logger=True,
+                    on_step=None,
+                    on_epoch=True,
+                    batch_size=batch.num_graphs,
+                    sync_dist=False
+                )
 
         self.log_dict(
             log_dict,
@@ -748,10 +855,22 @@ class ProteinModule(L.LightningModule):
         return outputs
 
     def configure_optimizers(self):
-        # return self.optim(self.model.denoiser.parameters())
-        return self.optim(self.model.parameters())
-        # return self.optim(
-        #     list(self.model.denoiser.parameters())
-        #     + list(self.model.encoder.parameters())
-        #     + list(self.model.decoder.parameters())
-        # )
+        if self.freeze_encoder and self.freeze_decoder:
+            print("Freezing autoenc parameters")
+            return self.optim(
+                list(self.model.denoiser.parameters())
+            )
+        elif self.freeze_encoder:
+            print("Freezing encoder parameters")
+            return self.optim(
+                list(self.model.denoiser.parameters())
+                + list(self.model.decoder.parameters())
+            )
+        elif self.freeze_decoder:
+            print("Freezing decoder parameters")
+            return self.optim(
+                list(self.model.denoiser.parameters())
+                + list(self.model.encoder.parameters())
+            )
+        else:
+            return self.optim(self.model.parameters())

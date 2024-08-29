@@ -125,7 +125,8 @@ def process_file(file_path: str, write_dir: str, splits: Optional[Dict[str, List
         os.remove(file_path)
         raise errors.DataError(f'Mdtraj failed with error {e}')
 
-    chain_dict['ss'] = pdb_ss[0]
+    # chain_dict['ss'] = pdb_ss[0]
+    complex_feats['ss'] = pdb_ss[0]
     metadata['coil_percent'] = np.sum(pdb_ss == 'C') / metadata['modeled_seq_len']
     metadata['helix_percent'] = np.sum(pdb_ss == 'H') / metadata['modeled_seq_len']
     metadata['strand_percent'] = np.sum(pdb_ss == 'E') / metadata['modeled_seq_len']
