@@ -2,6 +2,7 @@
 import numpy as np
 import random
 import torch
+import copy
 
 from torch.utils import data
 
@@ -109,10 +110,19 @@ class ClusteredBatchSampler:
         if self.shuffle:
             # deterministically shuffle based on epoch and seed
             g = np.random.default_rng(self.seed + self.epoch)
-            g.shuffle(self.clusters)
+
+            if df['is_af2_struct'].any():
+                real_clusters = df[~df['is_af2_struct']].cluster.unique()
+                af_clusters = df[df['is_af2_struct']].cluster.unique()
+                subsample_af_clusters = g.choice(af_clusters, size=len(real_clusters * 3), replace=False)
+                clusters = np.concatenate([real_clusters, subsample_af_clusters])
+            else:
+                clusters = self.clusters
+            g.shuffle(clusters)
+
 
         # sample one example per cluster
-        for cluster in self.clusters:
+        for cluster in clusters:
             cluster_sample = df[df['cluster'] == cluster].sample(1, random_state=g)
             iloc = cluster_sample['iloc'].iloc[0]
             assert df.iloc[iloc].pdb_name == cluster_sample.pdb_name.iloc[0]

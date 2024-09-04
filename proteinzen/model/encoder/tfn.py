@@ -11,8 +11,11 @@ import torch_geometric.utils as pygu
 import e3nn
 from e3nn import o3
 
+from . import wigner
+
 
 from proteinzen.model.modules.layers.node.tfn import TensorProductConvLayer, TensorProductAggLayer, TensorProductBroadcastLayer
+from proteinzen.model.modules.layers.edge.tfn import FasterTensorProduct
 from proteinzen.model.modules.common import GaussianRandomFourierBasis
 from proteinzen.model.modules.openfold.layers import StructureModuleTransition, Linear
 from proteinzen.model.utils.graph import sample_inv_cubic_edges
@@ -34,6 +37,62 @@ def get_irrep_seq(ns, nv, reduce_pseudoscalars):
     return irrep_seq
 
 
+class EdgeUpdate(nn.Module):
+    def __init__(self,
+                 res_irreps,
+                 sh_irreps,
+                 res_h_edge):
+        super().__init__()
+        if not isinstance(res_irreps, o3.Irreps):
+            res_irreps = o3.Irreps(res_irreps)
+        self.res_irreps = res_irreps
+
+        self.res_irreps_slice_dict = {
+            ir: sl for (_, ir), sl in zip(self.res_irreps, self.res_irreps.slices())
+        }
+
+        self.tp_in_irreps = (res_irreps * 2).simplify()
+        self.sh_irreps = sh_irreps
+        self.out_irreps = o3.Irreps(f"{res_h_edge}x0e")
+
+        self.tp = FasterTensorProduct(
+            self.tp_in_irreps,
+            self.sh_irreps,
+            self.out_irreps
+        )
+        self.ffn = nn.Sequential(
+            nn.Linear(res_h_edge, 2*res_h_edge),
+            nn.ReLU(),
+            nn.Linear(2*res_h_edge, self.tp.weight_numel),
+        )
+        self.ln = nn.LayerNorm(res_h_edge)
+
+
+    def forward(self,
+                res_features,
+                edge_features,
+                edge_sh,
+                edge_index
+    ):
+        res_src = res_features[edge_index[1]]
+        res_dst = res_features[edge_index[0]]
+
+        cat_list = []
+        for _, ir in self.tp_in_irreps:
+            sl = self.res_irreps_slice_dict[ir]
+            cat_list.append(res_src[..., sl])
+            cat_list.append(res_dst[..., sl])
+
+        tp_input = torch.cat(cat_list, dim=-1)
+        tp_update = self.tp(
+            tp_input,
+            edge_sh,
+            self.ffn(edge_features)
+        )
+        edge_features = self.ln(edge_features + tp_update)
+        return edge_features
+
+
 class JointConvLayer(nn.Module):
     def __init__(self,
                  atom_in_irreps,
@@ -43,9 +102,12 @@ class JointConvLayer(nn.Module):
                  res_out_irreps,
                  h_edge,
                  res_h_mult_factor,
-                 broadcast=False):
+                 res_edge_mult_factor,
+                 broadcast=False,
+                 res_edge_update=False,
+                 compatibility_mode=True):
         super().__init__()
-        res_h_edge = h_edge * res_h_mult_factor
+        res_h_edge = h_edge * res_h_mult_factor * res_edge_mult_factor
 
         self.atom_conv = TensorProductConvLayer(
             atom_in_irreps,
@@ -56,9 +118,9 @@ class JointConvLayer(nn.Module):
             edge_groups=["bond_features", "radius_edge_features"]
         )
         self.agg_conv = TensorProductAggLayer(
-            atom_in_irreps,
+            atom_in_irreps if compatibility_mode else atom_out_irreps,
             sh_irreps,
-            res_out_irreps,
+            res_out_irreps if compatibility_mode else res_in_irreps,
             h_edge,
             faster=True
         )
@@ -78,6 +140,15 @@ class JointConvLayer(nn.Module):
                 h_edge,
                 faster=True
             )
+        if res_edge_update:
+            self.res_edge_update = EdgeUpdate(
+                res_out_irreps,
+                sh_irreps,
+                res_h_edge
+            )
+        else:
+            self.res_edge_update = None
+
 
     def forward(self, data_dict):
         atom_features = self.atom_conv(
@@ -110,7 +181,17 @@ class JointConvLayer(nn.Module):
                 edge_attr=data_dict['bcast_edge_features'],
                 edge_sh=data_dict['bcast_edge_sh']
             )
-        return atom_features, res_features
+        if self.res_edge_update is not None:
+            res_edge_features = self.res_edge_update(
+                res_features=res_features,
+                edge_features=data_dict['res_edge_features'],
+                edge_sh=data_dict['res_edge_sh'],
+                edge_index=data_dict['res_edge_index'],
+            )
+        else:
+            res_edge_features=data_dict['res_edge_features']
+
+        return atom_features, res_features, res_edge_features
 
 
 class ProteinAtomicEmbedder(nn.Module):
@@ -135,10 +216,13 @@ class ProteinAtomicEmbedder(nn.Module):
         knn_k=30,
         reduce_pseudoscalars=False,
         dropout=0.0,
+        res_edge_mult_factor=1,
         lrange_graph=False,
         broadcast_to_atoms=False,
         smooth_nodewise=False,
         use_masking_features=False,
+        res_edge_update=False,
+        compatibility_mode=True
     ):
         super().__init__()
         assert n_layers > 4
@@ -201,7 +285,7 @@ class ProteinAtomicEmbedder(nn.Module):
         )
 
 
-        res_h_edge = res_h_mult_factor * h_edge
+        res_h_edge = res_h_mult_factor * h_edge * res_edge_mult_factor
         res_ns = res_h_mult_factor * ns
         res_nv = res_h_mult_factor * nv
         self.res_h_edge = res_h_edge
@@ -237,7 +321,10 @@ class ProteinAtomicEmbedder(nn.Module):
                     res_out_irreps=res_irrep_seq[i+1],
                     h_edge=h_edge,
                     res_h_mult_factor=res_h_mult_factor,
-                    broadcast=broadcast_to_atoms
+                    res_edge_mult_factor=res_edge_mult_factor,
+                    broadcast=broadcast_to_atoms,
+                    res_edge_update=res_edge_update,
+                    compatibility_mode=compatibility_mode
                 )
                 for i in range(len(atom_irrep_seq)-1)
             ]
@@ -266,6 +353,8 @@ class ProteinAtomicEmbedder(nn.Module):
             self.latent_logvar = Linear(h_frame, h_frame)
         else:
             self.to_frame_scalars = None
+
+        self.compatibility_mode = compatibility_mode
 
 
     def _edge_rbf_features(self, coords, edge_index, D_max, num_rbf, eps=1e-12):
@@ -464,9 +553,10 @@ class ProteinAtomicEmbedder(nn.Module):
         #     data['residue']['seq_noising_mask'].float().mean()
         # )
         for layer in self.embedding_layers:
-            atom_features, res_features = layer(data_dict)
+            atom_features, res_features, res_edge_features = layer(data_dict)
             data_dict["atom_features"] = atom_features
             data_dict["res_features"] = res_features
+            data_dict['res_edge_features'] = res_edge_features
 
         if self.smooth is not None:
             res_features = self.smooth(
@@ -482,10 +572,12 @@ class ProteinAtomicEmbedder(nn.Module):
         if self.to_frame_scalars is not None:
             rigids_1 = ru.Rigid.from_tensor_7(data['residue']['rigids_1'])
             rigids_inv_quat = rigids_1.get_rots().invert().get_quats()
-            with torch.device(rigids_inv_quat.device):
-                inv_wigner_D = self.final_irreps.D_from_quaternion(rigids_inv_quat)
 
-            final_res_features = torch.einsum("...ij,...j->...i", inv_wigner_D, final_res_features)
+            if self.compatibility_mode:
+                inv_wigner_D = self.final_irreps.D_from_quaternion(rigids_inv_quat.cpu()).to(rigids_inv_quat.device)
+                final_res_features = torch.einsum("...ij,...j->...i", inv_wigner_D, final_res_features)
+            else:
+                final_res_features = wigner.fast_wigner_D_rotation(self.final_irreps, rigids_inv_quat, final_res_features)
             final_res_features = self.out_ln(self.to_frame_scalars(final_res_features))
             final_res_features = self.transition(final_res_features)
             final_res_features = {

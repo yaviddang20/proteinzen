@@ -362,8 +362,8 @@ class TensorProductAggLayer(torch.nn.Module):
                 out_nodes=None,
                 reduce='mean',
                 edge_weight=1.0):
-        _device = dst_node_attr.device
-        _dtype = dst_node_attr.dtype
+        _device = agg_node_attr.device
+        _dtype = agg_node_attr.dtype
         out_irreps = self.fc(edge_attr).to(_device).to(_dtype)
         out_irreps.mul_(edge_weight)
         tp = self.tp(agg_node_attr, edge_sh, out_irreps)

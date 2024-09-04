@@ -69,9 +69,5 @@ class LatentInterpolant:
         }
 
     def _euler_step(self, d_t, t, x_1, x_t):
-        # x_vf = (x_1 - x_t) / (1 - t)
-        # return x_t + x_vf * d_t
-
-        # exponential euler step
-        x_vf = 5 * (x_1 - x_t)
+        x_vf = (x_1 - x_t) / (1 - t)
         return x_t + x_vf * d_t

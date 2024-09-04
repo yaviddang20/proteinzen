@@ -115,10 +115,21 @@ def main(model,
     os.makedirs(model.val_dir, exist_ok=True)
     task_sampler = single_task_sampler(tasks(corrupter))
 
-    if 'freeze_encoder' in zen_cfg or 'freeze_decoder' in zen_cfg:
+    if 'only_load_state_dict' in zen_cfg:
         assert zen_cfg['experiment']['warm_start'] is not None
         ckpt = torch.load(zen_cfg['experiment']['warm_start'])
-        model.load_state_dict(ckpt['state_dict'])
+        encoder_dict = {
+            k.removeprefix("model.encoder."): v
+            for k, v in ckpt['state_dict'].items()
+            if k.startswith("model.encoder")
+        }
+        decoder_dict = {
+            k.removeprefix("model.decoder."): v
+            for k, v in ckpt['state_dict'].items()
+            if k.startswith("model.decoder")
+        }
+        model.model.encoder.load_state_dict(encoder_dict)
+        model.model.decoder.load_state_dict(decoder_dict)
         zen_cfg['experiment']['warm_start'] = None
 
 

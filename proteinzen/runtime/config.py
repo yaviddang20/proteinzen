@@ -28,7 +28,7 @@ from proteinzen.model.denoiser.molecule.torsional import MoleculeTorsionDenoiser
 from proteinzen.model.design.ipmp import IPMPEncoder, IPMPDecoder
 from proteinzen.model.design.ipmp_seq_only import IPMPDenoiser as DirichletIPMPDenoiser
 from proteinzen.model.wrappers.sidechain import IPMPLatentSidechainWrapper
-from proteinzen.model.wrappers.protein import IPMPLatentWrapper, TFNLatentWrapper, IPMPDenseLatentWrapper, TFNDenseLatentWrapper
+from proteinzen.model.wrappers.protein import IPMPLatentWrapper, TFNLatentWrapper, ChimeraLatentWrapper, IPMPDenseLatentWrapper, TFNDenseLatentWrapper
 
 from proteinzen.tasks.fm.bb import BackboneFrameInterpolation
 from proteinzen.tasks.fm.protein import ProteinInterpolation, ProteinSeqInterpolation, ProteinSeqMultiChiInterpolation
@@ -202,14 +202,18 @@ def config_hydra_store():
         name="protein_multichi"
     )
 
+    # latent_fm_wrapper = ChimeraLatentWrapper
+    latent_fm_wrapper = TFNLatentWrapper
     model_store = store(group="model")
-    model_store(TFNLatentWrapper, name="fm_sidechain")
+    # model_store(TFNLatentWrapper, name="fm_sidechain")
+    model_store(latent_fm_wrapper, name="fm_sidechain")
     model_store(GraphIpaFrameDenoiser, name="diffusion_bb")
     # model_store(GraphIpaFrameDenoiser, name="fm_bb")
     model_store(DynamicGraphIpaFrameDenoiser, name="fm_bb")
     # model_store(IpaScoreWrapper, name="fm_bb")
     # model_store(IPMPLatentWrapper, name="fm_protein")
-    model_store(TFNLatentWrapper, name="fm_protein")
+    # model_store(TFNLatentWrapper, name="fm_protein")
+    model_store(latent_fm_wrapper, name="fm_protein")
     model_store(IPMPDenseLatentWrapper, name="densefm_protein")
     # model_store(TFNDenseLatentWrapper, name="fm_protein")
     model_store(DynamicGraphIpaFrameSeqDenoiser, name="dirichlet_protein")
@@ -263,7 +267,7 @@ def config_hydra_store():
             check_val_every_n_epoch=1,
             log_every_n_steps=50,
             use_distributed_sampler=False,
-            gradient_clip_val=1.0,
+            # gradient_clip_val=1.0,
         ), name="default")
 
     optim_store = exp_store(group="experiment/optim")

@@ -90,8 +90,9 @@ def _retrieve_mmcif_files(
                 continue
             mmcif_path = os.path.join(mmcif_file_dir, mmcif_file)
             total_num_files += 1
-            if min_file_size <= os.path.getsize(mmcif_path) <= max_file_size:
-                all_mmcif_paths.append(mmcif_path)
+            # if min_file_size <= os.path.getsize(mmcif_path) <= max_file_size:
+            #     all_mmcif_paths.append(mmcif_path)
+            all_mmcif_paths.append(mmcif_path)
         if debug and total_num_files >= 100:
             # Don't process all files for debugging
             break
@@ -120,11 +121,14 @@ def process_mmcif(
     metadata = {}
     mmcif_name = os.path.basename(mmcif_path).replace('.cif', '')
     metadata['pdb_name'] = mmcif_name
-    # mmcif_subdir = os.path.join(write_dir, mmcif_name[1:3].lower())
-    # if not os.path.isdir(mmcif_subdir):
-    #     os.mkdir(mmcif_subdir)
-    # processed_mmcif_path = os.path.join(mmcif_subdir, f'{mmcif_name}.pkl')
-    processed_mmcif_path = os.path.join(write_dir, f'{mmcif_name}.pkl')
+    if mmcif_name.startswith("AF-"):
+        mmcif_subdir = os.path.join(write_dir, mmcif_name[5:7].lower())
+    else:
+        mmcif_subdir = os.path.join(write_dir, mmcif_name[1:3].lower())
+    if not os.path.isdir(mmcif_subdir):
+        os.makedirs(mmcif_subdir, exist_ok=True)
+    processed_mmcif_path = os.path.join(mmcif_subdir, f'{mmcif_name}.pkl')
+    # processed_mmcif_path = os.path.join(write_dir, f'{mmcif_name}.pkl')
     processed_mmcif_path = os.path.abspath(processed_mmcif_path)
     metadata['processed_path'] = processed_mmcif_path
     try:
@@ -287,9 +291,9 @@ def process_fn(
 
 def main(args):
     # Get all mmcif files to read.
-    # all_mmcif_paths = _retrieve_mmcif_files(
-    #     args.mmcif_dir, args.max_file_size, args.min_file_size, args.debug)
-    all_mmcif_paths = list(glob.glob(os.path.join(args.mmcif_dir, "*.cif")))
+    all_mmcif_paths = _retrieve_mmcif_files(
+        args.mmcif_dir, args.max_file_size, args.min_file_size, args.debug)
+    # all_mmcif_paths = list(glob.glob(os.path.join(args.mmcif_dir, "*.cif")))
     total_num_paths = len(all_mmcif_paths)
     write_dir = args.write_dir
     if not os.path.exists(write_dir):

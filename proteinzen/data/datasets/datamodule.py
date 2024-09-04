@@ -54,14 +54,12 @@ class ProteinDataModule(L.LightningDataModule):
             os.path.join(self.data_dir, csv),
             split='val',
             min_percent_ordered=0.0
-
         )
 
         self.test_dataset = PdbDataset(
             os.path.join(self.data_dir, csv),
             split='test',
             min_percent_ordered=0.0
-
         )
 
     def build_dataloader(self, x):
@@ -120,6 +118,10 @@ class FramediffDataModule(L.LightningDataModule):
                  sample_from_clusters=False,
                  batch_by_edge_fn=None,
                  min_ordered_percent=None,
+                 use_tmpdir=False,
+                 predict_on_train=False,
+                 cache_dir=None,
+                 normalize_cache=False
                  ):
         super().__init__()
         self.data_dir = data_dir
@@ -130,20 +132,29 @@ class FramediffDataModule(L.LightningDataModule):
         self.sample_from_clusters = sample_from_clusters
         self.batch_by_edge_fn = batch_by_edge_fn
         self.max_num_per_batch = max_num_per_batch
+        self.predict_on_train = predict_on_train
 
         self.sample_lengths = sample_lengths
         csv = "filtered_metadata.csv"
         # csv = "mini_metadata.csv"
         self.train_dataset = PdbDataset(
-            os.path.join(self.data_dir, csv),
+            csv_path=os.path.join(self.data_dir, csv),
             min_num_res=min_len,
             max_num_res=max_len,
-            min_percent_ordered=min_ordered_percent
+            min_percent_ordered=min_ordered_percent,
+            use_tmpdir=use_tmpdir,
+            cache_dir=cache_dir,
+            normalize_cache=normalize_cache
         )
         self.val_dataset = LengthDataset(
             self.sample_lengths,
             batch_size=batch_size,
-            same_length_per_batch=length_batch)
+            same_length_per_batch=length_batch,
+            normalize_cache_path=(
+                None if not normalize_cache
+                else os.path.join(cache_dir, "latent_stats.pt")
+            )
+        )
 
     def build_dataloader(self, x):
         collate_fn = gen_collate_fn(self.task_sampler)
@@ -224,17 +235,21 @@ class FramediffDataModule(L.LightningDataModule):
         )
 
     def predict_dataloader(self):
-        def collate_fn(batch):
-            batch = batch[0]
-            batch['task'] = self.task_sampler.sample_task()
-            return batch
+        if self.predict_on_train:
+            print(self.train_dataloader())
+            return self.train_dataloader()
+        else:
+            def collate_fn(batch):
+                batch = batch[0]
+                batch['task'] = self.task_sampler.sample_task()
+                return batch
 
-        return DataLoader(
-            self.val_dataset,
-            shuffle=False,
-            collate_fn=collate_fn,
-            batch_size=1
-        )
+            return DataLoader(
+                self.val_dataset,
+                shuffle=False,
+                collate_fn=collate_fn,
+                batch_size=1
+            )
 
 
 class GeomDataModule(L.LightningDataModule):

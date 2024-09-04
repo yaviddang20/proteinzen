@@ -5,6 +5,7 @@ from proteinzen.model.design.ipmp import IPMPDecoder as DesignIPMPDecoder
 from proteinzen.model.design.mlp import MLPDecoder
 from proteinzen.model.encoder.ipmp import IPMPEncoder as MLMIPMPEncoder
 from proteinzen.model.encoder.tfn import ProteinAtomicEmbedder
+from proteinzen.model.encoder.chimera import ProteinAtomicChimeraEmbedder
 from proteinzen.model.denoiser.protein.frames import DynamicGraphIpaFrameDenoiser
 from proteinzen.model.denoiser.protein.dense import IpaDenoiser
 
@@ -87,6 +88,7 @@ class TFNLatentWrapper(nn.Module):
                  c_s_in=6,
                  num_rbf=16,
                  num_layers=4,
+                 denoiser_num_layers=8,
                  num_heads=8,
                  num_qk_pts=8,
                  num_v_pts=12,
@@ -94,12 +96,16 @@ class TFNLatentWrapper(nn.Module):
                  sidechain_k=30,
                  knn_k=20,
                  lrange_k=40,
+                 res_h_mult_factor=2,
+                 res_edge_mult_factor=1,
+                 encoder_res_edge_updates=False,
                  self_conditioning=True,
                  broadcast_to_atoms=False,
                  lrange_embedding=False,
                  smooth_embedding=False,
                  mlp_decoder=False,
                  use_masking_features=False,
+                 compatibility_mode=True
                  ):
         super().__init__()
         self.encoder = ProteinAtomicEmbedder(
@@ -109,7 +115,89 @@ class TFNLatentWrapper(nn.Module):
             broadcast_to_atoms=broadcast_to_atoms,
             lrange_graph=lrange_embedding,
             smooth_nodewise=smooth_embedding,
-            use_masking_features=use_masking_features
+            use_masking_features=use_masking_features,
+            res_h_mult_factor=res_h_mult_factor,
+            res_edge_mult_factor=res_edge_mult_factor,
+            res_edge_update=encoder_res_edge_updates,
+            compatibility_mode=compatibility_mode
+        )
+        if mlp_decoder:
+            self.decoder = MLPDecoder(
+                c_s=c_s//2,
+                c_latent=c_latent,
+            )
+        else:
+            self.decoder = DesignIPMPDecoder(
+                c_s=c_s//2,
+                c_z=c_z,
+                c_latent=c_latent,
+                c_hidden=c_s//2,
+                c_s_in=c_s_in,
+                num_rbf=num_rbf,
+                num_layers=num_layers,
+                k=sidechain_k,
+            )
+        self.denoiser = DynamicGraphIpaFrameDenoiser(
+            c_s=c_s,
+            c_latent=c_latent,
+            c_z=c_z,
+            c_hidden=16,
+            num_heads=16,
+            num_qk_pts=num_qk_pts,
+            num_v_pts=num_v_pts,
+            n_layers=denoiser_num_layers,
+            h_time=h_time,
+            knn_k=knn_k,
+            lrange_k=lrange_k,
+            self_conditioning=self_conditioning,
+        )
+        self.c_latent = c_latent
+        self.self_conditioning = self_conditioning
+
+    def sample_prior(self, num_nodes, device):
+        return {
+            "noised_latent_sidechain": torch.randn((num_nodes, self.c_latent), device=device)
+        }
+
+
+class ChimeraLatentWrapper(nn.Module):
+    def __init__(self,
+                 c_s=256,
+                 c_latent=128,
+                 c_z=128,
+                 c_hidden=256,
+                 c_s_in=6,
+                 num_rbf=16,
+                 num_layers=4,
+                 num_heads=8,
+                 num_qk_pts=8,
+                 num_v_pts=12,
+                 h_time=64,
+                 sidechain_k=30,
+                 knn_k=20,
+                 lrange_k=40,
+                 res_h_mult_factor=2,
+                 res_edge_mult_factor=1,
+                 encoder_res_edge_updates=False,
+                 self_conditioning=True,
+                 broadcast_to_atoms=False,
+                 lrange_embedding=False,
+                 smooth_embedding=False,
+                 mlp_decoder=False,
+                 use_masking_features=True,
+                 compatibility_mode=True
+                 ):
+        super().__init__()
+        self.encoder = ProteinAtomicChimeraEmbedder(
+            c_s=128,
+            c_z=128,
+            h_frame=c_latent,
+            res_num_rbf=num_rbf,
+            knn_k=sidechain_k,
+            broadcast_to_atoms=broadcast_to_atoms,
+            lrange_graph=lrange_embedding,
+            use_masking_features=use_masking_features,
+            res_h_mult_factor=res_h_mult_factor,
         )
         if mlp_decoder:
             self.decoder = MLPDecoder(

@@ -730,7 +730,7 @@ class ProteinModule(L.LightningModule):
         for loss_name, loss_list in loss_dict.items():
             if loss_name in ['loss', 'frameflow_loss']:
                 continue
-            if not loss_name.startswith("pt_"):
+            if not loss_name.startswith("pt_") and not loss_name.startswith("latent_"):
                 continue
             stratified_losses = t_stratified_loss(
                 t, loss_list, loss_name=loss_name)

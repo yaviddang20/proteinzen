@@ -132,7 +132,8 @@ class Experiment:
                     #     prot_models = []
                     #     for i, _ in enumerate(clean_traj):
                     #         clean = clean_traj[i]
-                    #         seq = clean_seq[i].argmax(dim=-1)
+                    #         # seq = clean_seq[i].argmax(dim=-1)
+                    #         seq = clean_seq[i]
                     #         seq = "".join([restypes[j] for j in seq.tolist()])
                     #         print(seq)
                     #         prot = prot_traj[i]
@@ -200,10 +201,11 @@ def main(model,
 
     # corrupter._sample_cfg.num_timesteps = 200
     # corrupter._sample_cfg.num_timesteps = 500
+    # corrupter.se3_noiser._sample_cfg.num_timesteps = 500
     # corrupter._sample_cfg.num_timesteps = 200
     # corrupter._rots_cfg.exp_rate = 5
     # corrupter._rots_cfg.sample_schedule = 'linear'
-    # corrupter.se3_noiser._rots_cfg.exp_rate = 5
+    # corrupter.se3_noiser._rots_cfg.exp_rate = 20
     # corrupter.se3_noiser._rots_cfg.sample_schedule = 'linear'
     # corrupter.sidechain_noiser.sample_sched = 'sigmoid'
     # corrupter.sidechain_noiser.sample_c = 10
@@ -245,12 +247,24 @@ if __name__ == '__main__':
     #         )
     #     ))[0]
 
-    ckpt_path = sorted(list(glob.glob(
+    ckpt_list = list(glob.glob(
         os.path.join(
             args.run_dir,
             "lightning_logs/version_0/checkpoints/*.ckpt",
         )
-    )))[args.checkpoint_idx]
+    ))
+    epoch_list = []
+    for ckpt_path in ckpt_list:
+        if ckpt_path.split("/")[-1] == "last.ckpt":
+            epoch_list.append((ckpt_path, 1e6))
+        else:
+            epoch = ckpt_path.split("=")[1].split("-")[0]
+            epoch_list.append((ckpt_path, int(epoch)))
+
+    epoch_list = sorted(epoch_list, key=lambda x: x[1])
+    epoch_list, _ = zip(*epoch_list)
+    ckpt_path = epoch_list[args.checkpoint_idx]
+    print(ckpt_path)
 
 
     cfg = load_from_yaml(config_path)
@@ -288,9 +302,9 @@ if __name__ == '__main__':
             cfg['datamodule']['sample_lengths'] = {
                 60: 5,
                 # 70: 5,
-                # 80: 5,
+                80: 5,
                 # 90: 5,
-                # 100: 5,
+                100: 5,
                 # 200: 5,
                 # 300: 5,
                 # 110: 5,

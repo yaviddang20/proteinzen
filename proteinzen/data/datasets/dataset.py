@@ -1,6 +1,7 @@
 """ Generic dataset for all input data """
 from typing import Dict
 import logging
+import os
 
 import pandas as pd
 import numpy as np
@@ -26,7 +27,10 @@ class PdbDataset(data.Dataset):
             max_num_res=500,
             min_percent_ordered=None,
             subset=None,
-            split=None
+            split=None,
+            use_tmpdir=False,
+            cache_dir=None,
+            normalize_cache=False,
         ):
         self._log = logging.getLogger(__name__)
         self.csv_path = csv_path
@@ -35,6 +39,9 @@ class PdbDataset(data.Dataset):
         self.subset = subset
         self.split = split
         self.min_percent_ordered = min_percent_ordered
+        self.use_tmpdir = use_tmpdir
+        self.cache_dir = cache_dir
+        self.normalize_cache = normalize_cache
         self._init_metadata()
 
     def _init_metadata(self):
@@ -47,6 +54,9 @@ class PdbDataset(data.Dataset):
         pdb_csv = pdb_csv[pdb_csv.modeled_seq_len >= self.min_num_res]
         if self.subset is not None:
             pdb_csv = pdb_csv.iloc[:self.subset]
+
+        pdb_csv["is_af2_struct"] = pdb_csv.pdb_name.str.startswith("AF-")
+
         pdb_csv = pdb_csv.sort_values('modeled_seq_len', ascending=False)
 
         if self.split is not None:
@@ -59,8 +69,23 @@ class PdbDataset(data.Dataset):
                 self.min_percent_ordered = 0
             elif "framediff" in self.csv_path:
                 self.min_percent_ordered = 0.5
+            elif "afdb" in self.csv_path:
+                self.min_percent_ordered = 0.5
 
         pdb_csv = pdb_csv[pdb_csv["coil_percent"] < (1 - self.min_percent_ordered)]
+
+        if self.use_tmpdir:
+            assert 'TMPDIR' in os.environ
+            pdb_csv['tmpfile_path'] = [
+                os.path.join(os.environ['TMPDIR'], pdb_name + ".pt")
+                for pdb_name in pdb_csv['pdb_name']
+            ]
+
+        if self.cache_dir is not None:
+            cache_df = pd.read_csv(os.path.join(self.cache_dir, "metadata.csv"))
+            # assert len(cache_df) == len(pdb_csv), "diff lengths not supported atm"
+            pdb_csv = pdb_csv.merge(cache_df, on="pdb_name")
+            assert len(pdb_csv) > 0
 
         self.csv = pdb_csv
 
@@ -117,6 +142,29 @@ class PdbDataset(data.Dataset):
         chain_feats = self._process_csv_row(processed_file_path)
         chain_feats['name'] = csv_row['pdb_name']
         chain_feats['csv_idx'] = torch.ones(1, dtype=torch.long) * idx
+
+        if self.use_tmpdir:
+            tmpfile_path = csv_row['tmpfile_path']
+            chain_feats['tmpfile_path'] = tmpfile_path
+            if os.path.exists(tmpfile_path):
+                tmp_dict = torch.load(tmpfile_path, map_location='cpu')
+                chain_feats['residue']['latent_mu'] = tmp_dict['latent_mu']
+                chain_feats['residue']['latent_logvar'] = tmp_dict['latent_logvar']
+            else:
+                chain_feats['residue']['latent_mu'] = torch.zeros([0, 128])
+                chain_feats['residue']['latent_logvar'] = torch.zeros([0, 128])
+
+        if self.cache_dir is not None:
+            cache_data = torch.load(csv_row['latent_cache_file'], map_location='cpu')
+            chain_feats['residue']['latent_mu'] = cache_data['latent_mu']
+            chain_feats['residue']['latent_logvar'] = cache_data['latent_logvar']
+            if self.normalize_cache:
+                cache_stats = torch.load(os.path.join(self.cache_dir, "latent_stats.pt"), map_location='cpu')
+                chain_feats['residue']['latent_norm_mu'] = cache_stats['mu'][None]
+                chain_feats['residue']['latent_norm_std'] = cache_stats['std'][None]
+
+
+
         return chain_feats
 
 
@@ -126,10 +174,15 @@ class LengthDataset(data.Dataset):
             lengths: Dict[int, int],
             batch_size: int = 3000,
             same_length_per_batch=False,
+            normalize_cache_path=None
         ):
         self._log = logging.getLogger(__name__)
         self.lengths = lengths
         self.batch_size = batch_size
+        if normalize_cache_path is not None:
+            self.cache_stats = torch.load(normalize_cache_path)
+        else:
+            self.cache_stats = None
 
         self.batches = []
         self.sample_ids = []
@@ -161,10 +214,15 @@ class LengthDataset(data.Dataset):
         return len(self.batches)
 
     def __getitem__(self, idx):
-        return {
+        ret =  {
             "num_res": self.batches[idx],
             "sample_id": self.sample_ids[idx]
         }
+        if self.cache_stats is not None:
+            ret['latent_norm_mu'] = self.cache_stats['mu'].clone()
+            ret['latent_norm_std'] = self.cache_stats['std'].clone()
+
+        return ret
 
 
 class GEOMDataset(data.Dataset):

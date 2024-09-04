@@ -343,10 +343,13 @@ def latent_scalar_sidechain_diffusion_loss(batch,
     }
 
 
-def latent_scalar_sidechain_fm_loss(batch,
-                                    latent_outputs,
-                                    t_norm_clip=0.9,
-                                    scale=0.01):
+def latent_scalar_sidechain_fm_loss(
+        batch,
+        latent_outputs,
+        t_norm_clip=0.9,
+        scale=0.01,
+        pointwise=False
+    ):
     res_data = batch['residue']
     x_mask = res_data['res_mask']
     noising_mask = res_data['noising_mask']
@@ -369,20 +372,27 @@ def latent_scalar_sidechain_fm_loss(batch,
     latent_ref_noise = torch.square(noised_latent - latent).sum(dim=-1) * total_mask
     latent_ref_noise = _nodewise_to_graphwise(latent_ref_noise, res_data.batch, total_mask)
 
-    latent_mu = latent_outputs['latent_mu']
-    latent_logvar = latent_outputs['latent_logvar']
-    latent_denoising_nll = _nll(denoised_latent, latent_mu, latent_logvar)
-    latent_denoising_nll = _nodewise_to_graphwise(latent_denoising_nll, res_data.batch, total_mask)
+    if pointwise:
+        dim_size = latent.shape[-1]
+        latent_denoising_loss = latent_denoising_loss / dim_size
+        latent_fm_loss = latent_fm_loss / dim_size
+        latent_ref_noise = latent_ref_noise / dim_size
 
-    latent_ref_noise_nll = _nll(latent, latent_mu, latent_logvar)
-    latent_ref_noise_nll = _nodewise_to_graphwise(latent_ref_noise_nll, res_data.batch, total_mask)
+
+    # latent_mu = latent_outputs['latent_mu']
+    # latent_logvar = latent_outputs['latent_logvar']
+    # latent_denoising_nll = _nll(denoised_latent, latent_mu, latent_logvar)
+    # latent_denoising_nll = _nodewise_to_graphwise(latent_denoising_nll, res_data.batch, total_mask)
+
+    # latent_ref_noise_nll = _nll(latent, latent_mu, latent_logvar)
+    # latent_ref_noise_nll = _nodewise_to_graphwise(latent_ref_noise_nll, res_data.batch, total_mask)
 
     return {
         "latent_denoising_loss": latent_denoising_loss,
         "latent_fm_loss": latent_fm_loss,
         "latent_ref_noise": latent_ref_noise,
-        "latent_denoising_nll": latent_denoising_nll,
-        "latent_ref_noise_nll": latent_ref_noise_nll,
+        # "latent_denoising_nll": latent_denoising_nll,
+        # "latent_ref_noise_nll": latent_ref_noise_nll,
     }
 
 

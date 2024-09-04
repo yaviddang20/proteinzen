@@ -1,5 +1,6 @@
 import copy
 from typing import Sequence, Dict, Union
+import os
 
 import tqdm
 import tree
@@ -40,6 +41,7 @@ class ProteinInterpolation(Task):
                  protein_noiser: ProteinInterpolant,
                  aux_loss_t_min=0.25,
                  compute_passthrough=True,
+                 pt_loss_t_min=0.0,
                  pt_clash_loss_t=1.1,
                  kl_strength=0,#1e-6,
                  rescale_kl_noise=False,
@@ -50,12 +52,16 @@ class ProteinInterpolation(Task):
                  vae_seq_masking=False,
                  vae_loss=True,
                  vae_seq_loss=True,
-                 train_vae_only=False):
+                 train_vae_only=False,
+                 no_grad_encoder=False,
+                 latent_fm_loss_scale=1,
+                 latent_pointwise_loss=False):
         super().__init__()
         self.se3_noiser = protein_noiser.se3_noiser
         self.sidechain_noiser = protein_noiser.sidechain_noiser
         self.aux_loss_t_min = aux_loss_t_min
         self.compute_passthrough = compute_passthrough
+        self.pt_loss_t_min = pt_loss_t_min
         self.pt_clash_loss_t = pt_clash_loss_t
         self.rng = np.random.default_rng()
         self.kl_strength = kl_strength
@@ -67,8 +73,10 @@ class ProteinInterpolation(Task):
         self.vae_seq_masking = vae_seq_masking
         self.vae_loss = vae_loss
         self.vae_seq_loss = vae_seq_loss
-
+        self.no_grad_encoder = no_grad_encoder
         self.train_vae_only = train_vae_only
+        self.latent_fm_loss_scale = latent_fm_loss_scale
+        self.latent_pointwise_loss = latent_pointwise_loss
 
     def _gen_diffuse_mask(self, data: HeteroData):
         return torch.ones_like(data['res_mask']).bool()
@@ -89,6 +97,16 @@ class ProteinInterpolation(Task):
         self.se3_noiser.set_device(data['residue']['atom37'].device)
         self.sidechain_noiser.set_device(data['residue']['atom37'].device)
         res_data = data['residue']
+
+        if "latent_mu" in res_data and "latent_logvar" in res_data:
+            right_size = (
+                res_data["latent_mu"].shape[0] == res_data.num_nodes
+            ) and (
+                res_data["latent_logvar"].shape[0] == res_data.num_nodes
+            )
+            if not right_size:
+                del res_data["latent_mu"]
+                del res_data["latent_logvar"]
 
         # compute base features
         chain_feats = {
@@ -145,6 +163,7 @@ class ProteinInterpolation(Task):
 
         data = self.se3_noiser.corrupt_batch(data)
 
+
         return data
 
     def process_sample_input(self, data: Dict, device='cpu'):
@@ -152,8 +171,36 @@ class ProteinInterpolation(Task):
         return data
 
     def _run_model(self, model, inputs, self_conditioning=None, pt_use_gt_seq=True):
-        # generate latent sidechains
-        latent_data = model.encoder(inputs, apply_noising_masks=self.vae_seq_masking)
+        res_data = inputs['residue']
+        if 'latent_mu' in res_data and 'latent_logvar' in res_data:
+            print("using cached latents")
+            latent_data = {
+                "latent_mu": res_data['latent_mu'],
+                "latent_logvar": res_data['latent_logvar'],
+            }
+            if 'latent_norm_mu' in res_data and 'latent_norm_std' in res_data:
+                latent_data.update({
+                    "latent_norm_mu": res_data['latent_norm_mu'],
+                    "latent_norm_std": res_data['latent_norm_std']
+                })
+        else:
+            print("generate latent")
+            # generate latent sidechains
+            if self.no_grad_encoder:
+                with torch.no_grad():
+                    latent_data = model.encoder(inputs, apply_noising_masks=self.vae_seq_masking)
+            else:
+                latent_data = model.encoder(inputs, apply_noising_masks=self.vae_seq_masking)
+
+            if "tmpfile_path" in inputs:
+                for i, tmpfile_path in enumerate(inputs['tmpfile_path']):
+                    select = (res_data.batch == i)
+                    save_dict = {
+                        'latent_mu': latent_data['latent_mu'][select].detach().cpu(),
+                        'latent_logvar': latent_data['latent_logvar'][select].detach().cpu(),
+                    }
+                    torch.save(save_dict, tmpfile_path)
+
 
         ## sample only if we're training
         if not isinstance(latent_data, dict):
@@ -168,7 +215,10 @@ class ProteinInterpolation(Task):
                 latent_data['latent_logvar'] * 0.5
             )
             latent_data[self.sidechain_x_1_key] = latent_data['latent_mu'] + latent_sigma * torch.randn_like(latent_sigma)
-
+            if "latent_norm_mu" in latent_data and "latent_norm_std" in latent_data:
+                latent_data[self.sidechain_x_1_key] = (
+                    latent_data[self.sidechain_x_1_key] - latent_data['latent_norm_mu'][res_data.batch]
+                ) / latent_data['latent_norm_std'][res_data.batch]
         else:
             latent_data[self.sidechain_x_1_key] = latent_data['latent_mu']
 
@@ -250,7 +300,8 @@ class ProteinInterpolation(Task):
         if not self.train_vae_only and model.self_conditioning and np.random.uniform() > 0.5:
             with torch.no_grad():
                 self_conditioning, _, sc_pt_outputs = self._run_model(model, inputs, pt_use_gt_seq=False)
-                self_conditioning.update(sc_pt_outputs)
+                if sc_pt_outputs is not None:
+                    self_conditioning.update(sc_pt_outputs)
         else:
             self_conditioning = None
 
@@ -323,6 +374,7 @@ class ProteinInterpolation(Task):
         )]
         clean_traj = []
         denoiser_out = None
+
         for t_2 in tqdm.tqdm(ts[1:]):
             # Run model.
             trans_t_1, rotmats_t_1, _, sidechain_t_1, _, _ = prot_traj[-1]
@@ -352,10 +404,20 @@ class ProteinInterpolation(Task):
 
                 pred_latent_sidechain = denoiser_out[self.sidechain_x_1_pred_key].detach()
 
+                if 'latent_norm_mu' in inputs and 'latent_norm_std' in inputs:
+                    print(pred_latent_sidechain.shape, inputs['latent_norm_mu'][None].shape)
+                    norm_pred_latent_sidechain = (
+                        pred_latent_sidechain + inputs['latent_norm_mu'][None]
+                    ) * inputs['latent_norm_std'][None]
+                    latent_output = {
+                        self.sidechain_x_1_key: norm_pred_latent_sidechain
+                    }
+                else:
+                    latent_output = {
+                        self.sidechain_x_1_key: pred_latent_sidechain
+                    }
 
-                latent_output = {
-                    self.sidechain_x_1_key: pred_latent_sidechain
-                }
+
                 data_list = []
                 for n in num_res:
                     data = HeteroData(
@@ -413,7 +475,11 @@ class ProteinInterpolation(Task):
             d_t = t_2 - t_1
             trans_t_2 = self.se3_noiser._trans_euler_step(d_t, t_1, pred_trans_1, trans_t_1)
             rotmats_t_2 = self.se3_noiser._rots_euler_step(d_t, t_1, pred_rotmats_1, rotmats_t_1)
-            sidechain_t_2 = self.sidechain_noiser._euler_step(d_t, t_1, pred_latent_sidechain, sidechain_t_1)
+            sidechain_t_2 = self.sidechain_noiser._euler_step(
+                d_t=d_t,
+                t=t_1,
+                x_1=pred_latent_sidechain,
+                x_t=sidechain_t_1)
 
             # sidechain_t_2 = torch.randn_like(sidechain_t_2) * 10
 
@@ -465,9 +531,17 @@ class ProteinInterpolation(Task):
         pred_psis = denoiser_out['psi'].detach().cpu()
         pred_latent_sidechain = denoiser_out[self.sidechain_x_1_pred_key].detach()
 
-        latent_output = {
-            self.sidechain_x_1_key: pred_latent_sidechain
-        }
+        if 'latent_norm_mu' in inputs and 'latent_norm_std' in inputs:
+            norm_pred_latent_sidechain = (
+                pred_latent_sidechain + inputs['latent_norm_mu'][None]
+            ) * inputs['latent_norm_std'][None]
+            latent_output = {
+                self.sidechain_x_1_key: norm_pred_latent_sidechain
+            }
+        else:
+            latent_output = {
+                self.sidechain_x_1_key: pred_latent_sidechain
+            }
         data_list = []
         for n in num_res:
             data = HeteroData(
@@ -534,7 +608,8 @@ class ProteinInterpolation(Task):
             latent_loss_dict = latent_scalar_sidechain_fm_loss(
                 inputs,
                 outputs,
-                scale=1 #0.1
+                scale=1,
+                pointwise=self.latent_pointwise_loss
             )
             bb_denoising_loss = (
                 bb_frame_diffusion_loss_dict["trans_vf_loss"] +
@@ -559,7 +634,7 @@ class ProteinInterpolation(Task):
                 frameflow_bb_denoising_finegrain_loss = (
                     frameflow_bb_frame_diffusion_loss_dict["scaled_pred_bb_mse"]
                     + frameflow_bb_frame_diffusion_loss_dict["scaled_dist_mat_loss"]
-                ) * (inputs['t'] > self.aux_loss_t_min)
+                ) * (inputs['t'] > 0.25)
                 frameflow_loss = (frameflow_bb_denoising_loss + 0.25 * frameflow_bb_denoising_finegrain_loss).mean()
         else:
             bb_frame_diffusion_loss_dict = {}
@@ -613,7 +688,7 @@ class ProteinInterpolation(Task):
                 pt_abs_pos_loss
                 + pt_rel_pos_loss
                 + (inputs['t'] > self.pt_clash_loss_t) * pt_loss_dict['pred_sidechain_clash_loss']
-            )
+            ) * (inputs['t'] > self.pt_loss_t_min)
 
             pt_loss_dict = {"pt_" + k: v for k,v in pt_loss_dict.items()}
         else:
@@ -622,7 +697,7 @@ class ProteinInterpolation(Task):
 
         loss = (
             bb_denoising_loss
-            + latent_denoising_loss
+            + self.latent_fm_loss_scale * latent_denoising_loss
             + 0.25 * bb_denoising_finegrain_loss
             + vae_loss * self.vae_loss
             + pt_loss
