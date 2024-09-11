@@ -233,6 +233,13 @@ def make_atom14_positions(protein):
     return protein
 
 
+def make_atom14_positions_np(batch):
+    batch = tree_map(lambda n: torch.tensor(n), batch, np.ndarray)
+    out = make_atom14_positions(batch)
+    out = tensor_tree_map(lambda t: np.array(t), out)
+    return out
+
+
 def atom37_to_frames(protein, eps=1e-8):
     aatype = protein["aatype"]
     all_atom_positions = protein["all_atom_positions"]

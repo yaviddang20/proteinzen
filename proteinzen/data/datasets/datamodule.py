@@ -99,7 +99,7 @@ class FramediffDataModule(L.LightningDataModule):
     def __init__(self,
                  task_sampler: TaskSampler,
                  data_dir,
-                 batch_size,
+                 batch_size,  # this is PER GPU
                  num_workers,
                  min_len=30,
                  max_len=1000,

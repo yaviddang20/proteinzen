@@ -71,6 +71,6 @@ cd esmfold
 bash ${REPO_ROOT}/scripts/analysis/esmfold.sh > esmfold.log
 
 conda activate ${ENV_NAME}
-python ${REPO_ROOT}/scripts/analysis/esm_analysis.py --esmlog esmfold.log --folded_folder $PWD --samples ../samples | tail -n 3 > ${RUN_DIR}/$OUTPREFIX/num_designable.txt
+python ${REPO_ROOT}/scripts/analysis/esm_analysis.py --esmlog esmfold.log --folded_folder $PWD --samples ../samples # | tail -n 3 > ${RUN_DIR}/$OUTPREFIX/num_designable.txt
 cd ..
 bash ${REPO_ROOT}/scripts/analysis/analysis_suite.sh

@@ -158,6 +158,14 @@ def config_hydra_store():
     datamodule_store(
         pbuilds(
             FramediffDataModule,
+            data_dir=f"{os.environ.get('REPO_ROOT')}/data/framediff95",
+            batch_size=3000,
+            num_workers=4
+        ),
+        name="framediff95")
+    datamodule_store(
+        pbuilds(
+            FramediffDataModule,
             data_dir=f"{os.environ.get('REPO_ROOT')}/data/frameflow",
             batch_size=3000,
             num_workers=4
@@ -171,6 +179,14 @@ def config_hydra_store():
             num_workers=4
         ),
         name="afdb_128")
+    datamodule_store(
+        pbuilds(
+            FramediffDataModule,
+            data_dir=f"{os.environ.get('REPO_ROOT')}/data/afdb_512",
+            batch_size=3000,
+            num_workers=4
+        ),
+        name="afdb_512")
     datamodule_store(
         pbuilds(
             GeomDataModule,

@@ -1,4 +1,6 @@
 """ Batch samplers for datasets """
+import logging
+
 import numpy as np
 import random
 import torch
@@ -8,7 +10,7 @@ from torch.utils import data
 
 from .dataset import PdbDataset, GEOMDataset
 
-
+log = logging.getLogger(__name__)
 
 class BatchSampler:
     '''
@@ -114,10 +116,13 @@ class ClusteredBatchSampler:
             if df['is_af2_struct'].any():
                 real_clusters = df[~df['is_af2_struct']].cluster.unique()
                 af_clusters = df[df['is_af2_struct']].cluster.unique()
-                subsample_af_clusters = g.choice(af_clusters, size=len(real_clusters * 3), replace=False)
+                # sample at least 25% real data
+                num_af_clusters = min(len(real_clusters)*3, len(af_clusters))
+                subsample_af_clusters = g.choice(af_clusters, size=num_af_clusters, replace=False)
                 clusters = np.concatenate([real_clusters, subsample_af_clusters])
             else:
                 clusters = self.clusters
+            print(len(clusters))
             g.shuffle(clusters)
 
 
@@ -151,6 +156,8 @@ class ClusteredBatchSampler:
         splits = []
         for i in range(self.num_replicas):
             splits.append(self.batches[split_size*i: split_size*(i+1)])
+            if i == self.rank:
+                log.info(f"rank {self.rank} has split {(split_size*i, split_size*(i+1))}")
 
         self.batches = splits[self.rank]
 
@@ -164,6 +171,7 @@ class ClusteredBatchSampler:
         if self.shuffle:
             self._form_batches()
         print(f"rank {self.rank}: epoch is {self.epoch}")
+        log.info(f"rank {self.rank}: epoch is {self.epoch}")
 
         for batch in self.batches:
             yield batch

@@ -9,6 +9,9 @@ from .atomic.atom14 import atom14_mse_loss, chi_loss
 from .atomic.atomic import residue_knn_neighborhood_atomic_dist_loss, local_atomic_context_loss, smooth_lddt_loss
 from .atomic.interresidue import intersidechain_clash_loss
 from .latent import so3_embedding_kl, scalars_kl_div
+from .frames import all_atom_fape_loss
+
+from proteinzen.utils.openfold.rigid_utils import Rigid
 
 
 def seq_cce_loss(ref_seq,
@@ -56,8 +59,11 @@ def autoencoder_losses(batch,
                        label_smoothing=0.0,
                        logit_norm_loss=0.0,
                        use_smooth_lddt=False,
+                       use_fape=False,
+                       fape_length_scale=1.,
                        t_norm_clip=0.9,
-                       apply_seq_noising_mask=False):
+                       apply_seq_noising_mask=False
+):
     res_data = batch['residue']
 
     gt_atom14 = res_data['atom14_gt_positions']
@@ -100,7 +106,7 @@ def autoencoder_losses(batch,
     if apply_seq_noising_mask:
         seq_noising_mask = res_data['seq_noising_mask']
     else:
-        seq_noising_mask = res_data['seq_mask']
+        seq_noising_mask = ~res_data['seq_mask']
 
     if "seq_probs" in model_outputs and model_outputs["seq_probs"] is not None:
         seq_loss = seq_cce_loss(
@@ -156,6 +162,20 @@ def autoencoder_losses(batch,
     else:
         smooth_lddt = torch.zeros_like(t)
 
+    if use_fape:
+        fape = all_atom_fape_loss(
+            pred_atom14=pred_atom14,
+            gt_atom14=gt_atom14,
+            pred_rigids=model_outputs['final_rigids'],
+            gt_rigids=Rigid.from_tensor_7(batch['residue']['rigids_1']),
+            batch=res_data.batch,
+            atom14_mask=atom14_gt_mask,
+            length_scale=fape_length_scale
+        )
+    else:
+        fape = torch.zeros_like(t)
+
+
     sidechain_chi_loss = chi_loss(
         gt_torsions[..., 3:, :],
         alt_torsions[..., 3:, :],
@@ -191,6 +211,7 @@ def autoencoder_losses(batch,
         "scaled_atom14_mse": scaled_atom14_mse,
         "pred_sidechain_clash_loss": pred_atom14_clash_loss,
         "smooth_lddt": smooth_lddt,
+        "fape": fape,
         # "bond_length_mse": bond_length_mse,
         # "bond_angle_loss": bond_angle_loss,
         "chi_loss": sidechain_chi_loss,

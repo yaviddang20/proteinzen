@@ -312,9 +312,13 @@ class SE3Interpolant:
         mask = res_mask & noising_mask
 
         # [B]
-        t = self.sample_t(batch.num_graphs)
+        if "t" not in batch:
+            t = self.sample_t(batch.num_graphs)
+            batch["t"] = t
+        else:
+            t = batch["t"]
+
         nodewise_t = batchwise_to_nodewise(t, res_data.batch)
-        batch["t"] = t
 
         if "rotmats_0" in res_data:
             rotmats_0 = res_data['rotmats_0']

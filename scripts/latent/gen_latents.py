@@ -58,11 +58,29 @@ def main(model,
         os.makedirs(zen_cfg['experiment']['out_dir'], exist_ok=True)
 
     filepaths = []
+    # total_batch = 0
+    # for batch in tqdm.tqdm(datamodule_inst.train_dataloader()):
+    #     total_batch += batch.num_graphs
+    # print("Total num data:", total_batch)
+    # missing_df = pd.read_csv("/wynton/home/kortemme/alexjli/projects/proteinzen/analysis/missing.csv")
+
     for batch in tqdm.tqdm(datamodule_inst.train_dataloader()):
         batch = batch.to(device)
+
+        # skip = True
+        # for pdb_name in batch['name']:
+        #     if pdb_name in missing_df.pdb_name:
+        #         skip = False
+        #         print(pdb_name)
+        # if skip:
+        #     print("skipping")
+        #     continue
+
         with torch.no_grad():
             outputs = model.encoder(batch)
-        for i, pdb_name in enumerate(batch['name']):
+        for i in range(batch.num_graphs):
+            pdb_name = batch['name'][i]
+
             select = (batch['residue'].batch == i)
             latent_mu = outputs['latent_mu'][select].detach().cpu()
             latent_logvar = outputs['latent_logvar'][select].detach().cpu()

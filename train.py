@@ -71,7 +71,7 @@ class Experiment:
             enable_progress_bar=True,
             enable_model_summary=True,
             devices=devices,
-            reload_dataloaders_every_n_epochs=1,
+            # reload_dataloaders_every_n_epochs=1,
             # strategy='ddp_find_unused_parameters_true',
             # detect_anomaly=True
         )
@@ -117,7 +117,7 @@ def main(model,
 
     if 'only_load_state_dict' in zen_cfg:
         assert zen_cfg['experiment']['warm_start'] is not None
-        ckpt = torch.load(zen_cfg['experiment']['warm_start'])
+        ckpt = torch.load(zen_cfg['experiment']['warm_start'], map_location='cpu')
         encoder_dict = {
             k.removeprefix("model.encoder."): v
             for k, v in ckpt['state_dict'].items()

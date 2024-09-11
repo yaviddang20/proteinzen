@@ -277,7 +277,9 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                  skip_conn_spatial_edges=False,
                  sc_edge_unit_vecs=True,
                  impute_oxy=False,
-                 num_aa=20):
+                 num_aa=20,
+                 masked_latent_feature=False
+    ):
         super().__init__()
 
         self.c_s = c_s
@@ -288,12 +290,13 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         self.n_layers = n_layers
         self.impute_oxy = impute_oxy
         self.sc_edge_unit_vecs = sc_edge_unit_vecs
+        self.masked_latent_feature = masked_latent_feature
 
         self.h_time = h_time
         self.time_rbf = GaussianRandomFourierBasis(n_basis=h_time//2)
 
         # node_embedding + time_embedding + fixed_mask + self_conditioning
-        self.node_in = c_s + h_time + 1 + self_conditioning * (7 + c_latent)
+        self.node_in = c_s + h_time + 1 + self_conditioning * (7 + c_latent) + (1 if masked_latent_feature else 0)
 
         self.embed_node = nn.Sequential(
             nn.Linear(
@@ -435,11 +438,16 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
             residx,
             num_embeddings=self.c_s,
             device=device)
-        node_input = torch.cat([
-                res_pos,
-                fourier_time,
-                res_data['noising_mask'].float()[..., None]
-            ], dim=-1)
+        node_input = [
+            res_pos,
+            fourier_time,
+            res_data['noising_mask'].float()[..., None]
+        ]
+        if self.masked_latent_feature:
+            node_input.append(
+                res_data['seq_noising_mask'].float()[..., None]
+            )
+        node_input = torch.cat(node_input, dim=-1)
 
         if self.self_conditioning and self_condition is not None:
             self_cond_rigids = self_condition['final_rigids']
@@ -493,6 +501,9 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         rigids_t = rigids_t.scale_translation(0.1)
         rigids = rigids_t
 
+        rigid_traj = []
+        latent_traj = []
+
         for i, layer in enumerate(self.denoiser):
             # recompute graph
             raw_edge_features, edge_index = self._gen_spatial_edge_features(
@@ -516,6 +527,9 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
                 seq_edge_index,
                 res_data,
             )
+            if i < len(self.denoiser) - 1:
+                rigid_traj.append(rigids)
+                latent_traj.append(latent_features)
 
         _, psi = self.torsion_angles(node_features)
         rigids = rigids.scale_translation(10)
@@ -532,5 +546,7 @@ class DynamicGraphIpaFrameDenoiser(nn.Module):
         ret['node_features'] = node_features
         ret['pred_latent_sidechain'] = latent_features
         ret['edge_index'] = edge_index
+        ret['rigid_traj'] = rigid_traj
+        ret['latent_traj'] = latent_traj
 
         return ret

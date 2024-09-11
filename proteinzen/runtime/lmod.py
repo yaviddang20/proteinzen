@@ -711,6 +711,10 @@ class ProteinModule(L.LightningModule):
         #     if key.startswith("model.decoder")
         # })
 
+    def on_train_epoch_start(self):
+        super().on_train_epoch_start()
+        if hasattr(self.trainer.train_dataloader.batch_sampler, "epoch"):
+            self.trainer.train_dataloader.batch_sampler.set_epoch(self.trainer.current_epoch)
 
     def training_step(self, batch):
         task: TaskList = batch.task

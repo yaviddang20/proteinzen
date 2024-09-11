@@ -49,13 +49,27 @@ class ProteinInterpolation(Task):
                  t_clip_se3=0.9,
                  t_clip_aa=0.9,
                  disable_bb_aux_loss=False,
+                 square_bb_aux_loss_t_factor=False,
                  vae_seq_masking=False,
                  vae_loss=True,
                  vae_seq_loss=True,
                  train_vae_only=False,
                  no_grad_encoder=False,
                  latent_fm_loss_scale=1,
-                 latent_pointwise_loss=False):
+                 latent_pointwise_loss=False,
+                 t_min=0.01,
+                 t_max=0.99,
+                 lognorm_sample_t=False,
+                 lognorm_t_mu=0.0,
+                 lognorm_t_std=1.0,
+                 rigid_traj_loss=False,
+                 aa_traj_loss=False,
+                 use_fape_loss=False,
+                 fape_length_scale=1.,
+                 traj_decay_factor=0.99,
+                 percent_all_mask=0.25,
+                 percent_no_mask=0.25,
+    ):
         super().__init__()
         self.se3_noiser = protein_noiser.se3_noiser
         self.sidechain_noiser = protein_noiser.sidechain_noiser
@@ -67,6 +81,8 @@ class ProteinInterpolation(Task):
         self.kl_strength = kl_strength
         self.rescale_kl_noise = rescale_kl_noise
         self.use_smooth_lddt = use_smooth_lddt
+        self.use_fape_loss = use_fape_loss
+        self.fape_length_scale = fape_length_scale
         self.t_clip_se3 = t_clip_se3
         self.t_clip_aa = t_clip_aa
         self.disable_bb_aux_loss = disable_bb_aux_loss
@@ -77,6 +93,17 @@ class ProteinInterpolation(Task):
         self.train_vae_only = train_vae_only
         self.latent_fm_loss_scale = latent_fm_loss_scale
         self.latent_pointwise_loss = latent_pointwise_loss
+        self.rigid_traj_loss = rigid_traj_loss
+        self.aa_traj_loss = aa_traj_loss
+        self.square_bb_aux_loss_t_factor = square_bb_aux_loss_t_factor
+        self.percent_all_mask = percent_all_mask
+        self.percent_no_mask = percent_no_mask
+
+        self.t_min = t_min
+        self.t_max = t_max
+        self.lognorm_sample_t = lognorm_sample_t
+        self.lognorm_t_mu = lognorm_t_mu
+        self.lognorm_t_std = lognorm_t_std
 
     def _gen_diffuse_mask(self, data: HeteroData):
         return torch.ones_like(data['res_mask']).bool()
@@ -84,13 +111,22 @@ class ProteinInterpolation(Task):
     def _gen_seq_noising_mask(self, data: HeteroData):
         # return torch.zeros_like(data['res_mask']).bool()
         select_noising_scheme = self.rng.random()
-        if select_noising_scheme < 0.25:
+        if select_noising_scheme < self.percent_no_mask:
             return torch.ones_like(data['res_mask']).bool()
-        elif select_noising_scheme > 0.75:
+        elif select_noising_scheme > 1 - self.percent_all_mask:
             return torch.zeros_like(data['res_mask']).bool()
         else:
             percent = self.rng.random()
             return torch.rand(data['res_mask'].shape, device=data['res_mask'].device) > percent
+
+    def _sample_t(self, num_batch, device):
+        if self.lognorm_sample_t:
+            t = torch.randn(num_batch, device=device).float()
+            t = (t * self.lognorm_t_std) + self.lognorm_t_mu
+            t = torch.sigmoid(t)
+        else:
+            t = torch.rand(num_batch, device=device).float()
+        return t * (1 - 2 * self.t_min) + self.t_min
 
     def process_input(self, data: HeteroData):
         data = copy.deepcopy(data)
@@ -161,8 +197,8 @@ class ProteinInterpolation(Task):
         # noising masks
         res_data['atom14_noising_mask'] = res_data['atom14_mask']
 
+        data['t'] = self._sample_t(data.num_graphs, self.se3_noiser._device)
         data = self.se3_noiser.corrupt_batch(data)
-
 
         return data
 
@@ -173,7 +209,7 @@ class ProteinInterpolation(Task):
     def _run_model(self, model, inputs, self_conditioning=None, pt_use_gt_seq=True):
         res_data = inputs['residue']
         if 'latent_mu' in res_data and 'latent_logvar' in res_data:
-            print("using cached latents")
+            # print("using cached latents")
             latent_data = {
                 "latent_mu": res_data['latent_mu'],
                 "latent_logvar": res_data['latent_logvar'],
@@ -184,7 +220,7 @@ class ProteinInterpolation(Task):
                     "latent_norm_std": res_data['latent_norm_std']
                 })
         else:
-            print("generate latent")
+            # print("generate latent")
             # generate latent sidechains
             if self.no_grad_encoder:
                 with torch.no_grad():
@@ -283,6 +319,7 @@ class ProteinInterpolation(Task):
                     use_gt_seq=pt_use_gt_seq)
                 passthrough_outputs.update(noised_latent_data)
                 passthrough_outputs.update(latent_data)
+                passthrough_outputs['final_rigids'] = latent_outputs['final_rigids']
             else:
                 passthrough_outputs = None
 
@@ -604,7 +641,8 @@ class ProteinInterpolation(Task):
         if not self.train_vae_only:
             bb_frame_diffusion_loss_dict = bb_frame_fm_loss(
                 inputs, outputs, sep_rot_loss=True,
-                t_norm_clip=self.t_clip_se3)
+                t_norm_clip=self.t_clip_se3,
+                square_aux_loss_time_factor=self.square_bb_aux_loss_t_factor)
             latent_loss_dict = latent_scalar_sidechain_fm_loss(
                 inputs,
                 outputs,
@@ -636,6 +674,36 @@ class ProteinInterpolation(Task):
                     + frameflow_bb_frame_diffusion_loss_dict["scaled_dist_mat_loss"]
                 ) * (inputs['t'] > 0.25)
                 frameflow_loss = (frameflow_bb_denoising_loss + 0.25 * frameflow_bb_denoising_finegrain_loss).mean()
+
+            # bb_traj_loss = 0
+            # aa_traj_loss = 0
+            # if self.rigid_traj_loss:
+            #     traj_len = len(outputs['rigid_traj']) + 1
+            #     for k, rigids_k in enumerate(outputs['rigid_traj']):
+            #         outputs_copy = copy.copy(outputs)
+            #         outputs_copy['final_rigids'] = rigids_k
+            #         bb_traj_loss_dict = bb_frame_fm_loss(
+            #             inputs, outputs_copy, sep_rot_loss=True,
+            #             t_norm_clip=0.9)
+            #         bb_traj_loss = (
+            #             bb_traj_loss_dict["trans_vf_loss"] +
+            #             bb_traj_loss_dict["rot_vf_loss"]
+            #         )
+            #         traj_loss += bb_traj_loss * (0.99 ** (traj_len - k))
+            # if self.aa_traj_loss:
+            #     traj_len = len(outputs['aa_traj']) + 1
+            #     for k, rigids_k in enumerate(outputs['rigid_traj']):
+            #         outputs_copy = copy.copy(outputs)
+            #         outputs_copy['final_rigids'] = rigids_k
+            #         bb_traj_loss_dict = bb_frame_fm_loss(
+            #             inputs, outputs_copy, sep_rot_loss=True,
+            #             t_norm_clip=0.9)
+            #         bb_traj_loss = (
+            #             bb_traj_loss_dict["trans_vf_loss"] +
+            #             bb_traj_loss_dict["rot_vf_loss"]
+            #         )
+            #         traj_loss += bb_traj_loss * (0.99 ** (traj_len - k))
+
         else:
             bb_frame_diffusion_loss_dict = {}
             latent_loss_dict = {}
@@ -666,15 +734,19 @@ class ProteinInterpolation(Task):
             pt_outputs = outputs["pt_outputs"]
             assert pt_outputs is not None
             pt_loss_dict = autoencoder_losses(
-                inputs, pt_outputs, use_smooth_lddt=self.use_smooth_lddt,
+                inputs, pt_outputs,
+                use_smooth_lddt=self.use_smooth_lddt,
+                use_fape=self.use_fape_loss,
+                fape_length_scale=self.fape_length_scale,
                 t_norm_clip=self.t_clip_aa,
-                apply_seq_noising_mask=False
+                apply_seq_noising_mask=False,
             )
             norm = 1 - torch.min(inputs['t'], torch.as_tensor(self.t_clip_aa))
             pt_abs_pos_loss = (
                 pt_loss_dict["scaled_atom14_mse"]
                 + pt_loss_dict["sidechain_dists_mse"] * (not self.use_smooth_lddt)
-                + pt_loss_dict["smooth_lddt"] / (norm ** 2)
+                + pt_loss_dict["smooth_lddt"] # / (norm ** 2)
+                + pt_loss_dict["fape"] # / (norm ** 2)
                 # + pt_loss_dict["chi_loss"]
                 # + pt_loss_dict["seq_loss"]
             ) * (inputs['t'] > self.aux_loss_t_min)

@@ -22,6 +22,8 @@ def all_atom_fape_loss(
     gt_rigids,
     batch,
     atom14_mask,
+    length_scale=10.,
+    l1_clamp_distance=10.
 ):
     ret = []
     for i in range(batch.max().item()+1):
@@ -33,8 +35,8 @@ def all_atom_fape_loss(
             pred_positions=pred_atom14[subset],
             target_positions=gt_atom14[subset],
             positions_mask=atom14_mask[subset],
-            length_scale=10.,
-            l1_clamp_distance=10.
+            length_scale=length_scale,
+            l1_clamp_distance=l1_clamp_distance
         )
         ret.append(fape)
     loss = torch.cat(ret, dim=-1)

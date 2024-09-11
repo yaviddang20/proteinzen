@@ -105,7 +105,8 @@ class TFNLatentWrapper(nn.Module):
                  smooth_embedding=False,
                  mlp_decoder=False,
                  use_masking_features=False,
-                 compatibility_mode=True
+                 denoiser_masked_latent_feature=False,
+                 compatibility_mode=False
                  ):
         super().__init__()
         self.encoder = ProteinAtomicEmbedder(
@@ -150,6 +151,7 @@ class TFNLatentWrapper(nn.Module):
             knn_k=knn_k,
             lrange_k=lrange_k,
             self_conditioning=self_conditioning,
+            masked_latent_feature=denoiser_masked_latent_feature
         )
         self.c_latent = c_latent
         self.self_conditioning = self_conditioning

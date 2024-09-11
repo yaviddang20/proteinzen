@@ -84,8 +84,11 @@ class PdbDataset(data.Dataset):
         if self.cache_dir is not None:
             cache_df = pd.read_csv(os.path.join(self.cache_dir, "metadata.csv"))
             # assert len(cache_df) == len(pdb_csv), "diff lengths not supported atm"
-            pdb_csv = pdb_csv.merge(cache_df, on="pdb_name")
-            assert len(pdb_csv) > 0
+            print(len(pdb_csv), len(cache_df))
+            merged_csv = pdb_csv.merge(cache_df, on="pdb_name")
+            print(len(pdb_csv), len(merged_csv))
+            assert len(pdb_csv) == len(merged_csv), (len(pdb_csv), len(merged_csv))
+            pdb_csv = merged_csv
 
         self.csv = pdb_csv
 

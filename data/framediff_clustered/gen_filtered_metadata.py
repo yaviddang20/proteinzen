@@ -36,7 +36,7 @@ print(len(df) - sum(not_ca_only))
 df = df[not_ca_only]
 
 pdb_to_cluster = {}
-with open("clusters-by-entity-30.txt", "r") as f:
+with open("clusters-by-entity-95.txt", "r") as f:
     for i, line in enumerate(f):
         for chain in line.split(' '):
             pdb = chain.split('_')[0]

@@ -270,6 +270,8 @@ if __name__ == '__main__':
     cfg = load_from_yaml(config_path)
     cfg['experiment']['warm_start'] = ckpt_path
     cfg['datamodule']['batch_size'] = 2000
+    if 'compatibility_mode' not in cfg['model']:
+        cfg['model']['compatibility_mode'] = True
 
     if cfg['domain']['domain'] == "backbone":
         if args.debug:
@@ -312,7 +314,7 @@ if __name__ == '__main__':
                 # 230: 1
             }
         else:
-            if cfg['datamodule']['max_len'] == 128:
+            if cfg['datamodule']['max_len'] == 128 or 'afdb_128' in cfg['datamodule']['data_dir']:
                 cfg['datamodule']['sample_lengths'] = {
                     i: 10
                     for i in range(60, 128+1)
