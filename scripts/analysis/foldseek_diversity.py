@@ -40,3 +40,13 @@ if __name__ == '__main__':
     num_clusters = run_easy_cluster("designable_samples_folded", "designable_clusters")
     with open("num_foldseek_clusters.txt", "w") as fp:
         fp.write(f"Num clusters: {num_clusters}")
+
+    os.makedirs("consistent_clusters", exist_ok=True)
+    num_clusters = run_easy_cluster("consistent_samples_folded", "consistent_clusters")
+    with open("num_foldseek_consistent_clusters.txt", "w") as fp:
+        fp.write(f"Num clusters: {num_clusters}")
+
+    os.makedirs("precise_clusters", exist_ok=True)
+    num_clusters = run_easy_cluster("precise_samples_folded", "precise_clusters")
+    with open("num_foldseek_precise_clusters.txt", "w") as fp:
+        fp.write(f"Num clusters: {num_clusters}")

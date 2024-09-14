@@ -15,6 +15,8 @@ export GEOMSTATS_BACKEND=pytorch
 echo $SGE_GPU
 echo $CUDA_VISIBLE_DEVICES
 
+module load Sali cuda
+
 # SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 # source $SCRIPT_DIR/env_vars.sh
 source /wynton/home/kortemme/alexjli/projects/proteinzen/env_vars.sh

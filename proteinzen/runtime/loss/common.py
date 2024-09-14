@@ -6,7 +6,7 @@ from proteinzen.data.openfold.residue_constants import restype_order_with_x
 
 from .utils import _nodewise_to_graphwise
 from .atomic.atom14 import atom14_mse_loss, chi_loss
-from .atomic.atomic import residue_knn_neighborhood_atomic_dist_loss, local_atomic_context_loss, smooth_lddt_loss
+from .atomic.atomic import residue_knn_neighborhood_atomic_dist_loss, local_atomic_context_loss, smooth_lddt_loss, sparse_smooth_lddt_loss
 from .atomic.interresidue import intersidechain_clash_loss
 from .latent import so3_embedding_kl, scalars_kl_div
 from .frames import all_atom_fape_loss
@@ -152,7 +152,7 @@ def autoencoder_losses(batch,
     scaled_atom14_mse = atom14_mse / (norm_scale**2) * 0.01
 
     if use_smooth_lddt:
-        smooth_lddt = smooth_lddt_loss(
+        smooth_lddt = sparse_smooth_lddt_loss(
             pred_atom14=pred_atom14_gt_seq,
             gt_atom14=gt_atom14,
             alt_atom14=alt_atom14,

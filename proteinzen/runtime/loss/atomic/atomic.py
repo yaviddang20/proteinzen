@@ -245,3 +245,79 @@ def smooth_lddt_loss(
             torch.sum(lddt * mask * radius_mask) / torch.sum(mask)
         )
     return 1 - torch.stack(smooth_lddt)
+
+def sparse_smooth_lddt_loss(
+    pred_atom14,
+    gt_atom14,
+    alt_atom14,
+    batch,
+    atom14_mask,
+    eps=1e-8,
+    r=15,
+    max_num_neighbors=10000,
+):
+    """ smooth_lddt_loss from AlphaFold3
+
+    Args:
+        pred_atom14 (_type_): _description_
+        gt_atom14 (_type_): _description_
+        alt_atom14 (_type_): _description_
+        batch (_type_): _description_
+        atom14_mask (_type_): _description_
+        r (int, optional): _description_. Defaults to 6.
+        eps (_type_, optional): _description_. Defaults to 1e-6.
+        max_num_neighbors (int, optional): _description_. Defaults to 100.
+
+    Returns:
+        _type_: _description_
+    """
+    res_mask = atom14_mask[:, 1]
+    # re: ambiguous atom14 naming
+    # im gonna use a heuristic for the ref atom14
+    # where we'll just take the ref residue atom ordering
+    # as the one which is lowest in rmsd to the predicted structure
+    # in a lot of cases this probably won't hold but it will at least work
+    # in low rmsd regimes i think
+    with torch.no_grad():
+        pred_gt_diff = torch.square(pred_atom14 - gt_atom14).sum(dim=-1)
+        pred_alt_diff = torch.square(pred_atom14 - alt_atom14).sum(dim=-1)
+        pred_gt_mse = torch.sum(pred_gt_diff * atom14_mask, dim=-1)
+        pred_alt_mse = torch.sum(pred_alt_diff * atom14_mask, dim=-1)
+
+        gt_over_alt = pred_gt_mse < pred_alt_mse
+        ref_atom14 = gt_atom14 * gt_over_alt[..., None, None] + alt_atom14 * ~gt_over_alt[..., None, None]
+
+    flat_ref_atom14 = ref_atom14[atom14_mask]
+    flat_pred_atom14 = pred_atom14[atom14_mask]
+    batch_expand = batch[..., None].expand(-1, atom14_mask.shape[-1])[atom14_mask]
+    edge_index = radius_graph(flat_ref_atom14, r, batch_expand, max_num_neighbors=max_num_neighbors)
+
+    pred_dist_vec = flat_pred_atom14[edge_index[0]] - flat_pred_atom14[edge_index[1]]
+    pred_dists = torch.linalg.vector_norm(pred_dist_vec + eps, dim=-1)
+
+    ref_dist_vec = flat_ref_atom14[edge_index[0]] - flat_ref_atom14[edge_index[1]]
+    ref_dists = torch.linalg.vector_norm(ref_dist_vec + eps, dim=-1)
+
+    abs_dev = torch.abs(pred_dists - ref_dists + eps)
+    smooth_lddt = 0.25 * (
+        torch.sigmoid(0.5 - abs_dev)
+        + torch.sigmoid(1 - abs_dev)
+        + torch.sigmoid(2 - abs_dev)
+        + torch.sigmoid(4 - abs_dev)
+    )
+    edge_batch = batch_expand[edge_index[1]]
+    num_graph = batch_expand.max().item() + 1
+    graphwise_smooth_lddt = scatter(
+        smooth_lddt,
+        edge_batch,
+        dim=0,
+        dim_size=num_graph
+    )
+    graphwise_num_edges = scatter(
+        torch.ones_like(edge_batch),
+        edge_batch,
+        dim=0,
+        dim_size=num_graph
+    )
+    smooth_lddt = graphwise_smooth_lddt / graphwise_num_edges
+    return 1 - smooth_lddt

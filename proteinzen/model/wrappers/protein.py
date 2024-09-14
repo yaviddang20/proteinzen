@@ -326,12 +326,29 @@ class TFNDenseLatentWrapper(nn.Module):
                  use_init_dgram=False,
                  update_edges_with_dgram=False,
                  use_proteus_transition=False,
+                 res_h_mult_factor=2,
+                 res_edge_mult_factor=1,
+                 encoder_res_edge_updates=False,
+                 broadcast_to_atoms=False,
+                 lrange_embedding=False,
+                 smooth_embedding=False,
+                 use_masking_features=False,
+                 denoiser_masked_latent_feature=False,
+                 compatibility_mode=False
                  ):
         super().__init__()
         self.encoder = ProteinAtomicEmbedder(
             h_frame=c_latent,
             res_num_rbf=num_rbf,
             knn_k=sidechain_k,
+            broadcast_to_atoms=broadcast_to_atoms,
+            lrange_graph=lrange_embedding,
+            smooth_nodewise=smooth_embedding,
+            use_masking_features=use_masking_features,
+            res_h_mult_factor=res_h_mult_factor,
+            res_edge_mult_factor=res_edge_mult_factor,
+            res_edge_update=encoder_res_edge_updates,
+            compatibility_mode=compatibility_mode
         )
         self.decoder = DesignIPMPDecoder(
             c_s=c_s//2,

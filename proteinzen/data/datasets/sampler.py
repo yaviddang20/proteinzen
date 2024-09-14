@@ -349,8 +349,19 @@ class ClusteredLengthBatchSampler:
         # deterministically shuffle based on epoch and seed
         g = np.random.default_rng(self.seed + self.epoch)
 
+        if df['is_af2_struct'].any():
+            real_clusters = df[~df['is_af2_struct']].cluster.unique()
+            af_clusters = df[df['is_af2_struct']].cluster.unique()
+            # sample at least 25% real data
+            num_af_clusters = min(len(real_clusters)*3, len(af_clusters))
+            subsample_af_clusters = g.choice(af_clusters, size=num_af_clusters, replace=False)
+            clusters = np.concatenate([real_clusters, subsample_af_clusters])
+        else:
+            clusters = self.clusters
+        print(len(clusters))
+
         # sample one example per cluster
-        for cluster in self.clusters:
+        for cluster in clusters:
             cluster_sample = df[df['cluster'] == cluster].sample(1, random_state=g)
             iloc = cluster_sample['iloc'].iloc[0]
             assert df.iloc[iloc].pdb_name == cluster_sample.pdb_name.iloc[0]
@@ -385,7 +396,7 @@ class ClusteredLengthBatchSampler:
                     self.batches.append(batch)
                 current_node_count = sample_node_count
                 batch = [iloc]
-            print(batch, sample_node_count)
+            print(batch, current_node_count, sample_node_count)
         if not self.drop_last and len(batch) > 0:
             self.batches.append(batch)
 

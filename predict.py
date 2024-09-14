@@ -201,6 +201,7 @@ def main(model,
 
     # corrupter._sample_cfg.num_timesteps = 200
     # corrupter._sample_cfg.num_timesteps = 500
+    corrupter.se3_noiser._sample_cfg.num_timesteps = 200
     # corrupter.se3_noiser._sample_cfg.num_timesteps = 500
     # corrupter._sample_cfg.num_timesteps = 200
     # corrupter._rots_cfg.exp_rate = 5
