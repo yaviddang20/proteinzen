@@ -1,11 +1,11 @@
 #!/bin/bash
 #$ -S /bin/bash
-#$ -o novelty.out
+#$ -o novelty_precise.out
 #$ -j y
 #$ -r y
 #$ -R y
-#$ -pe smp 32
 #$ -cwd
+#$ -pe smp 32
 #$ -l mem_free=2G
 #$ -l h_rt=24:00:00
 
@@ -14,38 +14,14 @@ source $SCRIPT_DIR/../../env_vars.sh
 
 conda activate foldseek
 
-DESIGNABLE_DIR=$1
+PRECISE_DIR=$1
 OUTPUTDIR=$2
 mkdir $OUTPUTDIR
 
 # i think i also got this from jason yim, need to double check
-foldseek easy-search $DESIGNABLE_DIR \
-    /wynton/group/kortemme/alexjli/databases/foldseek/frameflow/frameflow_db \
-    $OUTPUTDIR/aln_frameflow.tsv \
-    $OUTPUTDIR/tmpFolder \
-    --alignment-type 1 \
-    --format-output query,target,alntmscore,lddt \
-    --tmscore-threshold 0.0 \
-    --threads 32 \
-    --exhaustive-search \
-    --max-seqs 10000000000
-
-# i think i also got this from jason yim, need to double check
-foldseek easy-search $DESIGNABLE_DIR \
-    /wynton/group/kortemme/alexjli/databases/foldseek/framediff_monomers/framediff_db \
-    $OUTPUTDIR/aln_framediff.tsv \
-    $OUTPUTDIR/tmpFolder \
-    --alignment-type 1 \
-    --format-output query,target,alntmscore,lddt \
-    --tmscore-threshold 0.0 \
-    --exhaustive-search \
-    --threads 32 \
-    --max-seqs 10000000000
-
-# i think i also got this from jason yim, need to double check
-foldseek easy-search $DESIGNABLE_DIR \
+foldseek easy-search $PRECISE_DIR \
     /wynton/group/kortemme/foldseek_db/PDB \
-    $OUTPUTDIR/aln_PDB.tsv \
+    $OUTPUTDIR/aln_PDB_precise.tsv \
     $OUTPUTDIR/tmpFolder \
     --alignment-type 1 \
     --format-output query,target,alntmscore,lddt \
@@ -54,11 +30,10 @@ foldseek easy-search $DESIGNABLE_DIR \
     --threads 32 \
     --max-seqs 10000000000
 
-
 # i think i also got this from jason yim, need to double check
-foldseek easy-search $DESIGNABLE_DIR \
+foldseek easy-search $PRECISE_DIR \
     /wynton/group/kortemme/foldseek_db/AF_proteome \
-    $OUTPUTDIR/aln_AFDB_proteome.tsv \
+    $OUTPUTDIR/aln_AFDB_proteome_precise.tsv \
     $OUTPUTDIR/tmpFolder \
     --alignment-type 1 \
     --format-output query,target,alntmscore,lddt \
@@ -68,31 +43,31 @@ foldseek easy-search $DESIGNABLE_DIR \
     --max-seqs 10000000000
 
 # i think i also got this from jason yim, need to double check
-foldseek easy-search $DESIGNABLE_DIR \
+foldseek easy-search $PRECISE_DIR \
     /wynton/group/kortemme/foldseek_db/AF_swiss_prot \
-    $OUTPUTDIR/aln_AFDB_swiss_prot.tsv \
+    $OUTPUTDIR/aln_AFDB_swiss_prot_precise.tsv \
     $OUTPUTDIR/tmpFolder \
     --alignment-type 1 \
     --format-output query,target,alntmscore,lddt \
     --tmscore-threshold 0.0 \
-    --exhaustive-search \
     --threads 32 \
+    --exhaustive-search \
     --max-seqs 10000000000
 
 # # i think i also got this from jason yim, need to double check
-# foldseek easy-search $DESIGNABLE_DIR \
+# foldseek easy-search $PRECISE_DIR \
 #     /wynton/group/kortemme/foldseek_db/AF_uniprot50 \
-#     $OUTPUTDIR/aln_AFDB_uniprot50.tsv \
+#     $OUTPUTDIR/aln_AFDB_uniprot_precise.tsv \
 #     $OUTPUTDIR/tmpFolder \
 #     --alignment-type 1 \
 #     --format-output query,target,alntmscore,lddt \
 #     --tmscore-threshold 0.0 \
 #     --exhaustive-search \
-#     --threads 32 \
-#     --max-seqs 10000000000
+#     --max-seqs 10000000000  \
+#     --threads 32
 
 
 # conda activate ${ENV_NAME}
 # python ${REPO_ROOT}/scripts/analysis/summarize_foldseek.py
 conda activate proteinzen
-python ~/projects/proteinzen/scripts/analysis/summarize_foldseek.py
+python ~/projects/proteinzen/scripts/analysis/summarize_foldseek_precise.py

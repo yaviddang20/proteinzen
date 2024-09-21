@@ -7,6 +7,7 @@ python ${REPO_ROOT}/scripts/analysis/extract_designable_samples.py --csv esmfold
 python ${REPO_ROOT}/scripts/analysis/extract_consistent_samples.py --csv esmfold/folding_rmsd.csv --folded_folders esmfold/ --samples samples/
 python ${REPO_ROOT}/scripts/analysis/extract_precise_samples.py --csv esmfold/folding_rmsd.csv --folded_folders esmfold/ --samples samples/
 qsub ${REPO_ROOT}/scripts/analysis/foldseek_novelty.sh designable_samples_folded/ novelty/
+qsub ${REPO_ROOT}/scripts/analysis/foldseek_novelty_precise.sh precise_samples_folded/ novelty/
 python ${REPO_ROOT}/scripts/analysis/plot_sample_dssp.py
 python ${REPO_ROOT}/scripts/analysis/plot_folded_dssp.py
 python ${REPO_ROOT}/scripts/analysis/esmfold_over_len.py

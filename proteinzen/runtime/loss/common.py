@@ -62,9 +62,18 @@ def autoencoder_losses(batch,
                        use_fape=False,
                        fape_length_scale=1.,
                        t_norm_clip=0.9,
-                       apply_seq_noising_mask=False
+                       apply_seq_noising_mask=False,
+                       use_sidechain_dists_mse_loss=True,
+                       use_local_atomic_dist_loss=True,
+                       use_sidechain_clash_loss=True,
+
 ):
     res_data = batch['residue']
+
+    t = batch['t']
+    norm_scale = 1 - torch.min(
+        t, torch.as_tensor(t_norm_clip)
+    )
 
     gt_atom14 = res_data['atom14_gt_positions']
     alt_atom14 = res_data['atom14_alt_gt_positions']
@@ -129,25 +138,29 @@ def autoencoder_losses(batch,
         res_data.batch,
         denoiser_mask)
     atom14_rmsd = atom14_mse.sqrt()
-    sidechain_dists_mse = residue_knn_neighborhood_atomic_dist_loss(
-        gt_ref_atom14=gt_atom14,
-        alt_ref_atom14=alt_atom14,
-        pred_atom14=pred_atom14_gt_seq,
-        gt_atom14_mask=atom14_gt_mask.bool(),
-        alt_atom14_mask=atom14_alt_gt_mask.bool(),
-        batch=res_data.batch
-    )
-    local_atomic_dist_loss = local_atomic_context_loss(
-        pred_atom14=pred_atom14_gt_seq,
-        gt_atom14=gt_atom14,
-        alt_atom14=alt_atom14,
-        batch=res_data.batch,
-        atom14_mask=atom14_gt_mask.bool()
-    )
-    t = batch['t']
-    norm_scale = 1 - torch.min(
-        t, torch.as_tensor(t_norm_clip)
-    )
+    if use_sidechain_dists_mse_loss:
+        sidechain_dists_mse = residue_knn_neighborhood_atomic_dist_loss(
+            gt_ref_atom14=gt_atom14,
+            alt_ref_atom14=alt_atom14,
+            pred_atom14=pred_atom14_gt_seq,
+            gt_atom14_mask=atom14_gt_mask.bool(),
+            alt_atom14_mask=atom14_alt_gt_mask.bool(),
+            batch=res_data.batch
+        )
+    else:
+        sidechain_dists_mse = torch.zeros_like(t)
+
+    if use_local_atomic_dist_loss:
+        local_atomic_dist_loss = local_atomic_context_loss(
+            pred_atom14=pred_atom14_gt_seq,
+            gt_atom14=gt_atom14,
+            alt_atom14=alt_atom14,
+            batch=res_data.batch,
+            atom14_mask=atom14_gt_mask.bool()
+        )
+    else:
+        local_atomic_dist_loss = torch.zeros_like(t)
+
     scaled_local_atomic_dist_loss = local_atomic_dist_loss / (norm_scale**2) * 0.01
     scaled_atom14_mse = atom14_mse / (norm_scale**2) * 0.01
 
@@ -183,12 +196,15 @@ def autoencoder_losses(batch,
         res_data.batch,
         torsions_mask[..., 3:]
     )
-    pred_atom14_clash_loss = intersidechain_clash_loss(
-        pred_atom14=pred_atom14,
-        atom14_mask=model_outputs['decoded_atom14_mask'].bool(),
-        seq=seq_logits.argmax(dim=-1),
-        batch=res_data.batch
-    )
+    if use_sidechain_clash_loss:
+        pred_atom14_clash_loss = intersidechain_clash_loss(
+            pred_atom14=pred_atom14,
+            atom14_mask=model_outputs['decoded_atom14_mask'].bool(),
+            seq=seq_logits.argmax(dim=-1),
+            batch=res_data.batch
+        )
+    else:
+        pred_atom14_clash_loss = torch.zeros_like(t)
 
     latent_mu = model_outputs['latent_mu']
     latent_logvar = model_outputs['latent_logvar']

@@ -348,7 +348,8 @@ class TFNDenseLatentWrapper(nn.Module):
             res_h_mult_factor=res_h_mult_factor,
             res_edge_mult_factor=res_edge_mult_factor,
             res_edge_update=encoder_res_edge_updates,
-            compatibility_mode=compatibility_mode
+            compatibility_mode=compatibility_mode,
+            n_layers=4
         )
         self.decoder = DesignIPMPDecoder(
             c_s=c_s//2,

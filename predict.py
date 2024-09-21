@@ -321,9 +321,15 @@ if __name__ == '__main__':
                     for i in range(60, 128+1)
                 }
             else:
+                # cfg['datamodule']['sample_lengths'] = {
+                #     i: 50
+                #     for i in range(100, 300+1, 50)
+                # }
                 cfg['datamodule']['sample_lengths'] = {
-                    i: 50
-                    for i in range(100, 300+1, 50)
+                    70: 100,
+                    100: 100,
+                    200: 100,
+                    300: 100,
                 }
 
     samples_dir = os.path.join(args.run_dir, args.out_prefix)

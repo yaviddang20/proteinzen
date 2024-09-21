@@ -716,7 +716,10 @@ class ProteinInterpolation(Task):
         autoenc_loss_dict = autoencoder_losses(
             inputs, outputs, use_smooth_lddt=self.use_smooth_lddt,
             t_norm_clip=self.t_clip_aa,
-            apply_seq_noising_mask=self.vae_seq_masking
+            apply_seq_noising_mask=self.vae_seq_masking,
+            use_sidechain_dists_mse_loss=(not self.use_smooth_lddt),
+            use_local_atomic_dist_loss=False,
+            use_sidechain_clash_loss=False,
         )
 
         vae_loss = (
@@ -740,6 +743,9 @@ class ProteinInterpolation(Task):
                 fape_length_scale=self.fape_length_scale,
                 t_norm_clip=self.t_clip_aa,
                 apply_seq_noising_mask=False,
+                use_sidechain_dists_mse_loss=(not self.use_smooth_lddt),
+                use_local_atomic_dist_loss=False,
+                use_sidechain_clash_loss=False,
             )
             norm = 1 - torch.min(inputs['t'], torch.as_tensor(self.t_clip_aa))
             pt_abs_pos_loss = (

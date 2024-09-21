@@ -225,7 +225,7 @@ class ProteinAtomicEmbedder(nn.Module):
         compatibility_mode=True
     ):
         super().__init__()
-        assert n_layers > 4
+        assert n_layers >= 4
         self.sh_irreps = o3.Irreps.spherical_harmonics(lmax=1)
         atom_irrep_seq = get_irrep_seq(ns, nv, reduce_pseudoscalars=reduce_pseudoscalars)
         atom_irrep_seq = atom_irrep_seq + [atom_irrep_seq[-1] for _ in range(n_layers - len(atom_irrep_seq) + 1)]
