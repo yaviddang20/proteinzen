@@ -45,6 +45,7 @@ class ProteinInterpolation(Task):
                  pt_clash_loss_t=1.1,
                  kl_strength=0,#1e-6,
                  rescale_kl_noise=False,
+                 norm_latent_space=False,
                  use_smooth_lddt=False,
                  t_clip_se3=0.9,
                  t_clip_aa=0.9,
@@ -98,6 +99,7 @@ class ProteinInterpolation(Task):
         self.square_bb_aux_loss_t_factor = square_bb_aux_loss_t_factor
         self.percent_all_mask = percent_all_mask
         self.percent_no_mask = percent_no_mask
+        self.norm_latent_space = norm_latent_space
 
         self.t_min = t_min
         self.t_max = t_max
@@ -258,36 +260,37 @@ class ProteinInterpolation(Task):
         else:
             latent_data[self.sidechain_x_1_key] = latent_data['latent_mu']
 
-        # res_data = inputs['residue']
-        # latent_sidechains = latent_data[self.sidechain_x_1_key]
-        # sidechain_centers = pygu.scatter(
-        #     latent_sidechains[res_data.res_mask],
-        #     res_data.batch[res_data.res_mask],
-        #     dim=0,
-        #     reduce='mean'
-        # )
-        # sidechain_var = pygu.scatter(
-        #     (latent_sidechains[res_data.res_mask] - sidechain_centers[res_data.batch[res_data.res_mask]])**2,
-        #     res_data.batch[res_data.res_mask],
-        #     dim=0,
-        # )
-        # sidechain_count = pygu.scatter(
-        #     torch.ones_like(res_data.res_mask).float()[res_data.res_mask],
-        #     res_data.batch[res_data.res_mask],
-        #     dim=0,
-        # )
-        # sidechain_count[sidechain_count < 2] = 2
-        # sidechain_std = torch.sqrt(sidechain_var / (sidechain_count-1)[..., None])
+        if self.norm_latent_space:
+            res_data = inputs['residue']
+            latent_sidechains = latent_data[self.sidechain_x_1_key]
+            sidechain_centers = pygu.scatter(
+                latent_sidechains[res_data.res_mask],
+                res_data.batch[res_data.res_mask],
+                dim=0,
+                reduce='mean'
+            )
+            sidechain_var = pygu.scatter(
+                (latent_sidechains[res_data.res_mask] - sidechain_centers[res_data.batch[res_data.res_mask]])**2,
+                res_data.batch[res_data.res_mask],
+                dim=0,
+            )
+            sidechain_count = pygu.scatter(
+                torch.ones_like(res_data.res_mask).float()[res_data.res_mask],
+                res_data.batch[res_data.res_mask],
+                dim=0,
+            )
+            sidechain_count[sidechain_count < 2] = 2
+            sidechain_std = torch.sqrt(sidechain_var / (sidechain_count-1)[..., None])
 
-        # latent_sidechains = (latent_sidechains - sidechain_centers[res_data.batch]) / sidechain_std[res_data.batch]
-        # latent_data[self.sidechain_x_1_key] = latent_sidechains
+            latent_sidechains = (latent_sidechains - sidechain_centers[res_data.batch]) / sidechain_std[res_data.batch]
+            latent_data[self.sidechain_x_1_key] = latent_sidechains
 
-        # if self.rescale_kl_noise:
-        #     latent_sigma = torch.exp(
-        #         latent_data['latent_logvar'] * 0.5
-        #     )
-        #     latent_sigma = latent_sigma / torch.maximum(sidechain_std[res_data.batch], torch.tensor(1e-8, device=latent_sigma.device))
-        #     latent_data['latent_logvar'] = torch.log(2 * latent_sigma)
+            if self.rescale_kl_noise:
+                latent_sigma = torch.exp(
+                    latent_data['latent_logvar'] * 0.5
+                )
+                latent_sigma = latent_sigma / torch.maximum(sidechain_std[res_data.batch], torch.tensor(1e-8, device=latent_sigma.device))
+                latent_data['latent_logvar'] = torch.log(2 * latent_sigma)
 
         # decoder
         decoder_outputs = model.decoder(inputs, latent_data)

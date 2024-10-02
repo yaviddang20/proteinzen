@@ -71,3 +71,45 @@ class LatentInterpolant:
     def _euler_step(self, d_t, t, x_1, x_t):
         x_vf = (x_1 - x_t) / (1 - t)
         return x_t + x_vf * d_t
+
+
+class DenseLatentInterpolant:
+    def __init__(self,
+                 min_t=1e-2):
+        self.min_t = min_t
+
+    def _corrupt_x(self, x_1, t, res_mask):
+        t = t.view(-1, *[1 for _ in range(x_1.dim()-1)])
+        x_0 = torch.randn_like(x_1)
+        x_t = (1 - t) * x_0 + t * x_1
+        x_t = _diffuse_mask(x_t, x_1, res_mask)
+        return x_t * res_mask[..., None]
+
+    @torch.no_grad()
+    def corrupt_batch(self, batch: HeteroData, intermediates):
+        res_data = batch["residue"]
+
+        # [N]
+        res_mask = res_data["res_mask"]
+        noising_mask = res_data["noising_mask"]
+        mask = res_mask & noising_mask
+        dense_mask = mask.view(batch.num_graphs, -1)
+        edge_mask = dense_mask[..., None] & dense_mask[..., None, :]
+
+        # [B]
+        t = batch["t"]
+        nodewise_t = t[res_data.batch]
+        # Apply corruptions
+        latent_sidechain = intermediates['latent_sidechain']
+        latent_edge = intermediates['latent_edge']
+        noised_latent = self._corrupt_x(latent_sidechain, t, dense_mask)
+        noised_edge = self._corrupt_x(latent_edge, t, edge_mask)
+
+        return {
+            "noised_latent_sidechain": noised_latent,
+            "noised_latent_edge": noised_edge
+        }
+
+    def _euler_step(self, d_t, t, x_1, x_t):
+        x_vf = (x_1 - x_t) / (1 - t)
+        return x_t + x_vf * d_t

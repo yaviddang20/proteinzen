@@ -12,7 +12,11 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from proteinzen.data.datasets.datamodule import ProteinDataModule, FramediffDataModule, GeomDataModule
 
 from proteinzen.stoch_interp.interpolate.se3 import SE3Interpolant, SE3InterpolantConfig
-from proteinzen.stoch_interp.interpolate.protein import ProteinInterpolant, ProteinDirichletInterpolant, ProteinDirichletChiInterpolant, ProteinDirichletMultiChiInterpolant, ProteinFisherInterpolant, ProteinCatFlowInterpolant, ProteinFisherMultiChiInterpolant
+from proteinzen.stoch_interp.interpolate.protein import (
+    ProteinInterpolant, ProteinDirichletInterpolant,
+    ProteinDirichletChiInterpolant, ProteinDirichletMultiChiInterpolant,
+    ProteinFisherInterpolant, ProteinCatFlowInterpolant,
+    ProteinFisherMultiChiInterpolant, DenseProteinInterpolant)
 from proteinzen.stoch_interp.interpolate.molecule import HarmonicPriorInterpolant
 from proteinzen.stoch_interp.interpolate.torsion import TorsionInterpolant
 from proteinzen.stoch_interp.interpolate.dirichlet import DirichletConditionalFlow
@@ -28,10 +32,12 @@ from proteinzen.model.denoiser.molecule.torsional import MoleculeTorsionDenoiser
 from proteinzen.model.design.ipmp import IPMPEncoder, IPMPDecoder
 from proteinzen.model.design.ipmp_seq_only import IPMPDenoiser as DirichletIPMPDenoiser
 from proteinzen.model.wrappers.sidechain import IPMPLatentSidechainWrapper
-from proteinzen.model.wrappers.protein import IPMPLatentWrapper, TFNLatentWrapper, ChimeraLatentWrapper, IPMPDenseLatentWrapper, TFNDenseLatentWrapper
+from proteinzen.model.wrappers.protein import (
+    IPMPLatentWrapper, TFNLatentWrapper, ChimeraLatentWrapper, IPMPDenseLatentWrapper, TFNDenseLatentWrapper, DenseChimeraLatentWrapper)
 
 from proteinzen.tasks.fm.bb import BackboneFrameInterpolation
 from proteinzen.tasks.fm.protein import ProteinInterpolation, ProteinSeqInterpolation, ProteinSeqMultiChiInterpolation
+from proteinzen.tasks.fm.protein_dense import DenseProteinInterpolation
 from proteinzen.tasks.fm.molecule import HarmonicFlowMatching, TorsionalFlowMatching
 from proteinzen.tasks.fm.sidechain import DirichletFlowMatching
 
@@ -76,6 +82,7 @@ def config_hydra_store():
     paradigm_store({"paradigm": "diffusion"}, name="diffusion")
     paradigm_store({"paradigm": "fm"}, name="fm")
     paradigm_store({"paradigm": "densefm"}, name="densefm")
+    paradigm_store({"paradigm": "fulldensefm"}, name="fulldensefm")
     paradigm_store({"paradigm": "dirichlet"}, name="dirichlet")
     paradigm_store({"paradigm": "fisher"}, name="fisher")
     paradigm_store({"paradigm": "catflow"}, name="catflow")
@@ -104,6 +111,10 @@ def config_hydra_store():
         ProteinInterpolant,
         se3_cfg=builds(SE3InterpolantConfig),
         name="densefm_protein")
+    corruption_store(
+        DenseProteinInterpolant,
+        se3_cfg=builds(SE3InterpolantConfig),
+        name="fulldensefm_protein")
     corruption_store(
         ProteinDirichletInterpolant,
         se3_cfg=builds(SE3InterpolantConfig),
@@ -232,6 +243,7 @@ def config_hydra_store():
     model_store(latent_fm_wrapper, name="fm_protein")
     # model_store(IPMPDenseLatentWrapper, name="densefm_protein")
     model_store(TFNDenseLatentWrapper, name="densefm_protein")
+    model_store(DenseChimeraLatentWrapper, name="fulldensefm_protein")
     model_store(DynamicGraphIpaFrameSeqDenoiser, name="dirichlet_protein")
     model_store(DynamicGraphIpaFrameSeqDenoiser, name="fisher_protein")
     model_store(DynamicGraphIpaFrameSeqDenoiser, name="catflow_protein")
@@ -262,6 +274,7 @@ def config_hydra_store():
     task_store(pbuilds(BackboneFrameInterpolation), name="fm_bb")
     task_store(pbuilds(ProteinInterpolation), name="fm_protein")
     task_store(pbuilds(ProteinInterpolation), name="densefm_protein")
+    task_store(pbuilds(DenseProteinInterpolation), name="fulldensefm_protein")
     task_store(pbuilds(ProteinSeqInterpolation), name="dirichlet_protein")
     task_store(pbuilds(ProteinSeqInterpolation), name="fisher_protein")
     # task_store(pbuilds(ProteinDirichletChiInterpolation), name="dirichlet_protein")

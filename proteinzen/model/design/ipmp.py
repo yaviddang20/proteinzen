@@ -299,6 +299,9 @@ class IPMPDecoder(nn.Module):
         edge_bb_dists = edge_bb_dists.view(edge_index.shape[1], -1, 1)
         edge_rbf = _rbf(edge_bb_dists, D_min=2.0, D_max=22.0, D_count=self.num_rbf, device=edge_index.device)
         edge_rbf = edge_rbf.view(edge_index.shape[1], -1)
+
+        # edge_rbf = torch.zeros_like(edge_rbf)
+
         ## edge rel pos embedding
         edge_dist_rel_pos = _edge_positional_embeddings(edge_index, num_embeddings=self.num_pos_embed, device=edge_index.device)
         # ## direction vecs from src CA to dst bb

@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from proteinzen.model.modules.equiformer_v2.so2_ops import Nodewise_SO3_Convolution
+from proteinzen.model.modules.openfold.layers import Linear
 
 class ProjectLayer(nn.Module):
     """ Layer to interface between different lmax features """
@@ -77,3 +78,43 @@ class GaussianRandomFourierBasis(nn.Module):
     def forward(self, ts):
         tp = 2 * np.pi * ts * self.kappa
         return torch.cat([torch.cos(tp), torch.sin(tp)], dim=-1)
+
+
+class FeedForward(nn.Module):
+    def __init__(self,
+                 c_in,
+                 c_hidden,
+                 c_out,
+                 dropout=0.,
+                 pre_ln=False,
+                 lin_bias=True,
+                 final_init="final"
+    ):
+        super().__init__()
+
+        self.linear_1 = Linear(c_in, c_hidden, init="relu", bias=lin_bias)
+        self.linear_2 = Linear(c_hidden, c_hidden, init="relu", bias=lin_bias)
+        self.linear_3 = Linear(c_hidden, c_out, init=final_init, bias=lin_bias)
+        self.relu = nn.ReLU()
+        if dropout > 0:
+            self.dropout = nn.Dropout(dropout)
+        else:
+            self.dropout = None
+        if pre_ln:
+            self.ln = nn.LayerNorm(c_in)
+        else:
+            self.ln = None
+
+    def forward(self, s):
+        if self.ln is not None:
+            s = self.ln(s)
+
+        s = self.linear_1(s)
+        s = self.relu(s)
+        s = self.linear_2(s)
+        s = self.relu(s)
+        s = self.linear_3(s)
+        if self.dropout is not None:
+            s = self.dropout(s)
+
+        return s

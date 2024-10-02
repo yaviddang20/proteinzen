@@ -1,4 +1,4 @@
-from .latent import LatentInterpolant
+from .latent import LatentInterpolant, DenseLatentInterpolant
 from .se3 import SE3Interpolant, SE3InterpolantConfig
 from .fisher import FisherFlow
 from .dirichlet import DirichletConditionalFlow
@@ -19,6 +19,19 @@ class ProteinInterpolant:
             min_t=se3_cfg.min_t,
             self_condition=se3_cfg.self_condition,
             dim_size=latent_dim_size)
+
+
+class DenseProteinInterpolant:
+    """ Wrapper for SE3Interpolant and LatentInterpolant """
+    def __init__(self,
+                 se3_cfg: SE3InterpolantConfig,
+                 use_batch_ot=False):
+        self._cfg = se3_cfg
+        self.se3_noiser = SE3Interpolant(
+            se3_cfg,
+            use_batch_ot=use_batch_ot)
+        self.latent_noiser = DenseLatentInterpolant(
+            min_t=se3_cfg.min_t)
 
 
 class ProteinDirichletInterpolant:

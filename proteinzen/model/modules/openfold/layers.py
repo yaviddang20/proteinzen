@@ -1061,6 +1061,9 @@ class InvariantPointAttention(nn.Module):
         num_v_points,
         inf: float = 1e5,
         eps: float = 1e-8,
+        pre_ln=False,
+        lin_bias=True,
+        final_init='final'
     ):
         """
         Args:
@@ -1093,17 +1096,17 @@ class InvariantPointAttention(nn.Module):
         # Here as in the official source, they have bias and use the default
         # Lecun initialization.
         hc = self.c_hidden * self.no_heads
-        self.linear_q = Linear(self.c_s, hc)
-        self.linear_kv = Linear(self.c_s, 2 * hc)
+        self.linear_q = Linear(self.c_s, hc, bias=lin_bias)
+        self.linear_kv = Linear(self.c_s, 2 * hc, bias=lin_bias)
 
         hpq = self.no_heads * self.no_qk_points * 3
-        self.linear_q_points = Linear(self.c_s, hpq)
+        self.linear_q_points = Linear(self.c_s, hpq, bias=lin_bias)
 
         hpkv = self.no_heads * (self.no_qk_points + self.no_v_points) * 3
-        self.linear_kv_points = Linear(self.c_s, hpkv)
+        self.linear_kv_points = Linear(self.c_s, hpkv, bias=lin_bias)
 
-        self.linear_b = Linear(self.c_z, self.no_heads)
-        self.down_z = Linear(self.c_z, self.c_z // 4)
+        self.linear_b = Linear(self.c_z, self.no_heads, bias=lin_bias)
+        self.down_z = Linear(self.c_z, self.c_z // 4, bias=lin_bias)
 
         self.head_weights = nn.Parameter(torch.zeros((self.no_heads)))
         ipa_point_weights_init_(self.head_weights)
@@ -1111,10 +1114,15 @@ class InvariantPointAttention(nn.Module):
         concat_out_dim =  (
             self.c_z // 4 + self.c_hidden + self.no_v_points * 4
         )
-        self.linear_out = Linear(self.no_heads * concat_out_dim, self.c_s, init="final")
+        self.linear_out = Linear(self.no_heads * concat_out_dim, self.c_s, init=final_init, bias=lin_bias)
 
         self.softmax = nn.Softmax(dim=-1)
         self.softplus = nn.Softplus()
+
+        self.pre_ln = pre_ln
+        if pre_ln:
+            self.pre_ln_s = nn.LayerNorm(c_s)
+            self.pre_ln_z = nn.LayerNorm(c_z)
 
     def forward(
         self,
@@ -1142,6 +1150,10 @@ class InvariantPointAttention(nn.Module):
             z = _z_reference_list
         else:
             z = [z]
+
+        if self.pre_ln:
+            s = self.pre_ln_s(s)
+            z = self.pre_ln_z(z)
 
         #######################################
         # Generate scalar and point activations

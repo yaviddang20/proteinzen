@@ -55,6 +55,64 @@ class EdgeTransition(nn.Module):
         edge_embed = self.layer_norm(edge_embed)
         return edge_embed
 
+class DenseEdgeTransition(nn.Module):
+    def __init__(
+            self,
+            *,
+            node_embed_size,
+            edge_embed_in,
+            edge_embed_out,
+            num_layers=2,
+            node_dilation=2,
+            pre_ln=False,
+            lin_bias=True,
+            final_init="final"
+        ):
+        super().__init__()
+
+        bias_embed_size = node_embed_size // node_dilation
+        self.initial_embed = Linear(
+            node_embed_size, bias_embed_size, init="relu", bias=lin_bias)
+        hidden_size = bias_embed_size * 2 + edge_embed_in
+        trunk_layers = []
+        for _ in range(num_layers):
+            trunk_layers.append(Linear(hidden_size, hidden_size, init="relu", bias=lin_bias))
+            trunk_layers.append(nn.ReLU())
+        self.trunk = nn.Sequential(*trunk_layers)
+        self.final_layer = Linear(hidden_size, edge_embed_out, init="default", bias=lin_bias)
+
+        self.pre_ln = pre_ln
+        if pre_ln:
+            self.ln_s = nn.LayerNorm(node_embed_size)
+            self.ln_z = nn.LayerNorm(edge_embed_in)
+        else:
+            self.layer_norm = nn.LayerNorm(edge_embed_out)
+
+    def forward(self, node_embed, edge_embed):
+        if self.pre_ln:
+            node_embed = self.ln_s(node_embed)
+            edge_embed = self.ln_z(edge_embed)
+
+        node_embed = self.initial_embed(node_embed)
+        batch_size, num_res, _ = node_embed.shape
+        edge_bias = torch.cat([
+            torch.tile(node_embed[:, :, None, :], (1, 1, num_res, 1)),
+            torch.tile(node_embed[:, None, :, :], (1, num_res, 1, 1)),
+        ], axis=-1)
+        edge_embed = torch.cat(
+            [
+                edge_embed,
+                edge_bias
+            ], dim=-1
+        ).reshape(batch_size * num_res**2, -1)
+        edge_embed = self.final_layer(self.trunk(edge_embed) + edge_embed)
+        if not self.pre_ln:
+            edge_embed = self.layer_norm(edge_embed)
+        edge_embed = edge_embed.reshape(
+            batch_size, num_res, num_res, -1
+        )
+        return edge_embed
+
 
 class EdgeGate(nn.Module):
     def __init__(

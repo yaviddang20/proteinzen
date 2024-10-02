@@ -2,12 +2,14 @@ import torch
 from torch import nn
 
 from proteinzen.model.design.ipmp import IPMPDecoder as DesignIPMPDecoder
+from proteinzen.model.design.ipa import IPADecoder
 from proteinzen.model.design.mlp import MLPDecoder
 from proteinzen.model.encoder.ipmp import IPMPEncoder as MLMIPMPEncoder
 from proteinzen.model.encoder.tfn import ProteinAtomicEmbedder
 from proteinzen.model.encoder.chimera import ProteinAtomicChimeraEmbedder
+from proteinzen.model.encoder.chimera_dense import ProteinAtomicChimeraDenseEmbedder
 from proteinzen.model.denoiser.protein.frames import DynamicGraphIpaFrameDenoiser
-from proteinzen.model.denoiser.protein.dense import IpaDenoiser
+from proteinzen.model.denoiser.protein.dense import IpaDenoiser, DenseIpaDenoiser
 
 
 class IPMPLatentWrapper(nn.Module):
@@ -386,4 +388,78 @@ class TFNDenseLatentWrapper(nn.Module):
     def sample_prior(self, num_nodes, device):
         return {
             "noised_latent_sidechain": torch.randn((num_nodes, self.c_latent), device=device)
+        }
+
+class DenseChimeraLatentWrapper(nn.Module):
+    def __init__(self,
+                 c_s=256,
+                 c_latent=128,
+                 c_z=128,
+                 c_hidden=256,
+                 c_s_in=6,
+                 num_rbf=16,
+                 num_layers=4,
+                 num_heads=8,
+                 num_qk_pts=8,
+                 num_v_pts=12,
+                 h_time=64,
+                 sidechain_k=30,
+                 res_h_mult_factor=2,
+                 self_conditioning=True,
+                 broadcast_to_atoms=False,
+                 lrange_embedding=False,
+                 mlp_decoder=False,
+                 use_masking_features=True,
+                 use_init_dgram=False,
+                 update_edges_with_dgram=False,
+                 use_proteus_transition=False,
+                 ):
+        super().__init__()
+        self.encoder = ProteinAtomicChimeraDenseEmbedder(
+            c_s=c_s//2,
+            c_z=c_z,
+            c_s_out=c_latent,
+            c_z_out=c_latent,
+            res_num_rbf=num_rbf,
+            knn_k=sidechain_k,
+            broadcast_to_atoms=broadcast_to_atoms,
+            lrange_graph=lrange_embedding,
+            use_masking_features=use_masking_features,
+            res_h_mult_factor=res_h_mult_factor,
+            n_layers=4
+        )
+        self.decoder = IPADecoder(
+            c_s=c_s//2,
+            c_z=c_z,
+            c_s_in=c_latent,
+            c_z_in=c_latent,
+            c_hidden=c_s//2,
+            num_layers=num_layers,
+        )
+        self.denoiser = DenseIpaDenoiser(
+            c_s=c_s,
+            c_latent=c_latent,
+            c_z=c_z,
+            c_hidden=16,
+            num_heads=16,
+            num_qk_points=num_qk_pts,
+            num_v_points=num_v_pts,
+            num_blocks=8,
+            use_init_dgram=use_init_dgram,
+            update_edges_with_dgram=update_edges_with_dgram,
+            use_proteus_transition=use_proteus_transition,
+        )
+        self.c_latent = c_latent
+        self.self_conditioning = self_conditioning
+
+        # some compatibility code
+        self.lrange_k = 10000
+        self.knn_k = 10000
+        self.lrange_logn_scale = 10000
+        self.lrange_logn_offset = 10000
+
+    def sample_prior(self, num_batch, num_nodes, device):
+        return {
+            "noised_latent_sidechain": torch.randn((num_batch, num_nodes, self.c_latent), device=device),
+            "noised_latent_edge": torch.randn((num_batch, num_nodes, num_nodes, self.c_latent), device=device)
         }

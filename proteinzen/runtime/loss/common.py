@@ -66,7 +66,7 @@ def autoencoder_losses(batch,
                        use_sidechain_dists_mse_loss=True,
                        use_local_atomic_dist_loss=True,
                        use_sidechain_clash_loss=True,
-
+                       kl_loss=True,
 ):
     res_data = batch['residue']
 
@@ -206,9 +206,12 @@ def autoencoder_losses(batch,
     else:
         pred_atom14_clash_loss = torch.zeros_like(t)
 
-    latent_mu = model_outputs['latent_mu']
-    latent_logvar = model_outputs['latent_logvar']
-    kl_div = scalars_kl_div(latent_mu, latent_logvar, res_data.batch, minimal_mask)
+    if kl_loss:
+        latent_mu = model_outputs['latent_mu']
+        latent_logvar = model_outputs['latent_logvar']
+        kl_div = scalars_kl_div(latent_mu, latent_logvar, res_data.batch, minimal_mask)
+    else:
+        kl_div = torch.zeros_like(t)
 
     logit_norm_loss = logit_norm_loss * _nodewise_to_graphwise(
         torch.sum(seq_logits**2, dim=-1),
@@ -241,6 +244,39 @@ def autoencoder_losses(batch,
     }
 
     return out_dict
+
+
+def kl_losses(batch,
+              model_outputs):
+
+    res_data = batch['residue']
+    res_mask = res_data['res_mask']
+    noising_mask = res_data['noising_mask']
+    mask = res_mask & noising_mask
+    mask = mask.view(batch.num_graphs, -1)
+
+    def kl(mu, logvar):
+        kl_div = -0.5 * (logvar - mu.square() - logvar.exp() + 1)
+        kl_div = kl_div.sum(dim=-1)
+        return kl_div
+
+    latent_node_mu = model_outputs['latent_node_mu']
+    latent_node_logvar = model_outputs['latent_node_logvar']
+    node_kl_div = kl(latent_node_mu, latent_node_logvar) * mask
+    node_kl_div = node_kl_div.sum(dim=-1) / mask.sum(dim=-1)
+
+    edge_mask = mask[..., None] & mask[..., None, :]
+
+    latent_edge_mu = model_outputs['latent_edge_mu']
+    latent_edge_logvar = model_outputs['latent_edge_logvar']
+    edge_kl_div = kl(latent_edge_mu, latent_edge_logvar) * edge_mask
+    edge_kl_div = edge_kl_div.sum(dim=(-1, -2)) / edge_mask.sum(dim=(-1, -2))
+
+    return {
+        'node_kl_div': node_kl_div,
+        'edge_kl_div': edge_kl_div
+    }
+
 
 
 def pt_autoencoder_losses(batch,
@@ -423,6 +459,111 @@ def latent_scalar_sidechain_fm_loss(
 
     # latent_ref_noise_nll = _nll(latent, latent_mu, latent_logvar)
     # latent_ref_noise_nll = _nodewise_to_graphwise(latent_ref_noise_nll, res_data.batch, total_mask)
+
+    return {
+        "latent_denoising_loss": latent_denoising_loss,
+        "latent_fm_loss": latent_fm_loss,
+        "latent_ref_noise": latent_ref_noise,
+        # "latent_denoising_nll": latent_denoising_nll,
+        # "latent_ref_noise_nll": latent_ref_noise_nll,
+    }
+
+def latent_scalar_dense_sidechain_fm_loss(
+        batch,
+        latent_outputs,
+        t_norm_clip=0.9,
+        scale=0.01,
+        pointwise=False,
+        detach_gt_latent_grad=False
+    ):
+    res_data = batch['residue']
+    x_mask = res_data['res_mask']
+    noising_mask = res_data['noising_mask']
+    total_mask = x_mask & noising_mask
+    total_mask = total_mask.view(batch.num_graphs, -1)
+
+    latent = latent_outputs['latent_sidechain']
+    if detach_gt_latent_grad:
+        latent = latent.detach()
+    # latent = latent_outputs['latent_mu']
+    noised_latent = latent_outputs['noised_latent_sidechain']
+    denoised_latent = latent_outputs['pred_latent_sidechain']
+
+    latent_denoising_loss = torch.square(denoised_latent - latent).sum(dim=-1) * total_mask
+    latent_denoising_loss = latent_denoising_loss.sum(dim=-1) / total_mask.sum(dim=-1)
+
+    t = batch['t']
+    norm_scale = 1 - torch.min(
+        t, torch.as_tensor(t_norm_clip)
+    )
+    latent_fm_loss = latent_denoising_loss / (norm_scale ** 2) * scale
+
+    latent_ref_noise = torch.square(noised_latent - latent).sum(dim=-1) * total_mask
+    latent_ref_noise = latent_ref_noise.sum(dim=-1) / total_mask.sum(dim=-1)
+
+
+    if pointwise:
+        dim_size = latent.shape[-1]
+        latent_denoising_loss = latent_denoising_loss / dim_size
+        latent_fm_loss = latent_fm_loss / dim_size
+        latent_ref_noise = latent_ref_noise / dim_size
+
+
+    # latent_mu = latent_outputs['latent_mu']
+    # latent_logvar = latent_outputs['latent_logvar']
+    # latent_denoising_nll = _nll(denoised_latent, latent_mu, latent_logvar)
+    # latent_denoising_nll = _nodewise_to_graphwise(latent_denoising_nll, res_data.batch, total_mask)
+
+    # latent_ref_noise_nll = _nll(latent, latent_mu, latent_logvar)
+    # latent_ref_noise_nll = _nodewise_to_graphwise(latent_ref_noise_nll, res_data.batch, total_mask)
+
+    return {
+        "latent_denoising_loss": latent_denoising_loss,
+        "latent_fm_loss": latent_fm_loss,
+        "latent_ref_noise": latent_ref_noise,
+        # "latent_denoising_nll": latent_denoising_nll,
+        # "latent_ref_noise_nll": latent_ref_noise_nll,
+    }
+
+def latent_scalar_edge_fm_loss(
+        batch,
+        latent_outputs,
+        t_norm_clip=0.9,
+        scale=0.01,
+        pointwise=False,
+        detach_gt_latent_grad=False,
+    ):
+    res_data = batch['residue']
+    x_mask = res_data['res_mask']
+    noising_mask = res_data['noising_mask']
+    total_mask = x_mask & noising_mask
+    total_mask = total_mask.view(batch.num_graphs, -1)
+    total_mask = total_mask[..., None] & total_mask[..., None, :]
+
+    latent = latent_outputs['latent_edge']
+    if detach_gt_latent_grad:
+        latent = latent.detach()
+    # latent = latent_outputs['latent_mu']
+    noised_latent = latent_outputs['noised_latent_edge']
+    denoised_latent = latent_outputs['pred_latent_edge']
+
+    latent_denoising_loss = torch.square(denoised_latent - latent).sum(dim=-1) * total_mask
+    latent_denoising_loss = latent_denoising_loss.sum(dim=(-1, -2)) / total_mask.sum(dim=(-1, -2))
+
+    t = batch['t']
+    norm_scale = 1 - torch.min(
+        t, torch.as_tensor(t_norm_clip)
+    )
+    latent_fm_loss = latent_denoising_loss / (norm_scale ** 2) * scale
+
+    latent_ref_noise = torch.square(noised_latent - latent).sum(dim=-1) * total_mask
+    latent_ref_noise = latent_ref_noise.sum(dim=(-1, -2)) / total_mask.sum(dim=(-1, -2))
+
+    if pointwise:
+        dim_size = latent.shape[-1]
+        latent_denoising_loss = latent_denoising_loss / dim_size
+        latent_fm_loss = latent_fm_loss / dim_size
+        latent_ref_noise = latent_ref_noise / dim_size
 
     return {
         "latent_denoising_loss": latent_denoising_loss,
