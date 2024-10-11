@@ -44,7 +44,7 @@ if discrete:
     sns.lineplot(df, x="plot_loc", y="fraction_designable", color="orange", ax=ax2, errorbar=None, linewidth=3)
 else:
     sns.lineplot(df, x="seq_len", y="fraction_designable", color="orange", ax=ax2, errorbar=None)
-ax2.set(ylabel="Fraction Designable")
+ax2.set(ylabel="Fraction SSC")
 ax2.set_ylim(0, 1)
 ax2.yaxis.label.set_color('orange')
 

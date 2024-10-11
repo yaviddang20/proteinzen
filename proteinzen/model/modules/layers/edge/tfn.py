@@ -59,6 +59,9 @@ class FasterTensorProduct(torch.nn.Module):
                 list(weight.shape)[:-1] + [in_, out]) / np.sqrt(in_)
             start += in_ * out
 
+        # for key in out_dict:
+        #     print(key, in_dict[key].shape if key in in_dict else None, [t.shape for t in out_dict[key]])
+
         if out_dict['0e']:
             out_dict['0e'] = torch.cat(out_dict['0e'], dim=-1)
             out_dict['0e'] = torch.matmul(out_dict['0e'].unsqueeze(-2), weight_dict['0e']).squeeze(-2)

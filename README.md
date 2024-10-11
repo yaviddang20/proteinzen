@@ -9,13 +9,17 @@ Substrate-conditioned diffusion for ligand-binding protein generation
 
 ### Requirements
 - rdkit
+- deepspeed
 - pytorch
 - torch_geometric
 - torch_cluster
 - torch_scatter
 - lightning
+- lightning-utilities
 - biopython
 - hydra-zen
+- pandas
+- pyrosetta
 - pytest
 - e3nn
 

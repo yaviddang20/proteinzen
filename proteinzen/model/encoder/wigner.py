@@ -8,7 +8,7 @@ from typing import Tuple, Optional
 
 import torch
 from e3nn.o3 import Irrep, Irreps
-from e3nn.o3 import _rotation
+from . import _rotation
 
 
 def _torch_get_default_dtype() -> torch.dtype:

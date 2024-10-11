@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch_cluster import knn_graph
 from torch_geometric.utils import dropout_edge
 
+from proteinzen.model.modules.layers.node.conv import SequenceUpscaler
 from proteinzen.model.modules.layers.node.mpnn import IPMP
 from proteinzen.model.modules.common import GaussianRandomFourierBasis
 from proteinzen.model.modules.openfold.layers import  StructureModuleTransition
@@ -219,11 +220,14 @@ class IPMPDecoder(nn.Module):
                  num_layers=4,
                  h_time=64,
                  k=30,
-                 dropout=0.1):
+                 dropout=0.1,
+                 conv_downsample_factor=0
+        ):
         super().__init__()
         self.c_s = c_s
         self.c_z = c_z
         self.c_hidden = c_hidden
+        self.c_latent = c_latent
         self.num_rbf = num_rbf
         self.num_pos_embed = num_pos_embed
         atoms_per_res = 5
@@ -235,8 +239,18 @@ class IPMPDecoder(nn.Module):
 
         self.embed_time = GaussianRandomFourierBasis(h_time)
 
+        self.conv_downsample_factor = conv_downsample_factor
+        c_latent_final = c_latent * (2 ** conv_downsample_factor)
+        if conv_downsample_factor > 0:
+            self.upsample = SequenceUpscaler(
+                n_layers=conv_downsample_factor,
+                c_in=c_latent,
+                c_out=c_latent_final,
+                dropout=dropout,
+            )
+
         self.embed_node = nn.Sequential(
-            nn.Linear(c_latent + h_time*2, 2*c_s),
+            nn.Linear(c_latent_final + h_time*2, 2*c_s),
             nn.ReLU(),
             nn.Linear(2*c_s, c_s),
         )
@@ -282,6 +296,8 @@ class IPMPDecoder(nn.Module):
         # edge graph
         masked_X_ca = X_ca.clone()
         masked_X_ca[~res_mask] = torch.inf
+        print(X_ca[:5], bb[:5])
+        print(masked_X_ca.shape, res_mask.sum())
         edge_index = knn_graph(masked_X_ca, self.k, graph['residue'].batch)
 
         # edge features
@@ -290,6 +306,7 @@ class IPMPDecoder(nn.Module):
         src = edge_index[1]
         dst = edge_index[0]
 
+        print(edge_index.shape, bb.shape)
         ## edge distances
         edge_bb_src = bb[src]
         edge_bb_dst = bb[dst]
@@ -348,6 +365,11 @@ class IPMPDecoder(nn.Module):
         timestep_embed = timestep_embed[res_data.batch]
 
         node_features = intermediates['latent_sidechain']
+        if self.conv_downsample_factor > 0:
+            num_batch = graph.num_graphs
+            node_features = node_features.view(num_batch, -1, self.c_latent)
+            node_features = self.upsample(node_features, seq_len=rigids.shape[0] // num_batch)
+            node_features = node_features.flatten(start_dim=0, end_dim=1)
         node_update = self.embed_node(
             torch.cat([timestep_embed, node_features], dim=-1)
         )

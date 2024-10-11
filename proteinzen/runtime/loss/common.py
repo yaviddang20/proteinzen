@@ -8,7 +8,7 @@ from .utils import _nodewise_to_graphwise
 from .atomic.atom14 import atom14_mse_loss, chi_loss
 from .atomic.atomic import residue_knn_neighborhood_atomic_dist_loss, local_atomic_context_loss, smooth_lddt_loss, sparse_smooth_lddt_loss
 from .atomic.interresidue import intersidechain_clash_loss
-from .latent import so3_embedding_kl, scalars_kl_div
+from .latent import so3_embedding_kl, scalars_kl_div, gaussian_nll
 from .frames import all_atom_fape_loss
 
 from proteinzen.utils.openfold.rigid_utils import Rigid
@@ -209,7 +209,18 @@ def autoencoder_losses(batch,
     if kl_loss:
         latent_mu = model_outputs['latent_mu']
         latent_logvar = model_outputs['latent_logvar']
-        kl_div = scalars_kl_div(latent_mu, latent_logvar, res_data.batch, minimal_mask)
+        res_data_batch = res_data.batch
+        _mask = minimal_mask
+
+        # TODO: this is really hacky, we're assuming we're doing convolutional
+        # compression if we have shape mismatch
+        if latent_mu.shape[0] < minimal_mask.shape[0]:
+            res_data_batch = torch.arange(
+                batch.num_graphs, device=latent_mu.device
+            ).repeat_interleave(latent_mu.shape[0] // batch.num_graphs)
+            _mask = torch.ones_like(res_data_batch, dtype=torch.bool)
+
+        kl_div = scalars_kl_div(latent_mu, latent_logvar, res_data_batch, _mask)
     else:
         kl_div = torch.zeros_like(t)
 
@@ -421,7 +432,8 @@ def latent_scalar_sidechain_fm_loss(
         latent_outputs,
         t_norm_clip=0.9,
         scale=0.01,
-        pointwise=False
+        pointwise=False,
+        detach_gt_latent_grad=False,
     ):
     res_data = batch['residue']
     x_mask = res_data['res_mask']
@@ -429,12 +441,25 @@ def latent_scalar_sidechain_fm_loss(
     total_mask = x_mask & noising_mask
 
     latent = latent_outputs['latent_sidechain']
+    if detach_gt_latent_grad:
+        latent = latent.detach()
     # latent = latent_outputs['latent_mu']
     noised_latent = latent_outputs['noised_latent_sidechain']
     denoised_latent = latent_outputs['pred_latent_sidechain']
 
+    res_data_batch = res_data.batch
+
+    # TODO: this is super hacky, we're assuming we did convolutional
+    # compression from shape mismatch
+    if noised_latent.shape[0] < total_mask.shape[0]:
+        total_mask = torch.ones(latent.shape[:-1], device=latent.device, dtype=torch.bool)
+        res_data_batch = torch.arange(
+            batch.num_graphs, device=latent.device
+        ).repeat_interleave(latent.shape[0] // batch.num_graphs)
+        # print(latent.shape, res_data_batch.shape, total_mask.shape)
+
     latent_denoising_loss = torch.square(denoised_latent - latent).sum(dim=-1) * total_mask
-    latent_denoising_loss = _nodewise_to_graphwise(latent_denoising_loss, res_data.batch, total_mask)
+    latent_denoising_loss = _nodewise_to_graphwise(latent_denoising_loss, res_data_batch, total_mask)
 
     t = batch['t']
     norm_scale = 1 - torch.min(
@@ -443,7 +468,7 @@ def latent_scalar_sidechain_fm_loss(
     latent_fm_loss = latent_denoising_loss / (norm_scale ** 2) * scale
 
     latent_ref_noise = torch.square(noised_latent - latent).sum(dim=-1) * total_mask
-    latent_ref_noise = _nodewise_to_graphwise(latent_ref_noise, res_data.batch, total_mask)
+    latent_ref_noise = _nodewise_to_graphwise(latent_ref_noise, res_data_batch, total_mask)
 
     if pointwise:
         dim_size = latent.shape[-1]
@@ -571,6 +596,59 @@ def latent_scalar_edge_fm_loss(
         "latent_ref_noise": latent_ref_noise,
         # "latent_denoising_nll": latent_denoising_nll,
         # "latent_ref_noise_nll": latent_ref_noise_nll,
+    }
+
+
+def latent_encoder_consistency_loss(
+    batch,
+    latent_outputs,
+    detach_gt_latent_grad=True,
+    t_norm_clip=0.9,
+    scale=0.01,
+    reduction='mean'
+):
+    res_data = batch['residue']
+    x_mask = res_data['res_mask']
+    noising_mask = res_data['noising_mask']
+    total_mask = x_mask & noising_mask
+
+    latent = latent_outputs['latent_sidechain']
+    denoised_latent = latent_outputs['pred_latent_sidechain']
+    if detach_gt_latent_grad:
+        latent = latent.detach()
+
+    consistency_data = latent_outputs['consistency_data']
+    consistent_mu = consistency_data['latent_mu']
+    consistent_logvar = consistency_data['latent_logvar']
+    gt_consistency_nll = gaussian_nll(
+        latent,
+        consistent_mu,
+        consistent_logvar,
+        batch=res_data.batch,
+        mask=total_mask,
+        reduction=reduction
+    )
+    self_consistency_nll = gaussian_nll(
+        denoised_latent,
+        consistent_mu,
+        consistent_logvar,
+        batch=res_data.batch,
+        mask=total_mask,
+        reduction=reduction
+    )
+
+    t = batch['t']
+    norm_scale = 1 - torch.min(
+        t, torch.as_tensor(t_norm_clip)
+    )
+    scaled_gt_nll = gt_consistency_nll * scale / (norm_scale ** 2)
+    scaled_self_nll = self_consistency_nll * scale / (norm_scale ** 2)
+
+    return {
+        "consistency_nll_gt": gt_consistency_nll,
+        "consistency_nll_gt_scaled": scaled_gt_nll,
+        "consistency_nll_self": self_consistency_nll,
+        "consistency_nll_self_scaled": scaled_self_nll
     }
 
 

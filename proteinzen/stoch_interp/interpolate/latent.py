@@ -56,12 +56,20 @@ class LatentInterpolant:
         noising_mask = res_data["noising_mask"]
         mask = res_mask & noising_mask
 
+        latent_sidechain = intermediates['latent_sidechain']
+
         # [B]
         t = batch["t"]
-        nodewise_t = batchwise_to_nodewise(t, res_data.batch)
+        # TODO: this is really hacky, we're assuming we're doing convolutional
+        # compression if we have shape mismatch
+        if latent_sidechain.shape[0] < res_mask.shape[0]:
+            num_nodes = latent_sidechain.shape[0] // batch.num_graphs
+            nodewise_t = t.repeat_interleave(num_nodes)
+            mask = torch.ones_like(nodewise_t, dtype=torch.bool)
+        else:
+            nodewise_t = batchwise_to_nodewise(t, res_data.batch)
 
         # Apply corruptions
-        latent_sidechain = intermediates['latent_sidechain']
         noised_latent = self._corrupt_x(latent_sidechain, nodewise_t, mask, res_data.batch)
 
         return {

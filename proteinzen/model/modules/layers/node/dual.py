@@ -1,3 +1,5 @@
+from typing import Optional
+
 import math
 
 import torch
@@ -8,7 +10,7 @@ from proteinzen.model.modules.openfold.layers import Linear, ipa_point_weights_i
 from proteinzen.utils.openfold.rigid_utils import Rigid
 
 
-class FlexInvariantPointAttention(nn.Module):
+class DenseEquivariantPointAttention(nn.Module):
     """
     An attention layer which accomedates both frame-based and TFN-based features, largely based off of IPA
     """
@@ -17,7 +19,7 @@ class FlexInvariantPointAttention(nn.Module):
         c_s,
         c_z,
         c_hidden,
-        node_irreps,
+        node_irreps: o3.Irreps,
         num_heads,
         num_qk_points,
         num_v_points,
@@ -99,12 +101,12 @@ class FlexInvariantPointAttention(nn.Module):
 
     def forward(
         self,
+        *,
         s: torch.Tensor,
         z: torch.Tensor,
         r: Rigid,
         mask: torch.Tensor,
-        atom_coords=None,
-        atom_features=None,
+        is_atom: torch.BoolTensor
     ) -> torch.Tensor:
         """
         Args:
@@ -119,84 +121,101 @@ class FlexInvariantPointAttention(nn.Module):
         Returns:
             [*, N_res, C_s] single representation update
         """
-        do_atom_calcs = (atom_coords is not None and atom_features is not None)
+        do_atom_calcs = is_atom.any()
+        do_res_calcs = ~(is_atom.all())
 
         if self.pre_ln:
-            s = self.pre_ln_s(s)
+            s[is_atom] = self.pre_ln_s(s[is_atom])
             z = self.pre_ln_z(z)
 
-        #######################################
-        # Generate scalar and point activations
-        #######################################
-        # [*, N_res, H * C_hidden]
-        q = self.linear_q(s)
-        kv = self.linear_kv(s)
+        q = torch.zeros(list(s.shape[:-1]) + [self.no_heads, self.c_hidden], device=s.device)
+        k = torch.zeros(list(s.shape[:-1]) + [self.no_heads, self.c_hidden], device=s.device)
+        v = torch.zeros(list(s.shape[:-1]) + [self.no_heads, self.c_hidden], device=s.device)
+        q_pts = torch.zeros(list(s.shape[:-1]) + [self.no_heads, self.no_qk_pts, 3], device=s.device)
+        k_pts = torch.zeros(list(s.shape[:-1]) + [self.no_heads, self.no_qk_pts, 3], device=s.device)
+        v_pts = torch.zeros(list(s.shape[:-1]) + [self.no_heads, self.no_v_pts, 3], device=s.device)
 
-        # [*, N_res, H, C_hidden]
-        q = q.view(q.shape[:-1] + (self.no_heads, -1))
+        if do_res_calcs:
+            res_s = s[~is_atom, ..., :self.c_s]
+            #######################################
+            # Generate scalar and point activations
+            #######################################
+            # [*, N_res, H * C_hidden]
+            res_q = self.linear_q(res_s)
+            res_kv = self.linear_kv(res_s)
 
-        # [*, N_res, H, 2 * C_hidden]
-        kv = kv.view(kv.shape[:-1] + (self.no_heads, -1))
+            # [*, N_res, H, C_hidden]
+            res_q = res_q.view(res_q.shape[:-1] + (self.no_heads, -1))
 
-        # [*, N_res, H, C_hidden]
-        k, v = torch.split(kv, self.c_hidden, dim=-1)
+            # [*, N_res, H, 2 * C_hidden]
+            res_kv = res_kv.view(res_kv.shape[:-1] + (self.no_heads, -1))
 
-        # [*, N_res, H * P_q * 3]
-        q_pts = self.linear_q_points(s)
+            # [*, N_res, H, C_hidden]
+            res_k, res_v = torch.split(res_kv, self.c_hidden, dim=-1)
 
-        # This is kind of clunky, but it's how the original does it
-        # [*, N_res, H * P_q, 3]
-        q_pts = torch.split(q_pts, q_pts.shape[-1] // 3, dim=-1)
-        q_pts = torch.stack(q_pts, dim=-1)
-        q_pts = r[..., None].apply(q_pts)
+            # [*, N_res, H * P_q * 3]
+            res_q_pts = self.linear_q_points(res_s)
 
-        # [*, N_res, H, P_q, 3]
-        q_pts = q_pts.view(
-            q_pts.shape[:-2] + (self.no_heads, self.no_qk_points, 3)
-        )
+            # This is kind of clunky, but it's how the original does it
+            # [*, N_res, H * P_q, 3]
+            res_q_pts = torch.split(res_q_pts, res_q_pts.shape[-1] // 3, dim=-1)
+            res_q_pts = torch.stack(res_q_pts, dim=-1)
+            res_q_pts = r[..., None].apply(res_q_pts)
 
-        # [*, N_res, H * (P_q + P_v) * 3]
-        kv_pts = self.linear_kv_points(s)
+            # [*, N_res, H, P_q, 3]
+            res_q_pts = res_q_pts.view(
+                res_q_pts.shape[:-2] + (self.no_heads, self.no_qk_points, 3)
+            )
 
-        # [*, N_res, H * (P_q + P_v), 3]
-        kv_pts = torch.split(kv_pts, kv_pts.shape[-1] // 3, dim=-1)
-        kv_pts = torch.stack(kv_pts, dim=-1)
-        kv_pts = r[..., None].apply(kv_pts)
+            # [*, N_res, H * (P_q + P_v) * 3]
+            res_kv_pts = self.linear_kv_points(res_s)
 
-        # [*, N_res, H, (P_q + P_v), 3]
-        kv_pts = kv_pts.view(kv_pts.shape[:-2] + (self.no_heads, -1, 3))
+            # [*, N_res, H * (P_q + P_v), 3]
+            res_v_pts = torch.split(res_kv_pts, res_kv_pts.shape[-1] // 3, dim=-1)
+            res_v_pts = torch.stack(res_kv_pts, dim=-1)
+            res_v_pts = r[..., None].apply(res_kv_pts)
 
-        # [*, N_res, H, P_q/P_v, 3]
-        k_pts, v_pts = torch.split(
-            kv_pts, [self.no_qk_points, self.no_v_points], dim=-2
-        )
+            # [*, N_res, H, (P_q + P_v), 3]
+            res_kv_pts = res_kv_pts.view(res_kv_pts.shape[:-2] + (self.no_heads, -1, 3))
+
+            # [*, N_res, H, P_q/P_v, 3]
+            res_k_pts, res_v_pts = torch.split(
+                res_kv_pts, [self.no_qk_points, self.no_v_points], dim=-2
+            )
+
+            q[~is_atom] = res_q
+            k[~is_atom] = res_k
+            v[~is_atom] = res_v
+            q_pts[~is_atom] = res_q_pts
+            k_pts[~is_atom] = res_k_pts
+            v_pts[~is_atom] = res_v_pts
+
 
         if do_atom_calcs:
-            assert z.shape[1] == s.shape[1] + atom_features.shape[1]
-
-            atom_q_all = self.tfn_q(atom_features)
+            atom_s = s[is_atom, ..., :self.node_irreps.dim]
+            atom_q_all = self.tfn_q(atom_s)
 
             atom_q, atom_q_pts = atom_q_all.split([self.q_irreps.count("0e"), self.q_irreps.count("1o")], dim=-1)
             atom_q = atom_q.view(atom_q.shape[:-1] + (self.no_heads, -1))
             atom_q_pts = atom_q_pts.view(atom_q_pts.shape[:-2] + (self.no_heads, self.no_qk_points, 3))
-            atom_q_pts = atom_q_pts + atom_coords[..., None, None, :]
+            atom_q_pts = atom_q_pts + r.get_trans()[..., None, None, :]
 
-            atom_kv_all = self.tfn_kv(atom_features)
+            atom_kv_all = self.tfn_kv(atom_s)
             atom_kv, atom_kv_pts = atom_kv_all.split([self.kv_irreps.count("0e"), self.kv_irreps.count("1o")], dim=-1)
-            atom_kv = atom_kv.view(kv.shape[:-1] + (self.no_heads, -1))
+            atom_kv = atom_kv.view(atom_kv.shape[:-1] + (self.no_heads, -1))
             atom_k, atom_v = atom_kv.split(self.c_hidden, dim=-1)
             atom_kv_pts = atom_kv_pts.view(atom_kv_pts.shape[:-2] + (self.no_heads, -1, 3))
-            atom_kv_pts = atom_kv_pts + atom_coords[..., None, None, :]
+            atom_kv_pts = atom_kv_pts + r.get_trans()[..., None, None, :]
             atom_k_pts, atom_v_pts = torch.split(
                 atom_kv_pts, [self.no_qk_points, self.no_v_points], dim=-2
             )
 
-            q = torch.cat([q, atom_q], dim=1)
-            q_pts = torch.cat([q_pts, atom_q_pts], dim=1)
-            k = torch.cat([k, atom_k], dim=1)
-            k_pts = torch.cat([k_pts, atom_k_pts], dim=1)
-            v = torch.cat([v, atom_v], dim=1)
-            v_pts = torch.cat([v_pts, atom_v_pts], dim=1)
+            q[is_atom] = atom_q
+            k[is_atom] = atom_k
+            v[is_atom] = atom_v
+            q_pts[is_atom] = atom_q_pts
+            k_pts[is_atom] = atom_k_pts
+            v_pts[is_atom] = atom_v_pts
 
 
         ##########################
@@ -279,42 +298,38 @@ class FlexInvariantPointAttention(nn.Module):
         # [*, N_res, H * C_z // 4]
         o_pair = flatten_final_dims(o_pair, 2)
 
-        if do_atom_calcs:
-            num_res = s.shape[-2]
+        s_out = torch.zeros_like(s)
+
+        if do_res_calcs:
             o_feats = [
-                o[..., :num_res, :],
-                *torch.unbind(o_pt[..., :num_res, :, :], dim=-1),
-                o_pt_norm_feats[..., :num_res, :],
-                o_pair[..., :num_res, :]
+                o,
+                *torch.unbind(o_pt, dim=-1),
+                o_pt_norm_feats,
+                o_pair
             ]
+            o_feats = [_item[~is_atom] for _item in o_feats]
 
             # [*, N_res, C_s]
-            s = self.linear_out(
+            res_s_out = self.linear_out(
                 torch.cat(
                     o_feats, dim=-1
                 ).to(dtype=z.dtype)
             )
+            s_out[~is_atom] = res_s_out
 
+        if do_atom_calcs:
             tfn_feats = [
-                o[..., num_res:, :],
-                o_pt_norm_feats[..., num_res:, :],
-                o_pair[..., num_res:, :],
+                o,
+                o_pt_norm_feats,
+                o_pair,
                 flatten_final_dims(o_pt, 2)
             ]
-            atom_features = self.tfn_out(
+            tfn_feats = [_item[is_atom] for _item in tfn_feats]
+            tfn_s_out = self.tfn_out(
                 torch.cat(
                     tfn_feats, dim=-1
                 ).to(dtype=z.dtype)
             )
+            s_out[is_atom] = tfn_s_out
 
-        else:
-            o_feats = [o, *torch.unbind(o_pt, dim=-1), o_pt_norm_feats, o_pair]
-
-            # [*, N_res, C_s]
-            s = self.linear_out(
-                torch.cat(
-                    o_feats, dim=-1
-                ).to(dtype=z.dtype)
-            )
-
-        return s, atom_features
+        return s

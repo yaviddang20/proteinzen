@@ -77,6 +77,7 @@ class DenseProteinInterpolation(Task):
                  percent_all_mask=0.25,
                  percent_no_mask=0.25,
                  norm_latent_space=False,
+                 encoder_consistency_check=False
     ):
         super().__init__()
         self.se3_noiser = protein_noiser.se3_noiser
@@ -108,6 +109,7 @@ class DenseProteinInterpolation(Task):
         self.square_bb_aux_loss_t_factor = square_bb_aux_loss_t_factor
         self.percent_all_mask = percent_all_mask
         self.percent_no_mask = percent_no_mask
+        self.encoder_consistency_check = encoder_consistency_check
 
         self.t_min = t_min
         self.t_max = t_max
@@ -251,14 +253,14 @@ class DenseProteinInterpolation(Task):
                 latent_edge_sigma = latent_edge_sigma / torch.maximum(latent_edge_sigma, torch.tensor(1e-8, device=latent_edge_sigma.device))
                 latent_data['latent_edge_logvar'] = torch.log(2 * latent_edge_sigma)
 
-        print(torch.linalg.vector_norm(latent_data[self.sidechain_x_1_key], dim=-1).mean())
-        # print(torch.std_mean(latent_data[self.sidechain_x_1_key], dim=(0, 1)))
-        print(torch.linalg.vector_norm(latent_data['latent_node_mu'], dim=-1).mean())
-        # print(torch.std_mean(latent_data['latent_node_mu'], dim=(0, 1)))
-        print(torch.linalg.vector_norm(latent_data[self.edge_x_1_key], dim=-1).mean())
-        # print(torch.std_mean(latent_data[self.edge_x_1_key], dim=(0, 1, 2)))
-        print(torch.linalg.vector_norm(latent_data['latent_edge_mu'], dim=-1).mean())
-        # print(torch.std_mean(latent_data['latent_edge_mu'], dim=(0, 1, 2)))
+        # print(torch.linalg.vector_norm(latent_data[self.sidechain_x_1_key], dim=-1).mean())
+        # # print(torch.std_mean(latent_data[self.sidechain_x_1_key], dim=(0, 1)))
+        # print(torch.linalg.vector_norm(latent_data['latent_node_mu'], dim=-1).mean())
+        # # print(torch.std_mean(latent_data['latent_node_mu'], dim=(0, 1)))
+        # print(torch.linalg.vector_norm(latent_data[self.edge_x_1_key], dim=-1).mean())
+        # # print(torch.std_mean(latent_data[self.edge_x_1_key], dim=(0, 1, 2)))
+        # print(torch.linalg.vector_norm(latent_data['latent_edge_mu'], dim=-1).mean())
+        # # print(torch.std_mean(latent_data['latent_edge_mu'], dim=(0, 1, 2)))
 
         # decoder
         decoder_outputs = model.decoder(inputs, latent_data)
@@ -275,7 +277,7 @@ class DenseProteinInterpolation(Task):
             passthrough_inputs = copy.copy(inputs)
             passthrough_inputs['residue']['rigids_1'] = latent_outputs['final_rigids'].to_tensor_7()
             passthrough_inputs['residue']['x'] = latent_outputs['final_rigids'].get_trans()
-            passthrough_inputs['residue']['bb'] = latent_outputs['denoised_bb'][:, :4]
+            passthrough_inputs['residue']['bb'] = latent_outputs['denoised_bb'][..., :4, :]
             passthrough_latent = {
                 self.sidechain_x_1_key: latent_outputs[self.sidechain_x_1_pred_key],
                 self.edge_x_1_key: latent_outputs[self.edge_x_1_pred_key]
@@ -288,6 +290,21 @@ class DenseProteinInterpolation(Task):
             passthrough_outputs.update(noised_latent_data)
             passthrough_outputs.update(latent_data)
             passthrough_outputs['final_rigids'] = latent_outputs['final_rigids']
+
+            if self.encoder_consistency_check:
+                consistency_inputs = copy.copy(passthrough_inputs)
+                c_res_data = consistency_inputs['res_data']
+                c_res_data['atom14_gt_positions'] = passthrough_outputs['decoded_atom14']
+                c_res_data['atom14_gt_exists'] = passthrough_outputs['decoded_atom14_mask']
+                c_res_data['atom14_noising_mask'] = passthrough_outputs['decoded_atom14_mask']
+                c_res_data['seq'] = passthrough_outputs['decoded_seq_logits'].argmax(dim=-1)
+                for param in model.encoder.parameters():
+                    param.requires_grad = False
+                consistency_data = model.encoder(consistency_inputs, apply_noising_masks=self.vae_seq_masking)
+                for param in model.encoder.parameters():
+                    param.requires_grad = True
+                passthrough_outputs['consistency_data'] = consistency_data
+
         else:
             passthrough_outputs = None
 
@@ -317,6 +334,7 @@ class DenseProteinInterpolation(Task):
     def run_predict(self,
                     model,
                     inputs,
+                    keep_traj=False,
                     device='cuda:0'):
                     # device='cpu'):
         self.se3_noiser.set_device(device)
@@ -579,6 +597,26 @@ class DenseProteinInterpolation(Task):
             )
         )
 
+        encoder_inputs = batch#.copy()
+        res_data = encoder_inputs['residue']
+        res_data['atom14_gt_positions'] = decoder_output['decoded_atom14']
+        res_data['atom14_gt_exists'] = decoder_output['decoded_atom14_mask']
+        res_data['atom14_noising_mask'] = decoder_output['decoded_atom14_mask']
+        res_data['rigids_1'] = pred_rigids.to_tensor_7()
+        res_data['seq'] = argmax_seq
+        latent_data = model.encoder(encoder_inputs, apply_noising_masks=self.vae_seq_masking)
+        print(
+            torch.mean(torch.linalg.vector_norm(pred_latent_sidechain - latent_data['latent_node_mu'], dim=-1)),
+            torch.mean(torch.linalg.vector_norm((0.5 * latent_data['latent_node_logvar']).exp()))
+        )
+        print(
+            torch.mean(torch.linalg.vector_norm(pred_latent_edge - latent_data['latent_edge_mu'], dim=-1)),
+            torch.mean(torch.linalg.vector_norm((0.5 * latent_data['latent_edge_logvar']).exp()))
+        )
+        print(torch.mean(torch.linalg.vector_norm(pred_latent_sidechain, dim=-1)))
+        print(torch.mean(torch.linalg.vector_norm(pred_latent_edge, dim=-1)))
+
+
         # all_atom14 = decoder_output['decoded_all_atom14']
 
         # decoded_struct = _collect_from_seq(all_atom14, argmax_seq, torch.ones_like(argmax_seq).bool())
@@ -590,14 +628,25 @@ class DenseProteinInterpolation(Task):
         clean_traj_seqs = zip(*[traj[-2].split(num_res) for traj in clean_traj])
         prot_trajs = zip(*[traj[-1].split(num_res) for traj in prot_traj])
 
-        return {
-            "samples": decoded_struct.split(num_res),
-            "seqs": argmax_seq.split(num_res),
-            "clean_trajs": clean_trajs,
-            "clean_traj_seqs": clean_traj_seqs,
-            "prot_trajs": prot_trajs,
-            "inputs": inputs
-        }
+        if keep_traj:
+            return {
+                "samples": decoded_struct.split(num_res),
+                "seqs": argmax_seq.split(num_res),
+                "clean_trajs": clean_trajs,
+                "clean_traj_seqs": clean_traj_seqs,
+                "prot_trajs": prot_trajs,
+                "inputs": inputs
+            }
+        else:
+            del clean_trajs
+            del clean_traj_seqs
+            del prot_trajs
+            return {
+                "samples": decoded_struct.split(num_res),
+                "seqs": argmax_seq.split(num_res),
+                "inputs": inputs
+            }
+
 
 
     def compute_loss(self, inputs, outputs: Dict):

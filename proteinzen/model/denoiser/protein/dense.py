@@ -11,6 +11,7 @@ from proteinzen.model.modules.openfold.layers import LocalTriangleAttentionNew
 import proteinzen.utils.openfold.rigid_utils as ru
 from proteinzen.utils.openfold.rigid_utils import Rigid, batchwise_center
 from proteinzen.utils.framediff.all_atom import compute_backbone
+from proteinzen.model.modules.layers.node.conv import SequenceDownscaler, SequenceUpscaler
 
 def get_index_embedding(indices, embed_size, max_len=2056):
     """Creates sine / cosine positional embeddings from a prespecified indices.
@@ -146,8 +147,20 @@ class Embedder(nn.Module):
                  c_latent,
                  c_z,
                  index_embed_size=32,
-                 use_init_distogram=False):
+                 use_init_distogram=False,
+                 conv_downsample_factor=0
+    ):
         super(Embedder, self).__init__()
+
+        c_latent_init = c_latent
+        c_latent = c_latent * (2 ** conv_downsample_factor)
+        self.conv_downsample_factor = conv_downsample_factor
+        if self.conv_downsample_factor > 0:
+            self.upscale = SequenceUpscaler(
+                conv_downsample_factor,
+                c_in=c_latent_init,
+                c_out=c_latent
+            )
 
         # Time step embedding
         t_embed_size = index_embed_size
@@ -225,6 +238,9 @@ class Embedder(nn.Module):
         num_batch, num_res = seq_idx.shape
         node_feats = []
 
+        if self.conv_downsample_factor > 0:
+            latent_features = self.upscale(latent_features, seq_len=seq_idx.shape[1])
+
         # Set time step to epsilon=1e-5 for fixed residues.
         fixed_mask = fixed_mask[..., None]
         prot_t_embed = torch.tile(
@@ -259,7 +275,6 @@ class Embedder(nn.Module):
             )
             pair_feats.append(init_dgram.reshape([num_batch, num_res**2, -1]))
 
-
         node_embed = self.node_embedder(torch.cat(node_feats, dim=-1).float())
         edge_embed = self.edge_embedder(torch.cat(pair_feats, dim=-1).float())
         edge_embed = edge_embed.reshape([num_batch, num_res, num_res, -1])
@@ -282,6 +297,7 @@ class IpaScore(nn.Module):
                  coordinate_scaling=0.1,
                  update_edges_with_dist=False,
                  use_proteus_edge_transition=False,
+                 conv_downsample_factor=0,
                  ):
         super(IpaScore, self).__init__()
         # self.diffuser = diffuser
@@ -298,15 +314,6 @@ class IpaScore(nn.Module):
         self.num_blocks = num_blocks
 
         for b in range(num_blocks):
-            self.trunk[f'latent_to_node_{b}'] = nn.Sequential(
-                Linear(c_s + c_latent, c_s, init='relu'),
-                nn.ReLU(),
-                Linear(c_s, c_s, init='relu'),
-                nn.ReLU(),
-                Linear(c_s, c_s, init='final'),
-            )
-            self.trunk[f'latent_to_node_ln_{b}'] = nn.LayerNorm(c_s)
-
             self.trunk[f'ipa_{b}'] = InvariantPointAttention(
                  c_s=c_s,
                  c_z=c_z,
@@ -338,14 +345,6 @@ class IpaScore(nn.Module):
                 c=c_s)
             self.trunk[f'bb_update_{b}'] = BackboneUpdate(c_s)
 
-            self.trunk[f'node_to_latent_{b}'] = nn.Sequential(
-                Linear(c_s + c_latent, c_latent, init='relu'),
-                nn.ReLU(),
-                Linear(c_latent, c_latent, init='relu'),
-                nn.ReLU(),
-                Linear(c_latent, c_latent, init='final'),
-            )
-
             if b < num_blocks-1:
                 # No edge update on the last block.
                 if update_edges_with_dist:
@@ -376,6 +375,28 @@ class IpaScore(nn.Module):
 
         self.torsion_pred = TorsionAngles(c_s, 1)
 
+        self.conv_downsample_factor = conv_downsample_factor
+        if self.conv_downsample_factor > 0:
+            c_in = c_latent * (2 ** conv_downsample_factor)
+            self.project = Linear(c_s, c_in, bias=False)
+            self.downsample = SequenceDownscaler(
+                conv_downsample_factor,
+                c_in,
+                c_latent
+            )
+            self.final = Linear(c_latent, c_latent)#, init='final')
+            self.final_gate = Linear(c_latent, c_latent, init='gating')
+        else:
+            self.latent_delta = nn.Sequential(
+                Linear(c_s+c_latent, c_s, init='relu'),
+                nn.ReLU(),
+                Linear(c_s, c_s, init='relu'),
+                nn.ReLU(),
+                Linear(c_s, c_s, init='relu'),
+                nn.LayerNorm(c_s),
+                Linear(c_s, c_latent, init='final')
+            )
+
     def forward(self, init_node_embed, edge_embed, input_feats):
         node_mask = input_feats['res_mask'].type(torch.float32)
         diffuse_mask = (1 - input_feats['fixed_mask'].type(torch.float32)) * node_mask
@@ -390,13 +411,6 @@ class IpaScore(nn.Module):
         init_node_embed = init_node_embed * node_mask[..., None]
         node_embed = init_node_embed * node_mask[..., None]
         for b in range(self.num_blocks):
-            latent_embed = self.trunk[f'latent_to_node_{b}'](
-                torch.cat([node_embed, latent_features], dim=-1)
-            )
-            node_embed = self.trunk[f'latent_to_node_ln_{b}'](
-                (latent_embed + node_embed) * node_mask[..., None]
-            )
-
             ipa_embed = self.trunk[f'ipa_{b}'](
                 node_embed,
                 edge_embed,
@@ -416,11 +430,6 @@ class IpaScore(nn.Module):
                 node_embed * diffuse_mask[..., None])
             curr_rigids = curr_rigids.compose_q_update_vec(
                 rigid_update * diffuse_mask[..., None])
-
-            latent_update = self.trunk[f'node_to_latent_{b}'](
-                torch.cat([node_embed, latent_features], dim=-1)
-            )
-            latent_features = (latent_update + latent_features) * node_mask[..., None]
 
             if b < self.num_blocks-1:
                 if self.update_edges_with_dist:
@@ -442,6 +451,15 @@ class IpaScore(nn.Module):
                     edge_embed = self.trunk[f'edge_transition_{b}'](
                         node_embed, edge_embed_in)
                 edge_embed *= edge_mask[..., None]
+
+        if self.conv_downsample_factor > 0:
+            latent_update = self.downsample(self.project(node_embed))
+            gate = self.final_gate(latent_update)
+            latent_features = latent_features + self.final(latent_update) * torch.sigmoid(gate)
+        else:
+            latent_features = latent_features + self.latent_delta(
+                torch.cat([node_embed, latent_features], dim=-1)
+            ) * node_mask[..., None]
 
         curr_rigids = self.unscale_rigids(curr_rigids)
         _, psi_pred = self.torsion_pred(node_embed)
@@ -469,6 +487,7 @@ class IpaDenoiser(nn.Module):
                  use_init_dgram=False,
                  update_edges_with_dgram=False,
                  use_proteus_transition=False,
+                 conv_downsample_factor=0,
                  ):
         super().__init__()
         # some compatibility code
@@ -491,13 +510,15 @@ class IpaDenoiser(nn.Module):
             num_v_points=num_v_points,
             num_blocks=num_blocks,
             update_edges_with_dist=update_edges_with_dgram,
-            use_proteus_edge_transition=use_proteus_transition
+            use_proteus_edge_transition=use_proteus_transition,
+            conv_downsample_factor=conv_downsample_factor
         )
         self.embedder = Embedder(
             c_s=c_s,
             c_latent=c_latent,
             c_z=c_z,
-            use_init_distogram=use_init_dgram
+            use_init_distogram=use_init_dgram,
+            conv_downsample_factor=conv_downsample_factor
         )
 
     def forward(self, data, intermediates, self_condition=None):
@@ -574,12 +595,17 @@ class DenseEmbedder(nn.Module):
                  c_latent,
                  c_z,
                  index_embed_size=32,
-                 use_init_distogram=False):
+                 use_init_distogram=False,
+                 use_seq_mask_features=False
+        ):
         super().__init__()
+        self.use_seq_mask_features = use_seq_mask_features
 
         # Time step embedding
         t_embed_size = index_embed_size
         node_embed_dims = t_embed_size + 1 + c_latent
+        if use_seq_mask_features:
+            node_embed_dims += 1
         edge_in = (t_embed_size + c_latent + 1) * 2 + c_latent
 
         # Sequence index embedding
@@ -636,7 +662,8 @@ class DenseEmbedder(nn.Module):
             t,
             fixed_mask,
             self_conditioning_ca,
-            init_ca=None
+            seq_mask,
+            init_ca=None,
         ):
         """Embeds a set of inputs
 
@@ -664,6 +691,9 @@ class DenseEmbedder(nn.Module):
             latent_features,
         ], dim=-1)
         node_feats = [prot_t_embed]
+        if self.use_seq_mask_features:
+            node_feats.append(seq_mask[..., None])
+
         pair_feats = [self._cross_concat(prot_t_embed, num_batch, num_res)]
 
         # Positional index features.
@@ -897,6 +927,7 @@ class DenseIpaDenoiser(nn.Module):
                  use_init_dgram=False,
                  update_edges_with_dgram=False,
                  use_proteus_transition=False,
+                 use_seq_mask_features=False,
                  ):
         super().__init__()
         # some compatibility code
@@ -921,11 +952,12 @@ class DenseIpaDenoiser(nn.Module):
             update_edges_with_dist=update_edges_with_dgram,
             use_proteus_edge_transition=use_proteus_transition
         )
-        self.embedder = Embedder(
+        self.embedder = DenseEmbedder(
             c_s=c_s,
             c_latent=c_latent,
             c_z=c_z,
-            use_init_distogram=use_init_dgram
+            use_init_distogram=use_init_dgram,
+            use_seq_mask_features=use_seq_mask_features
         )
 
     def forward(self, data, intermediates, self_condition=None):
@@ -946,6 +978,7 @@ class DenseIpaDenoiser(nn.Module):
         t = data['t']
         batch_size = t.shape[0]
         fixed_mask = torch.zeros_like(res_mask).view(batch_size, -1)
+        seq_mask = res_data['seq_noising_mask'].float().view(batch_size, -1)
 
         if self_condition is not None:
             self_conditioning_ca = self_condition['final_rigids'].get_trans().view(batch_size, -1, 3)
@@ -962,11 +995,13 @@ class DenseIpaDenoiser(nn.Module):
 
         node_embed, edge_embed = self.embedder(
             latent_features=latent_sidechain_t,
+            latent_edge_features=latent_edge_t,
             seq_idx=seq_idx,
             t=t,
             fixed_mask=fixed_mask,
             self_conditioning_ca=self_conditioning_ca,
-            init_ca=rigids_t.get_trans()
+            init_ca=rigids_t.get_trans(),
+            seq_mask=seq_mask
         )
 
         input_feats = {

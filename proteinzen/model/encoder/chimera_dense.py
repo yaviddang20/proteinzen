@@ -12,6 +12,7 @@ import e3nn
 from e3nn import o3
 
 from . import wigner
+from .quantize import Quantizer
 
 
 from proteinzen.model.modules.layers.node.tfn import TensorProductConvLayer, TensorProductAggLayer, TensorProductBroadcastLayer
@@ -248,7 +249,8 @@ class ProteinAtomicChimeraDenseEmbedder(nn.Module):
         broadcast_to_atoms=False,
         use_masking_features=False,
         pre_ln=False,
-        lin_bias=True
+        lin_bias=True,
+        quantize_codebook_size=None
     ):
         super().__init__()
         assert n_layers >= 4
@@ -366,6 +368,15 @@ class ProteinAtomicChimeraDenseEmbedder(nn.Module):
         self.latent_node_logvar = nn.Linear(c_s, c_s_out)
         self.latent_edge_mu = nn.Linear(c_z, c_z_out)
         self.latent_edge_logvar = nn.Linear(c_z, c_z_out)
+
+
+        if quantize_codebook_size is None:
+            self.node_quantizer = None
+            self.edge_quantizer = None
+        else:
+            self.node_quantizer = Quantizer(h_dim=c_s_out, n_codebook=quantize_codebook_size)
+            self.edge_quantizer = Quantizer(h_dim=c_z_out, n_codebook=quantize_codebook_size)
+
 
     def _edge_rbf_features(self, coords, edge_index, D_max, num_rbf, eps=1e-12):
         edge_dst, edge_src = edge_index
@@ -574,10 +585,34 @@ class ProteinAtomicChimeraDenseEmbedder(nn.Module):
 
         out_dict = {
             'latent_node_mu': self.latent_node_mu(final_res_features),
-            'latent_node_logvar': self.latent_node_logvar(final_res_features),
             'latent_edge_mu': self.latent_edge_mu(final_res_edge_features),
-            'latent_edge_logvar': self.latent_edge_logvar(final_res_edge_features),
         }
         # print(out_dict['latent_edge_mu'].shape, out_dict['latent_edge_logvar'].shape)
+        if self.node_quantizer is not None:
+            quantized_node, node_quant_loss, node_commit_loss = self.node_quantizer(out_dict['latent_node_mu'], data_dict['res_mask'])
+            out_dict['quantized_node'] = quantized_node
+            out_dict.update({
+                'quantized_node': quantized_node,
+                'node_quant_loss': node_quant_loss,
+                'node_commit_loss': node_commit_loss,
+            })
+        else:
+            out_dict.update({
+                'latent_node_logvar': self.latent_node_logvar(final_res_features),
+            })
+
+        if self.edge_quantizer is not None:
+            edge_mask = data_dict['res_mask'][..., None] & data_dict['res_mask'][..., None, :]
+            quantized_edge, edge_quant_loss, edge_commit_loss = self.edge_quantizer(out_dict['latent_edge_mu'], edge_mask)
+            out_dict.update({
+                'quantized_edge': quantized_edge,
+                'edge_quant_loss': edge_quant_loss,
+                'edge_commit_loss': edge_commit_loss,
+            })
+        else:
+            out_dict.update({
+                'latent_edge_logvar': self.latent_edge_logvar(final_res_edge_features),
+            })
+
 
         return out_dict

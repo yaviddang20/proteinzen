@@ -13,7 +13,7 @@ from torch_geometric.data import HeteroData
 import torch_geometric.utils as pygu
 
 ## data constants
-element_to_period_row = {
+element_to_group_period = {
     'H' : (1, 1),
     'Li': (2, 2),
     'B' : (13, 2),
@@ -50,8 +50,8 @@ element_to_period_row = {
     'Hg': (12, 6),
     'Bi': (15, 6),
 }
-periods, rows = zip(*element_to_period_row.values())
-unique_periods, unique_rows = sorted(set(periods)), sorted(set(rows))
+groups, periods = zip(*element_to_group_period.values())
+unique_groups, unique_periods = sorted(set(groups)), sorted(set(periods))
 
 bonds = {BT.SINGLE: 0, BT.DOUBLE: 1, BT.TRIPLE: 2, BT.AROMATIC: 3}
 
@@ -78,8 +78,8 @@ MAX_BOND_ORDER = 3
 
 # ordered (featurization, max_value)
 prop_featurization = {
-    "atom_period": ("categorical", max(unique_periods)),  # 13
-    "atom_row": ("categorical", max(unique_rows)),  # 6
+    "atom_period": ("categorical", max(unique_groups)),  # 13
+    "atom_row": ("categorical", max(unique_periods)),  # 6
     "atom_chirality": ("ordinal", 1),  # 1
     "atom_hybridization": ("categorical", len(hybridization)),  # 5
     "atom_implicit_hs": ("ordinal", MAX_NUM_BONDS),  # 1
@@ -124,8 +124,8 @@ def mol_props(mol, implicit_H=True):
     # mol = conformer.GetOwningMol()
     ringinfo = mol.GetRingInfo()
     # atom features
+    atom_group = []
     atom_period = []
-    atom_row = []
     atom_chirality = []
     atom_hybridization = []
     atom_implicit_Hs = []
@@ -143,10 +143,10 @@ def mol_props(mol, implicit_H=True):
             h_idx.append(idx)
             continue
 
-        period, row = element_to_period_row[element]
+        group, period = element_to_group_period[element]
         # element embedding
+        atom_group.append(unique_groups.index(group))
         atom_period.append(unique_periods.index(period))
-        atom_row.append(unique_rows.index(row))
         # chirality
         atom_chirality.append(
             safe_lookup(atom.GetChiralTag(), chirality, default=0)
@@ -220,8 +220,8 @@ def mol_props(mol, implicit_H=True):
 
     props = {
         # "atom_pos": atom_pos,                       # N x 3
-        "atom_period": atom_period,                 # N, categorical
-        "atom_row": atom_row,                       # N, categorical
+        "atom_period": atom_group,                  # N, categorical
+        "atom_row": atom_period,                    # N, categorical
         "atom_chirality": atom_chirality,           # N, ordinal
         "atom_hybridization": atom_hybridization,   # N, categorical
         "atom_implicit_hs": atom_implicit_Hs,       # N, ordinal

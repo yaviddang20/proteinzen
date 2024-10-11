@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import nn
 
@@ -336,9 +338,13 @@ class TFNDenseLatentWrapper(nn.Module):
                  smooth_embedding=False,
                  use_masking_features=False,
                  denoiser_masked_latent_feature=False,
-                 compatibility_mode=False
+                 compatibility_mode=False,
+                 latent_conv_downsample_factor=0,
                  ):
         super().__init__()
+
+        self.latent_conv_downsample_factor = latent_conv_downsample_factor
+
         self.encoder = ProteinAtomicEmbedder(
             h_frame=c_latent,
             res_num_rbf=num_rbf,
@@ -351,7 +357,8 @@ class TFNDenseLatentWrapper(nn.Module):
             res_edge_mult_factor=res_edge_mult_factor,
             res_edge_update=encoder_res_edge_updates,
             compatibility_mode=compatibility_mode,
-            n_layers=4
+            n_layers=4,
+            conv_downsample_factor=latent_conv_downsample_factor
         )
         self.decoder = DesignIPMPDecoder(
             c_s=c_s//2,
@@ -362,6 +369,7 @@ class TFNDenseLatentWrapper(nn.Module):
             num_rbf=num_rbf,
             num_layers=num_layers,
             k=sidechain_k,
+            conv_downsample_factor=latent_conv_downsample_factor
         )
         self.denoiser = IpaDenoiser(
             c_s=c_s,
@@ -375,6 +383,7 @@ class TFNDenseLatentWrapper(nn.Module):
             use_init_dgram=use_init_dgram,
             update_edges_with_dgram=update_edges_with_dgram,
             use_proteus_transition=use_proteus_transition,
+            conv_downsample_factor=latent_conv_downsample_factor,
         )
         self.c_latent = c_latent
         self.self_conditioning = self_conditioning
@@ -385,10 +394,22 @@ class TFNDenseLatentWrapper(nn.Module):
         self.lrange_logn_scale = 10000
         self.lrange_logn_offset = 10000
 
-    def sample_prior(self, num_nodes, device):
-        return {
-            "noised_latent_sidechain": torch.randn((num_nodes, self.c_latent), device=device)
-        }
+    def sample_prior(self, num_nodes, device, num_batch=None):
+        if self.latent_conv_downsample_factor > 0:
+            assert num_batch is not None
+            num_latent_nodes = num_nodes
+            for _ in range(self.latent_conv_downsample_factor):
+                num_latent_nodes = math.ceil(num_latent_nodes / 2)
+            return {
+                "noised_latent_sidechain": torch.randn((num_batch * num_latent_nodes, self.c_latent), device=device)
+            }
+
+
+        else:
+            return {
+                "noised_latent_sidechain": torch.randn((num_nodes, self.c_latent), device=device)
+            }
+
 
 class DenseChimeraLatentWrapper(nn.Module):
     def __init__(self,
@@ -413,8 +434,14 @@ class DenseChimeraLatentWrapper(nn.Module):
                  use_init_dgram=False,
                  update_edges_with_dgram=False,
                  use_proteus_transition=False,
+                 quantize_encoder_codebook_size=None,
+                 denoiser_use_seq_mask_features=False,
+                 decoder_bb_struct_node_dropout=1.0,
+                 decoder_bb_struct_edge_dropout=1.0,
+                 decoder_bb_struct_dropout_mode="itemwise",
                  ):
         super().__init__()
+
         self.encoder = ProteinAtomicChimeraDenseEmbedder(
             c_s=c_s//2,
             c_z=c_z,
@@ -426,7 +453,8 @@ class DenseChimeraLatentWrapper(nn.Module):
             lrange_graph=lrange_embedding,
             use_masking_features=use_masking_features,
             res_h_mult_factor=res_h_mult_factor,
-            n_layers=4
+            n_layers=4,
+            quantize_codebook_size=quantize_encoder_codebook_size
         )
         self.decoder = IPADecoder(
             c_s=c_s//2,
@@ -435,6 +463,9 @@ class DenseChimeraLatentWrapper(nn.Module):
             c_z_in=c_latent,
             c_hidden=c_s//2,
             num_layers=num_layers,
+            bb_struct_node_dropout=decoder_bb_struct_node_dropout,
+            bb_struct_edge_dropout=decoder_bb_struct_edge_dropout,
+            bb_struct_dropout_mode=decoder_bb_struct_dropout_mode,
         )
         self.denoiser = DenseIpaDenoiser(
             c_s=c_s,
@@ -448,6 +479,7 @@ class DenseChimeraLatentWrapper(nn.Module):
             use_init_dgram=use_init_dgram,
             update_edges_with_dgram=update_edges_with_dgram,
             use_proteus_transition=use_proteus_transition,
+            use_seq_mask_features=denoiser_use_seq_mask_features
         )
         self.c_latent = c_latent
         self.self_conditioning = self_conditioning

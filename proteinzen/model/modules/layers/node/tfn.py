@@ -688,6 +688,39 @@ class FeedForward(nn.Module):
         return self.norm(out)
 
 
+class ForkedFeedForward(nn.Module):
+    # this is vaguely inspired by AlphaFold3 transitions
+    def __init__(self, in_irreps, h_irreps, out_irreps, bypass=True):
+        super().__init__()
+        self.in_irreps = in_irreps
+        self.h_irreps = h_irreps
+        self.out_irreps = out_irreps
+
+        self.lin1 = o3.Linear(in_irreps, h_irreps)
+        self.lin2 = o3.Linear(in_irreps, h_irreps)
+        self.tp = FasterTensorProduct(h_irreps, h_irreps, out_irreps)
+        self.weights = o3.Linear(in_irreps, o3.Irreps(f"{self.tp.weight_numel}x0e"))
+
+        # this is kinda like swish?
+        self.act = NormActivation(h_irreps, normalize=False, scalar_nonlinearity=torch.sigmoid)
+
+        if bypass:
+            self.bypass = o3.Linear(in_irreps, out_irreps)
+        # TODO: LayerNorm
+        self.norm = BatchNorm(in_irreps, normalization="component")
+
+    def forward(self, x):
+        _x = x
+        x = self.norm(x)
+        a = self.lin1(x)
+        a = self.act(a)
+        b = self.lin2(x)
+        out = self.tp(a, b, weight=self.weights(x))
+        if hasattr(self, "bypass"):
+            out = self.bypass(_x) + out
+        return out
+
+
 def separate_heads_dim(irreps, irreps_tensor, num_heads):
     slices = (irreps * num_heads).slices()
     tensor_slices = [irreps_tensor[..., s] for s in slices]

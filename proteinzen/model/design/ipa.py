@@ -86,7 +86,10 @@ class IPADecoder(nn.Module):
                  num_pos_embed=16,
                  num_layers=4,
                  h_time=64,
-                 k=30
+                 num_rbf=16,
+                 bb_struct_node_dropout=1.0,
+                 bb_struct_edge_dropout=1.0,
+                 bb_struct_dropout_mode="itemwise"
     ):
         super().__init__()
         self.c_s = c_s
@@ -97,18 +100,31 @@ class IPADecoder(nn.Module):
         self.num_pos_embed = num_pos_embed
         self.pre_ln = pre_ln
         self.lin_bias = lin_bias
+        self.num_rbf = num_rbf
+        assert bb_struct_dropout_mode in ['itemwise', 'featurewise', 'batchwise']
+        self.bb_struct_dropout_mode = bb_struct_dropout_mode
+        self.bb_struct_node_dropout = bb_struct_node_dropout
+        self.bb_struct_edge_dropout = bb_struct_edge_dropout
+
 
         self.embed_time = GaussianRandomFourierBasis(h_time)
+        node_in = c_s_in + h_time*2
+        edge_in = c_z_in + num_pos_embed
+
+        if self.bb_struct_node_dropout < 1.0:
+            node_in += 6  # num dihedrals
+        if self.bb_struct_edge_dropout < 1.0:
+            edge_in += 25 * num_rbf  # pairwise bb distances
 
         self.embed_node = nn.Sequential(
-            nn.Linear(c_s_in + h_time*2, 2*c_s),
+            nn.Linear(node_in, 2*c_s),
             nn.ReLU(),
             nn.Linear(2*c_s, c_s),
         )
         self.node_ln = nn.LayerNorm(c_s)
 
         self.embed_edge = nn.Sequential(
-            nn.Linear(c_z_in + num_pos_embed, 2*c_z),
+            nn.Linear(edge_in, 2*c_z),
             nn.ReLU(),
             nn.Linear(2*c_z, 2*c_z),
             nn.ReLU(),
@@ -133,12 +149,29 @@ class IPADecoder(nn.Module):
         if pre_ln:
             self.ln_s = nn.LayerNorm(c_s)
 
-
         self.seq_head = nn.Linear(c_s, 20)
         self.seq_embed = nn.Embedding(21, 20)
         self.torsion_pred = nn.Linear(c_s + 20, (4 + 1) * 2)
 
-        self.k = k
+
+    def _bb_features_dropout(self, features, p_dropout):
+        if p_dropout == 1:
+            return torch.zeros_like(features)
+
+        match self.bb_struct_dropout_mode:
+            case "featurewise":
+                dropout_mask = (torch.rand_like(features) < p_dropout)
+                return features * dropout_mask
+            case "itemwise":
+                dropout_shape = list(features.shape[:-1]) + [1]
+                dropout_mask = (torch.rand(dropout_shape, device=features.device) < p_dropout)
+                return features * dropout_mask
+            case "batchwise":
+                dropout_shape = list(features.shape[0]) + [1 for _ in range(features.dim()-1)]
+                dropout_mask = (torch.rand(dropout_shape, device=features.device) < p_dropout)
+                return features * dropout_mask
+            case _:
+                raise ValueError("self.bb_struct_dropout_mode is not valid")
 
 
     def forward(self,
@@ -157,6 +190,10 @@ class IPADecoder(nn.Module):
         tensor_7 = tensor_7.view(n_batch, -1, 7)
         rigids = ru.Rigid.from_tensor_7(tensor_7)
         res_mask = res_data['res_mask'].view(n_batch, -1)
+        bb = res_data['bb'].float()
+        bb = bb.view(n_batch, -1, *bb.shape[1:])
+        virtual_Cb = _ideal_virtual_Cb(bb)
+        bb = torch.cat([bb, virtual_Cb[..., None, :]], dim=-2)
 
         if t is None:
             if "rigids_1" in res_data:
@@ -169,9 +206,13 @@ class IPADecoder(nn.Module):
         timestep_embed = self.embed_time(t[..., None])
         timestep_embed = torch.tile(timestep_embed[:, None], (1, node_features.shape[1], 1))
 
-        node_update = self.embed_node(
-            torch.cat([timestep_embed, node_features], dim=-1)
-        )
+        node_update = [timestep_embed, node_features]
+        if self.bb_struct_node_dropout < 1.0:
+            dihedrals = _dihedrals(bb)
+            if self.bb_struct_node_dropout > 0.0:
+                dihedrals = self._bb_features_dropout(dihedrals, self.bb_struct_node_dropout)
+            node_update.append(dihedrals)
+        node_update = self.embed_node(torch.cat(node_update, dim=-1))
         # node_features = self.node_ln(node_features + node_update * res_mask[..., None])
         node_features = self.node_ln(node_update * res_mask[..., None])
 
@@ -179,11 +220,19 @@ class IPADecoder(nn.Module):
         edge_rel_pos = node_pos[..., None] - node_pos[None]
         edge_rel_pos_embed = _node_positional_embeddings(edge_rel_pos, num_embeddings=self.num_pos_embed, device=node_pos.device)
 
-        edge_features = torch.cat([
+        edge_features = [
             intermediates['latent_edge'],
-            torch.tile(edge_rel_pos_embed[None], (n_batch, 1, 1, 1))
-        ], dim=-1)
+            torch.tile(edge_rel_pos_embed[None], (n_batch, 1, 1, 1)),
+        ]
+        if self.bb_struct_edge_dropout < 1.0:
+            bb_dists = torch.linalg.vector_norm(bb[:, :, None, :, None, :] - bb[:, None, :, None, :, :], dim=-1)
+            bb_rbf = _rbf(bb_dists, D_count=self.num_rbf, device=bb_dists.device)
+            bb_rbf = bb_rbf.flatten(start_dim=-3)
+            if self.bb_struct_edge_dropout > 0.0:
+                bb_rbf = self._bb_features_dropout(bb_rbf, self.bb_struct_edge_dropout)
+            edge_features.append(bb_rbf)
 
+        edge_features = torch.cat(edge_features, dim=-1)
         edge_features = self.embed_edge(edge_features)
 
         res_mask = res_mask.view(node_features.shape[:2])

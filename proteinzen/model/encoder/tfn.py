@@ -14,6 +14,7 @@ from e3nn import o3
 from . import wigner
 
 
+from proteinzen.model.modules.layers.node.conv import SequenceDownscaler
 from proteinzen.model.modules.layers.node.tfn import TensorProductConvLayer, TensorProductAggLayer, TensorProductBroadcastLayer
 from proteinzen.model.modules.layers.edge.tfn import FasterTensorProduct
 from proteinzen.model.modules.common import GaussianRandomFourierBasis
@@ -215,14 +216,15 @@ class ProteinAtomicEmbedder(nn.Module):
         res_D_max=22,
         knn_k=30,
         reduce_pseudoscalars=False,
-        dropout=0.0,
+        dropout=0.1,
         res_edge_mult_factor=1,
         lrange_graph=False,
         broadcast_to_atoms=False,
         smooth_nodewise=False,
         use_masking_features=False,
         res_edge_update=False,
-        compatibility_mode=True
+        compatibility_mode=True,
+        conv_downsample_factor=0,
     ):
         super().__init__()
         assert n_layers >= 4
@@ -342,13 +344,24 @@ class ProteinAtomicEmbedder(nn.Module):
         else:
             self.smooth = None
 
+        self.conv_downsample_factor = conv_downsample_factor
+        h_frame_interim = h_frame * (2**conv_downsample_factor)
+
         if h_frame is not None:
             self.to_frame_scalars = nn.Linear(
                 self.final_irreps.dim,
-                h_frame
+                h_frame_interim
             )
-            self.out_ln = nn.LayerNorm(h_frame)
-            self.transition = StructureModuleTransition(h_frame)
+            self.out_ln = nn.LayerNorm(h_frame_interim)
+            if conv_downsample_factor > 0:
+                self.transition = SequenceDownscaler(
+                    n_layers=conv_downsample_factor,
+                    c_in=h_frame_interim,
+                    c_out=h_frame,
+                    dropout=dropout
+                )
+            else:
+                self.transition = StructureModuleTransition(h_frame)
             self.latent_mu = Linear(h_frame, h_frame, init='final')
             self.latent_logvar = Linear(h_frame, h_frame)
         else:
@@ -537,6 +550,7 @@ class ProteinAtomicEmbedder(nn.Module):
                 zero_timestep=False,
                 apply_noising_masks=False,
     ):
+        print(data.name)
         if apply_noising_masks:
             assert self.use_masking_features
         data_dict = self._gen_initial_features(
@@ -550,7 +564,9 @@ class ProteinAtomicEmbedder(nn.Module):
         #     data_dict['atom_features'].shape,
         #     data_dict['res_features'].shape,
         #     data_dict['bond_features'].shape,
-        #     data['residue']['seq_noising_mask'].float().mean()
+        #     data_dict["radius_edge_features"].shape,
+        #     data_dict['atom_edge_index'].shape,
+        #     data_dict['atom_edge_sh'].shape
         # )
         for layer in self.embedding_layers:
             atom_features, res_features, res_edge_features = layer(data_dict)
@@ -579,7 +595,13 @@ class ProteinAtomicEmbedder(nn.Module):
             else:
                 final_res_features = wigner.fast_wigner_D_rotation(self.final_irreps, rigids_inv_quat, final_res_features)
             final_res_features = self.out_ln(self.to_frame_scalars(final_res_features))
-            final_res_features = self.transition(final_res_features)
+            if self.conv_downsample_factor > 0:
+                num_batch = data.num_graphs
+                final_res_features = final_res_features.view(num_batch, -1, *final_res_features.shape[1:])
+                final_res_features = self.transition(final_res_features)
+                final_res_features = final_res_features.flatten(start_dim=0, end_dim=1)
+            else:
+                final_res_features = self.transition(final_res_features)
             final_res_features = {
                 'latent_mu': self.latent_mu(final_res_features),
                 'latent_logvar': self.latent_logvar(final_res_features),

@@ -19,10 +19,14 @@ from proteinzen.model.utils.graph import batchwise_to_nodewise
 from proteinzen.runtime.loss.utils import _nodewise_to_graphwise
 
 from proteinzen.runtime.loss.frames import bb_frame_fm_loss, all_atom_fape_loss
-from proteinzen.runtime.loss.common import autoencoder_losses, latent_scalar_sidechain_fm_loss, _collect_from_seq, pt_autoencoder_losses
+from proteinzen.runtime.loss.common import autoencoder_losses, latent_scalar_sidechain_fm_loss, latent_encoder_consistency_loss
 from proteinzen.stoch_interp.interpolate.se3 import _centered_gaussian, _uniform_so3
 from proteinzen.stoch_interp.interpolate.latent import _centered_gaussian as _centered_rn_gaussian
-from proteinzen.stoch_interp.interpolate.protein import ProteinInterpolant, ProteinFisherInterpolant, ProteinDirichletInterpolant, ProteinDirichletChiInterpolant, ProteinDirichletMultiChiInterpolant, ProteinCatFlowInterpolant, ProteinFisherMultiChiInterpolant
+from proteinzen.stoch_interp.interpolate.protein import (
+    ProteinInterpolant, ProteinFisherInterpolant, ProteinDirichletInterpolant,
+    ProteinDirichletChiInterpolant, ProteinDirichletMultiChiInterpolant, ProteinCatFlowInterpolant,
+    ProteinFisherMultiChiInterpolant
+)
 
 import proteinzen.stoch_interp.interpolate.utils as du
 from proteinzen.utils.framediff import all_atom
@@ -70,6 +74,7 @@ class ProteinInterpolation(Task):
                  traj_decay_factor=0.99,
                  percent_all_mask=0.25,
                  percent_no_mask=0.25,
+                 encoder_consistency_check=False
     ):
         super().__init__()
         self.se3_noiser = protein_noiser.se3_noiser
@@ -100,6 +105,7 @@ class ProteinInterpolation(Task):
         self.percent_all_mask = percent_all_mask
         self.percent_no_mask = percent_no_mask
         self.norm_latent_space = norm_latent_space
+        self.encoder_consistency_check = encoder_consistency_check
 
         self.t_min = t_min
         self.t_max = t_max
@@ -323,6 +329,23 @@ class ProteinInterpolation(Task):
                 passthrough_outputs.update(noised_latent_data)
                 passthrough_outputs.update(latent_data)
                 passthrough_outputs['final_rigids'] = latent_outputs['final_rigids']
+                if self.encoder_consistency_check:
+                    consistency_inputs = copy.copy(passthrough_inputs)
+                    c_res_data = consistency_inputs['res_data']
+                    c_res_data['atom14_gt_positions'] = passthrough_outputs['decoded_atom14']
+                    c_res_data['atom14_gt_exists'] = passthrough_outputs['decoded_atom14_mask']
+                    c_res_data['atom14_noising_mask'] = passthrough_outputs['decoded_atom14_mask']
+                    c_res_data['seq'] = passthrough_outputs['decoded_seq_logits'].argmax(dim=-1)
+                    c_res_data['rigids_1'] = latent_outputs['final_rigids'].to_tensor_7()
+                    c_res_data['x'] = latent_outputs['final_rigids'].get_trans()
+                    c_res_data['bb'] = latent_outputs['denoised_bb'][:, :4]
+                    for param in model.encoder.parameters():
+                        param.requires_grad = False
+                    consistency_data = model.encoder(consistency_inputs, apply_noising_masks=self.vae_seq_masking)
+                    for param in model.encoder.parameters():
+                        param.requires_grad = True
+                    passthrough_outputs['consistency_data'] = consistency_data
+                    passthrough_outputs.update(latent_outputs)
             else:
                 passthrough_outputs = None
 
@@ -383,10 +406,17 @@ class ProteinInterpolation(Task):
             _centered_gaussian(res_data.batch, device) * du.NM_TO_ANG_SCALE
         )
         rotmats_0 = _uniform_so3(total_num_res, device)
-        latent_prior = model.sample_prior(
-            int(res_data.batch.numel()),
-            device
-        )
+        if getattr(model, "latent_conv_downsample_factor", 0) > 0:
+            latent_prior = model.sample_prior(
+                int(inputs['num_res'][0]),
+                device,
+                num_batch=len(inputs['num_res'])
+            )
+        else:
+            latent_prior = model.sample_prior(
+                int(res_data.batch.numel()),
+                device
+            )
         sidechain_0 = latent_prior['noised_latent_sidechain']
 
         # Set-up time
@@ -650,7 +680,8 @@ class ProteinInterpolation(Task):
                 inputs,
                 outputs,
                 scale=1,
-                pointwise=self.latent_pointwise_loss
+                pointwise=self.latent_pointwise_loss,
+                detach_gt_latent_grad=True
             )
             bb_denoising_loss = (
                 bb_frame_diffusion_loss_dict["trans_vf_loss"] +
@@ -765,6 +796,16 @@ class ProteinInterpolation(Task):
                 + pt_loss_dict["chi_loss"]
                 + pt_loss_dict["seq_loss"]
             )
+            if self.encoder_consistency_check:
+                consistency_loss_dict = latent_encoder_consistency_loss(
+                    inputs,
+                    pt_outputs
+                )
+                pt_rel_pos_loss += (
+                    consistency_loss_dict["consistency_nll_gt_scaled"]
+                    + consistency_loss_dict["consistency_nll_self_scaled"]
+                )
+                pt_loss_dict.update(consistency_loss_dict)
             pt_loss = (
                 pt_abs_pos_loss
                 + pt_rel_pos_loss
