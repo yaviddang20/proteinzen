@@ -13,6 +13,8 @@ from proteinzen.utils.openfold.rigid_utils import Rigid, batchwise_center
 from proteinzen.utils.framediff.all_atom import compute_backbone
 from proteinzen.model.modules.layers.node.conv import SequenceDownscaler, SequenceUpscaler
 
+from ._attn import PairUpdate, PairEmbedder
+
 def get_index_embedding(indices, embed_size, max_len=2056):
     """Creates sine / cosine positional embeddings from a prespecified indices.
 
@@ -148,13 +150,15 @@ class Embedder(nn.Module):
                  c_z,
                  index_embed_size=32,
                  use_init_distogram=False,
-                 conv_downsample_factor=0
+                 conv_downsample_factor=0,
+                 use_pair_embedder=False
     ):
         super(Embedder, self).__init__()
 
         c_latent_init = c_latent
         c_latent = c_latent * (2 ** conv_downsample_factor)
         self.conv_downsample_factor = conv_downsample_factor
+        self.use_pair_embedder = use_pair_embedder
         if self.conv_downsample_factor > 0:
             self.upscale = SequenceUpscaler(
                 conv_downsample_factor,
@@ -165,17 +169,9 @@ class Embedder(nn.Module):
         # Time step embedding
         t_embed_size = index_embed_size
         node_embed_dims = t_embed_size + 1 + c_latent
-        edge_in = (t_embed_size + c_latent + 1) * 2
 
         # Sequence index embedding
         node_embed_dims += index_embed_size
-        edge_in += index_embed_size
-        edge_in += 22
-
-        self.use_init_distogram = use_init_distogram
-        if use_init_distogram:
-            edge_in += 22
-
 
         node_embed_size = c_s
         self.node_embedder = nn.Sequential(
@@ -187,24 +183,41 @@ class Embedder(nn.Module):
             nn.LayerNorm(node_embed_size),
         )
 
-        edge_embed_size = c_z
-        self.edge_embedder = nn.Sequential(
-            nn.Linear(edge_in, edge_embed_size),
-            nn.ReLU(),
-            nn.Linear(edge_embed_size, edge_embed_size),
-            nn.ReLU(),
-            nn.Linear(edge_embed_size, edge_embed_size),
-            nn.LayerNorm(edge_embed_size),
-        )
+        if self.use_pair_embedder:
+            self.pair_embedder = PairEmbedder(
+                c_z=c_z,
+                c_latent=c_latent,
+                c_hidden=c_z//2,
+                latent_pairs=False
+            )
 
-        self.timestep_embedder = fn.partial(
-            get_timestep_embedding,
-            embedding_dim=index_embed_size
-        )
-        self.index_embedder = fn.partial(
-            get_index_embedding,
-            embed_size=index_embed_size
-        )
+        else:
+            edge_in = (t_embed_size + c_latent + 1) * 2
+            edge_in += index_embed_size
+            edge_in += 22
+
+            self.use_init_distogram = use_init_distogram
+            if use_init_distogram:
+                edge_in += 22
+
+            edge_embed_size = c_z
+            self.edge_embedder = nn.Sequential(
+                nn.Linear(edge_in, edge_embed_size),
+                nn.ReLU(),
+                nn.Linear(edge_embed_size, edge_embed_size),
+                nn.ReLU(),
+                nn.Linear(edge_embed_size, edge_embed_size),
+                nn.LayerNorm(edge_embed_size),
+            )
+
+            self.timestep_embedder = fn.partial(
+                get_timestep_embedding,
+                embedding_dim=index_embed_size
+            )
+            self.index_embedder = fn.partial(
+                get_index_embedding,
+                embed_size=index_embed_size
+            )
 
     def _cross_concat(self, feats_1d, num_batch, num_res):
         return torch.cat([
@@ -220,7 +233,9 @@ class Embedder(nn.Module):
             t,
             fixed_mask,
             self_conditioning_ca,
-            init_ca=None
+            init_ca=None,
+            rigids=None,
+            sc_rigids=None
         ):
         """Embeds a set of inputs
 
@@ -251,33 +266,42 @@ class Embedder(nn.Module):
             latent_features,
         ], dim=-1)
         node_feats = [prot_t_embed]
-        pair_feats = [self._cross_concat(prot_t_embed, num_batch, num_res)]
-
         # Positional index features.
         node_feats.append(self.index_embedder(seq_idx))
         rel_seq_offset = seq_idx[:, :, None] - seq_idx[:, None, :]
         rel_seq_offset = rel_seq_offset.reshape([num_batch, num_res**2])
-        pair_feats.append(self.index_embedder(rel_seq_offset))
 
-        sc_dgram = calc_distogram(
-            self_conditioning_ca,
-            1e-5,
-            20,
-            22
-        )
-        pair_feats.append(sc_dgram.reshape([num_batch, num_res**2, -1]))
-        if self.use_init_distogram:
-            init_dgram = calc_distogram(
-                init_ca,
+        if self.use_pair_embedder:
+            assert rigids is not None
+            edge_embed = self.pair_embedder(
+                latent_features=latent_features,
+                rigids=rigids,
+                node_mask=fixed_mask,
+                sc_rigids=sc_rigids
+            )
+        else:
+            pair_feats = [self._cross_concat(prot_t_embed, num_batch, num_res)]
+            pair_feats.append(self.index_embedder(rel_seq_offset))
+
+            sc_dgram = calc_distogram(
+                self_conditioning_ca,
                 1e-5,
                 20,
                 22
             )
-            pair_feats.append(init_dgram.reshape([num_batch, num_res**2, -1]))
+            pair_feats.append(sc_dgram.reshape([num_batch, num_res**2, -1]))
+            if self.use_init_distogram:
+                init_dgram = calc_distogram(
+                    init_ca,
+                    1e-5,
+                    20,
+                    22
+                )
+                pair_feats.append(init_dgram.reshape([num_batch, num_res**2, -1]))
+            edge_embed = self.edge_embedder(torch.cat(pair_feats, dim=-1).float())
+            edge_embed = edge_embed.reshape([num_batch, num_res, num_res, -1])
 
         node_embed = self.node_embedder(torch.cat(node_feats, dim=-1).float())
-        edge_embed = self.edge_embedder(torch.cat(pair_feats, dim=-1).float())
-        edge_embed = edge_embed.reshape([num_batch, num_res, num_res, -1])
         return node_embed, edge_embed
 
 
@@ -297,12 +321,14 @@ class IpaScore(nn.Module):
                  coordinate_scaling=0.1,
                  update_edges_with_dist=False,
                  use_proteus_edge_transition=False,
+                 use_pair_update=False,
                  conv_downsample_factor=0,
                  ):
         super(IpaScore, self).__init__()
         # self.diffuser = diffuser
         self.update_edges_with_dist = update_edges_with_dist
         self.use_proteus_edge_transition = use_proteus_edge_transition
+        self.use_pair_update = use_pair_update
 
         self.scale_pos = lambda x: x * coordinate_scaling
         self.scale_rigids = lambda x: x.apply_trans_fn(self.scale_pos)
@@ -366,6 +392,12 @@ class IpaScore(nn.Module):
                         inf=1e9,
                         pair_dropout=0.25
                     )
+                elif self.use_pair_update:
+                    self.trunk[f'edge_transition_{b}'] = PairUpdate(
+                        c_z=c_z,
+                        c_hidden=c_z,
+                    )
+
                 else:
                     self.trunk[f'edge_transition_{b}'] = EdgeTransition(
                         node_embed_size=c_s,
@@ -447,6 +479,9 @@ class IpaScore(nn.Module):
                 if self.use_proteus_edge_transition:
                     edge_embed = self.trunk[f'edge_transition_{b}'](
                         node_embed, edge_embed, curr_rigids, edge_mask)
+                elif self.use_pair_update:
+                    edge_embed = self.trunk[f'edge_transition_{b}'](
+                        edge_embed, curr_rigids, edge_mask)
                 else:
                     edge_embed = self.trunk[f'edge_transition_{b}'](
                         node_embed, edge_embed_in)
@@ -487,6 +522,8 @@ class IpaDenoiser(nn.Module):
                  use_init_dgram=False,
                  update_edges_with_dgram=False,
                  use_proteus_transition=False,
+                 use_pair_embedder=False,
+                 use_pair_update=False,
                  conv_downsample_factor=0,
                  ):
         super().__init__()
@@ -497,6 +534,7 @@ class IpaDenoiser(nn.Module):
         self.lrange_logn_scale = 10000
         self.lrange_logn_offset = 10000
         self.c_latent = c_latent
+        self.use_pair_embedder = use_pair_embedder
 
         self.ipa_score = IpaScore(
             # diffuser,
@@ -511,6 +549,7 @@ class IpaDenoiser(nn.Module):
             num_blocks=num_blocks,
             update_edges_with_dist=update_edges_with_dgram,
             use_proteus_edge_transition=use_proteus_transition,
+            use_pair_update=use_pair_update,
             conv_downsample_factor=conv_downsample_factor
         )
         self.embedder = Embedder(
@@ -518,7 +557,8 @@ class IpaDenoiser(nn.Module):
             c_latent=c_latent,
             c_z=c_z,
             use_init_distogram=use_init_dgram,
-            conv_downsample_factor=conv_downsample_factor
+            conv_downsample_factor=conv_downsample_factor,
+            use_pair_embedder=use_pair_embedder
         )
 
     def forward(self, data, intermediates, self_condition=None):
@@ -552,14 +592,29 @@ class IpaDenoiser(nn.Module):
         rigids_t = rigids_t.view([t.shape[0], -1])
         latent_sidechain_t = intermediates['noised_latent_sidechain'].view(batch_size, -1, self.c_latent)
 
-        node_embed, edge_embed = self.embedder(
-            latent_features=latent_sidechain_t,
-            seq_idx=seq_idx,
-            t=t,
-            fixed_mask=fixed_mask,
-            self_conditioning_ca=self_conditioning_ca,
-            init_ca=rigids_t.get_trans()
-        )
+        if self.use_pair_embedder:
+            node_embed, edge_embed = self.embedder(
+                latent_features=latent_sidechain_t,
+                seq_idx=seq_idx,
+                t=t,
+                fixed_mask=fixed_mask,
+                self_conditioning_ca=self_conditioning_ca,
+                init_ca=rigids_t.get_trans(),
+                rigids=rigids_t,
+                sc_rigids=(
+                    self_condition['final_rigids'] if self_condition is not None
+                    else None
+                )
+            )
+        else:
+            node_embed, edge_embed = self.embedder(
+                latent_features=latent_sidechain_t,
+                seq_idx=seq_idx,
+                t=t,
+                fixed_mask=fixed_mask,
+                self_conditioning_ca=self_conditioning_ca,
+                init_ca=rigids_t.get_trans()
+            )
 
         input_feats = {
             'fixed_mask': fixed_mask,
@@ -741,11 +796,13 @@ class DenseIpaScore(nn.Module):
                  coordinate_scaling=0.1,
                  update_edges_with_dist=False,
                  use_proteus_edge_transition=False,
+                 use_pair_update=False,
                  ):
         super().__init__()
         # self.diffuser = diffuser
         self.update_edges_with_dist = update_edges_with_dist
         self.use_proteus_edge_transition = use_proteus_edge_transition
+        self.use_pair_update = use_pair_update
 
         self.scale_pos = lambda x: x * coordinate_scaling
         self.scale_rigids = lambda x: x.apply_trans_fn(self.scale_pos)
@@ -809,6 +866,12 @@ class DenseIpaScore(nn.Module):
                         inf=1e9,
                         pair_dropout=0.25
                     )
+                elif self.use_pair_update:
+                    self.trunk[f'edge_transition_{b}'] = PairUpdate(
+                        c_z=c_z,
+                        c_hidden=c_z,
+                    )
+
                 else:
                     self.trunk[f'edge_transition_{b}'] = EdgeTransition(
                         node_embed_size=c_s,

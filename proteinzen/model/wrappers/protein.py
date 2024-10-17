@@ -330,6 +330,7 @@ class TFNDenseLatentWrapper(nn.Module):
                  use_init_dgram=False,
                  update_edges_with_dgram=False,
                  use_proteus_transition=False,
+                 use_pair_update=False,
                  res_h_mult_factor=2,
                  res_edge_mult_factor=1,
                  encoder_res_edge_updates=False,
@@ -383,6 +384,7 @@ class TFNDenseLatentWrapper(nn.Module):
             use_init_dgram=use_init_dgram,
             update_edges_with_dgram=update_edges_with_dgram,
             use_proteus_transition=use_proteus_transition,
+            use_pair_update=use_pair_update,
             conv_downsample_factor=latent_conv_downsample_factor,
         )
         self.c_latent = c_latent
@@ -434,6 +436,7 @@ class DenseChimeraLatentWrapper(nn.Module):
                  use_init_dgram=False,
                  update_edges_with_dgram=False,
                  use_proteus_transition=False,
+                 use_pair_update=False,
                  quantize_encoder_codebook_size=None,
                  denoiser_use_seq_mask_features=False,
                  decoder_bb_struct_node_dropout=1.0,
