@@ -958,11 +958,27 @@ def _deepspeed_evo_attn(
     # DeepSpeed attn. kernel requires inputs to be type bf16 or fp16
     # Cast to bf16 so kernel can be used during inference
     orig_dtype = q.dtype
+    global bf16_supported
+    bf16_supported = True
     if orig_dtype not in [torch.bfloat16, torch.float16]:
-        o = DS4Sci_EvoformerAttention(q.to(dtype=torch.bfloat16),
-                                      k.to(dtype=torch.bfloat16),
-                                      v.to(dtype=torch.bfloat16),
-                                      [b.to(dtype=torch.bfloat16) for b in biases])
+        if bf16_supported:
+            try:
+                o = DS4Sci_EvoformerAttention(q.to(dtype=torch.bfloat16),
+                                            k.to(dtype=torch.bfloat16),
+                                            v.to(dtype=torch.bfloat16),
+                                            [b.to(dtype=torch.bfloat16) for b in biases])
+            except RuntimeError:
+                print("bf16 not supported on this gpu, switching to float16")
+                bf16_supported = False
+                o = DS4Sci_EvoformerAttention(q.to(dtype=torch.float16),
+                                            k.to(dtype=torch.float16),
+                                            v.to(dtype=torch.float16),
+                                            [b.to(dtype=torch.float16) for b in biases])
+        else:
+            o = DS4Sci_EvoformerAttention(q.to(dtype=torch.float16),
+                                        k.to(dtype=torch.float16),
+                                        v.to(dtype=torch.float16),
+                                        [b.to(dtype=torch.float16) for b in biases])
 
         o = o.to(dtype=orig_dtype)
     else:

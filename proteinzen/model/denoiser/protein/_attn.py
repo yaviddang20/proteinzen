@@ -124,7 +124,8 @@ class TriangleAttentionCore(nn.Module):
     def forward(
         self,
         z: torch.Tensor,
-        biases: List[torch.Tensor],
+        mask_bias: torch.Tensor,
+        edge_bias: torch.Tensor,
     ) -> torch.Tensor:
         """
         Args:
@@ -146,21 +147,18 @@ class TriangleAttentionCore(nn.Module):
             [*, Q, C_q] attention update
         """
         z = self.ln(z)
-        _biases = []
 
         if not self.starting:
             z = z.transpose(-2, -3)
-            for bias in biases:
-                if bias.dim() == 4:
-                    _biases.append(bias.transpose(-1, -2))
-                else:
-                    raise ValueError("We should really only have 4-dim biases")
+            mask_bias = mask_bias.transpose(-4, -1)
+            edge_bias = edge_bias.transpose(-1, -2)
+        biases = [mask_bias, edge_bias]
 
         # DeepSpeed attention kernel applies scaling internally
         q, k, v = self._prep_qkv(z, z,
                                  apply_scale=False)
 
-        o = _deepspeed_evo_attn(q, k, v, _biases)
+        o = _deepspeed_evo_attn(q, k, v, biases)
 
         o = self._wrap_up(o, z)
 
@@ -195,9 +193,10 @@ class PairUpdate(nn.Module):
         self.emb_rbf = nn.Sequential(
             Linear(num_rbf, c_hidden, bias=False),
             nn.LayerNorm(c_hidden),
+            Linear(c_hidden, no_heads, bias=False)
         )
-        self.rbf_bias_1 = Linear(c_hidden, no_heads, bias=False)
-        self.rbf_bias_2 = Linear(c_hidden, no_heads, bias=False)
+        self.ln_third_edge = nn.LayerNorm(c_z)
+        self.emb_third_edge = Linear(c_z, no_heads, bias=False)
 
         self.trig_attn_start = TriangleAttentionCore(c_z, self.c_hidden, self.no_heads, starting=True)
         self.trig_bias_start = Linear(c_hidden, no_heads, bias=False)
@@ -214,17 +213,29 @@ class PairUpdate(nn.Module):
         coords = rigids.get_trans()
         distances = torch.cdist(coords, coords)
 
-        # [B, I, J, c_rbf]
+        # [B, I, J, H]
         dist_bias = self.emb_rbf(
             _rbf(distances, D_min=self.D_min, D_max=self.D_max, D_count=self.num_rbf, device=distances.device)
         )
         # [B, I, 1, 1, J, H]
         mask_bias = (edge_mask[..., :, None, None, :] - 1) * self.inf
 
+        third_edge = self.emb_third_edge(self.ln_third_edge(edge_embed))
+        edge_bias = dist_bias + third_edge
+
+        edge_bias = edge_bias.unsqueeze(-4)
 
         z = edge_embed
-        z = z + self.trig_attn_start(z, [self.rbf_bias_1(dist_bias), mask_bias])
-        z = z + self.trig_attn_end(z, [self.rbf_bias_2(dist_bias), mask_bias])
+        z = z + self.trig_attn_start(
+            z, 
+            edge_bias=permute_final_dims(edge_bias, (2, 0, 1)), 
+            mask_bias=mask_bias
+        )
+        z = z + self.trig_attn_end(
+            z, 
+            edge_bias=permute_final_dims(edge_bias, (2, 0, 1)), 
+            mask_bias=mask_bias
+        )
 
         return z
 

@@ -395,7 +395,8 @@ class IpaScore(nn.Module):
                 elif self.use_pair_update:
                     self.trunk[f'edge_transition_{b}'] = PairUpdate(
                         c_z=c_z,
-                        c_hidden=c_z,
+                        c_hidden=c_z//4,
+                        no_heads=4
                     )
 
                 else:
