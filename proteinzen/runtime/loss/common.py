@@ -8,7 +8,7 @@ from .utils import _nodewise_to_graphwise
 from .atomic.atom14 import atom14_mse_loss, chi_loss
 from .atomic.atomic import residue_knn_neighborhood_atomic_dist_loss, local_atomic_context_loss, smooth_lddt_loss, sparse_smooth_lddt_loss
 from .atomic.interresidue import intersidechain_clash_loss
-from .latent import so3_embedding_kl, scalars_kl_div, gaussian_nll
+from .latent import so3_embedding_kl, scalars_kl_div, nodewise_kl_div, gaussian_nll
 from .frames import all_atom_fape_loss
 
 from proteinzen.utils.openfold.rigid_utils import Rigid
@@ -221,8 +221,10 @@ def autoencoder_losses(batch,
             _mask = torch.ones_like(res_data_batch, dtype=torch.bool)
 
         kl_div = scalars_kl_div(latent_mu, latent_logvar, res_data_batch, _mask)
+        kl_div_mu, node_mu, node_var = nodewise_kl_div(latent_mu, res_data_batch, _mask)
     else:
         kl_div = torch.zeros_like(t)
+        kl_div_mu, node_mu, node_var = torch.zeros_like(t), torch.zeros_like(t), torch.zeros_like(t)
 
     logit_norm_loss = logit_norm_loss * _nodewise_to_graphwise(
         torch.sum(seq_logits**2, dim=-1),
@@ -246,6 +248,9 @@ def autoencoder_losses(batch,
         # "bond_angle_loss": bond_angle_loss,
         "chi_loss": sidechain_chi_loss,
         "kl_div": kl_div,
+        "kl_div_mu": kl_div_mu,
+        "node_mu": node_mu,
+        "node_var": node_var,
         "logit_norm_loss": logit_norm_loss,
         "percent_masked": _nodewise_to_graphwise(
             (~seq_noising_mask).float(),
@@ -434,7 +439,11 @@ def latent_scalar_sidechain_fm_loss(
         scale=0.01,
         pointwise=False,
         detach_gt_latent_grad=False,
+        two_sided_loss=False,
+        beta_commit=0.25
     ):
+    if two_sided_loss:
+        assert not detach_gt_latent_grad
     res_data = batch['residue']
     x_mask = res_data['res_mask']
     noising_mask = res_data['noising_mask']
@@ -458,8 +467,16 @@ def latent_scalar_sidechain_fm_loss(
         ).repeat_interleave(latent.shape[0] // batch.num_graphs)
         # print(latent.shape, res_data_batch.shape, total_mask.shape)
 
-    latent_denoising_loss = torch.square(denoised_latent - latent).sum(dim=-1) * total_mask
-    latent_denoising_loss = _nodewise_to_graphwise(latent_denoising_loss, res_data_batch, total_mask)
+    if two_sided_loss:
+        denoised_detach = torch.square(denoised_latent.detach() - latent).sum(dim=-1) * total_mask
+        denoised_detach = _nodewise_to_graphwise(denoised_detach, res_data_batch, total_mask)
+        gt_detach = torch.square(denoised_latent - latent.detach()).sum(dim=-1) * total_mask
+        gt_detach = _nodewise_to_graphwise(gt_detach, res_data_batch, total_mask)
+        latent_denoising_loss = (beta_commit * denoised_detach + gt_detach)
+
+    else:
+        latent_denoising_loss = torch.square(denoised_latent - latent).sum(dim=-1) * total_mask
+        latent_denoising_loss = _nodewise_to_graphwise(latent_denoising_loss, res_data_batch, total_mask)
 
     t = batch['t']
     norm_scale = 1 - torch.min(
@@ -597,6 +614,63 @@ def latent_scalar_edge_fm_loss(
         # "latent_denoising_nll": latent_denoising_nll,
         # "latent_ref_noise_nll": latent_ref_noise_nll,
     }
+
+
+def noisy_latent_losses(
+    batch,
+    latent_outputs,
+):
+    res_data = batch['residue']
+    seq_mask = res_data['seq_mask']
+    noisy_seq_logits = latent_outputs['seq_logits_from_noisy_latent']
+    seq_loss = seq_cce_loss(
+        res_data['seq'],
+        noisy_seq_logits,
+        res_data.batch,
+        seq_mask
+    )
+
+    gt_torsions = res_data['torsion_angles_sin_cos']
+    alt_torsions = res_data['alt_torsion_angles_sin_cos']
+    torsions_mask = res_data['torsion_angles_mask']
+    chi_mask = torsions_mask[..., 3:]
+    # n_node x 4 x n_bin
+    noisy_torsion_logits = latent_outputs['torsion_logits_from_noisy_latent']
+    # n_node x 4 x 2
+    gt_chis = gt_torsions[..., 3:, :].float()
+    alt_chis = alt_torsions[..., 3:, :].float()
+
+    chi_bins = torch.linspace(
+        0,
+        2*torch.pi,
+        steps=noisy_torsion_logits.shape[-1] + 1,
+        device=noisy_torsion_logits.device
+    )[:-1]
+    # n_bin x 2
+    chi_bin_vecs = torch.stack([torch.cos(chi_bins), torch.sin(chi_bins)], dim=-1)
+    gt_bin_dists = torch.einsum("...ia,ja->...ij", gt_chis, chi_bin_vecs)
+    alt_bin_dists = torch.einsum("...ia,ja->...ij", alt_chis, chi_bin_vecs)
+    # n_node x 4
+    gt_bins = torch.argmax(gt_bin_dists, dim=-1)
+    alt_bins = torch.argmax(alt_bin_dists, dim=-1)
+
+    gt_cce = F.cross_entropy(
+        input=noisy_torsion_logits.flatten(0, 1),
+        target=gt_bins.flatten(),
+        reduction="none"
+    )
+    alt_cce = F.cross_entropy(
+        input=noisy_torsion_logits.flatten(0, 1),
+        target=alt_bins.flatten(),
+        reduction="none"
+    )
+    cce = torch.minimum(gt_cce, alt_cce).view(chi_mask.shape)
+    cce = _nodewise_to_graphwise(cce, res_data.batch, chi_mask)
+    return {
+        "noisy_latent_seq_loss": seq_loss,
+        "noisy_latent_torsion_loss": cce,
+    }
+
 
 
 def latent_encoder_consistency_loss(
@@ -750,3 +824,87 @@ def dirichlet_fm_losses(batch,
     }
 
     return out_dict
+
+
+def discrim_losses(batch, outputs):
+    discrim_outputs = outputs['discrim_outputs']
+
+    def real_label_score(t, label_smooth=False):
+        if label_smooth:
+            return F.binary_cross_entropy_with_logits(
+                t,
+                torch.full_like(t, 0.9),
+                reduction='none'
+            )
+        else:
+            return F.binary_cross_entropy_with_logits(
+                t,
+                torch.ones_like(t),
+                reduction='none'
+            )
+
+    def fake_label_score(t, label_smooth=False):
+        if label_smooth:
+            return F.binary_cross_entropy_with_logits(
+                t,
+                torch.full_like(t, 0.1),
+                reduction='none'
+            )
+        else:
+            return F.binary_cross_entropy_with_logits(
+                t,
+                torch.zeros_like(t),
+                reduction='none'
+            )
+
+    def list_sum(ts):
+        return torch.sum(torch.stack(ts, dim=0), dim=0)
+
+
+    fixed_bb_real_losses = [
+        real_label_score(t) for t in
+        [
+            discrim_outputs["gt_bb_gt_seq_repack_score_G_grad"],
+            discrim_outputs["gt_bb_pred_seq_repack_score_G_grad"],
+        ]
+    ]
+    fixed_bb_fake_losses = [
+        fake_label_score(t, label_smooth=True) for t in
+        [
+            discrim_outputs["gt_bb_gt_seq_repack_score_D_grad"],
+            discrim_outputs["gt_bb_pred_seq_repack_score_D_grad"],
+        ]
+    ]
+
+    pt_real_losses = [
+        real_label_score(t) for t in
+        [
+            discrim_outputs["pred_bb_gt_seq_score_G_grad"],
+            discrim_outputs["pred_bb_pred_seq_score_G_grad"],
+        ]
+    ]
+    pt_fake_losses = [
+        fake_label_score(t, label_smooth=True) for t in
+        [
+            discrim_outputs["pred_bb_gt_seq_score_D_grad"],
+            discrim_outputs["pred_bb_pred_seq_score_D_grad"],
+        ]
+    ]
+    return {
+        "discrim_gt_loss": real_label_score(discrim_outputs["gt_all_score"]),
+        "discrim_fixed_bb_G_loss": list_sum(fixed_bb_real_losses),
+        "discrim_fixed_bb_D_loss": list_sum(fixed_bb_fake_losses),
+        "pt_discrim_pt_bb_G_loss": list_sum(pt_real_losses),
+        "pt_discrim_pt_bb_D_loss": list_sum(pt_fake_losses),
+        "discrim_gt_score": F.sigmoid(discrim_outputs["gt_all_score"]),
+        "discrim_repack_score": F.sigmoid(discrim_outputs["gt_bb_gt_seq_repack_score_G_grad"]),
+        "discrim_redesign_score": F.sigmoid(discrim_outputs["gt_bb_pred_seq_repack_score_G_grad"]),
+        "pt_discrim_pt_bb_gt_seq_score": F.sigmoid(discrim_outputs["pred_bb_gt_seq_score_G_grad"]),
+        "pt_discrim_pt_bb_pred_seq_score": F.sigmoid(discrim_outputs["pred_bb_pred_seq_score_G_grad"]),
+    }
+
+
+
+
+
+

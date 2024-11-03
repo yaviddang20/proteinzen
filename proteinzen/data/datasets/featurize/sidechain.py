@@ -24,8 +24,8 @@ def _dihedrals(X, eps=1e-7):
     u_0 = U[..., 2:, :]
 
     # Backbone normals
-    n_2 = _normalize(torch.cross(u_2, u_1), dim=-1)
-    n_1 = _normalize(torch.cross(u_1, u_0), dim=-1)
+    n_2 = _normalize(torch.cross(u_2, u_1, dim=-1), dim=-1)
+    n_1 = _normalize(torch.cross(u_1, u_0, dim=-1), dim=-1)
 
     # Angle between normals
     cosD = torch.sum(n_2 * n_1, -1)

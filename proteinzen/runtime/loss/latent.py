@@ -5,6 +5,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+import torch_geometric.utils as pygu
+
 
 def so3_embedding_mse(ref_so3, pred_so3, num_nodes, x_mask, scaling=None):
     vec_diff = ref_so3.embedding[~x_mask] - pred_so3.embedding[~x_mask]
@@ -41,6 +43,18 @@ def scalars_kl_div(mu, logvar, batch, mask):
     kl_div = -0.5 * (logvar - mu.square() - logvar.exp() + 1)
     kl_div = kl_div.sum(dim=-1)
     return _nodewise_to_graphwise(kl_div, batch, mask)
+
+
+def nodewise_kl_div(x, batch, mask, eps=1e-8):
+    x = x * mask[..., None]
+    norm_factor = pygu.scatter(mask.float(), index=batch, reduce='sum')[..., None]
+    mu = pygu.scatter(x, index=batch, reduce='sum') / norm_factor.clip(min=1)
+    var = pygu.scatter(torch.square(x - mu[batch] + eps), index=batch, reduce='sum')
+    var = var / (norm_factor-1).clip(min=1)
+    logvar = torch.log(var)
+    kl_div = -0.5 * (logvar - mu.square() - var + 1)
+    kl_div = kl_div.sum(dim=-1)
+    return kl_div, mu.mean(dim=-1), var.mean(dim=-1)
 
 
 def gaussian_nll(data, mu, logvar, batch, mask, reduction='mean'):

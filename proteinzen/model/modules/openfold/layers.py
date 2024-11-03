@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from proteinzen.utils.openfold.rigid_utils import Rigid
 
+bf16_supported = True
 
 import importlib
 deepspeed_is_installed = importlib.util.find_spec("deepspeed") is not None
@@ -959,7 +960,6 @@ def _deepspeed_evo_attn(
     # Cast to bf16 so kernel can be used during inference
     orig_dtype = q.dtype
     global bf16_supported
-    bf16_supported = True
     if orig_dtype not in [torch.bfloat16, torch.float16]:
         if bf16_supported:
             try:

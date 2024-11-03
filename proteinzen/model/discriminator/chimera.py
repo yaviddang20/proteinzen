@@ -12,11 +12,11 @@ import e3nn
 from e3nn import o3
 
 from proteinzen.model.modules.layers.node.conv import SequenceDownscaler
+from proteinzen.model.modules.layers.node.mpnn import IPMP
 from proteinzen.model.modules.layers.node.tfn import (
     TensorProductConvLayer, TensorProductAggLayer, TensorProductBroadcastLayer,
-    FeedForward, ForkedFeedForward
+    FeedForward
 )
-from proteinzen.model.modules.layers.edge.tfn import FasterTensorProduct
 from proteinzen.model.modules.common import GaussianRandomFourierBasis
 from proteinzen.model.modules.openfold.layers import StructureModuleTransition, Linear
 from proteinzen.model.utils.graph import sample_inv_cubic_edges
@@ -27,8 +27,7 @@ from proteinzen.data.datasets.featurize.common import _edge_positional_embedding
 from proteinzen.data.datasets.featurize.sidechain import _dihedrals, _ideal_virtual_Cb
 from proteinzen.utils.openfold import rigid_utils as ru
 
-from . import wigner
-
+from proteinzen.model.encoder import wigner
 
 def get_irrep_seq(ns, nv, reduce_pseudoscalars):
     irrep_seq = [
@@ -40,79 +39,22 @@ def get_irrep_seq(ns, nv, reduce_pseudoscalars):
     return irrep_seq
 
 
-class EdgeUpdate(nn.Module):
-    def __init__(self,
-                 res_irreps,
-                 sh_irreps,
-                 res_h_edge):
-        super().__init__()
-        if not isinstance(res_irreps, o3.Irreps):
-            res_irreps = o3.Irreps(res_irreps)
-        self.res_irreps = res_irreps
-
-        self.res_irreps_slice_dict = {
-            ir: sl for (_, ir), sl in zip(self.res_irreps, self.res_irreps.slices())
-        }
-
-        self.tp_in_irreps = (res_irreps * 2).simplify()
-        self.sh_irreps = sh_irreps
-        self.out_irreps = o3.Irreps(f"{res_h_edge}x0e")
-
-        self.tp = FasterTensorProduct(
-            self.tp_in_irreps,
-            self.sh_irreps,
-            self.out_irreps
-        )
-        self.ffn = nn.Sequential(
-            nn.Linear(res_h_edge, 2*res_h_edge),
-            nn.ReLU(),
-            nn.Linear(2*res_h_edge, self.tp.weight_numel),
-        )
-        self.ln = nn.LayerNorm(res_h_edge)
-
-
-    def forward(self,
-                res_features,
-                edge_features,
-                edge_sh,
-                edge_index
-    ):
-        res_src = res_features[edge_index[1]]
-        res_dst = res_features[edge_index[0]]
-
-        cat_list = []
-        for _, ir in self.tp_in_irreps:
-            sl = self.res_irreps_slice_dict[ir]
-            cat_list.append(res_src[..., sl])
-            cat_list.append(res_dst[..., sl])
-
-        tp_input = torch.cat(cat_list, dim=-1)
-        tp_update = self.tp(
-            tp_input,
-            edge_sh,
-            self.ffn(edge_features)
-        )
-        edge_features = self.ln(edge_features + tp_update)
-        return edge_features
-
-
 class JointConvLayer(nn.Module):
     def __init__(self,
                  atom_in_irreps,
-                 res_in_irreps,
                  sh_irreps,
                  atom_out_irreps,
-                 res_out_irreps,
+                 res_irreps,
                  h_edge,
-                 res_h_mult_factor,
-                 res_edge_mult_factor,
+                 c_s,
+                 c_z,
                  broadcast=False,
-                 res_edge_update=False,
-                 compatibility_mode=True,
-                 use_ffn=False
-        ):
+                 dropout=0.1,
+                 edge_dropout=0.2,
+                 use_ffn=False,
+                 compat_mode=True
+    ):
         super().__init__()
-        res_h_edge = h_edge * res_h_mult_factor * res_edge_mult_factor
 
         self.atom_conv = TensorProductConvLayer(
             atom_in_irreps,
@@ -123,18 +65,32 @@ class JointConvLayer(nn.Module):
             edge_groups=["bond_features", "radius_edge_features"]
         )
         self.agg_conv = TensorProductAggLayer(
-            atom_in_irreps if compatibility_mode else atom_out_irreps,
+            atom_out_irreps,
             sh_irreps,
-            res_out_irreps if compatibility_mode else res_in_irreps,
+            res_irreps,
             h_edge,
-            faster=True
+            faster=True,
+            residual=False
         )
-        self.res_conv = TensorProductConvLayer(
-            res_in_irreps,
-            sh_irreps,
-            res_out_irreps,
-            res_h_edge,
-            faster=True
+
+        if not isinstance(res_irreps, o3.Irreps):
+            res_irreps = o3.Irreps(res_irreps)
+        self.res_irreps = res_irreps
+        self.irreps_to_scalar = nn.Sequential(
+            nn.Linear(res_irreps.dim, c_s),
+            nn.ReLU(),
+            nn.Linear(c_s, c_s),
+            nn.ReLU(),
+            nn.Linear(c_s, c_s),
+        )
+        self.ln = nn.LayerNorm(c_s)
+
+        self.ipmp = IPMP(
+            c_s=c_s,
+            c_z=c_z,
+            c_hidden=c_s,
+            dropout=dropout,
+            edge_dropout=edge_dropout,
         )
         self.use_ffn = use_ffn
         if self.use_ffn:
@@ -143,30 +99,26 @@ class JointConvLayer(nn.Module):
                 atom_out_irreps,
                 atom_out_irreps,
             )
-            self.res_ffn = FeedForward(
-                res_out_irreps,
-                res_out_irreps,
-                res_out_irreps,
-            )
+        self.compat_mode = compat_mode
 
         self.broadcast = broadcast
         if self.broadcast:
-            self.bcast_conv = TensorProductBroadcastLayer(
-                res_out_irreps,
-                sh_irreps,
-                atom_out_irreps,
-                h_edge,
-                faster=True
-            )
-        if res_edge_update:
-            self.res_edge_update = EdgeUpdate(
-                res_out_irreps,
-                sh_irreps,
-                res_h_edge
-            )
-        else:
-            self.res_edge_update = None
+            if not isinstance(atom_out_irreps, o3.Irreps):
+                atom_out_irreps = o3.Irreps(atom_out_irreps)
 
+            self.scalar_to_0e = nn.Linear(c_s, atom_out_irreps.count("0e"))
+            self.scalar_to_1o = nn.Linear(c_s, atom_out_irreps.count("1o") * 3)
+
+            bcast_irreps = f"{atom_out_irreps.count('0e')}x0e + {atom_out_irreps.count('1o')}x1o"
+
+            self.bcast_conv = TensorProductBroadcastLayer(
+                bcast_irreps,
+                sh_irreps,
+                bcast_irreps,
+                h_edge,
+                faster=True,
+                residual=False
+            )
 
     def forward(self, data_dict):
         atom_features = self.atom_conv(
@@ -179,51 +131,66 @@ class JointConvLayer(nn.Module):
             edge_sh=data_dict['atom_edge_sh']
         )
         if self.use_ffn:
-            atom_features = self.atom_ffn(atom_features)
+            if self.compat_mode:
+                atom_features = self.atom_ffn(atom_features)
+            else:
+                atom_features = atom_features + self.atom_ffn(atom_features)
 
-        res_features = self.agg_conv(
-            dst_node_attr=data_dict["res_features"],
+        res_update = self.agg_conv(
+            dst_node_attr=data_dict["res_features"],  # TODO: this is only used for shape?
             agg_node_attr=atom_features,
             agg_index=data_dict['atom_res_batch'],
             edge_attr=data_dict['agg_edge_features'],
             edge_sh=data_dict['agg_edge_sh']
         )
-        res_features = self.res_conv(
-            node_attr=res_features,
-            edge_index=data_dict['res_edge_index'],
-            edge_attr=data_dict['res_edge_features'],
-            edge_sh=data_dict['res_edge_sh']
+        rigids: ru.Rigid = data_dict['rigids']
+        rigids_inv_quat = rigids.get_rots().invert().get_quats()
+        res_update = wigner.fast_wigner_D_rotation(self.res_irreps, rigids_inv_quat, res_update)
+
+        # res_update = torch.einsum("...ij,...j->...i", inv_wigner_D, res_update)
+        res_features = self.ln(
+            data_dict["res_features"] +
+            self.irreps_to_scalar(res_update)
         )
-        if self.use_ffn:
-            res_features = self.res_ffn(res_features)
+        res_features, res_edge_features = self.ipmp(
+            s=res_features,
+            z=data_dict['res_edge_features'],
+            edge_index=data_dict['res_edge_index'],
+            r=rigids,
+            mask=data_dict['res_mask']
+        )
 
         if self.broadcast:
-            atom_features = self.bcast_conv(
-                src_node_attr=res_features,
+            res_0e = self.scalar_to_0e(res_features)
+            res_1o = self.scalar_to_1o(res_features)
+            res_1o = res_1o.view(list(res_1o.shape[:-1]) + [-1, 3])
+            res_1o = rigids[..., None].get_rots().apply(res_1o)
+
+            res_bcast_features = torch.cat(
+                [res_0e, res_1o.view(list(res_1o.shape[:-2]) + [-1])],
+                dim=-1
+            )
+            atom_update = self.bcast_conv(
+                src_node_attr=res_bcast_features,
                 bcast_node_attr=atom_features,
                 bcast_index=data_dict['atom_res_batch'],
                 edge_attr=data_dict['bcast_edge_features'],
                 edge_sh=data_dict['bcast_edge_sh']
             )
-        if self.res_edge_update is not None:
-            res_edge_features = self.res_edge_update(
-                res_features=res_features,
-                edge_features=data_dict['res_edge_features'],
-                edge_sh=data_dict['res_edge_sh'],
-                edge_index=data_dict['res_edge_index'],
-            )
-        else:
-            res_edge_features=data_dict['res_edge_features']
+            padded = F.pad(atom_update, (0, atom_features.shape[-1] - atom_update.shape[-1]))
+            atom_features = atom_features + padded
 
         return atom_features, res_features, res_edge_features
 
 
-class ProteinAtomicEmbedder(nn.Module):
+class ProteinAtomicChimeraDiscriminator(nn.Module):
     def __init__(
         self,
         ns=16,
         nv=4,
         h_edge=16,
+        c_s=128,
+        c_z=128,
         atom_in=atom14_atom_props.shape[-1],
         bond_in=atom14_bond_props.shape[-1],
         res_h_mult_factor=2,
@@ -240,17 +207,16 @@ class ProteinAtomicEmbedder(nn.Module):
         res_D_max=22,
         knn_k=30,
         reduce_pseudoscalars=False,
-        dropout=0.1,
-        res_edge_mult_factor=1,
+        dropout=0.0,
         lrange_graph=False,
         broadcast_to_atoms=False,
-        smooth_nodewise=False,
         use_masking_features=False,
-        res_edge_update=False,
-        compatibility_mode=True,
         use_ffn=False,
+        ipmp_dropout=0.0,#0.1,
+        ipmp_edge_dropout=0.0,#0.2,
         conv_downsample_factor=0,
-        expanded_bb_rbfs=False
+        compat_mode=True,
+        use_gumbel_softmax_logits=False
     ):
         super().__init__()
         assert n_layers >= 4
@@ -269,8 +235,10 @@ class ProteinAtomicEmbedder(nn.Module):
         self.num_pos_embed = num_pos_embed
         self.num_aa = num_aa
         self.lrange_graph = lrange_graph
+        self.use_gumbel_softmax_logits = use_gumbel_softmax_logits
 
         self.atomic_r = atomic_r
+        self.atom_max_neighbors = atom_max_neighbors
         self.agg_r = agg_r
         self.knn_k = knn_k
         self.res_D_max = res_D_max
@@ -313,7 +281,7 @@ class ProteinAtomicEmbedder(nn.Module):
         )
 
 
-        res_h_edge = res_h_mult_factor * h_edge * res_edge_mult_factor
+        res_h_edge = res_h_mult_factor * h_edge
         res_ns = res_h_mult_factor * ns
         res_nv = res_h_mult_factor * nv
         self.res_h_edge = res_h_edge
@@ -324,83 +292,46 @@ class ProteinAtomicEmbedder(nn.Module):
         if use_masking_features:
             res_in = res_in + 1
         self.res_embed = nn.Sequential(
-            nn.Linear(res_in, res_ns),
+            nn.Linear(res_in, c_s),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(res_ns, res_ns),
-            nn.LayerNorm(res_ns)
+            nn.Linear(c_s, c_s),
+            nn.LayerNorm(c_s)
         )
 
-        self.expanded_bb_rbfs = expanded_bb_rbfs
-        if expanded_bb_rbfs:
-            res_edge_in = res_in*2 + res_num_rbf*25 + num_pos_embed
-        else:
-            res_edge_in = res_in*2 + res_num_rbf + num_pos_embed
-
         self.res_edge_embed = nn.Sequential(
-            nn.Linear(res_edge_in, res_h_edge),
+            nn.Linear(res_in*2 + res_num_rbf*25 + num_pos_embed, c_z),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(res_h_edge, res_h_edge),
-            nn.LayerNorm(res_h_edge)
+            nn.Linear(c_z, c_z),
+            nn.LayerNorm(c_z)
         )
 
         self.embedding_layers = nn.ModuleList(
             [
                 JointConvLayer(
                     atom_in_irreps=atom_irrep_seq[i],
-                    res_in_irreps=res_irrep_seq[i],
                     sh_irreps=self.sh_irreps,
                     atom_out_irreps=atom_irrep_seq[i+1],
-                    res_out_irreps=res_irrep_seq[i+1],
+                    res_irreps=res_irrep_seq[i+1],
                     h_edge=h_edge,
-                    res_h_mult_factor=res_h_mult_factor,
-                    res_edge_mult_factor=res_edge_mult_factor,
+                    c_s=c_s,
+                    c_z=c_z,
                     broadcast=broadcast_to_atoms,
-                    res_edge_update=res_edge_update,
-                    compatibility_mode=compatibility_mode,
-                    use_ffn=use_ffn
+                    dropout=ipmp_dropout,
+                    edge_dropout=ipmp_edge_dropout,
+                    use_ffn=use_ffn,
+                    compat_mode=compat_mode
                 )
                 for i in range(len(atom_irrep_seq)-1)
             ]
         )
 
-        if smooth_nodewise:
-            self.smooth = TensorProductConvLayer(
-                in_irreps=res_irrep_seq[-1],
-                sh_irreps=self.sh_irreps,
-                out_irreps=res_irrep_seq[-1],
-                n_edge_features=res_h_mult_factor * h_edge,
-                faster=True,
-                residual=False
-            )
-        else:
-            self.smooth = None
+        self.score = nn.Sequential(
+            nn.LayerNorm(c_s),
+            nn.Linear(c_s, 1, bias=False)
+        )
 
-        self.conv_downsample_factor = conv_downsample_factor
-        h_frame_interim = h_frame * (2**conv_downsample_factor)
-
-        if h_frame is not None:
-            self.to_frame_scalars = nn.Linear(
-                self.final_irreps.dim,
-                h_frame_interim
-            )
-            self.out_ln = nn.LayerNorm(h_frame_interim)
-            if conv_downsample_factor > 0:
-                self.transition = SequenceDownscaler(
-                    n_layers=conv_downsample_factor,
-                    c_in=h_frame_interim,
-                    c_out=h_frame,
-                    dropout=dropout
-                )
-            else:
-                self.transition = StructureModuleTransition(h_frame)
-            self.latent_mu = Linear(h_frame, h_frame, init='final')
-            self.latent_logvar = Linear(h_frame, h_frame)
-        else:
-            self.to_frame_scalars = None
-
-        self.compatibility_mode = compatibility_mode
 
     def _res_edge_rbf_features(self, bb_coords, edge_index, D_max, num_rbf, eps=1e-12):
         edge_dst, edge_src = edge_index
@@ -458,7 +389,8 @@ class ProteinAtomicEmbedder(nn.Module):
         X_ca_copy = X_ca.clone()
         X_ca_copy[~res_data['res_mask']] = torch.inf
 
-        seq_one_hot = F.one_hot(seq, num_classes=self.num_aa) * res_data['seq_mask'][..., None]
+        seq_one_hot = res_data['seq_one_hot'] * res_data['seq_mask'][..., None]
+
         if apply_noising_masks:
             seq_one_hot = seq_one_hot * res_data['seq_noising_mask'][..., None]
             # print(seq_one_hot.sum(dim=-1))
@@ -481,20 +413,12 @@ class ProteinAtomicEmbedder(nn.Module):
             )
         else:
             res_edge_index = knn_graph(X_ca_copy, self.knn_k, res_data.batch)
-        if self.expanded_bb_rbfs:
-            res_rbf_features, res_edge_sh = self._res_edge_rbf_features(
-                atom14[:, :4],
-                res_edge_index,
-                D_max=self.res_D_max,
-                num_rbf=self.res_num_rbf
-            )
-        else:
-            res_rbf_features, res_edge_sh = self._edge_rbf_features(
-                X_ca,
-                res_edge_index,
-                D_max=self.res_D_max,
-                num_rbf=self.res_num_rbf
-            )
+        res_rbf_features, res_edge_sh = self._res_edge_rbf_features(
+            atom14[:, :4],
+            res_edge_index,
+            D_max=self.res_D_max,
+            num_rbf=self.res_num_rbf
+        )
         res_pos_embed_features = _edge_positional_embeddings(res_edge_index, self.num_pos_embed, device=X_ca.device)
         res_edge_features = self.res_edge_embed(
             torch.cat([
@@ -522,7 +446,7 @@ class ProteinAtomicEmbedder(nn.Module):
             ], dim=-1)
         bond_features = bond_graph['bond_props'].float()
         bond_edge_index = bond_graph["bond_edge_index"]
-        radius_edge_index = radius_graph(atom_coords, self.atomic_r, bond_graph['atom_batch'])
+        radius_edge_index = radius_graph(atom_coords, self.atomic_r, bond_graph['atom_batch'], max_num_neighbors=self.atom_max_neighbors)
         atom_res_batch = bond_graph['atom_res_batch']
 
         agg_rbf_features, agg_edge_sh, bcast_edge_sh = self._agg_edge_rbf_features(atom_coords, X_ca, atom_res_batch)
@@ -571,11 +495,15 @@ class ProteinAtomicEmbedder(nn.Module):
 
         # print(atom_edge_index.shape, atom_edge_sh.shape)
 
+        rigids = ru.Rigid.from_tensor_7(data['residue']['rigids_1'])
+
         return {
+            "rigids": rigids,
             "res_coords": X_ca,
             "atom_coords": atom_coords,
             "atom_features": atom_features,
             "res_features": res_features,
+            "res_mask": data['residue']['res_mask'],
             "bond_features": bond_features,
             "radius_edge_features": radius_edge_features,
             "agg_edge_features": agg_edge_features,
@@ -601,7 +529,6 @@ class ProteinAtomicEmbedder(nn.Module):
                 zero_timestep=False,
                 apply_noising_masks=False,
     ):
-        print(data.name)
         if apply_noising_masks:
             assert self.use_masking_features
         data_dict = self._gen_initial_features(
@@ -610,52 +537,15 @@ class ProteinAtomicEmbedder(nn.Module):
             zero_timestep=zero_timestep,
             apply_noising_masks=apply_noising_masks,
         )
-        # print(
-        #     data_dict['atom_coords'].shape,
-        #     data_dict['atom_features'].shape,
-        #     data_dict['res_features'].shape,
-        #     data_dict['bond_features'].shape,
-        #     data_dict["radius_edge_features"].shape,
-        #     data_dict['atom_edge_index'].shape,
-        #     data_dict['atom_edge_sh'].shape
-        # )
         for layer in self.embedding_layers:
             atom_features, res_features, res_edge_features = layer(data_dict)
             data_dict["atom_features"] = atom_features
             data_dict["res_features"] = res_features
-            data_dict['res_edge_features'] = res_edge_features
-
-        if self.smooth is not None:
-            res_features = self.smooth(
-                node_attr=data_dict["res_features"],
-                edge_index=data_dict['res_edge_index'],
-                edge_attr=data_dict['res_edge_features'],
-                edge_sh=data_dict['res_edge_sh']
-            )
-            data_dict["res_features"] = res_features
+            data_dict["res_edge_features"] = res_edge_features
 
         final_res_features = data_dict["res_features"]
+        num_batch = data.num_graphs
+        final_res_features = final_res_features.view(num_batch, -1, *final_res_features.shape[1:])
+        score = self.score(final_res_features.mean(dim=1))
 
-        if self.to_frame_scalars is not None:
-            rigids_1 = ru.Rigid.from_tensor_7(data['residue']['rigids_1'])
-            rigids_inv_quat = rigids_1.get_rots().invert().get_quats()
-
-            if self.compatibility_mode:
-                inv_wigner_D = self.final_irreps.D_from_quaternion(rigids_inv_quat.cpu()).to(rigids_inv_quat.device)
-                final_res_features = torch.einsum("...ij,...j->...i", inv_wigner_D, final_res_features)
-            else:
-                final_res_features = wigner.fast_wigner_D_rotation(self.final_irreps, rigids_inv_quat, final_res_features)
-            final_res_features = self.out_ln(self.to_frame_scalars(final_res_features))
-            if self.conv_downsample_factor > 0:
-                num_batch = data.num_graphs
-                final_res_features = final_res_features.view(num_batch, -1, *final_res_features.shape[1:])
-                final_res_features = self.transition(final_res_features)
-                final_res_features = final_res_features.flatten(start_dim=0, end_dim=1)
-            else:
-                final_res_features = self.transition(final_res_features)
-            final_res_features = {
-                'latent_mu': self.latent_mu(final_res_features),
-                'latent_logvar': self.latent_logvar(final_res_features),
-            }
-
-        return final_res_features
+        return score

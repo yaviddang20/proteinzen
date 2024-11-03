@@ -33,7 +33,9 @@ from proteinzen.model.design.ipmp import IPMPEncoder, IPMPDecoder
 from proteinzen.model.design.ipmp_seq_only import IPMPDenoiser as DirichletIPMPDenoiser
 from proteinzen.model.wrappers.sidechain import IPMPLatentSidechainWrapper
 from proteinzen.model.wrappers.protein import (
-    IPMPLatentWrapper, TFNLatentWrapper, ChimeraLatentWrapper, IPMPDenseLatentWrapper, TFNDenseLatentWrapper, DenseChimeraLatentWrapper)
+    IPMPLatentWrapper, TFNLatentWrapper, ChimeraLatentWrapper,
+    IPMPDenseLatentWrapper, TFNDenseLatentWrapper, ChimeraDenseLatentWrapper,
+    DenseChimeraLatentWrapper)
 
 from proteinzen.tasks.fm.bb import BackboneFrameInterpolation
 from proteinzen.tasks.fm.protein import ProteinInterpolation, ProteinSeqInterpolation, ProteinSeqMultiChiInterpolation
@@ -242,7 +244,8 @@ def config_hydra_store():
     # model_store(TFNLatentWrapper, name="fm_protein")
     model_store(latent_fm_wrapper, name="fm_protein")
     # model_store(IPMPDenseLatentWrapper, name="densefm_protein")
-    model_store(TFNDenseLatentWrapper, name="densefm_protein")
+    # model_store(TFNDenseLatentWrapper, name="densefm_protein")
+    model_store(ChimeraDenseLatentWrapper, name="densefm_protein")
     model_store(DenseChimeraLatentWrapper, name="fulldensefm_protein")
     model_store(DynamicGraphIpaFrameSeqDenoiser, name="dirichlet_protein")
     model_store(DynamicGraphIpaFrameSeqDenoiser, name="fisher_protein")

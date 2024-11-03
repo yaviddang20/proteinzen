@@ -15,6 +15,8 @@ from . import wigner
 from .quantize import Quantizer
 
 
+from proteinzen.model.modules.layers.node.conv import SequenceDownscaler
+from proteinzen.model.modules.layers.edge.conv import EdgeDownscaler
 from proteinzen.model.modules.layers.node.tfn import TensorProductConvLayer, TensorProductAggLayer, TensorProductBroadcastLayer
 from proteinzen.model.modules.layers.edge.sitewise import DenseEdgeTransition as EdgeTransition
 from proteinzen.model.modules.common import GaussianRandomFourierBasis, FeedForward
@@ -250,7 +252,8 @@ class ProteinAtomicChimeraDenseEmbedder(nn.Module):
         use_masking_features=False,
         pre_ln=False,
         lin_bias=True,
-        quantize_codebook_size=None
+        quantize_codebook_size=None,
+        conv_downsample_factor=0,
     ):
         super().__init__()
         assert n_layers >= 4
@@ -364,10 +367,45 @@ class ProteinAtomicChimeraDenseEmbedder(nn.Module):
             self.ln_s = nn.LayerNorm(c_s)
             self.ln_z = nn.LayerNorm(c_z)
 
-        self.latent_node_mu = nn.Linear(c_s, c_s_out)
-        self.latent_node_logvar = nn.Linear(c_s, c_s_out)
-        self.latent_edge_mu = nn.Linear(c_z, c_z_out)
-        self.latent_edge_logvar = nn.Linear(c_z, c_z_out)
+        self.conv_downsample_factor = conv_downsample_factor
+        c_s_interim = c_s // (2**conv_downsample_factor)
+        c_z_interim = c_z // (2**conv_downsample_factor)
+
+        if conv_downsample_factor > 0:
+            self.node_downsample = SequenceDownscaler(
+                n_layers=conv_downsample_factor,
+                c_in=c_s,
+                c_out=c_s_interim,
+                dropout=dropout
+            )
+            self.edge_downsample = EdgeDownscaler(
+                n_layers=conv_downsample_factor,
+                c_in=c_z,
+                c_out=c_z_interim,
+                dropout=dropout
+            )
+            self.latent_node_mu = nn.Sequential(
+                nn.LayerNorm(c_s_interim),
+                nn.Linear(c_s_interim, c_s_out, bias=False)
+            )
+            self.latent_node_logvar = nn.Sequential(
+                nn.LayerNorm(c_s_interim),
+                nn.Linear(c_s_interim, c_s_out, bias=False)
+            )
+            self.latent_edge_mu = nn.Sequential(
+                nn.LayerNorm(c_s_interim),
+                nn.Linear(c_s_interim, c_s_out, bias=False)
+            )
+            self.latent_edge_logvar = nn.Sequential(
+                nn.LayerNorm(c_z_interim),
+                nn.Linear(c_z_interim, c_s_out, bias=False)
+            )
+
+        else:
+            self.latent_node_mu = nn.Linear(c_s, c_s_out)
+            self.latent_node_logvar = nn.Linear(c_s, c_s_out)
+            self.latent_edge_mu = nn.Linear(c_z, c_z_out)
+            self.latent_edge_logvar = nn.Linear(c_z, c_z_out)
 
 
         if quantize_codebook_size is None:
@@ -582,6 +620,11 @@ class ProteinAtomicChimeraDenseEmbedder(nn.Module):
         if self.pre_ln:
             final_res_features = self.ln_s(final_res_features)
             final_res_edge_features = self.ln_z(final_res_edge_features)
+
+        if self.conv_downsample_factor > 0:
+            final_res_features = self.node_downsample(final_res_features * data_dict["res_mask"][..., None])
+            edge_mask = data_dict["res_mask"][..., None] & data_dict["res_mask"][..., None, :]
+            final_res_edge_features = self.edge_downsample(final_res_edge_features * edge_mask[..., None])
 
         out_dict = {
             'latent_node_mu': self.latent_node_mu(final_res_features),

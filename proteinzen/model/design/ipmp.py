@@ -221,7 +221,12 @@ class IPMPDecoder(nn.Module):
                  h_time=64,
                  k=30,
                  dropout=0.1,
-                 conv_downsample_factor=0
+                 conv_downsample_factor=0,
+                 bb_struct_node_dropout=0.0,
+                 bb_struct_edge_dropout=0.0,
+                 bb_struct_dropout_mode="itemwise",
+                 use_seq_mask_features=False,
+                 gumbel_softmax_pred_seq=False
         ):
         super().__init__()
         self.c_s = c_s
@@ -236,6 +241,9 @@ class IPMPDecoder(nn.Module):
             # + atoms_per_res * 3  # src CA to dst bb direction unit vectors
             + num_pos_embed  # rel pos embed
         )
+        self.bb_struct_node_dropout = bb_struct_node_dropout
+        self.bb_struct_edge_dropout = bb_struct_edge_dropout
+        self.bb_struct_dropout_mode = bb_struct_dropout_mode
 
         self.embed_time = GaussianRandomFourierBasis(h_time)
 
@@ -249,8 +257,12 @@ class IPMPDecoder(nn.Module):
                 dropout=dropout,
             )
 
+        self.use_seq_mask_features = use_seq_mask_features
+        node_in = c_latent_final + h_time*2
+        if self.use_seq_mask_features:
+            node_in += 1
         self.embed_node = nn.Sequential(
-            nn.Linear(c_latent_final + h_time*2, 2*c_s),
+            nn.Linear(node_in, 2*c_s),
             nn.ReLU(),
             nn.Linear(2*c_s, c_s),
         )
@@ -275,11 +287,37 @@ class IPMPDecoder(nn.Module):
         ])
 
         self.seq_head = nn.Linear(c_s, 20)
-        self.seq_embed = nn.Embedding(21, 20)
         self.torsion_pred = nn.Linear(c_s + 20, (4 + 1) * 2)
+
+        self.gumbel_softmax_pred_seq = gumbel_softmax_pred_seq
+        if gumbel_softmax_pred_seq:
+            self.seq_embed = nn.Linear(21, 20, bias=False)
+        else:
+            self.seq_embed = nn.Embedding(21, 20)
 
         self.k = k
 
+    def _bb_features_dropout(self, features, p_dropout):
+        if not self.training:
+            return features
+
+        if p_dropout == 1:
+            return torch.zeros_like(features)
+
+        match self.bb_struct_dropout_mode:
+            case "featurewise":
+                dropout_mask = (torch.rand_like(features) < p_dropout)
+                return features * dropout_mask
+            case "itemwise":
+                dropout_shape = list(features.shape[:-1]) + [1]
+                dropout_mask = (torch.rand(dropout_shape, device=features.device) < p_dropout)
+                return features * dropout_mask
+            case "batchwise":
+                dropout_shape = list(features.shape[0]) + [1 for _ in range(features.dim()-1)]
+                dropout_mask = (torch.rand(dropout_shape, device=features.device) < p_dropout)
+                return features * dropout_mask
+            case _:
+                raise ValueError("self.bb_struct_dropout_mode is not valid")
 
     # @torch.no_grad()
     def _prep_features(self, graph, eps=1e-8):
@@ -296,8 +334,8 @@ class IPMPDecoder(nn.Module):
         # edge graph
         masked_X_ca = X_ca.clone()
         masked_X_ca[~res_mask] = torch.inf
-        print(X_ca[:5], bb[:5])
-        print(masked_X_ca.shape, res_mask.sum())
+        # print(X_ca[:5], bb[:5])
+        # print(masked_X_ca.shape, res_mask.sum())
         edge_index = knn_graph(masked_X_ca, self.k, graph['residue'].batch)
 
         # edge features
@@ -306,7 +344,7 @@ class IPMPDecoder(nn.Module):
         src = edge_index[1]
         dst = edge_index[0]
 
-        print(edge_index.shape, bb.shape)
+        # print(edge_index.shape, bb.shape)
         ## edge distances
         edge_bb_src = bb[src]
         edge_bb_dst = bb[dst]
@@ -316,6 +354,8 @@ class IPMPDecoder(nn.Module):
         edge_bb_dists = edge_bb_dists.view(edge_index.shape[1], -1, 1)
         edge_rbf = _rbf(edge_bb_dists, D_min=2.0, D_max=22.0, D_count=self.num_rbf, device=edge_index.device)
         edge_rbf = edge_rbf.view(edge_index.shape[1], -1)
+        if self.bb_struct_edge_dropout > 0.0:
+            edge_rbf = self._bb_features_dropout(edge_rbf, self.bb_struct_edge_dropout)
 
         # edge_rbf = torch.zeros_like(edge_rbf)
 
@@ -370,8 +410,12 @@ class IPMPDecoder(nn.Module):
             node_features = node_features.view(num_batch, -1, self.c_latent)
             node_features = self.upsample(node_features, seq_len=rigids.shape[0] // num_batch)
             node_features = node_features.flatten(start_dim=0, end_dim=1)
+
+        node_features_list = [timestep_embed, node_features]
+        if self.use_seq_mask_features:
+            node_features_list.append(res_data['seq_noising_mask'][..., None].float())
         node_update = self.embed_node(
-            torch.cat([timestep_embed, node_features], dim=-1)
+            torch.cat(node_features_list, dim=-1)
         )
         # node_features = self.node_ln(node_features + node_update * res_mask[..., None])
         node_features = self.node_ln(node_update * res_mask[..., None])
@@ -392,10 +436,16 @@ class IPMPDecoder(nn.Module):
         seq = seq.to(node_features.device)
         atom14_mask_dict = make_atom14_masks({"aatype": seq})
 
+        if self.gumbel_softmax_pred_seq:
+            seq_embed = F.gumbel_softmax(seq_logits, hard=True)
+            seq_embed = F.pad(seq_embed, (0, 1))  # this is assuming X is 20
+        else:
+            seq_embed = seq
+
         unnorm_torsions = self.torsion_pred(
             torch.cat([
                 node_features,
-                self.seq_embed(seq)
+                self.seq_embed(seq_embed)
             ], dim=-1)
         )
         chi_per_aatype = unnorm_torsions.view(-1, 5, 2)
@@ -414,12 +464,22 @@ class IPMPDecoder(nn.Module):
         out_dict['decoded_chis'] = chi_per_aatype
         out_dict['decoded_seq_logits'] = seq_logits
 
+        pred_seq_gumbel_one_hot = F.gumbel_softmax(seq_logits, hard=True)
+        pred_seq_gumbel_one_hot = F.pad(pred_seq_gumbel_one_hot, (0, 1))  # this is assuming X is 20
+        out_dict['decoded_seq_one_hot'] = pred_seq_gumbel_one_hot
+        gt_seq = res_data['seq']
+        out_dict['gt_seq_one_hot'] = F.one_hot(gt_seq, num_classes=21).float()
+
         if use_gt_seq:
-            gt_seq = res_data['seq']
+            if self.gumbel_softmax_pred_seq:
+                gt_seq_embed = F.one_hot(gt_seq, num_classes=21).float()
+            else:
+                gt_seq_embed = gt_seq
+
             unnorm_torsions = self.torsion_pred(
                 torch.cat([
                     node_features,
-                    self.seq_embed(gt_seq)
+                    self.seq_embed(gt_seq_embed)
                 ], dim=-1)
             )
             chi_per_aatype = unnorm_torsions.view(-1, 5, 2)

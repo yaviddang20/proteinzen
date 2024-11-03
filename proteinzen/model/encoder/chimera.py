@@ -11,11 +11,12 @@ import torch_geometric.utils as pygu
 import e3nn
 from e3nn import o3
 
-from . import wigner
-
-
+from proteinzen.model.modules.layers.node.conv import SequenceDownscaler
 from proteinzen.model.modules.layers.node.mpnn import IPMP
-from proteinzen.model.modules.layers.node.tfn import TensorProductConvLayer, TensorProductAggLayer, TensorProductBroadcastLayer
+from proteinzen.model.modules.layers.node.tfn import (
+    TensorProductConvLayer, TensorProductAggLayer, TensorProductBroadcastLayer,
+    FeedForward
+)
 from proteinzen.model.modules.common import GaussianRandomFourierBasis
 from proteinzen.model.modules.openfold.layers import StructureModuleTransition, Linear
 from proteinzen.model.utils.graph import sample_inv_cubic_edges
@@ -26,6 +27,7 @@ from proteinzen.data.datasets.featurize.common import _edge_positional_embedding
 from proteinzen.data.datasets.featurize.sidechain import _dihedrals, _ideal_virtual_Cb
 from proteinzen.utils.openfold import rigid_utils as ru
 
+from . import wigner
 
 def get_irrep_seq(ns, nv, reduce_pseudoscalars):
     irrep_seq = [
@@ -49,6 +51,8 @@ class JointConvLayer(nn.Module):
                  broadcast=False,
                  dropout=0.1,
                  edge_dropout=0.2,
+                 use_ffn=False,
+                 compat_mode=True
     ):
         super().__init__()
 
@@ -88,6 +92,14 @@ class JointConvLayer(nn.Module):
             dropout=dropout,
             edge_dropout=edge_dropout,
         )
+        self.use_ffn = use_ffn
+        if self.use_ffn:
+            self.atom_ffn = FeedForward(
+                atom_out_irreps,
+                atom_out_irreps,
+                atom_out_irreps,
+            )
+        self.compat_mode = compat_mode
 
         self.broadcast = broadcast
         if self.broadcast:
@@ -118,6 +130,11 @@ class JointConvLayer(nn.Module):
             },
             edge_sh=data_dict['atom_edge_sh']
         )
+        if self.use_ffn:
+            if self.compat_mode:
+                atom_features = self.atom_ffn(atom_features)
+            else:
+                atom_features = atom_features + self.atom_ffn(atom_features)
 
         res_update = self.agg_conv(
             dst_node_attr=data_dict["res_features"],  # TODO: this is only used for shape?
@@ -128,8 +145,7 @@ class JointConvLayer(nn.Module):
         )
         rigids: ru.Rigid = data_dict['rigids']
         rigids_inv_quat = rigids.get_rots().invert().get_quats()
-        with torch.no_grad():
-            res_update = wigner.fast_wigner_D_rotation(self.res_irreps, rigids_inv_quat, res_update)
+        res_update = wigner.fast_wigner_D_rotation(self.res_irreps, rigids_inv_quat, res_update)
 
         # res_update = torch.einsum("...ij,...j->...i", inv_wigner_D, res_update)
         res_features = self.ln(
@@ -186,6 +202,7 @@ class ProteinAtomicChimeraEmbedder(nn.Module):
         num_timestep=0,
         n_layers=8,
         atomic_r=5,
+        atom_max_neighbors=32,
         agg_r=10,
         res_D_max=22,
         knn_k=30,
@@ -194,8 +211,11 @@ class ProteinAtomicChimeraEmbedder(nn.Module):
         lrange_graph=False,
         broadcast_to_atoms=False,
         use_masking_features=False,
+        use_ffn=False,
         ipmp_dropout=0.1,
         ipmp_edge_dropout=0.2,
+        conv_downsample_factor=0,
+        compat_mode=True
     ):
         super().__init__()
         assert n_layers >= 4
@@ -216,6 +236,7 @@ class ProteinAtomicChimeraEmbedder(nn.Module):
         self.lrange_graph = lrange_graph
 
         self.atomic_r = atomic_r
+        self.atom_max_neighbors = atom_max_neighbors
         self.agg_r = agg_r
         self.knn_k = knn_k
         self.res_D_max = res_D_max
@@ -277,7 +298,7 @@ class ProteinAtomicChimeraEmbedder(nn.Module):
         )
 
         self.res_edge_embed = nn.Sequential(
-            nn.Linear(res_in*2 + res_num_rbf + num_pos_embed, c_z),
+            nn.Linear(res_in*2 + res_num_rbf*25 + num_pos_embed, c_z),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(c_z, c_z),
@@ -296,14 +317,40 @@ class ProteinAtomicChimeraEmbedder(nn.Module):
                     c_z=c_z,
                     broadcast=broadcast_to_atoms,
                     dropout=ipmp_dropout,
-                    edge_dropout=ipmp_edge_dropout
+                    edge_dropout=ipmp_edge_dropout,
+                    use_ffn=use_ffn,
+                    compat_mode=compat_mode
                 )
                 for i in range(len(atom_irrep_seq)-1)
             ]
         )
 
-        self.latent_mu = nn.Linear(c_s, h_frame)
-        self.latent_logvar = nn.Linear(c_s, h_frame)
+        self.conv_downsample_factor = conv_downsample_factor
+
+        if conv_downsample_factor > 0:
+            h_frame_interim = c_s // (2**conv_downsample_factor)
+            self.transition = SequenceDownscaler(
+                n_layers=conv_downsample_factor,
+                c_in=c_s,
+                c_out=h_frame_interim,
+                dropout=dropout
+            )
+        else:
+            h_frame_interim = c_s
+
+        self.latent_mu = nn.Linear(h_frame_interim, h_frame)
+        self.latent_logvar = nn.Linear(h_frame_interim, h_frame)
+
+    def _res_edge_rbf_features(self, bb_coords, edge_index, D_max, num_rbf, eps=1e-12):
+        edge_dst, edge_src = edge_index
+        X_cb = _ideal_virtual_Cb(bb_coords)
+        bb_coords = torch.cat([bb_coords, X_cb[..., None, :]], dim=-2)
+        X_ca = bb_coords[:, 1]
+        ca_vecs = X_ca[edge_dst] - X_ca[edge_src]
+        edge_sh = o3.spherical_harmonics(self.sh_irreps, ca_vecs, normalize=True, normalization='component')
+        edge_dist = torch.cdist(bb_coords[edge_dst], bb_coords[edge_src])
+        edge_rbf = _rbf(edge_dist, D_max=D_max, D_count=num_rbf, device=edge_dist.device).view(edge_dist.shape[0], -1)
+        return edge_rbf, edge_sh
 
     def _edge_rbf_features(self, coords, edge_index, D_max, num_rbf, eps=1e-12):
         edge_dst, edge_src = edge_index
@@ -373,8 +420,8 @@ class ProteinAtomicChimeraEmbedder(nn.Module):
             )
         else:
             res_edge_index = knn_graph(X_ca_copy, self.knn_k, res_data.batch)
-        res_rbf_features, res_edge_sh = self._edge_rbf_features(
-            X_ca,
+        res_rbf_features, res_edge_sh = self._res_edge_rbf_features(
+            atom14[:, :4],
             res_edge_index,
             D_max=self.res_D_max,
             num_rbf=self.res_num_rbf
@@ -406,7 +453,7 @@ class ProteinAtomicChimeraEmbedder(nn.Module):
             ], dim=-1)
         bond_features = bond_graph['bond_props'].float()
         bond_edge_index = bond_graph["bond_edge_index"]
-        radius_edge_index = radius_graph(atom_coords, self.atomic_r, bond_graph['atom_batch'])
+        radius_edge_index = radius_graph(atom_coords, self.atomic_r, bond_graph['atom_batch'], max_num_neighbors=self.atom_max_neighbors)
         atom_res_batch = bond_graph['atom_res_batch']
 
         agg_rbf_features, agg_edge_sh, bcast_edge_sh = self._agg_edge_rbf_features(atom_coords, X_ca, atom_res_batch)
@@ -504,6 +551,13 @@ class ProteinAtomicChimeraEmbedder(nn.Module):
             data_dict["res_edge_features"] = res_edge_features
 
         final_res_features = data_dict["res_features"]
+
+        if self.conv_downsample_factor > 0:
+            num_batch = data.num_graphs
+            final_res_features = final_res_features.view(num_batch, -1, *final_res_features.shape[1:])
+            final_res_features = self.transition(final_res_features)
+            final_res_features = final_res_features.flatten(start_dim=0, end_dim=1)
+
         out_dict = {
             'latent_mu': self.latent_mu(final_res_features),
             'latent_logvar': self.latent_logvar(final_res_features),

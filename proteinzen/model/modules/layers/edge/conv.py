@@ -7,6 +7,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+
 def swish(x):
     return x * torch.sigmoid(x)
 
@@ -82,7 +83,12 @@ class ResNetBlock(nn.Module):
         if out_channels is None:
             out_channels = in_channels
 
-        self.norm1 = nn.GroupNorm(1, in_channels)
+        self.norm1 = nn.GroupNorm(
+            num_groups=in_channels,
+            num_channels=in_channels,
+            eps=1e-6,
+            affine=True
+        )
         self.conv1 = nn.Conv2d(
             in_channels=in_channels,
             out_channels=out_channels,
@@ -90,7 +96,12 @@ class ResNetBlock(nn.Module):
             stride=1,
             padding=1
         )
-        self.norm2 = nn.GroupNorm(1, out_channels)
+        self.norm2 = nn.GroupNorm(
+            num_groups=out_channels,
+            num_channels=out_channels,
+            eps=1e-6,
+            affine=True
+        )
         self.dropout = nn.Dropout(dropout)
         self.conv2 = nn.Conv2d(
             in_channels=out_channels,
@@ -126,17 +137,17 @@ class EdgeDownscaler(nn.Module):
         assert c_in // c_out == 2 ** n_layers
         self.n_layers = n_layers
 
-        resolutions = [c_in / (2**i) for i in range(n_layers + 1)]
+        resolutions = [int(c_in // (2**i)) for i in range(n_layers + 1)]
 
         self.blocks = nn.ModuleDict()
         for i in range(n_layers):
             self.blocks[f"resnet_{i}"] = ResNetBlock(
                 in_channels=resolutions[i],
-                out_channels=resolutions[i+1],
+                out_channels=resolutions[i],
                 dropout=dropout
             )
             self.blocks[f"downsample_{i}"] = Downsample(
-                in_channels=resolutions[i+1],
+                in_channels=resolutions[i],
                 out_channels=resolutions[i+1],
             )
         self.resnet_out = ResNetBlock(
@@ -149,13 +160,13 @@ class EdgeDownscaler(nn.Module):
         x = edge_embedding.clone()
         if is_atom is not None:
             x[is_atom] = 0
-        x = x.transpose(-1, -2)
+        x = x.transpose(-1, -3)
         for i in range(self.n_layers):
             x = self.blocks[f"resnet_{i}"](x)
             x = self.blocks[f"downsample_{i}"](x)
 
         x = self.resnet_out(x)
-        return x.transpose(-1, -2)
+        return x.transpose(-1, -3)
 
 
 class EdgeUpscaler(nn.Module):
@@ -170,17 +181,17 @@ class EdgeUpscaler(nn.Module):
         assert c_out // c_in == 2 ** n_layers
         self.n_layers = n_layers
 
-        resolutions = [c_in * (2**i) for i in range(n_layers + 1)]
+        resolutions = [int(c_in * (2**i)) for i in range(n_layers + 1)]
 
         self.blocks = nn.ModuleDict()
         for i in range(n_layers):
             self.blocks[f"resnet_{i}"] = ResNetBlock(
                 in_channels=resolutions[i],
-                out_channels=resolutions[i+1],
+                out_channels=resolutions[i],
                 dropout=dropout
             )
             self.blocks[f"upsample_{i}"] = Upsample(
-                in_channels=resolutions[i+1],
+                in_channels=resolutions[i],
                 out_channels=resolutions[i+1],
             )
         self.resnet_out = ResNetBlock(
@@ -189,8 +200,8 @@ class EdgeUpscaler(nn.Module):
             dropout=dropout
         )
 
-    def forward(self, seq_embedding, seq_len, is_atom=None):
-        x = seq_embedding.transpose(-1, -2)
+    def forward(self, edge_embedding, seq_len, is_atom=None):
+        x = edge_embedding.transpose(-1, -3)
         for i in range(self.n_layers):
             x = self.blocks[f"resnet_{i}"](x)
             x = self.blocks[f"upsample_{i}"](x)

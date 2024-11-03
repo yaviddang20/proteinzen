@@ -7,7 +7,7 @@ import torch
 
 # matrix
 
-DEFAULT_EPS=1e-8
+DEFAULT_EPS=1e-6
 
 
 def rand_matrix(*shape, requires_grad=False, dtype=None, device=None):

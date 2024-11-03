@@ -127,10 +127,11 @@ def full_dist_mat_loss(pred_x_ca, ref_x_ca, batch, x_mask, eps=1e-8):
 
         pred_dist_mat = torch.linalg.vector_norm(pred[:, None] - pred[None] + eps, dim=-1)
         ref_dist_mat = torch.linalg.vector_norm(ref[:, None] - ref[None] + eps, dim=-1)
-        mask = ~x_mask[select]
+        mask = x_mask[select]
         edge_mask = mask[None] * mask[..., None]
 
-        dist_mse = torch.square(pred_dist_mat / (ref_dist_mat + eps) - 1)
+        # dist_mse = torch.square(pred_dist_mat / (ref_dist_mat + eps) - 1)
+        dist_mse = torch.square(pred_dist_mat - ref_dist_mat)
         dist_mse = torch.sum(dist_mse * edge_mask) / edge_mask.long().sum()
         ret.append(dist_mse)
     return torch.stack(ret, dim=0)
@@ -306,14 +307,17 @@ def bb_frame_fm_loss(batch,
         res_mask,
         r=local_atomic_dist_r
     )
+    edge_dist_loss = full_dist_mat_loss(pred_frame_X_ca, ref_frame_X_ca, res_data.batch, res_mask)
 
     if square_aux_loss_time_factor:
         scaled_dist_mat_loss = dist_mat_loss / (norm_scale ** 2) * 0.01
         scaled_backbone_mse = backbone_mse / (norm_scale ** 2) * 0.01
+        scaled_edge_dist_loss = edge_dist_loss / (norm_scale ** 2) * 0.01
     else:
         # this seems to work well
         scaled_dist_mat_loss = dist_mat_loss / norm_scale * 0.01
         scaled_backbone_mse = backbone_mse / norm_scale * 0.01
+        scaled_edge_dist_loss = edge_dist_loss / norm_scale * 0.01
 
     # testing this
     # scaled_dist_mat_loss = dist_mat_loss * 0.01
@@ -336,7 +340,6 @@ def bb_frame_fm_loss(batch,
     #     res_data.batch,
     #     ~noising_mask)
 
-    # edge_dist_loss = full_dist_mat_loss(pred_frame_X_ca, ref_frame_X_ca, res_data.batch, ~res_mask)
 
     return {
         "rot_vf_loss": rot_vf_loss,
@@ -347,7 +350,8 @@ def bb_frame_fm_loss(batch,
         "ref_x_ca_mse": ref_X_ca_mse,
         "dist_mat_loss": dist_mat_loss,
         "scaled_dist_mat_loss": scaled_dist_mat_loss,
-        # "edge_dist_loss": edge_dist_loss,
+        "edge_dist_loss": edge_dist_loss,
+        "scaled_edge_dist_loss": scaled_edge_dist_loss,
         # "bb_dihedrals_loss": bb_dihedrals_loss,
         # "bb_conn_mse": bb_conn_lens,
         # "bb_angles_loss": bb_conn_angles

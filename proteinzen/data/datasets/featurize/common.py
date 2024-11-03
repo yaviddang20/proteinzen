@@ -16,6 +16,7 @@ def _rbf(D, D_min=0., D_max=20., D_count=16, device='cpu', dtype=None):
     D_expand = torch.unsqueeze(D, -1)
 
     RBF = torch.exp(-((D_expand - D_mu) / D_sigma) ** 2)
+    RBF = RBF.view(*D.shape, -1)
     return RBF
 
 

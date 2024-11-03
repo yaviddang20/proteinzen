@@ -1,7 +1,9 @@
 import numpy as np
 import torch
 from e3nn import o3
+from e3nn.util.jit import compile_mode
 
+@compile_mode("trace")
 class FasterTensorProduct(torch.nn.Module):
     # Implemented by Bowen Jing
     def __init__(self, in_irreps, sh_irreps, out_irreps, **kwargs):

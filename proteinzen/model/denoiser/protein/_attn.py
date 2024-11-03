@@ -3,6 +3,7 @@ import math
 from torch import nn
 from typing import Optional, Callable, List, Sequence, Union
 import torch.nn.functional as F
+import importlib
 
 from proteinzen.data.datasets.featurize.common import _rbf
 from proteinzen.model.modules.openfold.layers import (
@@ -10,6 +11,71 @@ from proteinzen.model.modules.openfold.layers import (
     TriangleMultiplicationIncoming, TriangleMultiplicationOutgoing
 )
 from proteinzen.utils.openfold import rigid_utils as ru
+
+
+deepspeed_is_installed = importlib.util.find_spec("deepspeed") is not None
+if deepspeed_is_installed:
+    import deepspeed
+
+evoformer_supported = False
+
+
+@torch.jit.ignore
+def softmax_no_cast(t: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """
+        Softmax, but without automatic casting to fp32 when the input is of
+        type bfloat16
+    """
+    d = t.dtype
+    deepspeed_is_initialized = (
+        deepspeed_is_installed and
+        deepspeed.comm.comm.is_initialized()
+    )
+    if d is torch.bfloat16 and not deepspeed_is_initialized:
+        with torch.cuda.amp.autocast(enabled=False):
+            s = torch.nn.functional.softmax(t, dim=dim)
+    else:
+        s = torch.nn.functional.softmax(t, dim=dim)
+
+    return s
+
+
+@torch.jit.script
+def _attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, biases: List[torch.Tensor]) -> torch.Tensor:
+    # print(query.shape, key.shape, value.shape, [b.shape for b in biases])
+    # [*, H, C_hidden, K]
+    key = permute_final_dims(key, (1, 0))
+
+    # [*, H, Q, K]
+    a = torch.matmul(query, key)
+
+    for b in biases:
+        a += b
+
+    a = softmax_no_cast(a, -1)
+
+    # [*, H, Q, C_hidden]
+    a = torch.matmul(a, value)
+
+    return a
+
+def swish(x):
+    return x * torch.sigmoid(x)
+
+class SwishTransition(nn.Module):
+    def __init__(self, c, dilation=4):
+        super().__init__()
+        self.ln = nn.LayerNorm(c)
+        self.lin_a = Linear(c, c*dilation, bias=False)
+        self.lin_b = Linear(c, c*dilation, bias=False)
+        self.lin_out = Linear(c*dilation, c, bias=False)
+
+    def forward(self, x):
+        x = self.ln(x)
+        a = self.lin_a(x)
+        b = self.lin_b(x)
+        out = self.lin_out(swish(a) * b)
+        return out
 
 
 class TriangleAttentionCore(nn.Module):
@@ -158,7 +224,24 @@ class TriangleAttentionCore(nn.Module):
         q, k, v = self._prep_qkv(z, z,
                                  apply_scale=False)
 
-        o = _deepspeed_evo_attn(q, k, v, biases)
+        global evoformer_supported
+        if evoformer_supported:
+            try:
+                o = _deepspeed_evo_attn(q, k, v, biases)
+            except RuntimeError:
+                evoformer_supported = False
+                attn_mask = 0
+                for b in biases:
+                    attn_mask = attn_mask + b
+                o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+                # o = _attention(q, k, v, biases)
+                o = o.transpose(-2, -3)
+        else:
+            attn_mask = 0
+            for b in biases:
+                attn_mask = attn_mask + b
+            o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            o = o.transpose(-2, -3)
 
         o = self._wrap_up(o, z)
 
@@ -202,6 +285,7 @@ class PairUpdate(nn.Module):
         self.trig_bias_start = Linear(c_hidden, no_heads, bias=False)
         self.trig_attn_end = TriangleAttentionCore(c_z, self.c_hidden, self.no_heads, starting=False)
         self.trig_bias_end = Linear(c_hidden, no_heads, bias=False)
+        self.transition = SwishTransition(c_z)
 
         self.dropout_row_layer = DropoutRowwise(dropout)
         self.dropout_col_layer = DropoutColumnwise(dropout)
@@ -218,7 +302,7 @@ class PairUpdate(nn.Module):
             _rbf(distances, D_min=self.D_min, D_max=self.D_max, D_count=self.num_rbf, device=distances.device)
         )
         # [B, I, 1, 1, J, H]
-        mask_bias = (edge_mask[..., :, None, None, :] - 1) * self.inf
+        mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
 
         third_edge = self.emb_third_edge(self.ln_third_edge(edge_embed))
         edge_bias = dist_bias + third_edge
@@ -227,15 +311,16 @@ class PairUpdate(nn.Module):
 
         z = edge_embed
         z = z + self.trig_attn_start(
-            z, 
-            edge_bias=permute_final_dims(edge_bias, (2, 0, 1)), 
+            z,
+            edge_bias=permute_final_dims(edge_bias, (2, 0, 1)),
             mask_bias=mask_bias
         )
         z = z + self.trig_attn_end(
-            z, 
-            edge_bias=permute_final_dims(edge_bias, (2, 0, 1)), 
+            z,
+            edge_bias=permute_final_dims(edge_bias, (2, 0, 1)),
             mask_bias=mask_bias
         )
+        z = z + self.transition(z)
 
         return z
 
@@ -246,19 +331,19 @@ def relpos(node_idx, clip=32):
         min=-clip,
         max=clip
     )
-    return F.one_hot(relpos_idx, num_classes=2*clip+1)
+    relpos_idx = relpos_idx + clip
+    return F.one_hot(relpos_idx, num_classes=2*clip+1).float()
 
 
-def calc_distogram(pos, min_bin, max_bin, num_bins):
-    dists_2d = torch.linalg.norm(
-        pos[:, :, None, :] - pos[:, None, :, :], axis=-1)[..., None]
+def calc_distogram(dists_2d, min_bin, max_bin, num_bins):
     lower = torch.linspace(
         min_bin,
         max_bin,
         num_bins,
-        device=pos.device)
+        device=dists_2d.device)
     upper = torch.cat([lower[1:], lower.new_tensor([1e8])], dim=-1)
-    dgram = ((dists_2d > lower) * (dists_2d < upper)).type(pos.dtype)
+    # print(dists_2d.shape, lower.shape, upper.shape)
+    dgram = ((dists_2d[..., None] > lower) * (dists_2d[..., None] < upper)).type(dists_2d.dtype)
     return dgram
 
 
@@ -274,6 +359,7 @@ class PairEmbedder(nn.Module):
                  no_blocks=2,
                  relpos_clip=32,
                  dropout=0.25,
+                 inf=1e9,
                  latent_pairs=False):
         super().__init__()
 
@@ -286,6 +372,7 @@ class PairEmbedder(nn.Module):
         self.relpos_clip = relpos_clip
         self.no_blocks = no_blocks
         self.latent_pairs = latent_pairs
+        self.inf = inf
 
         self.c_a = (
             num_rbf
@@ -293,10 +380,10 @@ class PairEmbedder(nn.Module):
             + 4  # rel quat
         )
 
-        self.ln_relpos = nn.LayerNorm(2*relpos_clip+1)
+        # self.ln_relpos = nn.LayerNorm(2*relpos_clip+1)
         self.lin_z_ij = Linear(2*relpos_clip+1, c_hidden)
 
-        self.ln_latent = nn.LayerNorm(c_latent)
+        self.ln_latent = nn.LayerNorm(c_latent if latent_pairs else 2*c_latent)
         self.lin_latent = Linear(
             c_latent if latent_pairs else 2*c_latent,
             c_hidden, bias=False)
@@ -311,8 +398,19 @@ class PairEmbedder(nn.Module):
         for i in range(no_blocks):
             self.trunk[f'mult_out_{i}'] = TriangleMultiplicationOutgoing(c_hidden, c_hidden)
             self.trunk[f'mult_in_{i}'] = TriangleMultiplicationIncoming(c_hidden, c_hidden)
+            self.trunk[f'edge_bias_{i}'] = nn.Sequential(
+                nn.LayerNorm(c_hidden),
+                Linear(c_hidden, no_heads, bias=False)
+            )
             self.trunk[f'attn_start_{i}'] = TriangleAttentionCore(c_hidden, c_head, no_heads, starting=True)
             self.trunk[f'attn_end_{i}'] = TriangleAttentionCore(c_hidden, c_head, no_heads, starting=False)
+            self.trunk[f'transition_{i}'] = SwishTransition(c_hidden)
+
+        self.final_layer = nn.Sequential(
+            nn.LayerNorm(c_hidden),
+            nn.ReLU(),
+            Linear(c_hidden, c_z, bias=False)
+        )
 
     def _featurize_rigids(self, rigids, distogram=False):
         X_ca = rigids.get_trans()
@@ -342,7 +440,7 @@ class PairEmbedder(nn.Module):
             rigids.shape[0], -1
         )
         relpos_feats = relpos(node_idx, clip=self.relpos_clip)
-        z = self.lin_z_ij(self.ln_relpos(relpos_feats))
+        z = self.lin_z_ij(relpos_feats)
         a_current = self._featurize_rigids(rigids, distogram=False)
         if sc_rigids is not None:
             a_sc = self._featurize_rigids(sc_rigids, distogram=True)
@@ -362,6 +460,8 @@ class PairEmbedder(nn.Module):
         z = z + self.lin_latent(self.ln_latent(latent_pairs))
         z = z * edge_mask[..., None]
 
+        mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
+
         for i in range(self.no_blocks):
             z = z + self.dropout_row_layer(
                 self.trunk[f'mult_out_{i}'](z, edge_mask)
@@ -369,14 +469,17 @@ class PairEmbedder(nn.Module):
             z = z + self.dropout_row_layer(
                 self.trunk[f'mult_in_{i}'](z, edge_mask)
             )
+            edge_bias = self.trunk[f'edge_bias_{i}'](z)
+            edge_bias = permute_final_dims(edge_bias.unsqueeze(-4), (2, 0, 1))
             z = z + self.dropout_row_layer(
-                self.trunk[f'trig_start_{i}'](z, edge_mask)
+                self.trunk[f'attn_start_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
             )
             z = z + self.dropout_col_layer(
-                self.trunk[f'trig_end_{i}'](z, edge_mask)
+                self.trunk[f'attn_end_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
             )
+            z = z + self.trunk[f'transition_{i}'](z)
 
-        return z
+        return self.final_layer(z) * edge_mask[..., None]
 
 
 

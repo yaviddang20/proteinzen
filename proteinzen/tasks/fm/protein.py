@@ -19,7 +19,12 @@ from proteinzen.model.utils.graph import batchwise_to_nodewise
 from proteinzen.runtime.loss.utils import _nodewise_to_graphwise
 
 from proteinzen.runtime.loss.frames import bb_frame_fm_loss, all_atom_fape_loss
-from proteinzen.runtime.loss.common import autoencoder_losses, latent_scalar_sidechain_fm_loss, latent_encoder_consistency_loss
+from proteinzen.runtime.loss.common import (
+    autoencoder_losses, latent_scalar_sidechain_fm_loss, latent_encoder_consistency_loss,
+    noisy_latent_losses, discrim_losses
+)
+from proteinzen.runtime.loss.atomic.holes import buried_cavity_loss
+from proteinzen.runtime.loss.traj import traj_loss
 from proteinzen.stoch_interp.interpolate.se3 import _centered_gaussian, _uniform_so3
 from proteinzen.stoch_interp.interpolate.latent import _centered_gaussian as _centered_rn_gaussian
 from proteinzen.stoch_interp.interpolate.protein import (
@@ -30,6 +35,36 @@ from proteinzen.stoch_interp.interpolate.protein import (
 
 import proteinzen.stoch_interp.interpolate.utils as du
 from proteinzen.utils.framediff import all_atom
+
+
+def outputs_to_inputs(data, outputs, gt_seq=False):
+    inputs = copy.copy(data)
+    res_data = inputs['residue']
+    res_data['rigids_1'] = outputs['final_rigids'].to_tensor_7()
+    res_data['x'] = outputs['final_rigids'].get_trans()
+    res_data['bb'] = outputs['denoised_bb'][:, :4]
+    if gt_seq:
+        res_data['atom14_gt_positions'] = outputs['decoded_atom14_gt_seq']
+        res_data['seq_one_hot'] = outputs['gt_seq_one_hot']
+    else:
+        res_data['atom14_gt_positions'] = outputs['decoded_atom14']
+        res_data['atom14_gt_exists'] = outputs['decoded_atom14_mask']
+        res_data['atom14_noising_mask'] = outputs['decoded_atom14_mask']
+        res_data['seq'] = outputs['decoded_seq_logits'].argmax(dim=-1)
+        res_data['seq_one_hot'] = outputs['decoded_seq_one_hot']
+    return inputs
+
+
+def no_grad_for_model(model, *args, **kwargs):
+    for param in model.parameters():
+        param.requires_grad = False
+    output = model(*args, **kwargs)
+    for param in model.parameters():
+        param.requires_grad = True
+    return output
+
+def no_grad_for_input(model, data):
+    return model(data.detach())
 
 
 class ProteinInterpolation(Task):
@@ -48,6 +83,7 @@ class ProteinInterpolation(Task):
                  pt_loss_t_min=0.0,
                  pt_clash_loss_t=1.1,
                  kl_strength=0,#1e-6,
+                 mu_kl_strength=0,
                  rescale_kl_noise=False,
                  norm_latent_space=False,
                  use_smooth_lddt=False,
@@ -62,21 +98,31 @@ class ProteinInterpolation(Task):
                  no_grad_encoder=False,
                  latent_fm_loss_scale=1,
                  latent_pointwise_loss=False,
+                 denoising_detach_gt_latent_grad=True,
+                 denoising_twosided_detach_latent_grad=False,
+                 beta_commit=0.25,
                  t_min=0.01,
                  t_max=0.99,
                  lognorm_sample_t=False,
                  lognorm_t_mu=0.0,
                  lognorm_t_std=1.0,
                  rigid_traj_loss=False,
+                 seq_traj_loss=False,
                  aa_traj_loss=False,
+                 dist_traj_loss=False,
                  use_fape_loss=False,
                  fape_length_scale=1.,
                  traj_decay_factor=0.99,
                  percent_all_mask=0.25,
                  percent_no_mask=0.25,
-                 encoder_consistency_check=False
+                 encoder_consistency_check=False,
+                 supervise_noisy_latent=False,
+                 use_buried_cavity_loss=False,
+                 use_edge_dist_loss=False,
+                 use_gan_losses=False
     ):
         super().__init__()
+        assert not (denoising_detach_gt_latent_grad and denoising_twosided_detach_latent_grad)
         self.se3_noiser = protein_noiser.se3_noiser
         self.sidechain_noiser = protein_noiser.sidechain_noiser
         self.aux_loss_t_min = aux_loss_t_min
@@ -85,6 +131,7 @@ class ProteinInterpolation(Task):
         self.pt_clash_loss_t = pt_clash_loss_t
         self.rng = np.random.default_rng()
         self.kl_strength = kl_strength
+        self.mu_kl_strength = mu_kl_strength
         self.rescale_kl_noise = rescale_kl_noise
         self.use_smooth_lddt = use_smooth_lddt
         self.use_fape_loss = use_fape_loss
@@ -99,13 +146,23 @@ class ProteinInterpolation(Task):
         self.train_vae_only = train_vae_only
         self.latent_fm_loss_scale = latent_fm_loss_scale
         self.latent_pointwise_loss = latent_pointwise_loss
+        self.traj_decay_factor = traj_decay_factor
         self.rigid_traj_loss = rigid_traj_loss
-        self.aa_traj_loss = aa_traj_loss
+        self.seq_traj_loss = seq_traj_loss
+        self.dist_traj_loss = dist_traj_loss
         self.square_bb_aux_loss_t_factor = square_bb_aux_loss_t_factor
         self.percent_all_mask = percent_all_mask
         self.percent_no_mask = percent_no_mask
         self.norm_latent_space = norm_latent_space
         self.encoder_consistency_check = encoder_consistency_check
+        self.supervise_noisy_latent = supervise_noisy_latent
+        self.use_buried_cavity_loss = use_buried_cavity_loss
+        self.use_edge_dist_loss = use_edge_dist_loss
+        self.use_gan_losses = use_gan_losses
+
+        self.denoising_detach_gt_latent_grad = denoising_detach_gt_latent_grad
+        self.denoising_twosided_detach_latent_grad = denoising_twosided_detach_latent_grad
+        self.beta_commit = beta_commit
 
         self.t_min = t_min
         self.t_max = t_max
@@ -216,6 +273,12 @@ class ProteinInterpolation(Task):
 
     def _run_model(self, model, inputs, self_conditioning=None, pt_use_gt_seq=True):
         res_data = inputs['residue']
+
+        discrim_outputs = {}
+        if self.use_gan_losses:
+            inputs['residue']['seq_one_hot'] = F.one_hot(inputs['residue']['seq'], num_classes=21)
+            discrim_outputs["gt_all_score"] = model.discriminator(inputs)
+
         if 'latent_mu' in res_data and 'latent_logvar' in res_data:
             # print("using cached latents")
             latent_data = {
@@ -301,6 +364,17 @@ class ProteinInterpolation(Task):
         # decoder
         decoder_outputs = model.decoder(inputs, latent_data)
 
+        if self.use_gan_losses:
+            copy_decoder_outputs = copy.copy(decoder_outputs)
+            copy_decoder_outputs['final_rigids'] = ru.Rigid.from_tensor_7(inputs['residue']['rigids_1'])
+            copy_decoder_outputs['denoised_bb'] = inputs['residue']['atom37'][:, (0, 1, 2, 4, 3)]
+            repack_data = outputs_to_inputs(inputs, copy_decoder_outputs, gt_seq=True)
+            discrim_outputs["gt_bb_gt_seq_repack_score_G_grad"] = no_grad_for_model(model.discriminator, repack_data)
+            discrim_outputs["gt_bb_gt_seq_repack_score_D_grad"] = no_grad_for_input(model.discriminator, repack_data)
+            redesign_data = outputs_to_inputs(inputs, copy_decoder_outputs, gt_seq=False)
+            discrim_outputs["gt_bb_pred_seq_repack_score_G_grad"] = no_grad_for_model(model.discriminator, redesign_data)
+            discrim_outputs["gt_bb_pred_seq_repack_score_D_grad"] = no_grad_for_input(model.discriminator, redesign_data)
+
         if self.train_vae_only:
             latent_outputs = latent_data
             passthrough_outputs = None
@@ -311,6 +385,10 @@ class ProteinInterpolation(Task):
                 latent_data,
             )
             latent_outputs = model.denoiser(inputs, noised_latent_data, self_condition=self_conditioning)
+            if hasattr(model, "latent_supervisor"):
+                noised_seq_logits, noised_torsion_logits = model.latent_supervisor(noised_latent_data[self.sidechain_x_t_key])
+                latent_outputs['seq_logits_from_noisy_latent'] = noised_seq_logits
+                latent_outputs['torsion_logits_from_noisy_latent'] = noised_torsion_logits
 
             if self.compute_passthrough:
                 # compute passthrough outputs
@@ -329,29 +407,31 @@ class ProteinInterpolation(Task):
                 passthrough_outputs.update(noised_latent_data)
                 passthrough_outputs.update(latent_data)
                 passthrough_outputs['final_rigids'] = latent_outputs['final_rigids']
+
                 if self.encoder_consistency_check:
-                    consistency_inputs = copy.copy(passthrough_inputs)
-                    c_res_data = consistency_inputs['res_data']
-                    c_res_data['atom14_gt_positions'] = passthrough_outputs['decoded_atom14']
-                    c_res_data['atom14_gt_exists'] = passthrough_outputs['decoded_atom14_mask']
-                    c_res_data['atom14_noising_mask'] = passthrough_outputs['decoded_atom14_mask']
-                    c_res_data['seq'] = passthrough_outputs['decoded_seq_logits'].argmax(dim=-1)
-                    c_res_data['rigids_1'] = latent_outputs['final_rigids'].to_tensor_7()
-                    c_res_data['x'] = latent_outputs['final_rigids'].get_trans()
-                    c_res_data['bb'] = latent_outputs['denoised_bb'][:, :4]
-                    for param in model.encoder.parameters():
-                        param.requires_grad = False
-                    consistency_data = model.encoder(consistency_inputs, apply_noising_masks=self.vae_seq_masking)
-                    for param in model.encoder.parameters():
-                        param.requires_grad = True
+                    consistency_inputs = outputs_to_inputs(passthrough_inputs, passthrough_outputs)
+                    consistency_data = no_grad_for_model(model.encoder, consistency_inputs, apply_noising_masks=False)
                     passthrough_outputs['consistency_data'] = consistency_data
                     passthrough_outputs.update(latent_outputs)
+
+                if self.use_gan_losses:
+                    passthrough_outputs['denoised_bb'] = latent_outputs['denoised_bb']
+                    pt_gt_seq_data = outputs_to_inputs(passthrough_inputs, passthrough_outputs, gt_seq=True)
+                    discrim_outputs["pred_bb_gt_seq_score_G_grad"] = no_grad_for_model(model.discriminator, pt_gt_seq_data)
+                    discrim_outputs["pred_bb_gt_seq_score_D_grad"] = no_grad_for_input(model.discriminator, pt_gt_seq_data)
+                    pt_pred_seq_data = outputs_to_inputs(passthrough_inputs, passthrough_outputs, gt_seq=False)
+                    discrim_outputs["pred_bb_pred_seq_score_G_grad"] = no_grad_for_model(model.discriminator, pt_pred_seq_data)
+                    discrim_outputs["pred_bb_pred_seq_score_D_grad"] = no_grad_for_input(model.discriminator, pt_pred_seq_data)
             else:
                 passthrough_outputs = None
 
             # update outputs for loss calculation
             latent_outputs.update(noised_latent_data)
             latent_outputs.update(latent_data)
+
+            latent_outputs['discrim_outputs'] = discrim_outputs
+            import json
+            print(json.dumps({k: v.mean().item() for k, v in discrim_outputs.items()}, indent=4))
 
         return latent_outputs, decoder_outputs, passthrough_outputs
 
@@ -362,7 +442,7 @@ class ProteinInterpolation(Task):
         # TODO: should this be a separate flag?
         if not self.train_vae_only and model.self_conditioning and np.random.uniform() > 0.5:
             with torch.no_grad():
-                self_conditioning, _, sc_pt_outputs = self._run_model(model, inputs, pt_use_gt_seq=False)
+                self_conditioning, _, sc_pt_outputs = self._run_model(model, inputs, pt_use_gt_seq=True)
                 if sc_pt_outputs is not None:
                     self_conditioning.update(sc_pt_outputs)
         else:
@@ -552,6 +632,7 @@ class ProteinInterpolation(Task):
                 x_t=sidechain_t_1)
 
             # sidechain_t_2 = torch.randn_like(sidechain_t_2) * 10
+            # sidechain_t_2 = torch.zeros_like(sidechain_t_2)
 
             atom14_t_2 = all_atom.compute_backbone(
                 ru.Rigid(
@@ -618,6 +699,7 @@ class ProteinInterpolation(Task):
                 residue={
                     "res_mask": torch.ones(n, device=device).bool(),
                     "noising_mask": torch.ones(n, device=device).bool(),
+                    "seq_noising_mask": torch.ones(n, device=device).bool(),
                     "atom14_gt_positions": torch.zeros((n, 14, 3), device=device).float(),
                     "seq": torch.ones(n, device=device).long() * 20,  # should be X
                     "num_nodes": n
@@ -648,6 +730,29 @@ class ProteinInterpolation(Task):
                 decoder_output['decoded_atom14'].detach().cpu()
             )
         )
+
+        encoder_inputs = batch#.copy()
+        res_data = encoder_inputs['residue']
+        res_data['atom14_gt_positions'] = decoder_output['decoded_atom14']
+        res_data['atom14_gt_exists'] = decoder_output['decoded_atom14_mask']
+        res_data['atom14_noising_mask'] = decoder_output['decoded_atom14_mask']
+        res_data['rigids_1'] = pred_rigids.to_tensor_7()
+        res_data['seq'] = argmax_seq
+        encoder_inputs['name'] = "sample"
+        latent_data = model.encoder(encoder_inputs, apply_noising_masks=self.vae_seq_masking)
+        print(
+            torch.mean(torch.linalg.vector_norm(pred_latent_sidechain - latent_data['latent_mu'], dim=-1)),
+            torch.mean(torch.linalg.vector_norm((0.5 * latent_data['latent_logvar']).exp()))
+        )
+        print(
+            torch.mean(
+                torch.abs(
+                    (pred_latent_sidechain - latent_data['latent_mu']) / (0.5 * latent_data['latent_logvar']).exp()
+                )
+            )
+        )
+        print(torch.mean(torch.linalg.vector_norm(pred_latent_sidechain, dim=-1)))
+        print(torch.mean(torch.linalg.vector_norm(latent_data['latent_mu'], dim=-1)))
 
         # all_atom14 = decoder_output['decoded_all_atom14']
 
@@ -681,7 +786,9 @@ class ProteinInterpolation(Task):
                 outputs,
                 scale=1,
                 pointwise=self.latent_pointwise_loss,
-                detach_gt_latent_grad=True
+                detach_gt_latent_grad=self.denoising_detach_gt_latent_grad,
+                two_sided_loss=self.denoising_twosided_detach_latent_grad,
+                beta_commit=self.beta_commit
             )
             bb_denoising_loss = (
                 bb_frame_diffusion_loss_dict["trans_vf_loss"] +
@@ -690,6 +797,7 @@ class ProteinInterpolation(Task):
             bb_denoising_finegrain_loss = (
                 bb_frame_diffusion_loss_dict["scaled_pred_bb_mse"]
                 + bb_frame_diffusion_loss_dict["scaled_dist_mat_loss"]
+                + bb_frame_diffusion_loss_dict["scaled_edge_dist_loss"] * self.use_edge_dist_loss
             ) * (inputs['t'] > self.aux_loss_t_min)
             bb_denoising_finegrain_loss = bb_denoising_finegrain_loss * (not self.disable_bb_aux_loss)
 
@@ -709,37 +817,15 @@ class ProteinInterpolation(Task):
                 ) * (inputs['t'] > 0.25)
                 frameflow_loss = (frameflow_bb_denoising_loss + 0.25 * frameflow_bb_denoising_finegrain_loss).mean()
 
-            # bb_traj_loss = 0
-            # aa_traj_loss = 0
-            # if self.rigid_traj_loss:
-            #     traj_len = len(outputs['rigid_traj']) + 1
-            #     for k, rigids_k in enumerate(outputs['rigid_traj']):
-            #         outputs_copy = copy.copy(outputs)
-            #         outputs_copy['final_rigids'] = rigids_k
-            #         bb_traj_loss_dict = bb_frame_fm_loss(
-            #             inputs, outputs_copy, sep_rot_loss=True,
-            #             t_norm_clip=0.9)
-            #         bb_traj_loss = (
-            #             bb_traj_loss_dict["trans_vf_loss"] +
-            #             bb_traj_loss_dict["rot_vf_loss"]
-            #         )
-            #         traj_loss += bb_traj_loss * (0.99 ** (traj_len - k))
-            # if self.aa_traj_loss:
-            #     traj_len = len(outputs['aa_traj']) + 1
-            #     for k, rigids_k in enumerate(outputs['rigid_traj']):
-            #         outputs_copy = copy.copy(outputs)
-            #         outputs_copy['final_rigids'] = rigids_k
-            #         bb_traj_loss_dict = bb_frame_fm_loss(
-            #             inputs, outputs_copy, sep_rot_loss=True,
-            #             t_norm_clip=0.9)
-            #         bb_traj_loss = (
-            #             bb_traj_loss_dict["trans_vf_loss"] +
-            #             bb_traj_loss_dict["rot_vf_loss"]
-            #         )
-            #         traj_loss += bb_traj_loss * (0.99 ** (traj_len - k))
+            if any([self.rigid_traj_loss, self.seq_traj_loss, self.dist_traj_loss]):
+                traj_loss_dict = traj_loss(inputs, outputs, traj_decay_factor=self.traj_decay_factor)
+            else:
+                traj_loss_dict = {}
+
 
         else:
             bb_frame_diffusion_loss_dict = {}
+            traj_loss_dict = {}
             latent_loss_dict = {}
             bb_denoising_loss = 0
             bb_denoising_finegrain_loss = 0
@@ -763,8 +849,18 @@ class ProteinInterpolation(Task):
             + autoenc_loss_dict["seq_loss"] * self.vae_seq_loss
             + autoenc_loss_dict["chi_loss"]
             + autoenc_loss_dict["kl_div"] * self.kl_strength
+            + autoenc_loss_dict["kl_div_mu"] * self.mu_kl_strength
             + autoenc_loss_dict["smooth_lddt"]
         )
+
+        if self.use_buried_cavity_loss:
+            buried_cavity_loss_dict = buried_cavity_loss(
+                inputs, outputs
+            )
+            vae_loss = vae_loss + buried_cavity_loss_dict['cavity_volume_loss']
+        else:
+            buried_cavity_loss_dict = {}
+
         # latent_denoising_loss = latent_loss_dict["latent_denoising_loss"] * 0.01
 
         if not self.train_vae_only and self.compute_passthrough:
@@ -801,11 +897,18 @@ class ProteinInterpolation(Task):
                     inputs,
                     pt_outputs
                 )
-                pt_rel_pos_loss += (
+                pt_abs_pos_loss += (
                     consistency_loss_dict["consistency_nll_gt_scaled"]
                     + consistency_loss_dict["consistency_nll_self_scaled"]
-                )
+                ) * (inputs['t'] > self.aux_loss_t_min)
                 pt_loss_dict.update(consistency_loss_dict)
+            if self.use_buried_cavity_loss:
+                pt_buried_cavity_loss_dict = buried_cavity_loss(
+                    inputs, outputs
+                )
+                pt_abs_pos_loss = pt_abs_pos_loss + pt_buried_cavity_loss_dict['cavity_volume_loss']
+                pt_loss_dict.update(pt_buried_cavity_loss_dict)
+
             pt_loss = (
                 pt_abs_pos_loss
                 + pt_rel_pos_loss
@@ -823,13 +926,46 @@ class ProteinInterpolation(Task):
             + 0.25 * bb_denoising_finegrain_loss
             + vae_loss * self.vae_loss
             + pt_loss
-        ).mean()
+        )
+        if not self.train_vae_only and any([self.rigid_traj_loss, self.seq_traj_loss, self.dist_traj_loss]):
+            loss = loss + (
+                traj_loss_dict['traj_bb_loss'] * self.rigid_traj_loss
+                + traj_loss_dict['traj_pred_dist_loss'] * self.dist_traj_loss * 0.5
+                + traj_loss_dict['traj_seq_loss'] * self.seq_traj_loss * 0.25
+            )
+        if self.supervise_noisy_latent:
+            noisy_latent_loss_dict = noisy_latent_losses(inputs, outputs)
+            loss = loss + (
+                noisy_latent_loss_dict['noisy_latent_seq_loss']
+                + noisy_latent_loss_dict['noisy_latent_torsion_loss']
+            )
+        else:
+            noisy_latent_loss_dict = {}
+
+        if self.use_gan_losses:
+            discrim_loss_dict = discrim_losses(
+                inputs, outputs
+            )
+            loss = loss + (
+                discrim_loss_dict["discrim_gt_loss"] +
+                discrim_loss_dict["discrim_fixed_bb_G_loss"] * 0.25 +
+                discrim_loss_dict["discrim_fixed_bb_D_loss"] * 0.25 +
+                discrim_loss_dict["pt_discrim_pt_bb_G_loss"] * 0.25 * (inputs['t'] > self.pt_loss_t_min) +
+                discrim_loss_dict["pt_discrim_pt_bb_D_loss"] * 0.25 * (inputs['t'] > self.pt_loss_t_min)
+            )
+        else:
+            discrim_loss_dict = {}
+
+        loss = loss.mean()
 
         loss_dict = {"loss": loss, "frameflow_loss": frameflow_loss}
         loss_dict.update(bb_frame_diffusion_loss_dict)
         loss_dict.update(autoenc_loss_dict)
         loss_dict.update(latent_loss_dict)
         loss_dict.update(pt_loss_dict)
+        loss_dict.update(traj_loss_dict)
+        loss_dict.update(noisy_latent_loss_dict)
+        loss_dict.update(discrim_loss_dict)
         return loss_dict
 
 

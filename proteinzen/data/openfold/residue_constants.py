@@ -1314,3 +1314,23 @@ def aatype_to_str_sequence(aatype):
         restypes_with_x[aatype[i]]
         for i in range(len(aatype))
     ])
+
+
+# atomic radii per atom type
+def _gen_atomic_radius_per_aatype():
+    restype_atom14_radius = np.zeros([21, 14], np.float32)
+    for restype, restype_letter in enumerate(restypes):
+        resname = restype_1to3[restype_letter]
+        atom_list = restype_name_to_atom14_names[resname]
+
+        # create lower and upper bounds for clashes
+        for atom_idx, atom_name in enumerate(atom_list):
+            if not atom_name:
+                continue
+            atom_radius = van_der_waals_radius[atom_name[0]]
+            restype_atom14_radius[
+                restype, atom_idx
+            ] = atom_radius
+    return restype_atom14_radius
+
+restype_atom14_radius = _gen_atomic_radius_per_aatype()

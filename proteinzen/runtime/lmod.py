@@ -722,7 +722,7 @@ class ProteinModule(L.LightningModule):
         loss_dict = task.compile_task_losses(batch, outputs)
 
         log_dict = tree.map_structure(
-            lambda x: torch.mean(x) if torch.is_tensor(x) else x,
+            lambda x: torch.round(torch.mean(x), decimals=3) if torch.is_tensor(x) else x,
             loss_dict
         )
         log_dict = {
@@ -738,7 +738,10 @@ class ProteinModule(L.LightningModule):
                 continue
             stratified_losses = t_stratified_loss(
                 t, loss_list, loss_name=loss_name)
-            stratified_losses = {f"train/{k}": torch.as_tensor(v, device=log_dict['train/loss'].device) for k,v in stratified_losses.items()}
+            stratified_losses = {
+                f"train/{k}": torch.round(torch.as_tensor(v, device=log_dict['train/loss'].device), decimals=3)
+                for k,v in stratified_losses.items()
+            }
             self.log_dict(
                 stratified_losses,
                 prog_bar=False,
@@ -760,7 +763,7 @@ class ProteinModule(L.LightningModule):
                 pt_loss_name = "train/pt_per_seq_recov_mask_partial"
             self.log(
                 loss_name,
-                log_dict['train/per_seq_recov'],
+                torch.round(log_dict['train/per_seq_recov'], decimals=3),
                 prog_bar=False,
                 logger=True,
                 on_step=None,
@@ -771,7 +774,7 @@ class ProteinModule(L.LightningModule):
             if 'train/pt_per_seq_recov' in log_dict:
                 self.log(
                     pt_loss_name,
-                    log_dict['train/pt_per_seq_recov'],
+                    torch.round(log_dict['train/pt_per_seq_recov'], decimals=3),
                     prog_bar=False,
                     logger=True,
                     on_step=None,
