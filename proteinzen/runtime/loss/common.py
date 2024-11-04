@@ -826,7 +826,7 @@ def dirichlet_fm_losses(batch,
     return out_dict
 
 
-def discrim_losses(batch, outputs):
+def discrim_losses(batch, outputs, losses_G):
     discrim_outputs = outputs['discrim_outputs']
 
     def real_label_score(t, label_smooth=False):
@@ -860,48 +860,51 @@ def discrim_losses(batch, outputs):
     def list_sum(ts):
         return torch.sum(torch.stack(ts, dim=0), dim=0)
 
+    if losses_G:
+        fixed_bb_real_losses = [
+            real_label_score(t) for t in
+            [
+                discrim_outputs["gt_bb_gt_seq_repack_score_G_grad"],
+                discrim_outputs["gt_bb_pred_seq_repack_score_G_grad"],
+            ]
+        ]
+        pt_real_losses = [
+            real_label_score(t) for t in
+            [
+                discrim_outputs["pred_bb_gt_seq_score_G_grad"],
+                discrim_outputs["pred_bb_pred_seq_score_G_grad"],
+            ]
+        ]
+        return {
+            "discrim_fixed_bb_G_loss": list_sum(fixed_bb_real_losses),
+            "pt_discrim_pt_bb_G_loss": list_sum(pt_real_losses),
+            "discrim_repack_score": F.sigmoid(discrim_outputs["gt_bb_gt_seq_repack_score_G_grad"]),
+            "discrim_redesign_score": F.sigmoid(discrim_outputs["gt_bb_pred_seq_repack_score_G_grad"]),
+            "pt_discrim_pt_bb_gt_seq_score": F.sigmoid(discrim_outputs["pred_bb_gt_seq_score_G_grad"]),
+            "pt_discrim_pt_bb_pred_seq_score": F.sigmoid(discrim_outputs["pred_bb_pred_seq_score_G_grad"]),
+        }
+    else:
+        fixed_bb_fake_losses = [
+            fake_label_score(t, label_smooth=True) for t in
+            [
+                discrim_outputs["gt_bb_gt_seq_repack_score_D_grad"],
+                discrim_outputs["gt_bb_pred_seq_repack_score_D_grad"],
+            ]
+        ]
 
-    fixed_bb_real_losses = [
-        real_label_score(t) for t in
-        [
-            discrim_outputs["gt_bb_gt_seq_repack_score_G_grad"],
-            discrim_outputs["gt_bb_pred_seq_repack_score_G_grad"],
+        pt_fake_losses = [
+            fake_label_score(t, label_smooth=True) for t in
+            [
+                discrim_outputs["pred_bb_gt_seq_score_D_grad"],
+                discrim_outputs["pred_bb_pred_seq_score_D_grad"],
+            ]
         ]
-    ]
-    fixed_bb_fake_losses = [
-        fake_label_score(t, label_smooth=True) for t in
-        [
-            discrim_outputs["gt_bb_gt_seq_repack_score_D_grad"],
-            discrim_outputs["gt_bb_pred_seq_repack_score_D_grad"],
-        ]
-    ]
-
-    pt_real_losses = [
-        real_label_score(t) for t in
-        [
-            discrim_outputs["pred_bb_gt_seq_score_G_grad"],
-            discrim_outputs["pred_bb_pred_seq_score_G_grad"],
-        ]
-    ]
-    pt_fake_losses = [
-        fake_label_score(t, label_smooth=True) for t in
-        [
-            discrim_outputs["pred_bb_gt_seq_score_D_grad"],
-            discrim_outputs["pred_bb_pred_seq_score_D_grad"],
-        ]
-    ]
-    return {
-        "discrim_gt_loss": real_label_score(discrim_outputs["gt_all_score"]),
-        "discrim_fixed_bb_G_loss": list_sum(fixed_bb_real_losses),
-        "discrim_fixed_bb_D_loss": list_sum(fixed_bb_fake_losses),
-        "pt_discrim_pt_bb_G_loss": list_sum(pt_real_losses),
-        "pt_discrim_pt_bb_D_loss": list_sum(pt_fake_losses),
-        "discrim_gt_score": F.sigmoid(discrim_outputs["gt_all_score"]),
-        "discrim_repack_score": F.sigmoid(discrim_outputs["gt_bb_gt_seq_repack_score_G_grad"]),
-        "discrim_redesign_score": F.sigmoid(discrim_outputs["gt_bb_pred_seq_repack_score_G_grad"]),
-        "pt_discrim_pt_bb_gt_seq_score": F.sigmoid(discrim_outputs["pred_bb_gt_seq_score_G_grad"]),
-        "pt_discrim_pt_bb_pred_seq_score": F.sigmoid(discrim_outputs["pred_bb_pred_seq_score_G_grad"]),
-    }
+        return {
+            "discrim_gt_loss": real_label_score(discrim_outputs["gt_all_score"]),
+            "discrim_gt_score": F.sigmoid(discrim_outputs["gt_all_score"]),
+            "discrim_fixed_bb_D_loss": list_sum(fixed_bb_fake_losses),
+            "pt_discrim_pt_bb_D_loss": list_sum(pt_fake_losses),
+        }
 
 
 

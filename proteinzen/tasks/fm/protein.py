@@ -275,9 +275,6 @@ class ProteinInterpolation(Task):
         res_data = inputs['residue']
 
         discrim_outputs = {}
-        if self.use_gan_losses:
-            inputs['residue']['seq_one_hot'] = F.one_hot(inputs['residue']['seq'], num_classes=21)
-            discrim_outputs["gt_all_score"] = model.discriminator(inputs)
 
         if 'latent_mu' in res_data and 'latent_logvar' in res_data:
             # print("using cached latents")
@@ -370,10 +367,10 @@ class ProteinInterpolation(Task):
             copy_decoder_outputs['denoised_bb'] = inputs['residue']['atom37'][:, (0, 1, 2, 4, 3)]
             repack_data = outputs_to_inputs(inputs, copy_decoder_outputs, gt_seq=True)
             discrim_outputs["gt_bb_gt_seq_repack_score_G_grad"] = no_grad_for_model(model.discriminator, repack_data)
-            discrim_outputs["gt_bb_gt_seq_repack_score_D_grad"] = no_grad_for_input(model.discriminator, repack_data)
+            # discrim_outputs["gt_bb_gt_seq_repack_score_D_grad"] = no_grad_for_input(model.discriminator, repack_data)
             redesign_data = outputs_to_inputs(inputs, copy_decoder_outputs, gt_seq=False)
             discrim_outputs["gt_bb_pred_seq_repack_score_G_grad"] = no_grad_for_model(model.discriminator, redesign_data)
-            discrim_outputs["gt_bb_pred_seq_repack_score_D_grad"] = no_grad_for_input(model.discriminator, redesign_data)
+            # discrim_outputs["gt_bb_pred_seq_repack_score_D_grad"] = no_grad_for_input(model.discriminator, redesign_data)
 
         if self.train_vae_only:
             latent_outputs = latent_data
@@ -418,10 +415,10 @@ class ProteinInterpolation(Task):
                     passthrough_outputs['denoised_bb'] = latent_outputs['denoised_bb']
                     pt_gt_seq_data = outputs_to_inputs(passthrough_inputs, passthrough_outputs, gt_seq=True)
                     discrim_outputs["pred_bb_gt_seq_score_G_grad"] = no_grad_for_model(model.discriminator, pt_gt_seq_data)
-                    discrim_outputs["pred_bb_gt_seq_score_D_grad"] = no_grad_for_input(model.discriminator, pt_gt_seq_data)
+                    # discrim_outputs["pred_bb_gt_seq_score_D_grad"] = no_grad_for_input(model.discriminator, pt_gt_seq_data)
                     pt_pred_seq_data = outputs_to_inputs(passthrough_inputs, passthrough_outputs, gt_seq=False)
                     discrim_outputs["pred_bb_pred_seq_score_G_grad"] = no_grad_for_model(model.discriminator, pt_pred_seq_data)
-                    discrim_outputs["pred_bb_pred_seq_score_D_grad"] = no_grad_for_input(model.discriminator, pt_pred_seq_data)
+                    # discrim_outputs["pred_bb_pred_seq_score_D_grad"] = no_grad_for_input(model.discriminator, pt_pred_seq_data)
             else:
                 passthrough_outputs = None
 
@@ -452,6 +449,48 @@ class ProteinInterpolation(Task):
         denoiser_output.update(design_output)
         denoiser_output["pt_outputs"] = pt_outputs
         return denoiser_output
+
+    def run_discrim(self, model, inputs, model_outputs):
+        passthrough_outputs = model_outputs['pt_outputs']
+
+        discrim_outputs = {}
+        inputs['residue']['seq_one_hot'] = F.one_hot(inputs['residue']['seq'], num_classes=21)
+        discrim_outputs["gt_all_score"] = model.discriminator(inputs)
+
+        copy_decoder_outputs = copy.copy(model_outputs)
+        copy_decoder_outputs['final_rigids'] = ru.Rigid.from_tensor_7(inputs['residue']['rigids_1'])
+        copy_decoder_outputs['denoised_bb'] = inputs['residue']['atom37'][:, (0, 1, 2, 4, 3)]
+        repack_data = outputs_to_inputs(inputs, copy_decoder_outputs, gt_seq=True)
+        # discrim_outputs["gt_bb_gt_seq_repack_score_G_grad"] = no_grad_for_model(model.discriminator, repack_data)
+        discrim_outputs["gt_bb_gt_seq_repack_score_D_grad"] = no_grad_for_input(model.discriminator, repack_data)
+        redesign_data = outputs_to_inputs(inputs, copy_decoder_outputs, gt_seq=False)
+        # discrim_outputs["gt_bb_pred_seq_repack_score_G_grad"] = no_grad_for_model(model.discriminator, redesign_data)
+        discrim_outputs["gt_bb_pred_seq_repack_score_D_grad"] = no_grad_for_input(model.discriminator, redesign_data)
+
+        passthrough_outputs['denoised_bb'] = model_outputs['denoised_bb']
+        passthrough_inputs = copy.copy(inputs)
+        passthrough_inputs['residue']['rigids_1'] = model_outputs['final_rigids'].to_tensor_7()
+        passthrough_inputs['residue']['x'] = model_outputs['final_rigids'].get_trans()
+        passthrough_inputs['residue']['bb'] = model_outputs['denoised_bb'][:, :4]
+        pt_gt_seq_data = outputs_to_inputs(passthrough_inputs, passthrough_outputs, gt_seq=True)
+        # discrim_outputs["pred_bb_gt_seq_score_G_grad"] = no_grad_for_model(model.discriminator, pt_gt_seq_data)
+        discrim_outputs["pred_bb_gt_seq_score_D_grad"] = no_grad_for_input(model.discriminator, pt_gt_seq_data)
+        pt_pred_seq_data = outputs_to_inputs(passthrough_inputs, passthrough_outputs, gt_seq=False)
+        # discrim_outputs["pred_bb_pred_seq_score_G_grad"] = no_grad_for_model(model.discriminator, pt_pred_seq_data)
+        discrim_outputs["pred_bb_pred_seq_score_D_grad"] = no_grad_for_input(model.discriminator, pt_pred_seq_data)
+
+        discrim_loss_dict = discrim_losses(
+            inputs, {"discrim_outputs": discrim_outputs}, losses_G=False
+        )
+        import json
+        print(json.dumps({k: v.mean().item() for k, v in discrim_outputs.items()}, indent=4))
+        loss = (
+            discrim_loss_dict["discrim_gt_loss"] +
+            discrim_loss_dict["discrim_fixed_bb_D_loss"] * 0.25 +
+            discrim_loss_dict["pt_discrim_pt_bb_D_loss"] * 0.25 * (inputs['t'] > self.pt_loss_t_min)
+        )
+        return loss.mean(), discrim_loss_dict["discrim_gt_loss"], discrim_loss_dict["discrim_gt_score"]
+
 
     def run_predict(self,
                     model,
@@ -944,14 +983,11 @@ class ProteinInterpolation(Task):
 
         if self.use_gan_losses:
             discrim_loss_dict = discrim_losses(
-                inputs, outputs
+                inputs, outputs, losses_G=True
             )
             loss = loss + (
-                discrim_loss_dict["discrim_gt_loss"] +
                 discrim_loss_dict["discrim_fixed_bb_G_loss"] * 0.25 +
-                discrim_loss_dict["discrim_fixed_bb_D_loss"] * 0.25 +
-                discrim_loss_dict["pt_discrim_pt_bb_G_loss"] * 0.25 * (inputs['t'] > self.pt_loss_t_min) +
-                discrim_loss_dict["pt_discrim_pt_bb_D_loss"] * 0.25 * (inputs['t'] > self.pt_loss_t_min)
+                discrim_loss_dict["pt_discrim_pt_bb_G_loss"] * 0.25 * (inputs['t'] > self.pt_loss_t_min)
             )
         else:
             discrim_loss_dict = {}

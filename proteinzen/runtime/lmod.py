@@ -699,6 +699,9 @@ class ProteinModule(L.LightningModule):
 
         self.median_metric = MedianMetric()
 
+        if hasattr(model, "discriminator"):
+            self.automatic_optimization = False
+
         # ckpt = torch.load(path, map_location='cpu')
         # self.model.encoder.load_state_dict({
         #     key[len("model.encoder."):]: ckpt['state_dict'][key]
@@ -783,16 +786,49 @@ class ProteinModule(L.LightningModule):
                     sync_dist=False
                 )
 
-        self.log_dict(
-            log_dict,
-            on_step=None,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-            batch_size=batch.num_graphs,
-            sync_dist=True)
-        # self._log.info(gen_pbar_str(loss_dict))
-        return loss_dict
+
+        if hasattr(self.model, "discriminator"):
+            optim_G, optim_D = self.optimizers()
+            loss_G = loss_dict['loss']
+            optim_G.zero_grad()
+            self.manual_backward(loss_G)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            optim_G.step()
+
+            # this is breaking the task abstraction, but i should really
+            # change this setup at some point anyway
+            loss_D, discrim_gt_loss, discrim_gt_score = task.task_list[0].run_discrim(self.model, batch, outputs)
+            optim_D.zero_grad()
+            self.manual_backward(loss_D)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            optim_D.step()
+
+            log_dict['discrim_gt_score'] = torch.round(discrim_gt_score.mean(), decimals=3)
+            log_dict['discrim_gt_loss'] = torch.round(discrim_gt_loss.mean(), decimals=3)
+
+
+            self.log_dict(
+                log_dict,
+                on_step=None,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+                batch_size=batch.num_graphs,
+                sync_dist=True)
+
+            return
+        else:
+            self.log_dict(
+                log_dict,
+                on_step=None,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+                batch_size=batch.num_graphs,
+                sync_dist=True)
+
+            # self._log.info(gen_pbar_str(loss_dict))
+            return loss_dict
 
     # def validation_step(self, batch, batch_idx):
     #     task: TaskList = batch.task
@@ -862,22 +898,32 @@ class ProteinModule(L.LightningModule):
         return outputs
 
     def configure_optimizers(self):
-        if self.freeze_encoder and self.freeze_decoder:
-            print("Freezing autoenc parameters")
-            return self.optim(
+        if hasattr(self.model, "discriminator"):
+            optim_G = self.optim(
+                list(self.model.encoder.parameters()) +
+                list(self.model.decoder.parameters()) +
                 list(self.model.denoiser.parameters())
             )
-        elif self.freeze_encoder:
-            print("Freezing encoder parameters")
-            return self.optim(
-                list(self.model.denoiser.parameters())
-                + list(self.model.decoder.parameters())
-            )
-        elif self.freeze_decoder:
-            print("Freezing decoder parameters")
-            return self.optim(
-                list(self.model.denoiser.parameters())
-                + list(self.model.encoder.parameters())
-            )
+            optim_D = self.optim(self.model.discriminator.parameters())
+            return optim_G, optim_D
+
         else:
-            return self.optim(self.model.parameters())
+            if self.freeze_encoder and self.freeze_decoder:
+                print("Freezing autoenc parameters")
+                return self.optim(
+                    list(self.model.denoiser.parameters())
+                )
+            elif self.freeze_encoder:
+                print("Freezing encoder parameters")
+                return self.optim(
+                    list(self.model.denoiser.parameters())
+                    + list(self.model.decoder.parameters())
+                )
+            elif self.freeze_decoder:
+                print("Freezing decoder parameters")
+                return self.optim(
+                    list(self.model.denoiser.parameters())
+                    + list(self.model.encoder.parameters())
+                )
+            else:
+                return self.optim(self.model.parameters())
