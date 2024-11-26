@@ -19,6 +19,8 @@ from proteinzen.utils.framediff.all_atom import compute_backbone
 from proteinzen.model.encoder.chimera import ProteinAtomicChimeraEmbedder
 
 from ._attn import PairUpdate, PairEmbedder
+from ._ipa_score_v2 import IpaScoreV2
+from ._ipa_score_v3 import IpaScoreV3
 
 def get_index_embedding(indices, embed_size, max_len=2056):
     """Creates sine / cosine positional embeddings from a prespecified indices.
@@ -606,7 +608,9 @@ class IpaDenoiser(nn.Module):
                  conv_downsample_factor=0,
                  use_traj_predictions=False,
                  force_flash_transformer=False,
-                 sc_atomic_embedder=False
+                 sc_atomic_embedder=False,
+                 use_v2=False,
+                 use_v3=False
                  ):
         super().__init__()
         # some compatibility code
@@ -618,24 +622,53 @@ class IpaDenoiser(nn.Module):
         self.c_latent = c_latent
         self.use_pair_embedder = use_pair_embedder
 
-        self.ipa_score = IpaScore(
-            # diffuser,
-            c_s=c_s,
-            c_latent=c_latent,
-            c_z=c_z,
-            c_skip=c_skip,
-            c_hidden=c_hidden,
-            num_heads=num_heads,
-            num_qk_points=num_qk_points,
-            num_v_points=num_v_points,
-            num_blocks=num_blocks,
-            update_edges_with_dist=update_edges_with_dgram,
-            use_proteus_edge_transition=use_proteus_transition,
-            use_pair_update=use_pair_update,
-            conv_downsample_factor=conv_downsample_factor,
-            use_traj_predictions=use_traj_predictions,
-            force_flash_transformer=force_flash_transformer
-        )
+        assert not (use_v2 and use_v3), "can only use v2 or v3"
+
+        if use_v2:
+            self.ipa_score = IpaScoreV2(
+                c_s=c_s,
+                c_latent=c_latent,
+                c_z=c_z,
+                c_hidden=c_hidden,
+                num_heads=num_heads,
+                num_qk_points=num_qk_points,
+                num_v_points=num_v_points,
+                num_blocks=num_blocks,
+                use_traj_predictions=use_traj_predictions,
+                force_flash_transformer=force_flash_transformer
+            )
+        elif use_v3:
+            self.ipa_score = IpaScoreV3(
+                c_s=c_s,
+                c_latent=c_latent,
+                c_z=c_z,
+                c_hidden=c_hidden,
+                num_heads=num_heads,
+                num_qk_points=num_qk_points,
+                num_v_points=num_v_points,
+                num_blocks=num_blocks//2,
+                use_traj_predictions=use_traj_predictions,
+                force_flash_transformer=force_flash_transformer
+            )
+        else:
+            self.ipa_score = IpaScore(
+                # diffuser,
+                c_s=c_s,
+                c_latent=c_latent,
+                c_z=c_z,
+                c_skip=c_skip,
+                c_hidden=c_hidden,
+                num_heads=num_heads,
+                num_qk_points=num_qk_points,
+                num_v_points=num_v_points,
+                num_blocks=num_blocks,
+                update_edges_with_dist=update_edges_with_dgram,
+                use_proteus_edge_transition=use_proteus_transition,
+                use_pair_update=use_pair_update,
+                conv_downsample_factor=conv_downsample_factor,
+                use_traj_predictions=use_traj_predictions,
+                force_flash_transformer=force_flash_transformer
+            )
         self.embedder = Embedder(
             c_s=c_s,
             c_latent=c_latent,
@@ -654,7 +687,7 @@ class IpaDenoiser(nn.Module):
                 use_ffn=True,
                 compat_mode=False,
                 atom_max_neighbors=128,
-                atomic_r=8
+                atomic_r=6
             )
         else:
             self.sc_atomic_embedder = None
@@ -721,7 +754,7 @@ class IpaDenoiser(nn.Module):
         if self.sc_atomic_embedder is not None:
             if self_condition is not None:
                 sc_data = copy.copy(data)
-                sc_res_data = sc_data['res_data']
+                sc_res_data = sc_data['residue']
                 sc_res_data['atom14_gt_positions'] = self_condition['decoded_atom14']
                 sc_res_data['atom14_gt_exists'] = self_condition['decoded_atom14_mask']
                 sc_res_data['atom14_noising_mask'] = self_condition['decoded_atom14_mask']

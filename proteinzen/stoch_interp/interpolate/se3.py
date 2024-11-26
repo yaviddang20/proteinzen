@@ -99,6 +99,8 @@ class SE3Interpolant:
                  rotate_rots_by_trans_align=False,
                  uniform_rot_noise=False,
                  harmonic_trans_noise=False,
+                 trans_preconditioning=False,
+                 trans_preconditioning_std=16,
                  sfm=False):
         self._cfg = cfg
         self._rots_cfg = cfg.rots
@@ -112,6 +114,8 @@ class SE3Interpolant:
         self.rotate_rots_by_trans_align = rotate_rots_by_trans_align
         self.uniform_rot_noise = uniform_rot_noise
         self.harmonic_trans_noise = harmonic_trans_noise
+        self.trans_preconditioning = trans_preconditioning
+        self.trans_preconditioning_std = trans_preconditioning_std
         self.sfm = sfm
 
         print(self.igso3)
@@ -148,6 +152,9 @@ class SE3Interpolant:
                 reduce='mean'
             )
             trans_0 = noise - center[batch]
+        elif self.trans_preconditioning_std:
+            trans_0 = _centered_gaussian(batch, device)
+            trans_0 = trans_0 * self.trans_preconditioning_std
         else:
             trans_nm_0 = _centered_gaussian(batch, device)
             trans_0 = trans_nm_0 * du.NM_TO_ANG_SCALE
@@ -363,7 +370,31 @@ class SE3Interpolant:
         res_data["rigids_t"] = rigids_t.to_tensor_7()
         res_data["rotmats_t"] = rotmats_t
         res_data["trans_t"] = trans_t
+
+        var_scaling_dict = self.var_scaling_factors(t)
+        # print(var_scaling_dict)
+        batch['trans_c_skip'] = var_scaling_dict['c_skip']
+        batch['trans_c_in'] = var_scaling_dict['c_in']
+        batch['trans_c_out'] = var_scaling_dict['c_out']
+        batch['trans_loss_weighting'] = var_scaling_dict['loss_weighting']
+
         return batch
+
+    def var_scaling_factors(self, t):
+        if not isinstance(t, torch.Tensor):
+            t = torch.as_tensor(t)
+
+        sig_1 = self.trans_preconditioning_std
+        sig_0 = self.trans_preconditioning_std
+        sig_signal = sig_1 * t
+        sig_noise = sig_0 * (1-t)
+        var_t = sig_signal ** 2 + sig_noise ** 2
+        return {
+            "c_skip": t * sig_1**2 / (var_t),
+            "c_out": (1-t) * sig_1 * sig_0 / torch.sqrt(var_t),
+            "c_in": 1 / torch.sqrt(var_t),
+            "loss_weighting": (var_t) / ((1-t) * sig_1 * sig_0)**2
+        }
 
     def rot_sample_kappa(self, t):
         if self._rots_cfg.sample_schedule == "exp":

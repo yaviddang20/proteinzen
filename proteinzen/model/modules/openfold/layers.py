@@ -10,8 +10,6 @@ import torch.nn.functional as F
 
 from proteinzen.utils.openfold.rigid_utils import Rigid
 
-bf16_supported = True
-
 import importlib
 deepspeed_is_installed = importlib.util.find_spec("deepspeed") is not None
 ds4s_is_installed = deepspeed_is_installed and importlib.util.find_spec("deepspeed.ops.deepspeed4science") is not None
@@ -959,27 +957,11 @@ def _deepspeed_evo_attn(
     # DeepSpeed attn. kernel requires inputs to be type bf16 or fp16
     # Cast to bf16 so kernel can be used during inference
     orig_dtype = q.dtype
-    global bf16_supported
     if orig_dtype not in [torch.bfloat16, torch.float16]:
-        if bf16_supported:
-            try:
-                o = DS4Sci_EvoformerAttention(q.to(dtype=torch.bfloat16),
-                                            k.to(dtype=torch.bfloat16),
-                                            v.to(dtype=torch.bfloat16),
-                                            [b.to(dtype=torch.bfloat16) for b in biases])
-            except RuntimeError:
-                print("bf16 not supported on this gpu, switching to float16")
-                bf16_supported = False
-                o = DS4Sci_EvoformerAttention(q.to(dtype=torch.float16),
-                                            k.to(dtype=torch.float16),
-                                            v.to(dtype=torch.float16),
-                                            [b.to(dtype=torch.float16) for b in biases])
-        else:
-            o = DS4Sci_EvoformerAttention(q.to(dtype=torch.float16),
-                                        k.to(dtype=torch.float16),
-                                        v.to(dtype=torch.float16),
-                                        [b.to(dtype=torch.float16) for b in biases])
-
+        o = DS4Sci_EvoformerAttention(q.to(dtype=torch.bfloat16),
+                                    k.to(dtype=torch.bfloat16),
+                                    v.to(dtype=torch.bfloat16),
+                                    [b.to(dtype=torch.bfloat16) for b in biases])
         o = o.to(dtype=orig_dtype)
     else:
         o = DS4Sci_EvoformerAttention(q, k, v, biases)
@@ -1171,7 +1153,7 @@ class InvariantPointAttention(nn.Module):
 
         if self.pre_ln:
             s = self.pre_ln_s(s)
-            z = self.pre_ln_z(z)
+            z[0] = self.pre_ln_z(z[0])
 
         #######################################
         # Generate scalar and point activations

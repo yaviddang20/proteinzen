@@ -6,6 +6,7 @@ from proteinzen.data.openfold.residue_constants import restype_order_with_x
 
 from .utils import _nodewise_to_graphwise
 from .atomic.atom14 import atom14_mse_loss, chi_loss
+from .atomic.atom10 import atom10_local_mse_loss
 from .atomic.atomic import residue_knn_neighborhood_atomic_dist_loss, local_atomic_context_loss, smooth_lddt_loss, sparse_smooth_lddt_loss
 from .atomic.interresidue import intersidechain_clash_loss
 from .latent import so3_embedding_kl, scalars_kl_div, nodewise_kl_div, gaussian_nll
@@ -19,6 +20,7 @@ def seq_cce_loss(ref_seq,
                  batch,
                  mask,
                  label_smoothing=0.0,
+                 seqwise_weight=None,
                  logits_as_probs=False):
     """ CCE loss on logits """
     if logits_as_probs:
@@ -28,6 +30,9 @@ def seq_cce_loss(ref_seq,
         cce = cce.squeeze(-1)
     else:
         cce = F.cross_entropy(seq_logits, ref_seq * mask, reduction='none', label_smoothing=label_smoothing)
+
+    if seqwise_weight is not None:
+        cce = cce * seqwise_weight
     return _nodewise_to_graphwise(cce, batch, mask)
 
 def seq_recov(ref_seq,
@@ -85,13 +90,13 @@ def autoencoder_losses(batch,
     seq_mask = res_data['seq_mask']
 
     res_mask = res_data['res_mask']
-    noising_mask = res_data['noising_mask']
-    mlm_mask = res_data['mlm_mask']
+    noising_mask = res_data['res_noising_mask']
+    # mlm_mask = res_data['mlm_mask']
     atom14_gt_mask = res_data['atom14_gt_exists']
     atom14_alt_gt_mask = res_data['atom14_alt_gt_exists']
 
     minimal_mask = res_mask & seq_mask
-    ae_mask = res_mask & mlm_mask & seq_mask
+    # ae_mask = res_mask & mlm_mask & seq_mask
     denoiser_mask = res_mask & noising_mask & seq_mask
     # decoded_all_atom14 = model_outputs['decoded_all_atom14']
     # decoded_all_chis = model_outputs['decoded_all_chis']
@@ -826,7 +831,7 @@ def dirichlet_fm_losses(batch,
     return out_dict
 
 
-def discrim_losses(batch, outputs, losses_G):
+def discrim_losses(batch, outputs, losses_G, train_vae_only):
     discrim_outputs = outputs['discrim_outputs']
 
     def real_label_score(t, label_smooth=False):
@@ -861,53 +866,392 @@ def discrim_losses(batch, outputs, losses_G):
         return torch.sum(torch.stack(ts, dim=0), dim=0)
 
     if losses_G:
-        fixed_bb_real_losses = [
-            real_label_score(t) for t in
-            [
-                discrim_outputs["gt_bb_gt_seq_repack_score_G_grad"],
-                discrim_outputs["gt_bb_pred_seq_repack_score_G_grad"],
+        if train_vae_only:
+            fixed_bb_real_losses = [
+                real_label_score(t) for t in
+                [
+                    discrim_outputs["gt_bb_gt_seq_repack_score_G_grad"],
+                    discrim_outputs["gt_bb_pred_seq_repack_score_G_grad"],
+                ]
             ]
-        ]
-        pt_real_losses = [
-            real_label_score(t) for t in
-            [
-                discrim_outputs["pred_bb_gt_seq_score_G_grad"],
-                discrim_outputs["pred_bb_pred_seq_score_G_grad"],
+            return {
+                "discrim_fixed_bb_G_loss": list_sum(fixed_bb_real_losses),
+                "discrim_repack_score": F.sigmoid(discrim_outputs["gt_bb_gt_seq_repack_score_G_grad"]),
+                "discrim_redesign_score": F.sigmoid(discrim_outputs["gt_bb_pred_seq_repack_score_G_grad"]),
+            }
+
+        else:
+            fixed_bb_real_losses = [
+                real_label_score(t) for t in
+                [
+                    discrim_outputs["gt_bb_gt_seq_repack_score_G_grad"],
+                    discrim_outputs["gt_bb_pred_seq_repack_score_G_grad"],
+                ]
             ]
-        ]
-        return {
-            "discrim_fixed_bb_G_loss": list_sum(fixed_bb_real_losses),
-            "pt_discrim_pt_bb_G_loss": list_sum(pt_real_losses),
-            "discrim_repack_score": F.sigmoid(discrim_outputs["gt_bb_gt_seq_repack_score_G_grad"]),
-            "discrim_redesign_score": F.sigmoid(discrim_outputs["gt_bb_pred_seq_repack_score_G_grad"]),
-            "pt_discrim_pt_bb_gt_seq_score": F.sigmoid(discrim_outputs["pred_bb_gt_seq_score_G_grad"]),
-            "pt_discrim_pt_bb_pred_seq_score": F.sigmoid(discrim_outputs["pred_bb_pred_seq_score_G_grad"]),
-        }
+            pt_real_losses = [
+                real_label_score(t) for t in
+                [
+                    discrim_outputs["pred_bb_gt_seq_score_G_grad"],
+                    discrim_outputs["pred_bb_pred_seq_score_G_grad"],
+                ]
+            ]
+            return {
+                "discrim_fixed_bb_G_loss": list_sum(fixed_bb_real_losses),
+                "pt_discrim_pt_bb_G_loss": list_sum(pt_real_losses),
+                "discrim_repack_score": F.sigmoid(discrim_outputs["gt_bb_gt_seq_repack_score_G_grad"]),
+                "discrim_redesign_score": F.sigmoid(discrim_outputs["gt_bb_pred_seq_repack_score_G_grad"]),
+                "pt_discrim_pt_bb_gt_seq_score": F.sigmoid(discrim_outputs["pred_bb_gt_seq_score_G_grad"]),
+                "pt_discrim_pt_bb_pred_seq_score": F.sigmoid(discrim_outputs["pred_bb_pred_seq_score_G_grad"]),
+            }
     else:
-        fixed_bb_fake_losses = [
-            fake_label_score(t, label_smooth=True) for t in
-            [
-                discrim_outputs["gt_bb_gt_seq_repack_score_D_grad"],
-                discrim_outputs["gt_bb_pred_seq_repack_score_D_grad"],
+        if train_vae_only:
+            fixed_bb_fake_losses = [
+                fake_label_score(t, label_smooth=True) for t in
+                [
+                    discrim_outputs["gt_bb_gt_seq_repack_score_D_grad"],
+                    discrim_outputs["gt_bb_pred_seq_repack_score_D_grad"],
+                ]
             ]
-        ]
+            return {
+                "discrim_gt_loss": real_label_score(discrim_outputs["gt_all_score"], label_smooth=True),
+                "discrim_gt_score": F.sigmoid(discrim_outputs["gt_all_score"]),
+                "discrim_fixed_bb_D_loss": list_sum(fixed_bb_fake_losses),
+            }
 
-        pt_fake_losses = [
-            fake_label_score(t, label_smooth=True) for t in
-            [
-                discrim_outputs["pred_bb_gt_seq_score_D_grad"],
-                discrim_outputs["pred_bb_pred_seq_score_D_grad"],
+        else:
+            fixed_bb_fake_losses = [
+                fake_label_score(t, label_smooth=True) for t in
+                [
+                    discrim_outputs["gt_bb_gt_seq_repack_score_D_grad"],
+                    discrim_outputs["gt_bb_pred_seq_repack_score_D_grad"],
+                ]
             ]
-        ]
-        return {
-            "discrim_gt_loss": real_label_score(discrim_outputs["gt_all_score"]),
-            "discrim_gt_score": F.sigmoid(discrim_outputs["gt_all_score"]),
-            "discrim_fixed_bb_D_loss": list_sum(fixed_bb_fake_losses),
-            "pt_discrim_pt_bb_D_loss": list_sum(pt_fake_losses),
-        }
+
+            pt_fake_losses = [
+                fake_label_score(t, label_smooth=True) for t in
+                [
+                    discrim_outputs["pred_bb_gt_seq_score_D_grad"],
+                    discrim_outputs["pred_bb_pred_seq_score_D_grad"],
+                ]
+            ]
+            return {
+                "discrim_gt_loss": real_label_score(discrim_outputs["gt_all_score"], label_smooth=True),
+                "discrim_gt_score": F.sigmoid(discrim_outputs["gt_all_score"]),
+                "discrim_fixed_bb_D_loss": list_sum(fixed_bb_fake_losses),
+                "pt_discrim_pt_bb_D_loss": list_sum(pt_fake_losses),
+            }
 
 
+def atom10_losses(batch,
+                       model_outputs,
+                       label_smoothing=0.0,
+                       use_fape=False,
+                       fape_length_scale=1.,
+                       t_norm_clip=0.9,
+                       use_local_atomic_dist_loss=True,
+                       use_sidechain_clash_loss=True,
+                       preconditioning=False
+):
+    res_data = batch['residue']
+
+    t = batch['t']
+    norm_scale = 1 - torch.min(
+        t, torch.as_tensor(t_norm_clip)
+    )
+
+    gt_atom14 = res_data['atom14_gt_positions']
+    alt_atom14 = res_data['atom14_alt_gt_positions']
+
+    seq = res_data['seq']
+    seq_mask = res_data['seq_mask']
+
+    res_mask = res_data['res_mask']
+    res_noising_mask = res_data['res_noising_mask']
+    atom14_gt_mask = res_data['atom14_gt_exists']
+    atom14_alt_gt_mask = res_data['atom14_alt_gt_exists']
+
+    ref_atom10_local_noise = res_data['noised_atom10_local']
+    pred_atom14 = model_outputs['denoised_atom14']
+    pred_atom10_local = model_outputs['denoised_atom10_local']
+    seq_logits = model_outputs['decoded_seq_logits']
+
+    gt_atom14 = gt_atom14 * atom14_gt_mask[..., None] + gt_atom14[:, 1:2] * (1 - atom14_gt_mask[..., None])
+    alt_atom14 = alt_atom14 * atom14_alt_gt_mask[..., None] + alt_atom14[:, 1:2] * (1 - atom14_alt_gt_mask[..., None])
+
+    atom14_mse = atom14_mse_loss(
+        gt_atom14,
+        alt_atom14,
+        pred_atom14,
+        res_data.batch,
+        torch.ones_like(atom14_gt_mask) * res_mask[..., None],
+        torch.ones_like(atom14_alt_gt_mask) * res_mask[..., None],
+        res_noising_mask & res_mask,
+        no_bb=False)
+
+    atom10_local_mse = atom10_local_mse_loss(
+        gt_atom14,
+        alt_atom14,
+        pred_atom10_local=pred_atom10_local,
+        gt_rigids=Rigid.from_tensor_7(res_data['rigids_1']),
+        batch=res_data.batch,
+        atom14_gt_mask=torch.ones_like(atom14_gt_mask) * res_mask[..., None],
+        atom14_alt_gt_mask=torch.ones_like(atom14_alt_gt_mask) * res_mask[..., None],
+        res_mask=res_mask,
+        res_noising_mask=res_noising_mask
+    )
+    atom10_ref_noise = atom10_local_mse_loss(
+        gt_atom14,
+        alt_atom14,
+        pred_atom10_local=ref_atom10_local_noise,
+        gt_rigids=Rigid.from_tensor_7(res_data['rigids_1']),
+        batch=res_data.batch,
+        atom14_gt_mask=torch.ones_like(atom14_gt_mask) * res_mask[..., None],
+        atom14_alt_gt_mask=torch.ones_like(atom14_alt_gt_mask) * res_mask[..., None],
+        res_mask=res_mask,
+        res_noising_mask=res_noising_mask
+    )
+    if preconditioning:
+        # atom10_fm_loss = atom10_local_mse * batch['atom10_loss_weighting'] * (res_data['atom10_vf_scaling'] ** 2)
+        atom10_fm_loss = atom10_local_mse * (res_data['atom10_vf_scaling'] ** 2)
+    else:
+        atom10_fm_loss = atom10_local_mse * (res_data['atom10_vf_scaling'] ** 2)
+    atom10_local_rmsd = atom10_local_mse.sqrt()
+
+    seq_loss = seq_cce_loss(
+        seq,
+        seq_logits,
+        res_data.batch,
+        seq_mask,
+        label_smoothing=label_smoothing)
+    per_seq_recov = seq_recov(
+        seq,
+        seq_logits,
+        res_data.batch,
+        seq_mask)
+    atom14_rmsd = atom14_mse.sqrt()
+
+    if use_local_atomic_dist_loss:
+        local_atomic_dist_loss = local_atomic_context_loss(
+            pred_atom14=pred_atom14,
+            gt_atom14=gt_atom14,
+            alt_atom14=alt_atom14,
+            batch=res_data.batch,
+            atom14_mask=torch.ones_like(atom14_gt_mask.bool()) * res_mask[..., None]
+        )
+    else:
+        local_atomic_dist_loss = torch.zeros_like(t)
+
+    scaled_local_atomic_dist_loss = local_atomic_dist_loss / (norm_scale**2) * 0.01
+    scaled_atom14_mse = atom14_mse / (norm_scale**2) * 0.01
+
+    smooth_lddt = sparse_smooth_lddt_loss(
+        pred_atom14=pred_atom14,
+        gt_atom14=gt_atom14,
+        alt_atom14=alt_atom14,
+        batch=res_data.batch,
+        atom14_mask=torch.ones_like(atom14_gt_mask.bool()) * res_mask[..., None]
+    )
+
+    if use_fape:
+        fape = all_atom_fape_loss(
+            pred_atom14=pred_atom14,
+            gt_atom14=gt_atom14,
+            pred_rigids=model_outputs['final_rigids'],
+            gt_rigids=Rigid.from_tensor_7(batch['residue']['rigids_1']),
+            batch=res_data.batch,
+            atom14_mask=torch.ones_like(atom14_gt_mask) * res_mask[..., None],
+            length_scale=fape_length_scale
+        )
+    else:
+        fape = torch.zeros_like(t)
 
 
+    if use_sidechain_clash_loss:
+        pred_atom14_clash_loss = intersidechain_clash_loss(
+            pred_atom14=pred_atom14,
+            atom14_mask=model_outputs['decoded_atom14_mask'].bool(),
+            seq=seq_logits.argmax(dim=-1),
+            batch=res_data.batch
+        )
+    else:
+        pred_atom14_clash_loss = torch.zeros_like(t)
 
 
+    out_dict = {
+        "seq_loss": seq_loss,
+        "per_seq_recov": per_seq_recov,
+        "atom14_mse": atom14_mse,
+        "atom14_rmsd": atom14_rmsd,
+        "atom10_fm_loss": atom10_fm_loss,
+        "atom10_local_rmsd": atom10_local_rmsd,
+        "atom10_local_ref_noise": atom10_ref_noise.sqrt(),
+        "local_atomic_dist_loss": local_atomic_dist_loss,
+        "scaled_local_atomic_dist_loss": scaled_local_atomic_dist_loss,
+        "scaled_atom14_mse": scaled_atom14_mse,
+        "pred_sidechain_clash_loss": pred_atom14_clash_loss,
+        "smooth_lddt": smooth_lddt,
+        "fape": fape,
+        # "bond_length_mse": bond_length_mse,
+        # "bond_angle_loss": bond_angle_loss,
+    }
+
+    return out_dict
+
+
+def atomic_losses(batch,
+                  model_outputs,
+                  label_smoothing=0.0,
+                  logit_norm_loss=0.0,
+                  use_smooth_lddt=False,
+                  use_fape=False,
+                  fape_length_scale=10.,
+                  t_norm_clip=0.9,
+                  use_sidechain_dists_mse_loss=True,
+                  use_local_atomic_dist_loss=True,
+                  use_sidechain_clash_loss=True,
+                  polar_upweight=False
+):
+    res_data = batch['residue']
+
+    t = batch['t']
+    norm_scale = 1 - torch.min(
+        t, torch.as_tensor(t_norm_clip)
+    )
+
+    gt_atom14 = res_data['atom14_gt_positions']
+    alt_atom14 = res_data['atom14_alt_gt_positions']
+
+    seq = res_data['seq']
+    seq_mask = res_data['seq_mask']
+
+    res_mask = res_data['res_mask']
+    noising_mask = res_data['res_noising_mask']
+    # mlm_mask = res_data['mlm_mask']
+    atom14_gt_mask = res_data['atom14_gt_exists']
+    atom14_alt_gt_mask = res_data['atom14_alt_gt_exists']
+
+    minimal_mask = res_mask & seq_mask
+    # ae_mask = res_mask & mlm_mask & seq_mask
+    denoiser_mask = res_mask & noising_mask & seq_mask
+    # decoded_all_atom14 = model_outputs['decoded_all_atom14']
+    # decoded_all_chis = model_outputs['decoded_all_chis']
+    pred_atom14 = model_outputs['denoised_atom14']
+    pred_atom14_gt_seq = model_outputs['denoised_atom14_gt_seq']
+    seq_logits = model_outputs['decoded_seq_logits']
+
+    # pred_atom14 = _collect_from_seq(decoded_all_atom14, seq, seq_mask)
+    # pred_chis = _collect_from_seq(decoded_all_chis, seq, seq_mask)
+
+    atom14_mse = atom14_mse_loss(
+        gt_atom14,
+        alt_atom14,
+        pred_atom14_gt_seq,
+        res_data.batch,
+        atom14_gt_mask,
+        atom14_alt_gt_mask,
+        minimal_mask,
+        no_bb=False,
+        seqwise_weight=(res_data['polar_mask'].float()+1 if polar_upweight else None)
+    )
+    seq_loss = seq_cce_loss(
+        seq,
+        seq_logits,
+        res_data.batch,
+        seq_mask,
+        label_smoothing=label_smoothing,
+        seqwise_weight=(res_data['polar_mask'].float()+1 if polar_upweight else None)
+    )
+    per_seq_recov = seq_recov(
+        seq,
+        seq_logits,
+        res_data.batch,
+        denoiser_mask)
+    atom14_rmsd = atom14_mse.sqrt()
+    if use_sidechain_dists_mse_loss:
+        sidechain_dists_mse = residue_knn_neighborhood_atomic_dist_loss(
+            gt_ref_atom14=gt_atom14,
+            alt_ref_atom14=alt_atom14,
+            pred_atom14=pred_atom14_gt_seq,
+            gt_atom14_mask=atom14_gt_mask.bool(),
+            alt_atom14_mask=atom14_alt_gt_mask.bool(),
+            batch=res_data.batch
+        )
+    else:
+        sidechain_dists_mse = torch.zeros_like(t)
+
+    if use_local_atomic_dist_loss:
+        local_atomic_dist_loss = local_atomic_context_loss(
+            pred_atom14=pred_atom14_gt_seq,
+            gt_atom14=gt_atom14,
+            alt_atom14=alt_atom14,
+            batch=res_data.batch,
+            atom14_mask=atom14_gt_mask.bool()
+        )
+    else:
+        local_atomic_dist_loss = torch.zeros_like(t)
+
+    scaled_local_atomic_dist_loss = local_atomic_dist_loss / (norm_scale**2) * 0.01
+    scaled_atom14_mse = atom14_mse / (norm_scale**2) * 0.01
+
+    if use_smooth_lddt:
+        smooth_lddt = smooth_lddt_loss(
+            pred_atom14=pred_atom14_gt_seq,
+            gt_atom14=gt_atom14,
+            alt_atom14=alt_atom14,
+            batch=res_data.batch,
+            atom14_mask=atom14_gt_mask.bool()
+        )
+    else:
+        smooth_lddt = torch.zeros_like(t)
+
+    if use_fape:
+        fape = all_atom_fape_loss(
+            pred_atom14=pred_atom14_gt_seq,
+            gt_atom14=gt_atom14,
+            pred_rigids=model_outputs['final_rigids'][..., 0],
+            gt_rigids=Rigid.from_tensor_7(batch['residue']['rigids_1'])[..., 0],
+            batch=res_data.batch,
+            atom14_mask=atom14_gt_mask,
+            length_scale=fape_length_scale
+        )
+    else:
+        fape = torch.zeros_like(t)
+    scaled_fape = fape / norm_scale
+
+
+    if use_sidechain_clash_loss:
+        pred_atom14_clash_loss = intersidechain_clash_loss(
+            pred_atom14=pred_atom14,
+            atom14_mask=model_outputs['decoded_atom14_mask'].bool(),
+            seq=seq_logits.argmax(dim=-1),
+            batch=res_data.batch
+        )
+    else:
+        pred_atom14_clash_loss = torch.zeros_like(t)
+
+
+    logit_norm_loss = logit_norm_loss * _nodewise_to_graphwise(
+        torch.sum(seq_logits**2, dim=-1),
+        res_data.batch,
+        denoiser_mask
+    )
+
+    out_dict = {
+        "seq_loss": seq_loss,
+        "per_seq_recov": per_seq_recov,
+        "atom14_mse": atom14_mse,
+        "atom14_rmsd": atom14_rmsd,
+        "sidechain_dists_mse": sidechain_dists_mse,
+        "local_atomic_dist_loss": local_atomic_dist_loss,
+        "scaled_local_atomic_dist_loss": scaled_local_atomic_dist_loss,
+        "scaled_atom14_mse": scaled_atom14_mse,
+        "pred_sidechain_clash_loss": pred_atom14_clash_loss,
+        "smooth_lddt": smooth_lddt,
+        "fape": fape,
+        "scaled_fape": scaled_fape,
+        # "bond_length_mse": bond_length_mse,
+        # "bond_angle_loss": bond_angle_loss,
+        "logit_norm_loss": logit_norm_loss,
+    }
+
+    return out_dict

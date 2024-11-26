@@ -187,7 +187,7 @@ def frames_to_atom14_pos(
     """
 
     # [*, N, 14]
-    group_mask = GROUP_IDX[aatype, ...]
+    group_mask = GROUP_IDX.to(aatype.device)[aatype, ...]
 
     # [*, N, 14, 8]
     group_mask = torch.nn.functional.one_hot(
@@ -204,10 +204,10 @@ def frames_to_atom14_pos(
     )
 
     # [*, N, 14, 1]
-    frame_atom_mask = ATOM_MASK[aatype, ...].unsqueeze(-1).to(r.device)
+    frame_atom_mask = ATOM_MASK.to(aatype.device)[aatype, ...].unsqueeze(-1).to(r.device)
 
     # [*, N, 14, 3]
-    frame_null_pos = IDEALIZED_POS[aatype, ...].to(r.device)
+    frame_null_pos = IDEALIZED_POS.to(aatype.device)[aatype, ...].to(r.device)
     pred_positions = t_atoms_to_global.apply(frame_null_pos)
     pred_positions = pred_positions * frame_atom_mask
 
@@ -477,3 +477,42 @@ def adjust_oxygen_pos(
     )
 
     return atom_37
+
+
+def frame5_to_atom14_pos(
+        r: Rigid,
+        aatype: torch.Tensor,
+    ):
+    """Convert frames to their idealized all atom representation.
+
+    Args:
+        r: All rigid groups. [..., N, 8, 3]
+        aatype: Residue types. [..., N]
+
+    Returns:
+
+    """
+    # this is ugly but i'm too lazy to do proper expansion
+    r = ru.Rigid.cat([
+        r[..., 0:1],
+        r[..., 0:1],
+        r[..., 0:1],
+        r,
+    ], dim=-1)
+
+    return frames_to_atom14_pos(r, aatype)
+
+
+def compute_atom14_from_frame5(rigids, res_mask, seq):
+    atom14_pos = frame5_to_atom14_pos(
+        rigids,
+        seq)
+    atom37_bb_pos = torch.zeros(rigids[..., 0].shape + (37, 3), device=atom14_pos.device)
+    # atom14 bb order = ['N', 'CA', 'C', 'O', 'CB']
+    # atom37 bb order = ['N', 'CA', 'C', 'CB', 'O']
+    atom37_bb_pos[..., :3, :] = atom14_pos[..., :3, :]
+    atom37_bb_pos[..., 3, :] = atom14_pos[..., 4, :]
+    atom37_bb_pos[..., 4, :] = atom14_pos[..., 3, :]
+    atom37 = adjust_oxygen_pos(atom37_bb_pos.view(-1, 37, 3), res_mask.view(-1)).view(atom37_bb_pos.shape)
+    atom14_pos[..., 3, :] = atom37[..., 4, :]
+    return atom14_pos

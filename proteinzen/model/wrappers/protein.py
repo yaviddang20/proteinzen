@@ -13,6 +13,7 @@ from proteinzen.model.encoder.chimera_dense import ProteinAtomicChimeraDenseEmbe
 from proteinzen.model.denoiser.protein.frames import DynamicGraphIpaFrameDenoiser
 from proteinzen.model.denoiser.protein.dense import IpaDenoiser, DenseIpaDenoiser
 from proteinzen.model.discriminator.chimera import ProteinAtomicChimeraDiscriminator
+from proteinzen.model.discriminator.ipmp import IPMPDiscriminator
 
 from ._supervisor import LatentNodeSupervisor
 
@@ -480,6 +481,8 @@ class ChimeraDenseLatentWrapper(nn.Module):
                  smooth_embedding=False,
                  use_masking_features=False,
                  denoiser_seq_mask_features=False,
+                 denoiser_use_v2=False,
+                 denoiser_use_v3=False,
                  decoder_seq_mask_features=False,
                  denoiser_masked_latent_feature=False,
                  compatibility_mode=False,
@@ -499,6 +502,7 @@ class ChimeraDenseLatentWrapper(nn.Module):
                  latent_supervisor=False,
                  sc_atomic_embedder=False,
                  discriminator=False,
+                 ipmp_discriminator=False,
                  ):
         super().__init__()
 
@@ -573,7 +577,9 @@ class ChimeraDenseLatentWrapper(nn.Module):
             use_traj_predictions=use_traj_predictions,
             force_flash_transformer=force_flash_transformer,
             use_seq_mask_features=denoiser_seq_mask_features,
-            sc_atomic_embedder=sc_atomic_embedder
+            sc_atomic_embedder=sc_atomic_embedder,
+            use_v2=denoiser_use_v2,
+            use_v3=denoiser_use_v3
         )
         self.c_latent = c_latent
         self.self_conditioning = self_conditioning
@@ -581,22 +587,28 @@ class ChimeraDenseLatentWrapper(nn.Module):
         if latent_supervisor:
             self.latent_supervisor = LatentNodeSupervisor(c_latent=c_latent, c_hidden=c_s//2)
         if discriminator:
-            self.discriminator = ProteinAtomicChimeraDiscriminator(
-                c_s=c_s//4,
-                c_z=c_z//4,
-                res_num_rbf=num_rbf,
-                knn_k=sidechain_k,
-                broadcast_to_atoms=broadcast_to_atoms,
-                lrange_graph=lrange_embedding,
-                use_masking_features=False,
-                res_h_mult_factor=res_h_mult_factor,
-                n_layers=4,
-                use_ffn=encoder_use_ffn,
-                compat_mode=compat_mode,
-                atom_max_neighbors=atom_max_neighbors,
-                atomic_r=atomic_r,
-                use_gumbel_softmax_logits=decoder_gumbel_softmax
-            )
+            if ipmp_discriminator:
+                self.discriminator = IPMPDiscriminator(
+                    c_s=c_s//2,
+                    c_z=c_z,
+                )
+            else:
+                self.discriminator = ProteinAtomicChimeraDiscriminator(
+                    c_s=c_s//4,
+                    c_z=c_z//4,
+                    res_num_rbf=num_rbf,
+                    knn_k=sidechain_k,
+                    broadcast_to_atoms=broadcast_to_atoms,
+                    lrange_graph=lrange_embedding,
+                    use_masking_features=False,
+                    res_h_mult_factor=res_h_mult_factor,
+                    n_layers=4,
+                    use_ffn=encoder_use_ffn,
+                    compat_mode=compat_mode,
+                    atom_max_neighbors=atom_max_neighbors,
+                    atomic_r=atomic_r,
+                    use_gumbel_softmax_logits=decoder_gumbel_softmax
+                )
 
         # some compatibility code
         self.lrange_k = 10000

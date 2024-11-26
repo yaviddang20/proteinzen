@@ -290,7 +290,8 @@ def sparse_smooth_lddt_loss(
     flat_ref_atom14 = ref_atom14[atom14_mask]
     flat_pred_atom14 = pred_atom14[atom14_mask]
     batch_expand = batch[..., None].expand(-1, atom14_mask.shape[-1])[atom14_mask]
-    edge_index = radius_graph(flat_ref_atom14, r, batch_expand, max_num_neighbors=max_num_neighbors)
+    with torch.no_grad():
+        edge_index = radius_graph(flat_ref_atom14, r, batch_expand, max_num_neighbors=max_num_neighbors)
 
     pred_dist_vec = flat_pred_atom14[edge_index[0]] - flat_pred_atom14[edge_index[1]]
     pred_dists = torch.linalg.vector_norm(pred_dist_vec + eps, dim=-1)

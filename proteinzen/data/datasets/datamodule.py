@@ -121,7 +121,8 @@ class FramediffDataModule(L.LightningDataModule):
                  use_tmpdir=False,
                  predict_on_train=False,
                  cache_dir=None,
-                 normalize_cache=False
+                 normalize_cache=False,
+                 use_val_split=False
                  ):
         super().__init__()
         self.data_dir = data_dir
@@ -137,16 +138,42 @@ class FramediffDataModule(L.LightningDataModule):
         self.sample_lengths = sample_lengths
         csv = "filtered_metadata.csv"
         # csv = "mini_metadata.csv"
-        self.train_dataset = PdbDataset(
-            csv_path=os.path.join(self.data_dir, csv),
-            min_num_res=min_len,
-            max_num_res=max_len,
-            min_percent_ordered=min_ordered_percent,
-            use_tmpdir=use_tmpdir,
-            cache_dir=cache_dir,
-            normalize_cache=normalize_cache
-        )
-        self.val_dataset = LengthDataset(
+
+        self.use_val_split = use_val_split
+        if use_val_split:
+            self.train_dataset = PdbDataset(
+                csv_path=os.path.join(self.data_dir, csv),
+                min_num_res=min_len,
+                max_num_res=max_len,
+                min_percent_ordered=min_ordered_percent,
+                use_tmpdir=use_tmpdir,
+                cache_dir=cache_dir,
+                normalize_cache=normalize_cache,
+                split='train'
+            )
+            self.val_dataset = PdbDataset(
+                csv_path=os.path.join(self.data_dir, csv),
+                min_num_res=min_len,
+                max_num_res=max_len,
+                min_percent_ordered=min_ordered_percent,
+                use_tmpdir=use_tmpdir,
+                cache_dir=cache_dir,
+                normalize_cache=normalize_cache,
+                split='val'
+            )
+            self.val_dataloader = lambda: self.build_dataloader(self.val_dataset)
+
+        else:
+            self.train_dataset = PdbDataset(
+                csv_path=os.path.join(self.data_dir, csv),
+                min_num_res=min_len,
+                max_num_res=max_len,
+                min_percent_ordered=min_ordered_percent,
+                use_tmpdir=use_tmpdir,
+                cache_dir=cache_dir,
+                normalize_cache=normalize_cache
+            )
+        self.predict_dataset = LengthDataset(
             self.sample_lengths,
             batch_size=batch_size,
             same_length_per_batch=length_batch,
@@ -221,18 +248,11 @@ class FramediffDataModule(L.LightningDataModule):
     def train_dataloader(self):
         return self.build_dataloader(self.train_dataset)
 
-    def val_dataloader(self):
-        def collate_fn(batch):
-            batch = batch[0]
-            batch['task'] = self.task_sampler.sample_task()
-            return batch
-
-        return DataLoader(
-            self.val_dataset,
-            shuffle=False,
-            collate_fn=collate_fn,
-            batch_size=1
-        )
+    # def val_dataloader(self):
+    #     if self.use_val_split:
+    #         return self.build_dataloader(self.val_dataset)
+    #     else:
+    #         return super().val_dataloader()
 
     def predict_dataloader(self):
         if self.predict_on_train:
@@ -245,7 +265,7 @@ class FramediffDataModule(L.LightningDataModule):
                 return batch
 
             return DataLoader(
-                self.val_dataset,
+                self.predict_dataset,
                 shuffle=False,
                 collate_fn=collate_fn,
                 batch_size=1

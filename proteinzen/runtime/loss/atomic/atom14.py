@@ -9,7 +9,8 @@ def atom14_mse_loss(gt_atom14,
                     atom14_gt_mask,
                     atom14_alt_gt_mask,
                     noising_mask,
-                    no_bb=True):
+                    no_bb=False,
+                    seqwise_weight=None):
     gt_mask = atom14_gt_mask * noising_mask[..., None]
     alt_mask = atom14_alt_gt_mask * noising_mask[..., None]
     if no_bb:
@@ -22,14 +23,17 @@ def atom14_mse_loss(gt_atom14,
 
     gt_diff = torch.square(gt_atom14 - pred_atom14).sum(dim=-1) * gt_mask
     alt_diff = torch.square(gt_atom14 - pred_atom14).sum(dim=-1) * alt_mask
-    num_atoms = atom14_gt_mask.int().sum(dim=-1)
 
     # we take the min mse per residue
-    gt_poswise_diff = gt_diff.sum(dim=-1) / torch.where(num_atoms>0, num_atoms, 1)
-    alt_poswise_diff = alt_diff.sum(dim=-1) / torch.where(num_atoms>0, num_atoms, 1)
-    min_diff = torch.min(gt_poswise_diff, alt_poswise_diff)  # n_node
+    gt_poswise_diff = gt_diff.sum(dim=-1)
+    alt_poswise_diff = alt_diff.sum(dim=-1)
+    choose_gt = (gt_poswise_diff < alt_poswise_diff)  # n_node
 
-    return _nodewise_to_graphwise(min_diff, batch, (num_atoms > 0))
+    min_diff = choose_gt[..., None] * gt_diff + (~choose_gt)[..., None] * alt_diff
+    if seqwise_weight is not None:
+        min_diff = min_diff * seqwise_weight[..., None]
+
+    return _nodewise_to_graphwise(min_diff, batch, gt_mask)
 
 
 def chi_loss(gt_chi_vecs,

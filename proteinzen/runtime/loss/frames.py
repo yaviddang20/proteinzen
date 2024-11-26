@@ -82,6 +82,7 @@ def angle_axis_rot_vf_loss(
         res_mask,
         norm_scale,
         angle_loss_weight=0.5,
+        seqwise_weight=None,
         eps=1e-8):
     pred_rot_vf = pred_rot_vf / norm_scale[batch, None]
     ref_rot_vf = ref_rot_vf / norm_scale[batch, None]
@@ -102,6 +103,8 @@ def angle_axis_rot_vf_loss(
         dim=-1
     )
     rot_loss = angle_loss * angle_loss_weight + axis_loss
+    if seqwise_weight is not None:
+        rot_loss = rot_loss * seqwise_weight
     return _nodewise_to_graphwise(rot_loss, batch, res_mask)
 
 
@@ -238,10 +241,11 @@ def bb_frame_fm_loss(batch,
                      t_norm_clip=0.9,
                      sep_rot_loss=True,
                      local_atomic_dist_r=6,
-                     square_aux_loss_time_factor=False):
+                     square_aux_loss_time_factor=False,
+                     trans_preconditioning=False):
     res_data = batch['residue']
     res_mask = res_data['res_mask']
-    noising_mask = res_data['noising_mask']
+    noising_mask = res_data['res_noising_mask']
     mask = res_mask & noising_mask
     res_batch = res_data.batch
     device = res_mask.device
@@ -296,9 +300,16 @@ def bb_frame_fm_loss(batch,
 
     trans_1_pred = denoised_bb_frames.get_trans()
     trans_1 = bb_frames.get_trans()
-    trans_vf_loss = torch.square(trans_1_pred - trans_1).sum(dim=-1) / (nodewise_norm_scale ** 2)
-    trans_vf_loss = _nodewise_to_graphwise(trans_vf_loss, res_data.batch, mask)
-    trans_vf_loss *= 0.01  # Angstroms to nm
+    if trans_preconditioning:
+        # trans_vf_loss = torch.square(trans_1_pred - trans_1).sum(dim=-1)
+        # trans_vf_loss = _nodewise_to_graphwise(trans_vf_loss, res_data.batch, mask) * batch['trans_loss_weighting']
+        trans_vf_loss = torch.square(trans_1_pred - trans_1).sum(dim=-1) / (nodewise_norm_scale ** 2)
+        trans_vf_loss = _nodewise_to_graphwise(trans_vf_loss, res_data.batch, mask)
+        trans_vf_loss *= 0.01  # Angstroms to nm
+    else:
+        trans_vf_loss = torch.square(trans_1_pred - trans_1).sum(dim=-1) / (nodewise_norm_scale ** 2)
+        trans_vf_loss = _nodewise_to_graphwise(trans_vf_loss, res_data.batch, mask)
+        trans_vf_loss *= 0.01  # Angstroms to nm
 
     dist_mat_loss = framediff_local_atomic_context_loss(
         denoised_bb,

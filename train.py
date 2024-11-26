@@ -107,6 +107,9 @@ def main(model,
     if 'freeze_decoder' in zen_cfg:
         kwargs['freeze_decoder'] = zen_cfg['freeze_decoder']
 
+    # for name, module in model.named_modules():
+    #     print(name, sum([p.numel() for p in module.parameters()]))
+
 
     # datamodule and optim are all partial'd __init__s
     # so we instantiate instances of each
@@ -133,8 +136,13 @@ def main(model,
         zen_cfg['experiment']['warm_start'] = None
 
 
+    # TODO: this is so jenk
+    if 'force_override_length_batching' in zen_cfg:
+        force_override_length_batching = bool(zen_cfg['force_override_length_batching'])
+    else:
+        force_override_length_batching = False
     # TODO: there's gotta be a nicer way of doing this
-    if hasattr(model.model, "lrange_logn_scale") and model.model.lrange_logn_scale > 0:
+    if not force_override_length_batching and hasattr(model.model, "lrange_logn_scale") and model.model.lrange_logn_scale > 0:
         _model = model.model
         def batch_by_edge_fn(n):
             lrange = round(

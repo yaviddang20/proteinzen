@@ -803,8 +803,8 @@ class ProteinModule(L.LightningModule):
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             optim_D.step()
 
-            log_dict['discrim_gt_score'] = torch.round(discrim_gt_score.mean(), decimals=3)
-            log_dict['discrim_gt_loss'] = torch.round(discrim_gt_loss.mean(), decimals=3)
+            log_dict['train/discrim_gt_score'] = torch.round(discrim_gt_score.mean(), decimals=3)
+            log_dict['train/discrim_gt_loss'] = torch.round(discrim_gt_loss.mean(), decimals=3)
 
 
             self.log_dict(
@@ -830,39 +830,95 @@ class ProteinModule(L.LightningModule):
             # self._log.info(gen_pbar_str(loss_dict))
             return loss_dict
 
-    # def validation_step(self, batch, batch_idx):
-    #     task: TaskList = batch.task
-    #     outputs = task.run_evals(self.model, batch)
-    #     loss_dict = task.compile_task_losses(batch, outputs)
+    def validation_step(self, batch, batch_idx):
+        task: TaskList = batch.task
+        outputs = task.run_evals(self.model, batch)
+        loss_dict = task.compile_task_losses(batch, outputs)
 
-    #     log_dict = tree.map_structure(
-    #         lambda x: torch.mean(x) if torch.is_tensor(x) else x,
-    #         loss_dict
-    #     )
-    #     log_dict = {"val_" + k: v for k,v in log_dict.items()}
+        log_dict = tree.map_structure(
+            lambda x: torch.round(torch.mean(x), decimals=3) if torch.is_tensor(x) else x,
+            loss_dict
+        )
+        log_dict = {
+            ("val/" + key): value
+            for key, value in
+            sorted(log_dict.items(), key = lambda x: x[0])
+        }
+        t = batch['t']
+        for loss_name, loss_list in loss_dict.items():
+            if loss_name in ['loss', 'frameflow_loss']:
+                continue
+            if not loss_name.startswith("pt_") and not loss_name.startswith("latent_"):
+                continue
+            stratified_losses = t_stratified_loss(
+                t, loss_list, loss_name=loss_name)
+            stratified_losses = {
+                f"val/{k}": torch.round(torch.as_tensor(v, device=log_dict['val/loss'].device), decimals=3)
+                for k,v in stratified_losses.items()
+            }
+            self.log_dict(
+                stratified_losses,
+                prog_bar=False,
+                logger=True,
+                on_step=None,
+                on_epoch=True,
+                batch_size=batch.num_graphs,
+                sync_dist=False)
 
-    #     self.log_dict(
-    #         log_dict,
-    #         logger=True,
-    #         batch_size=batch.num_graphs,
-    #         sync_dist=True)
-    #     self._log.info(gen_pbar_str(loss_dict))
+        if 'val/percent_masked' in log_dict and 'val/per_seq_recov' in log_dict:
+            if log_dict['val/percent_masked'] == 1.0:
+                loss_name = "val/per_seq_recov_mask_all"
+                pt_loss_name = "val/pt_per_seq_recov_mask_all"
+            elif log_dict['val/percent_masked'] == 0.0:
+                loss_name = "val/per_seq_recov_mask_none"
+                pt_loss_name = "val/pt_per_seq_recov_mask_none"
+            else:
+                loss_name = "val/per_seq_recov_mask_partial"
+                pt_loss_name = "val/pt_per_seq_recov_mask_partial"
+            self.log(
+                loss_name,
+                torch.round(log_dict['val/per_seq_recov'], decimals=3),
+                prog_bar=False,
+                logger=True,
+                on_step=None,
+                on_epoch=True,
+                batch_size=batch.num_graphs,
+                sync_dist=False
+            )
+            if 'val/pt_per_seq_recov' in log_dict:
+                self.log(
+                    pt_loss_name,
+                    torch.round(log_dict['val/pt_per_seq_recov'], decimals=3),
+                    prog_bar=False,
+                    logger=True,
+                    on_step=None,
+                    on_epoch=True,
+                    batch_size=batch.num_graphs,
+                    sync_dist=False
+                )
 
-    #     sample_outputs = task.run_predicts(self.model, batch)
-    #     sample_loss_dict = task.compile_task_losses(batch, sample_outputs)
-    #     sample_log_dict = tree.map_structure(
-    #         lambda x: torch.mean(x) if torch.is_tensor(x) else x,
-    #         sample_loss_dict
-    #     )
-    #     sample_log_dict = {"sample_" + k: v for k,v in sample_log_dict.items()}
-    #     self.log_dict(
-    #         sample_log_dict,
-    #         logger=True,
-    #         batch_size=batch.num_graphs,
-    #         sync_dist=True)
-    #     self._log.info(gen_pbar_str(sample_loss_dict))
 
-    #     return loss_dict
+        if hasattr(self.model, "discriminator"):
+            loss_G = loss_dict['loss']
+            # this is breaking the task abstraction, but i should really
+            # change this setup at some point anyway
+            loss_D, discrim_gt_loss, discrim_gt_score = task.task_list[0].run_discrim(self.model, batch, outputs)
+
+            log_dict['val/discrim_gt_score'] = torch.round(discrim_gt_score.mean(), decimals=3)
+            log_dict['val/discrim_gt_loss'] = torch.round(discrim_gt_loss.mean(), decimals=3)
+
+
+        self.log_dict(
+            log_dict,
+            on_step=None,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            batch_size=batch.num_graphs,
+            sync_dist=True)
+
+        # self._log.info(gen_pbar_str(loss_dict))
+        return loss_dict
 
     def test_step(self, batch, batch_idx):
         task: TaskList = batch.task
