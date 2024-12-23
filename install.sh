@@ -1,22 +1,27 @@
 # conda env create -n proteinzen
 # conda activate proteinzen
-conda install -y -c pytorch -c nvidia -c https://conda.rosettacommons.org -c conda-forge \
-    pytorch==2.4.1 \
-    torchvision==0.19.1 \
-    torchaudio==2.4.1 \
-    pytorch-cuda=12.4 \
-    nvidia/label/cuda-12.4.1::cuda-toolkit 
+## conda install -y -c pytorch -c nvidia \
+##     pytorch==2.5.1 \
+##     torchvision \
+##     torchaudio \
+##     pytorch-cuda=12.4
+## #     nvidia/label/cuda-12.4.1::cuda-toolkit
 
-conda install -y -c pyg -c conda-forge\
-    pyg \
-    pytorch-cluster \
-    pytorch-scatter \
-    lightning \
-    torchmetrics
+# conda install -y -c pyg \
+#     pyg \
+#     pytorch-cluster \
+#     pytorch-scatter \
 
-conda install -y -c conda-forge \
-    scipy \
-    pandas
+pip install torch_geometric
+pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.5.0+cu124.html
+pip install lightning torchmetrics pandas
+
+# conda install -y -c conda-forge \
+#     lightning \
+#     torchmetrics
+# conda install -y -c conda-forge \
+#     scipy \
+#     pandas
 
 conda install -y -c https://conda.rosettacommons.org \
     pyrosetta
@@ -25,7 +30,7 @@ conda install -y -c conda-forge cxx-compiler
 
 
 # you might need these
-conda install nvidia/label/cuda-12.4.1::cuda-cccl nvidia/label/cuda-12.4.1::libcurand
+# conda install nvidia/label/cuda-12.4.1::cuda-cccl nvidia/label/cuda-12.4.1::libcurand
 
 # conda install -y -c conda-forge \
 #     mdtraj \
@@ -55,6 +60,7 @@ pip install \
     tmtools \
     wandb
 
+pip install -e .
 
 # conda env create -n proteinzen
 # conda activate proteinzen

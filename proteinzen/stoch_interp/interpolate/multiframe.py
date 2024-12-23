@@ -96,7 +96,8 @@ class MultiSE3Interpolant:
                  prealign_noise=True,
                  trans_preconditioning=False,
                  trans_preconditioning_std=16,
-                 rigids_per_res=5):
+                 rigids_per_res=5,
+                 lognorm_t_sched=False):
         self._cfg = cfg
         self._rots_cfg = cfg.rots
         self._trans_cfg = cfg.trans
@@ -106,6 +107,7 @@ class MultiSE3Interpolant:
         self.prealign_noise = prealign_noise
         self.trans_preconditioning = trans_preconditioning
         self.trans_preconditioning_std = trans_preconditioning_std
+        self.lognorm_t_sched = lognorm_t_sched
 
         print(self.igso3)
 
@@ -122,8 +124,21 @@ class MultiSE3Interpolant:
         self._device = device
 
     def sample_t(self, num_batch):
-        t = torch.rand(num_batch, device=self._device).float()
-        return t * (1 - 2 * self._cfg.min_t) + self._cfg.min_t
+        if self.lognorm_t_sched:
+            lognorm_mu, lognorm_sig = -1.2, 1.5
+            ln_sig = lognorm_mu + torch.randn(num_batch, device=self._device).float() * lognorm_sig
+            # below is the actual math, but it turns out
+            # the conversion is sig_data independent :o
+            # ---
+            # sig_data = 16
+            # sig = sig_data * torch.exp(ln_sig)
+            # t = sig_data / (sig + sig_data)
+            t = 1 / (1 + torch.exp(ln_sig))
+            return t
+        else:
+            t = torch.rand(num_batch, device=self._device).float()
+            return t * (1 - 2 * self._cfg.min_t) + self._cfg.min_t
+
 
     def _sample_trans_0(self, batch, device):
         if self.trans_preconditioning_std:
@@ -222,11 +237,19 @@ class MultiSE3Interpolant:
         sig_signal = sig_1 * t
         sig_noise = sig_0 * (1-t)
         var_t = sig_signal ** 2 + sig_noise ** 2
+        # TODO: i did some emperical calculations to adjust c_out
+        # to have the vector field target be Var 1 rather than
+        # the denoiser target but you should check this math
+        # old: c_out = (1-t) * sig_1 * sig_0 / torch.sqrt(var_t)
+        c_skip = t * sig_1**2 / (var_t)
+        c_out = sig_1 * sig_0 / torch.sqrt(var_t)
+        c_in = 1 / torch.sqrt(var_t)
+        loss_weighting = 1 / (c_out ** 2)
         return {
-            "c_skip": t * sig_1**2 / (var_t),
-            "c_out": (1-t) * sig_1 * sig_0 / torch.sqrt(var_t),
-            "c_in": 1 / torch.sqrt(var_t),
-            "loss_weighting": (var_t) / ((1-t) * sig_1 * sig_0)**2
+            "c_skip": c_skip,
+            "c_out": c_out,
+            "c_in": c_in,
+            "loss_weighting": loss_weighting
         }
 
     def rot_sample_kappa(self, t):

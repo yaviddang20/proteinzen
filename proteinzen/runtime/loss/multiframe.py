@@ -95,10 +95,10 @@ def multiframe_fm_loss(
     trans_1_pred = denoised_frames.get_trans()
     trans_1 = gt_frames.get_trans()
     if trans_preconditioning:
-        trans_vf_loss = torch.square(trans_1_pred - trans_1).sum(dim=-1)
+        trans_vf_loss = torch.square(trans_1_pred - trans_1).sum(dim=-1) / (nodewise_norm_scale[..., None] ** 2)
         if polar_upweight:
             trans_vf_loss = trans_vf_loss * (res_data["polar_mask"].float() + 1)[..., None]
-        trans_vf_loss = _nodewise_to_graphwise(trans_vf_loss, res_data.batch, mask) * batch['trans_loss_weighting']
+        trans_vf_loss = _nodewise_to_graphwise(trans_vf_loss, res_data.batch, total_mask) * batch['trans_loss_weighting']
     else:
         trans_vf_loss = torch.square(trans_1_pred - trans_1).sum(dim=-1) / (nodewise_norm_scale[..., None] ** 2)
         if polar_upweight:

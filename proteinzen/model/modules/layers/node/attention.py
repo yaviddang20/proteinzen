@@ -1,4 +1,5 @@
 from proteinzen.model.modules.openfold.layers import Linear, flatten_final_dims, ipa_point_weights_init_
+from proteinzen.model.modules.openfold.layers_v2 import LayerNorm
 from proteinzen.utils.openfold.rigid_utils import Rigid
 
 
@@ -292,8 +293,8 @@ class FlashTransformerEncoderLayer(nn.Module):
 
         self.lin_q = Linear(h_dim, self.h_head * no_heads, bias=bias)
         self.lin_kv = Linear(h_dim, 2 * self.h_head * no_heads, bias=bias)
-        self.ln1 = nn.LayerNorm(h_dim)
-        self.ln2 = nn.LayerNorm(h_dim)
+        self.ln1 = LayerNorm(h_dim)
+        self.ln2 = LayerNorm(h_dim)
         self.dropout = nn.Dropout(dropout)
 
         self.ffn = nn.Sequential(

@@ -286,8 +286,18 @@ class IPMPDecoder(nn.Module):
             for _ in range(num_layers)
         ])
 
-        self.seq_head = nn.Linear(c_s, 20)
-        self.torsion_pred = nn.Linear(c_s + 20, (4 + 1) * 2)
+        # self.seq_head = nn.Linear(c_s, 20)
+        # self.torsion_pred = nn.Linear(c_s + 20, (4 + 1) * 2)
+        self.seq_head = nn.Sequential(
+            nn.Linear(c_s, 2*c_s),
+            nn.ReLU(),
+            nn.Linear(2*c_s, 20)
+        )
+        self.torsion_pred = nn.Sequential(
+            nn.Linear(c_s + 20, 2 * c_s),
+            nn.ReLU(),
+            nn.Linear(2*c_s, (4 + 1) * 2)
+        )
 
         self.gumbel_softmax_pred_seq = gumbel_softmax_pred_seq
         if gumbel_softmax_pred_seq:

@@ -94,6 +94,7 @@ class ProteinInterpolation(Task):
                  vae_seq_masking=False,
                  vae_loss=True,
                  vae_seq_loss=True,
+                 pt_seq_loss=True,
                  train_vae_only=False,
                  no_grad_encoder=False,
                  latent_fm_loss_scale=1,
@@ -142,6 +143,7 @@ class ProteinInterpolation(Task):
         self.vae_seq_masking = vae_seq_masking
         self.vae_loss = vae_loss
         self.vae_seq_loss = vae_seq_loss
+        self.pt_seq_loss = pt_seq_loss
         self.no_grad_encoder = no_grad_encoder
         self.train_vae_only = train_vae_only
         self.latent_fm_loss_scale = latent_fm_loss_scale
@@ -777,6 +779,7 @@ class ProteinInterpolation(Task):
                 decoder_output['decoded_atom14'].detach().cpu()
             )
         )
+        print(sidechain_0[0], pred_latent_sidechain[0])
 
         encoder_inputs = batch#.copy()
         res_data = encoder_inputs['residue']
@@ -787,19 +790,19 @@ class ProteinInterpolation(Task):
         res_data['seq'] = argmax_seq
         encoder_inputs['name'] = "sample"
         latent_data = model.encoder(encoder_inputs, apply_noising_masks=self.vae_seq_masking)
-        print(
-            torch.mean(torch.linalg.vector_norm(pred_latent_sidechain - latent_data['latent_mu'], dim=-1)),
-            torch.mean(torch.linalg.vector_norm((0.5 * latent_data['latent_logvar']).exp()))
-        )
-        print(
-            torch.mean(
-                torch.abs(
-                    (pred_latent_sidechain - latent_data['latent_mu']) / (0.5 * latent_data['latent_logvar']).exp()
-                )
-            )
-        )
-        print(torch.mean(torch.linalg.vector_norm(pred_latent_sidechain, dim=-1)))
-        print(torch.mean(torch.linalg.vector_norm(latent_data['latent_mu'], dim=-1)))
+        # print(
+        #     torch.mean(torch.linalg.vector_norm(pred_latent_sidechain - latent_data['latent_mu'], dim=-1)),
+        #     torch.mean(torch.linalg.vector_norm((0.5 * latent_data['latent_logvar']).exp()))
+        # )
+        # print(
+        #     torch.mean(
+        #         torch.abs(
+        #             (pred_latent_sidechain - latent_data['latent_mu']) / (0.5 * latent_data['latent_logvar']).exp()
+        #         )
+        #     )
+        # )
+        # print(torch.mean(torch.linalg.vector_norm(pred_latent_sidechain, dim=-1)))
+        # print(torch.mean(torch.linalg.vector_norm(latent_data['latent_mu'], dim=-1)))
 
         # all_atom14 = decoder_output['decoded_all_atom14']
 
@@ -937,7 +940,7 @@ class ProteinInterpolation(Task):
                 # pt_loss_dict["atom14_mse"]
                 # + pt_loss_dict["sidechain_dists_mse"]
                 + pt_loss_dict["chi_loss"]
-                + pt_loss_dict["seq_loss"]
+                + pt_loss_dict["seq_loss"] * self.pt_seq_loss
             )
             if self.encoder_consistency_check:
                 consistency_loss_dict = latent_encoder_consistency_loss(

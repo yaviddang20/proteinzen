@@ -260,7 +260,7 @@ def autoencoder_losses(batch,
         "percent_masked": _nodewise_to_graphwise(
             (~seq_noising_mask).float(),
             res_data.batch,
-            torch.ones_like(mlm_mask)),
+            torch.ones_like(seq_noising_mask)),
         #  "kl_div_l1": kl_div[1],
     }
 

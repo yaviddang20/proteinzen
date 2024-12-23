@@ -495,6 +495,7 @@ class ChimeraDenseLatentWrapper(nn.Module):
                  decoder_gumbel_softmax=False,
                  use_traj_predictions=False,
                  encoder_use_ffn=False,
+                 encoder_tanh_out=False,
                  atom_max_neighbors=32,
                  atomic_r=5,
                  force_flash_transformer=False,
@@ -521,7 +522,8 @@ class ChimeraDenseLatentWrapper(nn.Module):
             use_ffn=encoder_use_ffn,
             compat_mode=compat_mode,
             atom_max_neighbors=atom_max_neighbors,
-            atomic_r=atomic_r
+            atomic_r=atomic_r,
+            tanh_out=encoder_tanh_out
         )
         assert not (use_ipa_decoder and use_mlp_decoder)
         if use_ipa_decoder:

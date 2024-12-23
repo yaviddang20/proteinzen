@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 from functools import partial
 import copy
@@ -687,12 +688,27 @@ class MoleculeModule(L.LightningModule):
 
 
 class ProteinModule(L.LightningModule):
-    def __init__(self, model, optim, val_dir="validation", freeze_encoder=False, freeze_decoder=False):
+    def __init__(self,
+                 model,
+                 optim,
+                 val_dir="validation",
+                 freeze_encoder=False,
+                 freeze_decoder=False,
+                 finetune_seq_head=False,
+                 use_amp=False,
+                 use_cosine_lr_sched=False,
+    ):
         super().__init__()
         self._log = logging.getLogger(__name__)
         self.model = model
         self.optim = optim
         self.val_dir = val_dir
+        self.use_amp = use_amp
+        self.use_cosine_lr_sched = use_cosine_lr_sched
+        self.finetune_seq_head = finetune_seq_head
+        if self.use_amp:
+            torch.set_float32_matmul_precision("medium")
+
 
         self.freeze_encoder = freeze_encoder
         self.freeze_decoder = freeze_decoder
@@ -721,8 +737,13 @@ class ProteinModule(L.LightningModule):
 
     def training_step(self, batch):
         task: TaskList = batch.task
-        outputs = task.run_evals(self.model, batch)
-        loss_dict = task.compile_task_losses(batch, outputs)
+        if self.use_amp:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                outputs = task.run_evals(self.model, batch)
+            loss_dict = task.compile_task_losses(batch, outputs)
+        else:
+            outputs = task.run_evals(self.model, batch)
+            loss_dict = task.compile_task_losses(batch, outputs)
 
         log_dict = tree.map_structure(
             lambda x: torch.round(torch.mean(x), decimals=3) if torch.is_tensor(x) else x,
@@ -817,6 +838,7 @@ class ProteinModule(L.LightningModule):
                 sync_dist=True)
 
             return
+
         else:
             self.log_dict(
                 log_dict,
@@ -962,24 +984,87 @@ class ProteinModule(L.LightningModule):
             )
             optim_D = self.optim(self.model.discriminator.parameters())
             return optim_G, optim_D
-
+        elif self.finetune_seq_head:
+            optimizer = self.optim(
+                list(self.model.decoder.seq_head.parameters())
+            )
+            return optimizer
         else:
             if self.freeze_encoder and self.freeze_decoder:
                 print("Freezing autoenc parameters")
-                return self.optim(
+                optimizer = self.optim(
                     list(self.model.denoiser.parameters())
                 )
             elif self.freeze_encoder:
                 print("Freezing encoder parameters")
-                return self.optim(
+                optimizer = self.optim(
                     list(self.model.denoiser.parameters())
                     + list(self.model.decoder.parameters())
                 )
             elif self.freeze_decoder:
                 print("Freezing decoder parameters")
-                return self.optim(
+                optimizer = self.optim(
                     list(self.model.denoiser.parameters())
                     + list(self.model.encoder.parameters())
                 )
             else:
-                return self.optim(self.model.parameters())
+                optimizer = self.optim(self.model.parameters())
+
+            if self.use_cosine_lr_sched:
+                scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
+                    optimizer,
+                    num_warmup_steps=0,
+                    num_training_steps=int(1e6),
+                    num_cycles=1
+                )
+                return {
+                    'optimizer': optimizer,
+                    'lr_scheduler': scheduler
+                }
+            else:
+                return optimizer
+
+
+# from https://github.com/huggingface/transformers/blob/main/src/transformers/optimization.py
+def _get_cosine_with_hard_restarts_schedule_with_warmup_lr_lambda(
+    current_step: int, *, num_warmup_steps: int, num_training_steps: int, num_cycles: int
+):
+    if current_step < num_warmup_steps:
+        return float(current_step) / float(max(1, num_warmup_steps))
+    progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+    if progress >= 1.0:
+        return 0.0
+    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * ((float(num_cycles) * progress) % 1.0))))
+
+
+def get_cosine_with_hard_restarts_schedule_with_warmup(
+    optimizer: torch.optim.Optimizer, num_warmup_steps: int, num_training_steps: int, num_cycles: int = 1, last_epoch: int = -1
+):
+    """
+    Create a schedule with a learning rate that decreases following the values of the cosine function between the
+    initial lr set in the optimizer to 0, with several hard restarts, after a warmup period during which it increases
+    linearly between 0 and the initial lr set in the optimizer.
+
+    Args:
+        optimizer ([`~torch.optim.Optimizer`]):
+            The optimizer for which to schedule the learning rate.
+        num_warmup_steps (`int`):
+            The number of steps for the warmup phase.
+        num_training_steps (`int`):
+            The total number of training steps.
+        num_cycles (`int`, *optional*, defaults to 1):
+            The number of hard restarts to use.
+        last_epoch (`int`, *optional*, defaults to -1):
+            The index of the last epoch when resuming training.
+
+    Return:
+        `torch.optim.lr_scheduler.LambdaLR` with the appropriate schedule.
+    """
+
+    lr_lambda = partial(
+        _get_cosine_with_hard_restarts_schedule_with_warmup_lr_lambda,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps,
+        num_cycles=num_cycles,
+    )
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)

@@ -9,6 +9,7 @@ from typing import Optional, Callable, List, Sequence, Union
 import torch.nn.functional as F
 
 from proteinzen.utils.openfold.rigid_utils import Rigid
+from .layers_v2 import LayerNorm
 
 import importlib
 deepspeed_is_installed = importlib.util.find_spec("deepspeed") is not None
@@ -203,7 +204,7 @@ class StructureModuleTransition(nn.Module):
         self.linear_2 = Linear(self.c, self.c, init="relu")
         self.linear_3 = Linear(self.c, self.c, init="final")
         self.relu = nn.ReLU()
-        self.ln = nn.LayerNorm(self.c)
+        self.ln = LayerNorm(self.c)
         if dropout > 0:
             self.dropout = nn.Dropout(dropout)
         else:
@@ -245,7 +246,7 @@ class EdgeTransition(nn.Module):
             trunk_layers.append(nn.ReLU())
         self.trunk = nn.Sequential(*trunk_layers)
         self.final_layer = Linear(hidden_size, edge_embed_out, init="final")
-        self.layer_norm = nn.LayerNorm(edge_embed_out)
+        self.layer_norm = LayerNorm(edge_embed_out)
 
     def forward(self, node_embed, edge_embed):
         node_embed = self.initial_embed(node_embed)
@@ -319,8 +320,8 @@ class BaseTriangleMultiplicativeUpdate(nn.Module, ABC):
         self.linear_g = Linear(self.c_z, self.c_z, init="gating")
         self.linear_z = Linear(self.c_hidden, self.c_z, init="final")
 
-        self.layer_norm_in = nn.LayerNorm(self.c_z)
-        self.layer_norm_out = nn.LayerNorm(self.c_hidden)
+        self.layer_norm_in = LayerNorm(self.c_z)
+        self.layer_norm_out = LayerNorm(self.c_hidden)
 
         self.sigmoid = nn.Sigmoid()
 
@@ -524,7 +525,7 @@ class PairTransition(nn.Module):
         self.c_z = c_z
         self.n = n
 
-        self.layer_norm = nn.LayerNorm(self.c_z)
+        self.layer_norm = LayerNorm(self.c_z)
         self.linear_1 = Linear(self.c_z, self.n * self.c_z, init="relu")
         self.relu = nn.ReLU()
         self.linear_2 = Linear(self.n * self.c_z, c_z, init="final")
@@ -774,7 +775,7 @@ class LocalTriangleAttentionNew(nn.Module):
         self.dropout_row_layer = DropoutRowwise(pair_dropout)
         self.dropout_col_layer = DropoutColumnwise(pair_dropout)
 
-        self.layer_norm = nn.LayerNorm(c_z)
+        self.layer_norm = LayerNorm(c_z)
 
     def local_mha(self, x, rigids, num_neighbour,num_linear,triangle_bias, mask, starting_node):
         '''
@@ -991,7 +992,7 @@ class TriangleAttention(nn.Module):
         self.starting = starting
         self.inf = inf
 
-        self.layer_norm = nn.LayerNorm(self.c_in)
+        self.layer_norm = LayerNorm(self.c_in)
 
         self.linear = Linear(c_in, self.no_heads, bias=False, init="normal")
 
@@ -1062,7 +1063,8 @@ class InvariantPointAttention(nn.Module):
         eps: float = 1e-8,
         pre_ln=False,
         lin_bias=True,
-        final_init='final'
+        final_init='final',
+        use_compile_path=False
     ):
         """
         Args:
@@ -1089,6 +1091,7 @@ class InvariantPointAttention(nn.Module):
         self.no_v_points = num_v_points
         self.inf = inf
         self.eps = eps
+        self.use_compile_path = use_compile_path
 
         # These linear layers differ from their specifications in the
         # supplement. There, they lack bias and use Glorot initialization.
@@ -1120,8 +1123,90 @@ class InvariantPointAttention(nn.Module):
 
         self.pre_ln = pre_ln
         if pre_ln:
-            self.pre_ln_s = nn.LayerNorm(c_s)
-            self.pre_ln_z = nn.LayerNorm(c_z)
+            self.pre_ln_s = LayerNorm(c_s)
+            self.pre_ln_z = LayerNorm(c_z)
+
+    # @torch.compile()
+    def _attn(
+        self,
+        q,
+        k,
+        v,
+        q_pts,
+        k_pts,
+        v_pts,
+        z,
+        mask
+    ):
+        # [*, N_res, N_res, H]
+        b = self.linear_b(z)
+
+        # [*, H, N_res, N_res]
+        a = torch.matmul(
+            permute_final_dims(q, (1, 0, 2)),  # [*, H, N_res, C_hidden]
+            permute_final_dims(k, (1, 2, 0)),  # [*, H, C_hidden, N_res]
+        )
+        a *= math.sqrt(1.0 / (3 * self.c_hidden))
+        a += (math.sqrt(1.0 / 3) * permute_final_dims(b, (2, 0, 1)))
+
+        # [*, N_res, N_res, H, P_q, 3]
+        pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
+        pt_att = pt_displacement ** 2
+
+        # [*, N_res, N_res, H, P_q]
+        pt_att = sum(torch.unbind(pt_att, dim=-1))
+        head_weights = self.softplus(self.head_weights).view(
+            *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
+        )
+        head_weights = head_weights * math.sqrt(
+            1.0 / (3 * (self.no_qk_points * 9.0 / 2))
+        )
+        pt_att = pt_att * head_weights
+
+        # [*, N_res, N_res, H]
+        pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
+        # [*, N_res, N_res]
+        square_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
+        square_mask = self.inf * (square_mask - 1)
+
+        # [*, H, N_res, N_res]
+        pt_att = permute_final_dims(pt_att, (2, 0, 1))
+
+        a = a + pt_att
+        a = a + square_mask.unsqueeze(-3)
+        a = self.softmax(a)
+
+        ################
+        # Compute output
+        ################
+        # [*, N_res, H, C_hidden]
+        o = torch.matmul(
+            a, v.transpose(-2, -3).to(dtype=a.dtype)
+        ).transpose(-2, -3)
+
+        # [*, N_res, H * C_hidden]
+        o = flatten_final_dims(o, 2)
+
+        # [*, H, 3, N_res, P_v]
+        o_pt = torch.sum(
+            (
+                a[..., None, :, :, None]
+                * permute_final_dims(v_pts, (1, 3, 0, 2))[..., None, :, :]
+            ),
+            dim=-2,
+        )
+
+        # [*, N_res, H, P_v, 3]
+        o_pt = permute_final_dims(o_pt, (2, 0, 3, 1))
+
+        # [*, N_res, H, C_z // 4]
+        pair_z = self.down_z(z).to(dtype=a.dtype)
+        o_pair = torch.matmul(a.transpose(-2, -3), pair_z)
+
+        # [*, N_res, H * C_z // 4]
+        o_pair = flatten_final_dims(o_pair, 2)
+
+        return o, o_pt, o_pair
 
     def forward(
         self,
@@ -1204,87 +1289,8 @@ class InvariantPointAttention(nn.Module):
         ##########################
         # Compute attention scores
         ##########################
-        # [*, N_res, N_res, H]
-        b = self.linear_b(z[0])
-
-        if(_offload_inference):
-            z[0] = z[0].cpu()
-
-        if flash_attn:
-            # TODO: i need to validate the performance/speed of this implementation
-            # since this does some weird stuff to make use of scaled_dot_product_attention
-            # raise NotImplementedError()
-            q = permute_final_dims(q, (1, 0, 2))  # [*, H, N_res, C_hidden]
-            k = permute_final_dims(k, (1, 0, 2))  # [*, H, N_res, C_hidden]
-            scale = math.sqrt(1.0 / (3 * self.c_hidden))
-
-            bias = 0
-            bias += (math.sqrt(1.0 / 3) * permute_final_dims(b, (2, 0, 1)))
-
-            # [*, N_res, N_res, H, P_q, 3]
-            pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
-            pt_att = pt_displacement ** 2
-
-            # [*, N_res, N_res, H, P_q]
-            pt_att = sum(torch.unbind(pt_att, dim=-1))
-            head_weights = self.softplus(self.head_weights).view(
-                *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
-            )
-            head_weights = head_weights * math.sqrt(
-                1.0 / (3 * (self.no_qk_points * 9.0 / 2))
-            )
-            pt_att = pt_att * head_weights
-
-            # [*, N_res, N_res, H]
-            pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
-            # [*, N_res, N_res]
-            square_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
-            square_mask = self.inf * (square_mask - 1)
-
-            # [*, H, N_res, N_res]
-            pt_att = permute_final_dims(pt_att, (2, 0, 1))
-
-            bias = bias + pt_att
-            bias = bias + square_mask.unsqueeze(-3)
-
-            v_in = [
-                v.transpose(-2, -3),  # [*, H, N_res, C_hidden]
-                flatten_final_dims(v_pts, 2).transpose(-2, -3),  # [*, H, N_res, P_v * 3]
-            ]
-
-            n_res = v.shape[1]
-            attn_score_collector = torch.arange(n_res, device=v.device)
-            # N_res x N_res
-            attn_score_collector = F.one_hot(attn_score_collector, num_classes=n_res)
-            v_in.append(
-                # [*, H, N_res, N_res]
-                torch.tile(attn_score_collector[None, None, :, :], (v.shape[0], self.no_heads, 1, 1))
-            )
-
-            split_lens = [t.shape[-1] for t in v_in]
-            # print([t.shape for t in v_in])
-            # print(q.shape, k.shape, bias.shape)
-            v_in = torch.cat(v_in, dim=-1)
-
-            v_out = F.scaled_dot_product_attention(
-                query=q,
-                key=k,
-                value=v_in,
-                attn_mask=bias,
-                scale=scale
-            )
-
-            ################
-            # Compute output
-            ################
-
-            o, o_pt, a = v_out.split(split_lens, dim=-1)
-
-            # [*, N_res, H * C_hidden]
-            o = flatten_final_dims(o.transpose(-2, -3), 2)
-
-            # [*, N_res, H, P_v, 3]
-            o_pt = o_pt.transpose(-2, -3).view(o_pt.shape[0], n_res, self.no_heads, -1, 3)
+        if self.use_compile_path:
+            o, o_pt, o_pair = self._attn(q, k, v, q_pts, k_pts, v_pts, z, mask)
             o_pt = r[..., None, None].invert_apply(o_pt)
 
             # [*, N_res, H * P_v]
@@ -1294,98 +1300,192 @@ class InvariantPointAttention(nn.Module):
 
             # [*, N_res, H * P_v, 3]
             o_pt = o_pt.reshape(*o_pt.shape[:-3], -1, 3)
-
-            if(_offload_inference):
-                z[0] = z[0].to(o_pt.device)
-
-            # [*, N_res, H, C_z // 4]
-            pair_z = self.down_z(z[0]).to(dtype=a.dtype)
-            o_pair = torch.matmul(a.transpose(-2, -3), pair_z)
-
-            # [*, N_res, H * C_z // 4]
-            o_pair = flatten_final_dims(o_pair, 2)
 
             o_feats = [o, *torch.unbind(o_pt, dim=-1), o_pt_norm_feats, o_pair]
 
         else:
-            # [*, H, N_res, N_res]
-            a = torch.matmul(
-                permute_final_dims(q, (1, 0, 2)),  # [*, H, N_res, C_hidden]
-                permute_final_dims(k, (1, 2, 0)),  # [*, H, C_hidden, N_res]
-            )
-            a *= math.sqrt(1.0 / (3 * self.c_hidden))
-            a += (math.sqrt(1.0 / 3) * permute_final_dims(b, (2, 0, 1)))
-
-            # [*, N_res, N_res, H, P_q, 3]
-            pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
-            pt_att = pt_displacement ** 2
-
-            # [*, N_res, N_res, H, P_q]
-            pt_att = sum(torch.unbind(pt_att, dim=-1))
-            head_weights = self.softplus(self.head_weights).view(
-                *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
-            )
-            head_weights = head_weights * math.sqrt(
-                1.0 / (3 * (self.no_qk_points * 9.0 / 2))
-            )
-            pt_att = pt_att * head_weights
-
             # [*, N_res, N_res, H]
-            pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
-            # [*, N_res, N_res]
-            square_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
-            square_mask = self.inf * (square_mask - 1)
-
-            # [*, H, N_res, N_res]
-            pt_att = permute_final_dims(pt_att, (2, 0, 1))
-
-            a = a + pt_att
-            a = a + square_mask.unsqueeze(-3)
-            a = self.softmax(a)
-
-            ################
-            # Compute output
-            ################
-            # [*, N_res, H, C_hidden]
-            o = torch.matmul(
-                a, v.transpose(-2, -3).to(dtype=a.dtype)
-            ).transpose(-2, -3)
-
-            # [*, N_res, H * C_hidden]
-            o = flatten_final_dims(o, 2)
-
-            # [*, H, 3, N_res, P_v]
-            o_pt = torch.sum(
-                (
-                    a[..., None, :, :, None]
-                    * permute_final_dims(v_pts, (1, 3, 0, 2))[..., None, :, :]
-                ),
-                dim=-2,
-            )
-
-            # [*, N_res, H, P_v, 3]
-            o_pt = permute_final_dims(o_pt, (2, 0, 3, 1))
-            o_pt = r[..., None, None].invert_apply(o_pt)
-
-            # [*, N_res, H * P_v]
-            o_pt_dists = torch.sqrt(torch.sum(o_pt ** 2, dim=-1) + self.eps)
-            o_pt_norm_feats = flatten_final_dims(
-                o_pt_dists, 2)
-
-            # [*, N_res, H * P_v, 3]
-            o_pt = o_pt.reshape(*o_pt.shape[:-3], -1, 3)
+            b = self.linear_b(z[0])
 
             if(_offload_inference):
-                z[0] = z[0].to(o_pt.device)
+                z[0] = z[0].cpu()
 
-            # [*, N_res, H, C_z // 4]
-            pair_z = self.down_z(z[0]).to(dtype=a.dtype)
-            o_pair = torch.matmul(a.transpose(-2, -3), pair_z)
+            if flash_attn:
+                # TODO: i need to validate the performance/speed of this implementation
+                # since this does some weird stuff to make use of scaled_dot_product_attention
+                # raise NotImplementedError()
+                q = permute_final_dims(q, (1, 0, 2))  # [*, H, N_res, C_hidden]
+                k = permute_final_dims(k, (1, 0, 2))  # [*, H, N_res, C_hidden]
+                scale = math.sqrt(1.0 / (3 * self.c_hidden))
 
-            # [*, N_res, H * C_z // 4]
-            o_pair = flatten_final_dims(o_pair, 2)
+                bias = 0
+                bias += (math.sqrt(1.0 / 3) * permute_final_dims(b, (2, 0, 1)))
 
-            o_feats = [o, *torch.unbind(o_pt, dim=-1), o_pt_norm_feats, o_pair]
+                # [*, N_res, N_res, H, P_q, 3]
+                pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
+                pt_att = pt_displacement ** 2
+
+                # [*, N_res, N_res, H, P_q]
+                pt_att = sum(torch.unbind(pt_att, dim=-1))
+                head_weights = self.softplus(self.head_weights).view(
+                    *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
+                )
+                head_weights = head_weights * math.sqrt(
+                    1.0 / (3 * (self.no_qk_points * 9.0 / 2))
+                )
+                pt_att = pt_att * head_weights
+
+                # [*, N_res, N_res, H]
+                pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
+                # [*, N_res, N_res]
+                square_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
+                square_mask = self.inf * (square_mask - 1)
+
+                # [*, H, N_res, N_res]
+                pt_att = permute_final_dims(pt_att, (2, 0, 1))
+
+                bias = bias + pt_att
+                bias = bias + square_mask.unsqueeze(-3)
+
+                v_in = [
+                    v.transpose(-2, -3),  # [*, H, N_res, C_hidden]
+                    flatten_final_dims(v_pts, 2).transpose(-2, -3),  # [*, H, N_res, P_v * 3]
+                ]
+
+                n_res = v.shape[1]
+                attn_score_collector = torch.arange(n_res, device=v.device)
+                # N_res x N_res
+                attn_score_collector = F.one_hot(attn_score_collector, num_classes=n_res)
+                v_in.append(
+                    # [*, H, N_res, N_res]
+                    torch.tile(attn_score_collector[None, None, :, :], (v.shape[0], self.no_heads, 1, 1))
+                )
+
+                split_lens = [t.shape[-1] for t in v_in]
+                # print([t.shape for t in v_in])
+                # print(q.shape, k.shape, bias.shape)
+                v_in = torch.cat(v_in, dim=-1)
+
+                v_out = F.scaled_dot_product_attention(
+                    query=q,
+                    key=k,
+                    value=v_in,
+                    attn_mask=bias,
+                    scale=scale
+                )
+
+                ################
+                # Compute output
+                ################
+
+                o, o_pt, a = v_out.split(split_lens, dim=-1)
+
+                # [*, N_res, H * C_hidden]
+                o = flatten_final_dims(o.transpose(-2, -3), 2)
+
+                # [*, N_res, H, P_v, 3]
+                o_pt = o_pt.transpose(-2, -3).view(o_pt.shape[0], n_res, self.no_heads, -1, 3)
+                o_pt = r[..., None, None].invert_apply(o_pt)
+
+                # [*, N_res, H * P_v]
+                o_pt_dists = torch.sqrt(torch.sum(o_pt ** 2, dim=-1) + self.eps)
+                o_pt_norm_feats = flatten_final_dims(
+                    o_pt_dists, 2)
+
+                # [*, N_res, H * P_v, 3]
+                o_pt = o_pt.reshape(*o_pt.shape[:-3], -1, 3)
+
+                if(_offload_inference):
+                    z[0] = z[0].to(o_pt.device)
+
+                # [*, N_res, H, C_z // 4]
+                pair_z = self.down_z(z[0]).to(dtype=a.dtype)
+                o_pair = torch.matmul(a.transpose(-2, -3), pair_z)
+
+                # [*, N_res, H * C_z // 4]
+                o_pair = flatten_final_dims(o_pair, 2)
+
+                o_feats = [o, *torch.unbind(o_pt, dim=-1), o_pt_norm_feats, o_pair]
+
+            else:
+                # [*, H, N_res, N_res]
+                a = torch.matmul(
+                    permute_final_dims(q, (1, 0, 2)),  # [*, H, N_res, C_hidden]
+                    permute_final_dims(k, (1, 2, 0)),  # [*, H, C_hidden, N_res]
+                )
+                a *= math.sqrt(1.0 / (3 * self.c_hidden))
+                a += (math.sqrt(1.0 / 3) * permute_final_dims(b, (2, 0, 1)))
+
+                # [*, N_res, N_res, H, P_q, 3]
+                pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
+                pt_att = pt_displacement ** 2
+
+                # [*, N_res, N_res, H, P_q]
+                pt_att = sum(torch.unbind(pt_att, dim=-1))
+                head_weights = self.softplus(self.head_weights).view(
+                    *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
+                )
+                head_weights = head_weights * math.sqrt(
+                    1.0 / (3 * (self.no_qk_points * 9.0 / 2))
+                )
+                pt_att = pt_att * head_weights
+
+                # [*, N_res, N_res, H]
+                pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
+                # [*, N_res, N_res]
+                square_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
+                square_mask = self.inf * (square_mask - 1)
+
+                # [*, H, N_res, N_res]
+                pt_att = permute_final_dims(pt_att, (2, 0, 1))
+
+                a = a + pt_att
+                a = a + square_mask.unsqueeze(-3)
+                a = self.softmax(a)
+
+                ################
+                # Compute output
+                ################
+                # [*, N_res, H, C_hidden]
+                o = torch.matmul(
+                    a, v.transpose(-2, -3).to(dtype=a.dtype)
+                ).transpose(-2, -3)
+
+                # [*, N_res, H * C_hidden]
+                o = flatten_final_dims(o, 2)
+
+                # [*, H, 3, N_res, P_v]
+                o_pt = torch.sum(
+                    (
+                        a[..., None, :, :, None]
+                        * permute_final_dims(v_pts, (1, 3, 0, 2))[..., None, :, :]
+                    ),
+                    dim=-2,
+                )
+
+                # [*, N_res, H, P_v, 3]
+                o_pt = permute_final_dims(o_pt, (2, 0, 3, 1))
+                o_pt = r[..., None, None].invert_apply(o_pt)
+
+                # [*, N_res, H * P_v]
+                o_pt_dists = torch.sqrt(torch.sum(o_pt ** 2, dim=-1) + self.eps)
+                o_pt_norm_feats = flatten_final_dims(
+                    o_pt_dists, 2)
+
+                # [*, N_res, H * P_v, 3]
+                o_pt = o_pt.reshape(*o_pt.shape[:-3], -1, 3)
+
+                if(_offload_inference):
+                    z[0] = z[0].to(o_pt.device)
+
+                # [*, N_res, H, C_z // 4]
+                pair_z = self.down_z(z[0]).to(dtype=a.dtype)
+                o_pair = torch.matmul(a.transpose(-2, -3), pair_z)
+
+                # [*, N_res, H * C_z // 4]
+                o_pair = flatten_final_dims(o_pair, 2)
+
+                o_feats = [o, *torch.unbind(o_pt, dim=-1), o_pt_norm_feats, o_pair]
 
         # [*, N_res, C_s]
         s = self.linear_out(

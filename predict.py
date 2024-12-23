@@ -126,6 +126,7 @@ class Experiment:
                     # clean_traj_seqs = batch['clean_traj_seqs']
                     # prot_trajs = batch['prot_trajs']
                     # for clean_traj, clean_seq, prot_traj, sample_id in zip(clean_trajs, clean_traj_seqs, prot_trajs, sample_ids):
+                    #     sample_len = len(clean_seq[0])
                     #     clean_traj_name = f"clean_traj_len_{sample_len}_protein_{sample_id}.pdb"
                     #     prot_traj_name = f"prot_traj_len_{sample_len}_protein_{sample_id}.pdb"
                     #     clean_models = []
@@ -134,9 +135,10 @@ class Experiment:
                     #         clean = clean_traj[i]
                     #         # seq = clean_seq[i].argmax(dim=-1)
                     #         seq = clean_seq[i]
-                    #         seq = "".join([restypes[j] for j in seq.tolist()])
-                    #         print(seq)
-                    #         prot = prot_traj[i]
+                    #         print("".join([restypes[j] for j in seq.tolist()]))
+                    #         seq = "".join(["W" for _ in seq.tolist()])
+                    #         # seq = "".join([restypes[j] for j in seq.tolist()])
+                    #         # prot = prot_traj[i]
                     #         sample_len = clean.shape[0]
                     #         clean_atom91, _ = atom14_to_atom91(seq, clean.numpy(force=True))
                     #         clean_chain = atom91_to_chain(
@@ -145,18 +147,18 @@ class Experiment:
                     #             "A"
                     #         )
                     #         all_ala = "".join(["A" for _ in range(sample_len)])
-                    #         prot_atom91, _ = atom14_to_atom91(all_ala, prot.numpy(force=True))
-                    #         prot_chain = atom91_to_chain(
-                    #             all_ala,
-                    #             prot_atom91,
-                    #             "A"
-                    #         )
+                    #         # prot_atom91, _ = atom14_to_atom91(all_ala, prot.numpy(force=True))
+                    #         # prot_chain = atom91_to_chain(
+                    #         #     all_ala,
+                    #         #     prot_atom91,
+                    #         #     "A"
+                    #         # )
                     #         clean_model = chains_to_model([clean_chain], model_id=i)
-                    #         prot_model = chains_to_model([prot_chain], model_id=i)
+                    #         # prot_model = chains_to_model([prot_chain], model_id=i)
                     #         clean_models.append(clean_model)
-                    #         prot_models.append(prot_model)
+                    #         # prot_models.append(prot_model)
                     #     save_struct(models_to_struct(reversed(clean_models)), clean_traj_name)
-                    #     save_struct(models_to_struct(reversed(prot_models)), prot_traj_name)
+                    #     # save_struct(models_to_struct(reversed(prot_models)), prot_traj_name)
                     # for i, sample in enumerate(samples):
                     #     sample_len = sample.shape[0]
                     #     sample_id = sample_ids[i]
@@ -179,9 +181,6 @@ class Experiment:
                     #     torch.save(data, f"len_{sample_len}_protein_{sample_id}_traj_data.pt")
 
 
-
-
-
 def main(model,
          corrupter,
          datamodule,
@@ -201,7 +200,11 @@ def main(model,
 
     # corrupter._sample_cfg.num_timesteps = 200
     # corrupter._sample_cfg.num_timesteps = 500
-    corrupter.se3_noiser._sample_cfg.num_timesteps = 200
+    if hasattr(corrupter, "se3_noiser"):
+        corrupter.se3_noiser._sample_cfg.num_timesteps = 200
+        # corrupter.se3_noiser._rots_cfg.exp_rate = 5
+    else:
+        corrupter._sample_cfg.num_timesteps = 200
     # corrupter.se3_noiser._sample_cfg.num_timesteps = 500
     # corrupter._sample_cfg.num_timesteps = 200
     # corrupter._rots_cfg.exp_rate = 5

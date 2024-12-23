@@ -831,6 +831,21 @@ class Rotation:
         else:
             raise ValueError("Both rotations are None")
 
+    def reshape(self, *shape: Sequence) -> Rotation:
+        if len(shape) == 1 and isinstance(shape[0], (list, tuple)):
+                shape = shape[0]
+
+        if(self._rot_mats is not None):
+            return Rotation(rot_mats=self._rot_mats.reshape(list(shape) + [3, 3]), quats=None)
+        elif(self._quats is not None):
+            return Rotation(
+                rot_mats=None,
+                quats=self._quats.reshape(list(shape) + [4]),
+                normalize_quats=False,
+            )
+        else:
+            raise ValueError("Both rotations are None")
+
 
 
 class Rigid:
@@ -1422,7 +1437,7 @@ class Rigid:
             Change the dtype of the Rigid
 
             Returns:
-                A version of the transformation with the specified dtype 
+                A version of the transformation with the specified dtype
         """
         return Rigid(self._rots.to(device=self._rots.device, dtype=dtype), self._trans.to(dtype=dtype))
 

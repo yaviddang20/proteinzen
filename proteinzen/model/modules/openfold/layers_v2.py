@@ -169,6 +169,48 @@ class Linear(nn.Linear):
                 raise ValueError("Invalid init string.")
 
 
+class LayerNorm(nn.Module):
+    def __init__(self, c_in, eps=1e-5, elementwise_affine=True, bias=True):
+        super(LayerNorm, self).__init__()
+
+        self.c_in = (c_in,)
+        self.eps = eps
+
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(c_in))
+            if bias:
+                self.bias = nn.Parameter(torch.zeros(c_in))
+            else:
+                self.bias = None
+        else:
+            self.weight = None
+            self.bias = None
+
+    def forward(self, x):
+        d = x.dtype
+        deepspeed_is_initialized = (
+            deepspeed_is_installed and
+            deepspeed.comm.comm.is_initialized()
+        )
+        if(d is torch.bfloat16 and not deepspeed_is_initialized):
+            with torch.cuda.amp.autocast(enabled=False):
+                out = nn.functional.layer_norm(
+                    x,
+                    self.c_in,
+                    self.weight.to(dtype=d) if self.weight is not None else None,
+                    self.bias.to(dtype=d) if self.bias is not None else None,
+                    self.eps
+                )
+        else:
+            out = nn.functional.layer_norm(
+                x,
+                self.c_in,
+                self.weight,
+                self.bias,
+                self.eps,
+            )
+
+        return out
 
 class BackboneUpdate(nn.Module):
     """
@@ -185,7 +227,7 @@ class BackboneUpdate(nn.Module):
 
         self.c_s = c_s
 
-        self.ln = nn.LayerNorm(self.c_s)
+        self.ln = LayerNorm(self.c_s)
         self.linear_s = Linear(self.c_s, 6, init="final", bias=False)
 
     def forward(self, s: torch.Tensor):
@@ -208,7 +250,7 @@ class Transition(nn.Module):
         self.c = c
         self.n = n
 
-        self.ln = nn.LayerNorm(self.c)
+        self.ln = LayerNorm(self.c)
         self.lin_a = Linear(self.c, self.c * n, init="relu")
         self.lin_b = Linear(self.c, self.c * n, init="relu")
         self.lin_out = Linear(self.c * n, self.c, init="final")
@@ -224,8 +266,8 @@ class Transition(nn.Module):
 class AdaLN(nn.Module):
     def __init__(self, c_s, c_cond):
         super().__init__()
-        self.ln_s = nn.LayerNorm(c_s, elementwise_affine=False, bias=False)
-        self.ln_cond = nn.LayerNorm(c_cond, bias=False)
+        self.ln_s = LayerNorm(c_s, elementwise_affine=False, bias=False)
+        self.ln_cond = LayerNorm(c_cond, bias=False)
         self.lin_cond = Linear(c_cond, c_s)
         self.lin_cond_nobias = Linear(c_cond, c_s, bias=False)
 
@@ -262,8 +304,8 @@ class TorsionAngles(nn.Module):
         self.eps = eps
         self.num_torsions = num_torsions
 
-        self.ln_1 = nn.LayerNorm(c)
-        self.ln_2 = nn.LayerNorm(c)
+        self.ln_1 = LayerNorm(c)
+        self.ln_2 = LayerNorm(c)
         self.linear_1 = Linear(self.c, self.c, init="relu")
         self.linear_2 = Linear(self.c, self.c, init="relu")
         self.linear_final = Linear(
@@ -363,7 +405,7 @@ class ConditionedInvariantPointAttention(nn.Module):
         self.softplus = nn.Softplus()
 
         self.ln_s = AdaLN(c_s=c_s, c_cond=c_cond)
-        self.ln_z = nn.LayerNorm(c_z)
+        self.ln_z = LayerNorm(c_z)
 
     def forward(
         self,

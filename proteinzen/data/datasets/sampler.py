@@ -35,8 +35,12 @@ class BatchSampler:
         self.batch_by_edge_fn = batch_by_edge_fn
 
         self._form_batches()
+        self._need_to_rebatch = False
 
     def _form_batches(self):
+        if not self._need_to_rebatch:
+            return
+
         self.batches = []
         if self.shuffle:
             random.shuffle(self.idx)
@@ -52,17 +56,22 @@ class BatchSampler:
                     n_nodes += self.node_counts[next_idx]
                 batch.append(next_idx)
             self.batches.append(batch)
+        self._need_to_rebatch = False
 
     def __len__(self):
+        print(f"len called, current len is {len(self.batches)}")
         if not hasattr(self, "batches"):
             self._form_batches()
         return len(self.batches)
 
     def __iter__(self):
-        for batch in self.batches:
-            yield batch
+        print(f"__iter__ called, current len is {len(self.batches)}")
         if self.shuffle:
             self._form_batches()
+        for batch in self.batches:
+            yield batch
+        self._need_to_rebatch = True
+
 
 
 class ClusteredBatchSampler:

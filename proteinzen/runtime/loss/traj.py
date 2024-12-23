@@ -211,6 +211,48 @@ def interm_multirigid_loss(
         )
     return 0.01 * trans_loss + rot_loss
 
+
+def interm_pred_framepair_dist_loss(
+    gt_rigids,
+    framepair_preds_dict,
+    rigids_mask,
+    D_min=0,
+    D_max=10,
+    num_bins=22
+):
+    lower = torch.linspace(
+        D_min,
+        D_max,
+        num_bins,
+        device=rigids_mask.device)
+
+    to_queries = framepair_preds_dict['to_queries']
+    to_keys = framepair_preds_dict['to_keys']
+    n_padding = framepair_preds_dict['n_padding']
+    # n_batch x n_block x block_q x block_k x n_bins
+    dist_logits = framepair_preds_dict['logits']
+
+    n_batch = gt_rigids.shape[0]
+    gt_rigids = gt_rigids.view(n_batch, -1)
+    gt_trans = gt_rigids.get_trans()
+    gt_trans = F.pad(gt_trans, (0, 0, 0, n_padding))
+    gt_q_trans = to_queries(gt_trans)
+    gt_k_trans = to_keys(gt_trans)
+    gt_dist = torch.linalg.vector_norm(gt_q_trans[..., None, :] - gt_k_trans[..., None, :, :], dim=-1)
+    mask_padded = F.pad(rigids_mask.view(n_batch, -1).float(), (0, n_padding))[..., None]
+    q_mask = to_queries(mask_padded)
+    k_mask = to_keys(mask_padded)
+    edge_mask = q_mask[..., None, :] * k_mask[..., None, :, :]
+
+    # n_batch x n_block x block_q x block_k
+    dgram_labels = (gt_dist[..., None] > lower).long()
+    dgram_labels = torch.clip(dgram_labels.sum(dim=-1) - 1, min=0)
+    # n_batch x n_bins x n_block x block_q x block_k
+    dist_logits = dist_logits.permute((0, 4, 1, 2, 3))
+    cce = F.cross_entropy(dist_logits, dgram_labels, reduction="none")
+    edge_mask = edge_mask.squeeze(-1)
+    return (cce * edge_mask).sum(dim=(-1, -2, -3)) / edge_mask.float().sum(dim=(-1, -2, -3))
+
 def multiframe_traj_loss(
     batch,
     model_outputs,
@@ -241,12 +283,15 @@ def multiframe_traj_loss(
     rigids_per_res = rigids_1.shape[-1]
 
     bb_loss = 0
+    rigids_loss = 0
     pred_dist_loss = 0
+    pred_framepair_dist_loss = 0
     seq_loss = 0
+    seqpair_loss = 0
     for k in range(n_layers):
         data_k = traj_data[k]
-        scale = traj_decay_factor ** (n_layers - k)
-        bb_loss_k = interm_multirigid_loss(
+        scale = traj_decay_factor ** (n_layers - k + 1)
+        rigids_loss_k = interm_multirigid_loss(
             noised_rigids=rigids_t.view(-1, rigids_per_res),
             gt_rigids=rigids_1.view(-1, rigids_per_res),
             pred_rigids=data_k['rigids'].view(-1, rigids_per_res),
@@ -266,12 +311,55 @@ def multiframe_traj_loss(
             reduction="none"
         ).sum(dim=-1) / res_mask.float().sum(dim=-1)
 
-        bb_loss += bb_loss_k * scale
-        pred_dist_loss += dist_loss_k * scale
-        seq_loss += seq_loss_k * scale
+        rigids_loss = rigids_loss + rigids_loss_k * scale
+        pred_dist_loss = pred_dist_loss + dist_loss_k * scale
+        seq_loss = seq_loss + seq_loss_k * scale
+
+        if 'bb_rigids' in data_k:
+            bb_loss_k = interm_rigid_loss(
+                noised_rigids=rigids_t.view(-1, rigids_per_res)[..., 0],
+                gt_rigids=rigids_1.view(-1, rigids_per_res)[..., 0],
+                pred_rigids=data_k['bb_rigids'].view(-1),
+                res_batch=res_data.batch,
+                total_mask=res_data['res_mask']
+            )
+            bb_loss = bb_loss + bb_loss_k * scale
+        else:
+            bb_loss += torch.zeros_like(rigids_loss_k)
+
+        if 'framepair_logits_dict' in data_k:
+            rigids_mask = res_mask[..., None].tile((1, 1, rigids_per_res))
+            framepair_dist_loss_k = interm_pred_framepair_dist_loss(
+                gt_rigids=rigids_1.view(batch.num_graphs, -1),
+                framepair_preds_dict=data_k['framepair_logits_dict'],
+                rigids_mask=rigids_mask
+            )
+            pred_framepair_dist_loss = pred_framepair_dist_loss + framepair_dist_loss_k * scale
+        else:
+            pred_framepair_dist_loss = pred_framepair_dist_loss + torch.zeros_like(rigids_loss_k)
+
+        if 'seqpair_logits' in data_k:
+            # n_batch x n_logits x n_res x n_res
+            seqpair_logits = data_k['seqpair_logits'].permute((0, 3, 1, 2))
+            n_aa = data_k['seq_logits'].shape[-1]
+            assert n_aa * n_aa == seqpair_logits.shape[1]
+            gt_seq = res_data['seq'].view(batch.num_graphs, -1)
+            # n_batch x n_res x n_res
+            gt_pairwise_seq = gt_seq[..., :, None] * n_aa + gt_seq[..., None, :]
+            seqpair_loss_k = F.cross_entropy(
+                seqpair_logits,
+                gt_pairwise_seq.long(),
+                reduction="none"
+            ).sum(dim=(-1, -2)) / edge_mask.float().sum(dim=(-1, -2))
+            seqpair_loss = seqpair_loss + seqpair_loss_k * scale
+        else:
+            seqpair_loss = seqpair_loss + torch.zeros_like(rigids_loss_k)
 
     return {
         "traj_bb_loss": bb_loss / n_layers,
+        "traj_rigids_loss": rigids_loss / n_layers,
         "traj_pred_dist_loss": pred_dist_loss / n_layers,
-        "traj_seq_loss": seq_loss / n_layers-1
+        "traj_pred_framepair_dist_loss": pred_framepair_dist_loss / n_layers,
+        "traj_seq_loss": seq_loss / n_layers,
+        "traj_seqpair_loss": seqpair_loss / n_layers,
     }

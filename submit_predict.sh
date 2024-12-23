@@ -8,6 +8,7 @@
 #$ -pe smp 1
 #$ -l mem_free=32G
 #$ -l h_rt=7:00:00
+#$ -l h=!(qb3-atgpu32)
 #$ -l compute_cap=61,gpu_mem=40G
 
 export CUDA_VISIBLE_DEVICES=$SGE_GPU

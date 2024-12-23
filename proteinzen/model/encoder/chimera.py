@@ -215,7 +215,8 @@ class ProteinAtomicChimeraEmbedder(nn.Module):
         ipmp_dropout=0.1,
         ipmp_edge_dropout=0.2,
         conv_downsample_factor=0,
-        compat_mode=True
+        compat_mode=True,
+        tanh_out=False
     ):
         super().__init__()
         assert n_layers >= 4
@@ -234,6 +235,7 @@ class ProteinAtomicChimeraEmbedder(nn.Module):
         self.num_pos_embed = num_pos_embed
         self.num_aa = num_aa
         self.lrange_graph = lrange_graph
+        self.tanh_out = tanh_out
 
         self.atomic_r = atomic_r
         self.atom_max_neighbors = atom_max_neighbors
@@ -338,8 +340,15 @@ class ProteinAtomicChimeraEmbedder(nn.Module):
         else:
             h_frame_interim = c_s
 
-        self.latent_mu = nn.Linear(h_frame_interim, h_frame)
-        self.latent_logvar = nn.Linear(h_frame_interim, h_frame)
+        if self.tanh_out:
+            self.latent_mu = nn.Sequential(
+                nn.Linear(h_frame_interim, h_frame),
+                nn.Tanh()
+            )
+            self.latent_logvar = nn.Linear(h_frame_interim, h_frame)
+        else:
+            self.latent_mu = nn.Linear(h_frame_interim, h_frame)
+            self.latent_logvar = nn.Linear(h_frame_interim, h_frame)
 
     def _res_edge_rbf_features(self, bb_coords, edge_index, D_max, num_rbf, eps=1e-12):
         edge_dst, edge_src = edge_index
@@ -558,9 +567,11 @@ class ProteinAtomicChimeraEmbedder(nn.Module):
             final_res_features = self.transition(final_res_features)
             final_res_features = final_res_features.flatten(start_dim=0, end_dim=1)
 
-        out_dict = {
-            'latent_mu': self.latent_mu(final_res_features),
-            'latent_logvar': self.latent_logvar(final_res_features),
-        }
-
-        return out_dict
+        if self.tanh_out:
+            return self.latent_mu(final_res_features)
+        else:
+            out_dict = {
+                'latent_mu': self.latent_mu(final_res_features),
+                'latent_logvar': self.latent_logvar(final_res_features),
+            }
+            return out_dict

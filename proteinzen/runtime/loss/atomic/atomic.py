@@ -189,7 +189,7 @@ def smooth_lddt_loss(
     alt_atom14,
     batch,
     atom14_mask,
-    eps=1e-8,
+    eps=1e-6,
 ):
     """ smooth_lddt_loss from AlphaFold3
 

@@ -41,6 +41,7 @@ class MultiFrameInterpolation(Task):
                  scale_fape=False,
                  scale_fafe=False,
                  polar_upweight=False,
+                 trans_preconditioning=False,
     ):
         super().__init__()
         self.frame_noiser = protein_noiser
@@ -51,6 +52,8 @@ class MultiFrameInterpolation(Task):
         self.scale_fape = scale_fape
         self.scale_fafe = scale_fafe
         self.polar_upweight = polar_upweight
+        self.trans_preconditioning = trans_preconditioning
+
         self.rng = np.random.default_rng()
 
         self.polar_residues = torch.tensor([
@@ -146,6 +149,7 @@ class MultiFrameInterpolation(Task):
                     device='cuda:0'):
                     # device='cpu'):
         self.frame_noiser.set_device(device)
+        # model.self_conditioning = False
 
         num_res = inputs['num_res']
         total_num_res = sum(num_res)
@@ -198,6 +202,11 @@ class MultiFrameInterpolation(Task):
             ).to_tensor_7()
             t = torch.ones(batch.num_graphs, device=device) * t_1
             batch["t"] = t
+            if self.trans_preconditioning:
+                trans_var_scaling_dict = self.frame_noiser.var_scaling_factors(t)
+                batch['trans_c_skip'] = trans_var_scaling_dict['c_skip']
+                batch['trans_c_in'] = trans_var_scaling_dict['c_in']
+                batch['trans_c_out'] = trans_var_scaling_dict['c_out']
 
             denoiser_out = model(batch, self_condition=denoiser_out)
 
@@ -242,6 +251,11 @@ class MultiFrameInterpolation(Task):
         ).to_tensor_7()
         t = torch.ones(batch.num_graphs, device=device) * t_1
         batch["t"] = t
+        if self.trans_preconditioning:
+            trans_var_scaling_dict = self.frame_noiser.var_scaling_factors(t)
+            batch['trans_c_skip'] = trans_var_scaling_dict['c_skip']
+            batch['trans_c_in'] = trans_var_scaling_dict['c_in']
+            batch['trans_c_out'] = trans_var_scaling_dict['c_out']
 
         denoiser_out = model(batch, self_condition=denoiser_out)
 
@@ -284,7 +298,8 @@ class MultiFrameInterpolation(Task):
             t_norm_clip=0.9,
             square_aux_loss_time_factor=True,
             use_fafe=self.use_fafe,
-            polar_upweight=self.polar_upweight
+            polar_upweight=self.polar_upweight,
+            trans_preconditioning=self.trans_preconditioning
         )
 
         frame_vf_loss = (
@@ -323,8 +338,11 @@ class MultiFrameInterpolation(Task):
             + 0.25 * bb_denoising_finegrain_loss
             + atomic_loss
             + traj_loss_dict['traj_bb_loss']
+            + traj_loss_dict['traj_rigids_loss']
             + traj_loss_dict['traj_pred_dist_loss'] * 0.5
+            + traj_loss_dict['traj_pred_framepair_dist_loss'] * 0.5
             + traj_loss_dict['traj_seq_loss'] * 0.25
+            + traj_loss_dict['traj_seqpair_loss'] * 0.25
         )
         loss = loss.mean()
 
