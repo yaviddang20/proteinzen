@@ -799,7 +799,7 @@ class SequenceAtomTransformerBlock(nn.Module):
                 add_prev_atompair_features=False
     ):
         assert atompos.shape[1] % self.window_q == 0
-        assert atompos.shape[1] % self.window_k == 0
+        # assert atompos.shape[1] % self.window_k == 0
 
         atom_update, atompair_features = self.attn(
             atom_features,

@@ -271,12 +271,33 @@ class ProteinAtom10Interpolation(Task):
             d_t = t_2 - t_1
             trans_t_2 = self.se3_noiser._trans_euler_step(d_t, t_1, pred_trans_1, trans_t_1)
             rotmats_t_2 = self.se3_noiser._rots_euler_step(d_t, t_1, pred_rotmats_1, rotmats_t_1)
-            atom10_local_t_2 = self.sidechain_noiser._euler_step(
-                d_t,
-                t_1,
-                x_1=pred_atom10_local,
-                x_t=atom10_local_t_1
-            )
+
+            if self.sidechain_noiser.nonlocal_prior:
+                rigids_t_1 = ru.Rigid(
+                    rots=ru.Rotation(rot_mats=rotmats_t_1),
+                    trans=trans_t_1
+                )
+                rigids_t_2 = ru.Rigid(
+                    rots=ru.Rotation(rot_mats=rotmats_t_2),
+                    trans=trans_t_2
+                )
+                pred_atom10_global = pred_rigids[..., None].apply(pred_atom10_local)
+                atom10_global_t_1 = rigids_t_1[..., None].apply(atom10_local_t_1)
+                atom10_global_t_2 = self.sidechain_noiser._euler_step(
+                    d_t,
+                    t_1,
+                    x_1=pred_atom10_global,
+                    x_t=atom10_global_t_1
+                )
+                atom10_local_t_2 = rigids_t_2[..., None].invert_apply(atom10_global_t_2)
+            else:
+                atom10_local_t_2 = self.sidechain_noiser._euler_step(
+                    d_t,
+                    t_1,
+                    x_1=pred_atom10_local,
+                    x_t=atom10_local_t_1
+                )
+
 
             prot_traj.append(
                 (trans_t_2,
@@ -392,7 +413,7 @@ class ProteinAtom10Interpolation(Task):
         )
 
         atomic_loss = (
-            atom10_loss_dict["atom10_fm_loss"] * (0.01 if self.sidechain_noiser.nonlocal_prior else 1)
+            atom10_loss_dict["atom10_fm_loss"] * (0 if self.sidechain_noiser.nonlocal_prior else 1)
             + atom10_loss_dict["scaled_atom14_mse"]
             + atom10_loss_dict["seq_loss"]
             + atom10_loss_dict["smooth_lddt"]

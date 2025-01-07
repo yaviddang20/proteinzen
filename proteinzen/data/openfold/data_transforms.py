@@ -21,6 +21,7 @@ import numpy as np
 import torch
 
 from . import residue_constants as rc
+from proteinzen.data.constants import coarse_grain as cg
 from proteinzen.utils.openfold.rigid_utils import Rotation, Rigid
 from proteinzen.utils.openfold.tensor_utils import (
     tree_map,
@@ -377,6 +378,104 @@ def atom37_to_frames(protein, eps=1e-8):
     protein["rigidgroups_alt_gt_frames"] = alt_gt_frames_tensor
 
     return protein
+
+
+def atom37_to_cg_frames(protein, eps=1e-8):
+    aatype = protein["aatype"]
+    all_atom_positions = protein["all_atom_positions"]
+    all_atom_mask = protein["all_atom_mask"]
+
+    batch_dims = len(aatype.shape[:-1])
+
+    restype_cg_group_base_atom_names = np.full([21, 4, 3], "", dtype=object)
+    restype_cg_group_base_atom_names[:, 0, :] = ["C", "CA", "N"]
+    restype_cg_group_base_atom_names[:, 1, :] = ["CA", "C", "O"]
+
+    for restype, restype_letter in enumerate(rc.restypes):
+        resname = rc.restype_1to3[restype_letter]
+        for cg_group in [2, 3]:
+            if cg.cg_group_mask[resname][cg_group]:
+                names = cg.coarse_grain_sidechain_axes[resname][cg_group]
+                restype_cg_group_base_atom_names[
+                    restype, cg_group, :
+                ] = names
+
+    restype_cg_group_mask = all_atom_mask.new_zeros(
+        (*aatype.shape[:-1], 21, 4),
+    )
+    restype_cg_group_mask[..., 0] = 1
+    restype_cg_group_mask[..., 1] = 1
+    restype_cg_group_mask[..., :20, 2:] = all_atom_mask.new_tensor(
+        [cg.cg_group_mask[rc.restype_1to3[resname]][2:] for resname in rc.restypes]
+    )
+
+    lookuptable = rc.atom_order.copy()
+    lookuptable[""] = 0
+    lookup = np.vectorize(lambda x: lookuptable[x])
+    restype_cg_group_base_atom37_idx = lookup(
+        restype_cg_group_base_atom_names,
+    )
+    restype_cg_group_base_atom37_idx = aatype.new_tensor(
+        restype_cg_group_base_atom37_idx,
+    )
+    restype_cg_group_base_atom37_idx = (
+        restype_cg_group_base_atom37_idx.view(
+            *((1,) * batch_dims), *restype_cg_group_base_atom37_idx.shape
+        )
+    )
+
+    residx_cg_group_base_atom37_idx = batched_gather(
+        restype_cg_group_base_atom37_idx,
+        aatype,
+        dim=-3,
+        no_batch_dims=batch_dims,
+    )
+
+    base_atom_pos = batched_gather(
+        all_atom_positions,
+        residx_cg_group_base_atom37_idx,
+        dim=-2,
+        no_batch_dims=len(all_atom_positions.shape[:-2]),
+    )
+
+    gt_frames = Rigid.from_3_points(
+        p_neg_x_axis=base_atom_pos[..., 0, :],
+        origin=base_atom_pos[..., 1, :],
+        p_xy_plane=base_atom_pos[..., 2, :],
+        eps=eps,
+    )
+
+    group_exists = batched_gather(
+        restype_cg_group_mask,
+        aatype,
+        dim=-2,
+        no_batch_dims=batch_dims,
+    )
+
+    gt_atoms_exist = batched_gather(
+        all_atom_mask,
+        residx_cg_group_base_atom37_idx,
+        dim=-1,
+        no_batch_dims=len(all_atom_mask.shape[:-1]),
+    )
+    gt_exists = torch.min(gt_atoms_exist, dim=-1)[0] * group_exists
+
+    rots = torch.eye(3, dtype=all_atom_mask.dtype, device=aatype.device)
+    rots = torch.tile(rots, (*((1,) * batch_dims), 4, 1, 1))
+    rots[..., 0, 0, 0] = -1
+    rots[..., 0, 2, 2] = -1
+    rots = Rotation(rot_mats=rots)
+
+    gt_frames = gt_frames.compose(Rigid(rots, None))
+
+    gt_frames_tensor = gt_frames.to_tensor_4x4()
+
+    protein["cg_groups_gt_frames"] = gt_frames_tensor
+    protein["cg_groups_gt_exists"] = gt_exists
+    protein["cg_groups_group_exists"] = group_exists
+
+    return protein
+
 
 
 def get_chi_atom_indices():

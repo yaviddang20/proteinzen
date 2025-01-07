@@ -41,7 +41,8 @@ class Atom10Interpolant:
         self.nonlocal_prior = nonlocal_prior
         if nonlocal_prior:
             self.prior_std = 10
-
+            self.sig_data = 10
+            self.prior_offset = torch.zeros_like(self.prior_offset)
 
 
     def set_device(self, device):
@@ -125,6 +126,7 @@ class Atom10Interpolant:
         rigids = ru.Rigid.from_tensor_7(res_data['rigids_1'])
         atom10_local = rigids[..., None].invert_apply(atom10)
         atom10_local *= res_data['atom14_mask'][..., 4:][..., None]
+        atom10 = rigids[..., None].apply(atom10_local)
 
         rigids_t = ru.Rigid.from_tensor_7(res_data['rigids_t'])
 
@@ -134,7 +136,7 @@ class Atom10Interpolant:
 
         # Apply corruptions
         if self.nonlocal_prior:
-            noised_atom10_local = self._corrupt_x_nonlocal(atom10_local, nodewise_t, rigids_t, res_noising_mask)
+            noised_atom10_local = self._corrupt_x_nonlocal(atom10, nodewise_t, rigids_t, res_noising_mask)
         elif self.smarter_prior:
             noised_atom10_local = self._corrupt_x_smarter(atom10_local, nodewise_t, res_noising_mask)
         else:

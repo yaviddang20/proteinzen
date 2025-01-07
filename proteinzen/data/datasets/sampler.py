@@ -24,26 +24,31 @@ class BatchSampler:
                       including batches of a single element
     :param shuffle: if `True`, batches in shuffled order
     '''
-    def __init__(self, dataset: PdbDataset, batch_size=3000, drop_last=False, shuffle=True, batch_by_edge_fn=None):
+    def __init__(self,
+                 dataset: PdbDataset,
+                 batch_size=3000,
+                 drop_last=False,
+                 shuffle=True,
+                 batch_by_edge_fn=None,
+                 seed=0):
         self.dataset = dataset
         self.batch_size = batch_size
         self.drop_last = drop_last
         self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
 
         self.node_counts = dataset.csv.modeled_seq_len.tolist()
         self.idx = [i for i in range(len(self.node_counts))]
         self.batch_by_edge_fn = batch_by_edge_fn
 
         self._form_batches()
-        self._need_to_rebatch = False
 
     def _form_batches(self):
-        if not self._need_to_rebatch:
-            return
-
         self.batches = []
         if self.shuffle:
-            random.shuffle(self.idx)
+            g = np.random.default_rng(self.seed + self.epoch)
+            g.shuffle(self.idx)
         idx = np.array(self.idx)
         while len(idx) > 0:
             batch = []
@@ -56,7 +61,6 @@ class BatchSampler:
                     n_nodes += self.node_counts[next_idx]
                 batch.append(next_idx)
             self.batches.append(batch)
-        self._need_to_rebatch = False
 
     def __len__(self):
         print(f"len called, current len is {len(self.batches)}")
@@ -70,7 +74,18 @@ class BatchSampler:
             self._form_batches()
         for batch in self.batches:
             yield batch
-        self._need_to_rebatch = True
+
+    def set_epoch(self, epoch: int) -> None:
+        r"""
+        Sets the epoch for this sampler. When :attr:`shuffle=True`, this ensures all replicas
+        use a different random ordering for each epoch. Otherwise, the next iteration of this
+        sampler will yield the same ordering.
+
+        Args:
+            epoch (int): Epoch number.
+        """
+        self.epoch = epoch
+
 
 
 

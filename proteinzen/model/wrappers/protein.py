@@ -541,7 +541,7 @@ class ChimeraDenseLatentWrapper(nn.Module):
             )
         elif use_mlp_decoder:
             self.decoder = MLPDecoder(
-                c_s=c_s//2,
+                c_s=c_s//8,
                 c_latent=c_latent,
             )
         else:

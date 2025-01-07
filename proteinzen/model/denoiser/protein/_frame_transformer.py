@@ -100,6 +100,7 @@ def single_to_keys(single, indexing_matrix, W, H):
         B, K, H, D
     )
 
+# adapted from boltz1
 def pairs_to_framepairs(pairs, indexing_matrix, W, H):
     B, N, _, D = pairs.shape
     K = N // W
@@ -110,6 +111,18 @@ def pairs_to_framepairs(pairs, indexing_matrix, W, H):
         B, K, W, H, D
     )
     return ret
+
+# adapted from boltz1
+def single_to_weighted_keys(single, weight, indexing_matrix, W, H):
+    B, N, D = single.shape
+    K = N // W
+    D_out, D_in = weight.shape
+    assert D == D_in
+    single = single.view(B, 2 * K, W // 2, D_in)
+    return torch.einsum("b j i d, j k, o d -> b k i o", single, indexing_matrix, weight).reshape(
+        B, K, H, D_out
+    )
+
 
 
 class BlockInvariantPointAttention(nn.Module):
@@ -199,7 +212,7 @@ class BlockInvariantPointAttention(nn.Module):
         r: ru.Rigid,
         s_mask: torch.Tensor,
         to_queries: Callable,
-        to_keys: Callable
+        to_keys: Callable,
     ) -> torch.Tensor:
         """
         Args:
@@ -680,7 +693,17 @@ class ConditionedBlockInvariantPointAttention(nn.Module):
 
         return out.view(s.shape)
 
-
+class BlockAttentionPairBias(nn.Module):
+    def __init__(
+        self,
+        c_s,
+        c_z,
+        num_heads=4,
+    ):
+        super().__init__()
+        self.c_s = c_s
+        self.c_z = c_z
+        self.num_heads = num_heads
 
 class SequenceFrameTransformerBlock(nn.Module):
     def __init__(self,
@@ -761,10 +784,12 @@ class SequenceFrameTransformerUpdate(nn.Module):
         inf=1e8,
         n_blocks=2,
         do_rigid_updates=False,
+        broadcast_singles=False,
         broadcast_pairs=False,
         agg_rigid_embed=True,
         compile_ipa=False,
-        framepair_init=False
+        framepair_init=False,
+        framepair_ffn=False
     ):
         super().__init__()
         self.c_s = c_s
@@ -776,6 +801,7 @@ class SequenceFrameTransformerUpdate(nn.Module):
         self.do_rigid_updates = do_rigid_updates
         self.agg_rigid_embed = agg_rigid_embed
         self.framepair_init = framepair_init
+
         if framepair_init:
             self.lin_framepair_dist_vec = Linear(3, c_framepair, bias=False)
             self.lin_framepair_dist = Linear(1, c_framepair, bias=False)
@@ -791,17 +817,23 @@ class SequenceFrameTransformerUpdate(nn.Module):
         else:
             self.nodepair_to_framepair_broadcast = None
 
-        self.frame_ln = LayerNorm(c_frame, c_frame)
-        self.frame_l_to_framepair_broadcast = Linear(c_frame, c_framepair, bias=False)
-        self.frame_m_to_framepair_broadcast = Linear(c_frame, c_framepair, bias=False)
-        self.framepair_ffn = nn.Sequential(
-            LayerNorm(c_framepair),
-            Linear(c_framepair, c_framepair),
-            nn.ReLU(),
-            Linear(c_framepair, c_framepair),
-            nn.ReLU(),
-            Linear(c_framepair, c_framepair),
-        )
+        self.broadcast_singles = broadcast_singles
+        if broadcast_singles:
+            self.frame_ln = LayerNorm(c_frame, c_frame)
+            self.frame_l_to_framepair_broadcast = Linear(c_frame, c_framepair, bias=False)
+            self.frame_m_to_framepair_broadcast = Linear(c_frame, c_framepair, bias=False)
+
+        if framepair_ffn:
+            self.framepair_ffn = nn.Sequential(
+                LayerNorm(c_framepair),
+                Linear(c_framepair, c_framepair),
+                nn.ReLU(),
+                Linear(c_framepair, c_framepair),
+                nn.ReLU(),
+                Linear(c_framepair, c_framepair),
+            )
+        else:
+            self.framepair_ffn = None
 
         self.trunk = nn.ModuleDict()
         for b in range(n_blocks):
@@ -947,11 +979,6 @@ class SequenceFrameTransformerUpdate(nn.Module):
             )
         )
 
-        framepair_src = self.frame_ln(rigids_embed_flat)
-        framepair_l = self.frame_l_to_framepair_broadcast(framepair_src)
-        framepair_m = self.frame_m_to_framepair_broadcast(framepair_src)
-        framepair_l = to_queries(framepair_l).view(n_batch, -1, self.block_q, 1, self.c_framepair)
-        framepair_m = to_keys(framepair_m).view(n_batch, -1, 1, self.block_k, self.c_framepair)
         if framepair_embed is None:
             if self.framepair_init:
                 framepair_embed = self._framepair_init(
@@ -963,13 +990,21 @@ class SequenceFrameTransformerUpdate(nn.Module):
                 )
             else:
                 framepair_embed = 0
-        framepair_embed = framepair_embed + framepair_l + framepair_m
+
+        if self.broadcast_singles:
+            framepair_src = self.frame_ln(rigids_embed_flat)
+            framepair_l = self.frame_l_to_framepair_broadcast(framepair_src)
+            framepair_m = self.frame_m_to_framepair_broadcast(framepair_src)
+            framepair_l = to_queries(framepair_l).view(n_batch, -1, self.block_q, 1, self.c_framepair)
+            framepair_m = to_keys(framepair_m).view(n_batch, -1, 1, self.block_k, self.c_framepair)
+            framepair_embed = framepair_embed + framepair_l + framepair_m
 
         if self.nodepair_to_framepair_broadcast is not None:
             z_broadcast = self._broadcast_pairs(z, rigids_to_res_idx, rigids_mask, to_pairs)
             framepair_embed = framepair_embed + self.nodepair_to_framepair_broadcast(z_broadcast)
 
-        framepair_embed = framepair_embed + self.framepair_ffn(framepair_embed)
+        if self.framepair_ffn is not None:
+            framepair_embed = framepair_embed + self.framepair_ffn(framepair_embed)
 
         # rigids_padding = torch.zeros([n_batch, n_padding, 7], device=rigids_embed.device)
         # rigids_padding[:, 0] = 1

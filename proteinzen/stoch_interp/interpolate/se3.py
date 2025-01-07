@@ -100,7 +100,7 @@ class SE3Interpolant:
                  uniform_rot_noise=False,
                  harmonic_trans_noise=False,
                  trans_preconditioning=False,
-                 trans_preconditioning_std=16,
+                 trans_preconditioning_std=10,
                  sfm=False):
         self._cfg = cfg
         self._rots_cfg = cfg.rots
@@ -152,7 +152,7 @@ class SE3Interpolant:
                 reduce='mean'
             )
             trans_0 = noise - center[batch]
-        elif self.trans_preconditioning_std:
+        elif self.trans_preconditioning:
             trans_0 = _centered_gaussian(batch, device)
             trans_0 = trans_0 * self.trans_preconditioning_std
         else:

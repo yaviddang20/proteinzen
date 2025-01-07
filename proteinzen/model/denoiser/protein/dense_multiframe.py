@@ -8,17 +8,19 @@ import functools as fn
 
 from proteinzen.model.modules.layers.node.attention import FlashTransformerEncoder
 from proteinzen.model.modules.openfold.layers import InvariantPointAttention
-from proteinzen.model.modules.openfold.layers_v2 import Linear, ConditionedInvariantPointAttention, ConditionedTransition, BackboneUpdate, TorsionAngles, Transition, LayerNorm
+from proteinzen.model.modules.openfold.layers_v2 import Linear, ConditionedInvariantPointAttention, ConditionedTransition, BackboneUpdate, TorsionAngles, Transition, LayerNorm, AdaLN
 import proteinzen.utils.openfold.rigid_utils as ru
 from proteinzen.utils.openfold.rigid_utils import Rigid, batchwise_center
-from proteinzen.utils.framediff.all_atom import compute_backbone, compute_atom14_from_frame5
+from proteinzen.utils.framediff.all_atom import compute_backbone
+from proteinzen.utils.coarse_grain import compute_atom14_from_cg_frames
 
 from ._attn import ConditionedPairUpdate, MultiRigidPairEmbedder
 from ._frame_transformer import (
     SequenceFrameTransformerUpdate, ConditionedSequenceFrameTransformerUpdate,
-    get_indexing_matrix, single_to_keys, pairs_to_framepairs,
+    get_indexing_matrix, single_to_keys, single_to_weighted_keys, pairs_to_framepairs,
     KnnFrameTransformerUpdate, KnnInvariantPointAttention
 )
+from ._v5_helper import BroadcastZInvariantPointAttention
 
 def get_index_embedding(indices, embed_size, max_len=2056):
     """Creates sine / cosine positional embeddings from a prespecified indices.
@@ -151,6 +153,7 @@ class EdgeDistPredictor(nn.Module):
 class FramepairDistPredictor(nn.Module):
     def __init__(self, c_framepair, n_bins=22):
         super().__init__()
+        self.n_bins = n_bins
         self.proj = Linear(c_framepair, n_bins, bias=False)
 
     def forward(self, framepair_embed):
@@ -291,6 +294,7 @@ class Embedder(nn.Module):
 
         return node_embed, edge_embed, sidechain_frame_embed
 
+
 class EmbedderV2(nn.Module):
 
     def __init__(self,
@@ -304,7 +308,10 @@ class EmbedderV2(nn.Module):
                  block_k=128,
                  n_tfmr_blocks=3,
                  n_pair_embed_blocks=2,
-                 index_embed_size=32
+                 index_embed_size=32,
+                 break_symmetry=True,
+                 rigids_per_residue=3,
+                 use_sc_rigid_transformer=False,
     ):
         super().__init__()
         self.c_s = c_s
@@ -312,6 +319,8 @@ class EmbedderV2(nn.Module):
         self.c_sidechain = c_frame
         self.block_q = block_q
         self.block_k = block_k
+        self.break_symmetry = break_symmetry
+        self.rigids_per_residue = rigids_per_residue
 
         self.timestep_embedder = fn.partial(
             get_timestep_embedding,
@@ -333,9 +342,32 @@ class EmbedderV2(nn.Module):
             block_q=block_q,
             block_k=block_k,
             do_rigid_updates=False,
+            broadcast_singles=True,
             broadcast_pairs=True,
-            framepair_init=True
+            framepair_init=True,
+            framepair_ffn=True
         )
+        self.use_sc_rigid_transformer = use_sc_rigid_transformer
+        if use_sc_rigid_transformer:
+            self.sc_frame_tfmr = SequenceFrameTransformerUpdate(
+                c_s,
+                c_z,
+                c_frame,
+                c_framepair,
+                num_heads=num_heads,
+                n_blocks=n_tfmr_blocks,
+                block_q=block_q,
+                block_k=block_k,
+                do_rigid_updates=False,
+                broadcast_singles=True,
+                broadcast_pairs=True,
+                framepair_init=True,
+                framepair_ffn=True
+            )
+            self.node_adaln = AdaLN(c_s, c_s)
+            self.frame_adaln = AdaLN(c_frame, c_frame)
+            self.framepair_adaln = AdaLN(c_framepair, c_framepair)
+
 
         self.pair_embedder = MultiRigidPairEmbedder(
             c_z,
@@ -344,7 +376,7 @@ class EmbedderV2(nn.Module):
         )
 
         self.node_to_sidechain_frame = Linear(c_s, c_frame, bias=False)
-        self.pos_embedder = nn.Embedding(5, c_frame)
+        self.pos_embedder = nn.Embedding(rigids_per_residue, c_frame)
 
     def forward(
             self,
@@ -398,11 +430,18 @@ class EmbedderV2(nn.Module):
         node_feats = [t_embed, seq_idx_embed]
         node_embed = torch.cat(node_feats, dim=-1)
         node_embed = self.node_init(node_embed)
+        node_init = node_embed
 
-        rigids_embed = self.node_to_sidechain_frame(node_embed[..., None, :]).tile((1, 1, 5, 1))
-        rigids_embed = rigids_embed + self.pos_embedder(
-            torch.arange(5, device=rigids_embed.device)
-        )[None, None]
+        rigids_embed = self.node_to_sidechain_frame(node_embed[..., None, :]).tile((1, 1, self.rigids_per_residue, 1))
+        if self.break_symmetry:
+            rigids_embed = rigids_embed + self.pos_embedder(
+                torch.arange(self.rigids_per_residue, device=rigids_embed.device)
+            )[None, None]
+        else:
+            rigids_embed = rigids_embed + self.pos_embedder(
+                torch.tensor([0] + [1 for _ in range(self.rigids_per_residue-1)], device=rigids_embed.device)
+            )[None, None]
+        rigids_init = rigids_embed
 
         rigids_embed, node_embed, framepair_embed, _ = self.frame_tfmr(
             node_embed,
@@ -414,6 +453,21 @@ class EmbedderV2(nn.Module):
             to_pairs,
             framepair_embed=None
         )
+
+        if self.use_sc_rigid_transformer:
+            sc_rigids_embed, sc_node_embed, sc_framepair_embed, _ = self.sc_frame_tfmr(
+                node_init,
+                edge_embed,
+                rigids,
+                rigids_init,
+                to_queries,
+                to_keys,
+                to_pairs,
+                framepair_embed=None
+            )
+            node_embed = self.node_adaln(node_embed, sc_node_embed)
+            rigids_embed = self.frame_adaln(rigids_embed, sc_rigids_embed)
+            framepair_embed = self.framepair_adaln(framepair_embed, sc_framepair_embed)
 
         return node_embed, edge_embed, rigids_embed, framepair_embed
 
@@ -1493,6 +1547,575 @@ class IpaScoreV4(nn.Module):
         return model_out
 
 
+class EmbedderForV5(nn.Module):
+
+    def __init__(self,
+                 c_s,
+                 c_z,
+                 c_hidden=64,
+                 num_heads=4,
+                 block_q=32,
+                 block_k=128,
+                 n_tfmr_blocks=3,
+                 n_pair_embed_blocks=2,
+                 index_embed_size=32,
+                 break_symmetry=True,
+                 rigids_per_residue=3
+    ):
+        super().__init__()
+        self.c_s = c_s
+        self.c_z = c_z
+        self.block_q = block_q
+        self.block_k = block_k
+        self.break_symmetry = break_symmetry
+        self.rigids_per_residue = rigids_per_residue
+
+        self.timestep_embedder = fn.partial(
+            get_timestep_embedding,
+            embedding_dim=index_embed_size
+        )
+        self.index_embedder = fn.partial(
+            get_index_embedding,
+            embed_size=index_embed_size
+        )
+
+        self.node_init = Linear(index_embed_size*2, self.c_s, bias=False)
+        self.pos_embedder = nn.Embedding(rigids_per_residue, c_s)
+
+        self.ipa = BroadcastZInvariantPointAttention(
+            c_s=c_s,
+            c_z=c_z,
+            c_hidden=16,
+            num_heads=8,
+            num_qk_points=8,
+            num_v_points=12,
+            pre_ln=True,
+            lin_bias=False
+        )
+
+        tfmr_layer = torch.nn.TransformerEncoderLayer(
+            d_model=c_s,
+            nhead=4,
+            dim_feedforward=c_s,
+            batch_first=True,
+            dropout=0.0,
+            norm_first=True,
+        )
+        self.tfmr = torch.nn.TransformerEncoder(
+            tfmr_layer, 3)
+
+        self.pair_embedder = MultiRigidPairEmbedder(
+            c_z,
+            c_hidden,
+            no_blocks=n_pair_embed_blocks
+        )
+
+
+    def forward(
+            self,
+            *,
+            seq_idx,
+            t,
+            fixed_mask,
+            node_mask,
+            rigids,
+            sc_rigids=None,
+        ):
+        """Embeds a set of inputs
+
+        Args:
+            seq_idx: [..., N] Positional sequence index for each residue.
+            t: Sampled t in [0, 1].
+            fixed_mask: mask of fixed (motif) residues.
+            self_conditioning_ca: [..., N, 3] Ca positions of self-conditioning
+                input.
+
+        Returns:
+            node_embed: [B, N, D_node]
+            edge_embed: [B, N, N, D_edge]
+        """
+        n_batch = rigids.shape[0]
+        n_rigids = rigids.shape[1] * rigids.shape[2]
+        n_padding = (self.block_q - n_rigids % self.block_q) % self.block_q
+        n_attn_blocks = (n_rigids + n_padding) // self.block_q
+
+        edge_embed = self.pair_embedder(rigids, node_mask, sc_rigids=sc_rigids)
+
+        num_batch, num_res = seq_idx.shape
+        # Set time step to epsilon=1e-5 for fixed residues.
+        fixed_mask = fixed_mask[..., None]
+        t_embed = torch.tile(
+            self.timestep_embedder(t)[:, None, :], (1, num_res, 1))
+        seq_idx_embed = self.index_embedder(seq_idx)
+        node_feats = [t_embed, seq_idx_embed]
+        node_embed = torch.cat(node_feats, dim=-1)
+        node_embed = self.node_init(node_embed)
+
+        rigids_embed = node_embed[..., None, :].tile((1, 1, self.rigids_per_residue, 1))
+        rigids_embed = rigids_embed + self.pos_embedder(
+            torch.arange(self.rigids_per_residue, device=rigids_embed.device)
+        )[None, None]
+        rigids_embed = rigids_embed.view(n_batch, -1, self.c_s)
+
+        rigid_to_res_idx = torch.arange(rigids.shape[1], device=rigids_embed.device)[None, :, None].expand(
+            n_batch, -1, rigids.shape[-1]
+        ).reshape(
+            n_batch, -1
+        )
+        rigids_mask = node_mask.repeat_interleave(rigids.shape[-1], dim=-1).float()
+        rigids_update = self.ipa(
+            s=rigids_embed,
+            z=edge_embed,
+            r=rigids.view(n_batch, -1),
+            mask=rigids_mask,
+            rigid_to_res_idx=rigid_to_res_idx)
+        rigids_embed = rigids_embed + rigids_update * rigids_mask[..., None]
+
+        rigids_embed = self.tfmr(
+            rigids_embed,
+            src_key_padding_mask=1 - rigids_mask.float(),
+        )
+        rigids_embed = rigids_embed.view(n_batch, -1, self.rigids_per_residue, self.c_s)
+
+        return node_embed, edge_embed, rigids_embed
+
+
+class IpaScoreV5(nn.Module):
+    def __init__(self,
+                 c_s=256,
+                 c_z=128,
+                 c_hidden=256,
+                 num_heads=8,
+                 num_qk_points=8,
+                 num_v_points=12,
+                 num_blocks=4,
+                 coordinate_scaling=0.1,
+                 use_traj_predictions=False,
+                 traj_framepair_predictor=False,
+                 traj_seqpair_predictor=False,
+                 force_flash_transformer=False,
+                 block_q=32,
+                 block_k=128,
+                 propagate_framepair_embed=False,
+                 rel_quat_pair_updates=False,
+                 ):
+        super().__init__()
+        # self.diffuser = diffuser
+        self.c_s = c_s
+        self.use_traj_predictions = use_traj_predictions
+        self.traj_framepair_predictor = traj_framepair_predictor
+        self.traj_seqpair_predictor = traj_seqpair_predictor
+        self.force_flash_transformer = force_flash_transformer
+        self.propagate_framepair_embed = propagate_framepair_embed
+
+        self.scale_pos = lambda x: x * coordinate_scaling
+        self.scale_rigids = lambda x: x.apply_trans_fn(self.scale_pos)
+
+        self.unscale_pos = lambda x: x / coordinate_scaling
+        self.unscale_rigids = lambda x: x.apply_trans_fn(self.unscale_pos)
+        self.trunk = nn.ModuleDict()
+
+        self.num_blocks = num_blocks
+        self.block_q = block_q
+        self.block_k = block_k
+
+        for b in range(num_blocks):
+            self.trunk[f'ipa_{b}'] = BroadcastZInvariantPointAttention(
+                c_s=c_s,
+                c_z=c_z,
+                c_hidden=c_hidden,
+                num_heads=num_heads,
+                num_qk_points=num_qk_points,
+                num_v_points=num_v_points,
+                pre_ln=True,
+                lin_bias=False
+            )
+
+            # self.trunk[f'tfmr_{b}'] = FlashTransformerEncoder(
+            #     h_dim=c_s,
+            #     n_layers=2,
+            #     no_heads=4,
+            #     h_ff=c_s,
+            #     dropout=0.0,
+            #     ln_first=True,
+            #     dtype=None
+            # )
+            tfmr_layer = torch.nn.TransformerEncoderLayer(
+                d_model=c_s,
+                nhead=4,
+                dim_feedforward=c_s,
+                batch_first=True,
+                dropout=0.0,
+                norm_first=True,
+            )
+            self.trunk[f'tfmr_{b}'] = torch.nn.TransformerEncoder(
+                tfmr_layer, 2)
+
+            self.trunk[f'post_tfmr_{b}'] = Linear(
+                c_s, c_s, init="final", bias=False)
+            self.trunk[f'transition_{b}'] = Transition(
+                c=c_s,
+            )
+            self.trunk[f'rigids_update_{b}'] = BackboneUpdate(c_s)
+
+            if use_traj_predictions:
+                self.trunk[f'seq_pred_{b}'] = SeqPredictor(c_s)
+                self.trunk[f'dist_pred_{b}'] = EdgeDistPredictor(c_z)
+                if traj_seqpair_predictor:
+                    self.trunk[f'seqpair_pred_{b}'] = SeqPairPredictor(c_z)
+
+            if b < num_blocks-1:
+                # No edge update on the last block.
+                self.trunk[f'edge_transition_{b}'] = ConditionedPairUpdate(
+                    c_s=c_s,
+                    c_z=c_z,
+                    c_hidden=c_z//4,
+                    no_heads=4,
+                    include_rel_quat=rel_quat_pair_updates
+                )
+
+        self.torsion_pred = TorsionAngles(c_s, 1)
+
+    def forward(self, init_node_embed, edge_embed, input_feats):
+        node_mask = input_feats['res_mask'].type(torch.float32)
+        diffuse_mask = (1 - input_feats['fixed_mask'].type(torch.float32)) * node_mask
+        edge_mask = node_mask[..., None] * node_mask[..., None, :]
+        rigids_embed = input_feats['rigids_embed']
+        init_frames = input_feats['rigids_t'].type(torch.float32)
+        init_rigids = Rigid.from_tensor_7(init_frames)
+        curr_rigids = Rigid.from_tensor_7(torch.clone(init_frames))
+        rigids_mask = node_mask.repeat_interleave(init_rigids.shape[-1], dim=-1)
+        diffuse_mask = diffuse_mask.repeat_interleave(init_rigids.shape[-1], dim=-1)
+
+        batch_size = curr_rigids.shape[0]
+        curr_rigids = curr_rigids.view(batch_size, -1)
+        init_rigids_embed = rigids_embed
+
+        # Main trunk
+        curr_rigids = self.scale_rigids(curr_rigids)
+        n_res = rigids_embed.shape[1]
+        rigid_to_res_idx = torch.arange(n_res, device=rigids_embed.device)[None, :, None].expand(
+            batch_size, -1, init_rigids.shape[-1]
+        ).reshape(
+            batch_size, -1
+        )
+
+        traj_data = {
+            b: {}
+            for b in range(self.num_blocks)
+        }
+
+        for b in range(self.num_blocks):
+            rigids_embed = rigids_embed.view(batch_size, -1, rigids_embed.shape[-1])
+            ipa_embed = self.trunk[f'ipa_{b}'](
+                s=rigids_embed,
+                z=edge_embed,
+                r=curr_rigids,
+                mask=rigids_mask,
+                rigid_to_res_idx=rigid_to_res_idx)
+            rigids_embed = (rigids_embed + ipa_embed) * rigids_mask[..., None]
+
+            seq_tfmr_out = self.trunk[f'tfmr_{b}'](
+                rigids_embed, src_key_padding_mask=1 - rigids_mask.float())
+
+            rigids_embed = rigids_embed + self.trunk[f'post_tfmr_{b}'](seq_tfmr_out)
+            rigids_embed = rigids_embed * rigids_mask[..., None]
+
+            rigids_embed = rigids_embed + self.trunk[f'transition_{b}'](rigids_embed)
+            rigids_embed = rigids_embed * rigids_mask[..., None]
+
+            rigid_update = self.trunk[f'rigids_update_{b}'](
+                rigids_embed * diffuse_mask[..., None])
+            curr_rigids = curr_rigids.compose_q_update_vec(
+                rigid_update * diffuse_mask[..., None])
+
+            if b < self.num_blocks-1:
+                res_embed = rigids_embed.view(init_rigids_embed.shape).mean(dim=-2)
+                edge_embed = self.trunk[f'edge_transition_{b}'](
+                    res_embed, edge_embed, curr_rigids.view(init_rigids.shape)[..., 0], edge_mask)
+                edge_embed *= edge_mask[..., None]
+
+            if self.use_traj_predictions:
+                traj_data[b]['seq_logits'] = self.trunk[f"seq_pred_{b}"](rigids_embed.view(init_rigids_embed.shape))
+                traj_data[b]['dist_logits'] = self.trunk[f"dist_pred_{b}"](edge_embed)
+                traj_data[b]['rigids'] = self.unscale_rigids(curr_rigids.view(init_rigids.shape))
+
+
+        curr_rigids = self.unscale_rigids(curr_rigids.view(init_rigids.shape))
+        _, psi_pred = self.torsion_pred(rigids_embed.view(init_rigids_embed.shape)[..., 0, :])
+        model_out = {
+            'psi': psi_pred,
+            'final_rigids': curr_rigids,
+            'node_embed': rigids_embed,
+            'traj_data': traj_data
+        }
+        return model_out
+
+
+class IpaScoreV6(nn.Module):
+    def __init__(self,
+                 c_s=256,
+                 c_z=128,
+                 c_frame=64,
+                 c_framepair=64,
+                 c_hidden=256,
+                 num_heads=8,
+                 num_qk_points=8,
+                 num_v_points=12,
+                 num_blocks=4,
+                 coordinate_scaling=0.1,
+                 use_traj_predictions=False,
+                 traj_framepair_predictor=False,
+                 traj_seqpair_predictor=False,
+                 force_flash_transformer=False,
+                 block_q=32,
+                 block_k=128,
+                 propagate_framepair_embed=False,
+                 use_knn=False,
+                 k=30,
+                 rigid_transformer_num_blocks=1,
+                 rigid_transformer_rigid_updates=False,
+                 rigid_embed_skip_sc=False,
+                 rel_quat_pair_updates=False,
+                 ):
+        super().__init__()
+        # self.diffuser = diffuser
+        self.use_traj_predictions = use_traj_predictions
+        self.traj_framepair_predictor = traj_framepair_predictor
+        self.traj_seqpair_predictor = traj_seqpair_predictor
+        self.force_flash_transformer = force_flash_transformer
+        self.propagate_framepair_embed = propagate_framepair_embed
+        self.use_knn = use_knn
+        self.rigid_transformer_rigid_updates = rigid_transformer_rigid_updates
+        self.rigid_embed_skip_sc = rigid_embed_skip_sc
+        self.k = k
+
+        self.scale_pos = lambda x: x * coordinate_scaling
+        self.scale_rigids = lambda x: x.apply_trans_fn(self.scale_pos)
+
+        self.unscale_pos = lambda x: x / coordinate_scaling
+        self.unscale_rigids = lambda x: x.apply_trans_fn(self.unscale_pos)
+        self.trunk = nn.ModuleDict()
+
+        self.num_blocks = num_blocks
+        self.block_q = block_q
+        self.block_k = block_k
+
+        for b in range(num_blocks):
+            self.trunk[f'ipa_{b}'] = InvariantPointAttention(
+                c_s=c_s,
+                c_z=c_z,
+                c_hidden=c_hidden,
+                num_heads=num_heads,
+                num_qk_points=num_qk_points,
+                num_v_points=num_v_points,
+                pre_ln=True,
+                lin_bias=False
+            )
+
+            if force_flash_transformer:
+                self.trunk[f'tfmr_{b}'] = FlashTransformerEncoder(
+                    h_dim=c_s,
+                    n_layers=2,
+                    no_heads=4,
+                    h_ff=c_s,
+                    dropout=0.0,
+                    ln_first=True,
+                    dtype=None
+                )
+            else:
+                tfmr_layer = torch.nn.TransformerEncoderLayer(
+                    d_model=c_s,
+                    nhead=4,
+                    dim_feedforward=c_s,
+                    batch_first=True,
+                    dropout=0.0,
+                    norm_first=True,
+                )
+                self.trunk[f'tfmr_{b}'] = torch.nn.TransformerEncoder(
+                    tfmr_layer, 2)
+            self.trunk[f'post_tfmr_{b}'] = Linear(
+                c_s, c_s, init="final", bias=False)
+            self.trunk[f'transition_{b}'] = Transition(
+                c=c_s,
+            )
+            self.trunk[f'bb_update_{b}'] = BackboneUpdate(c_s)
+
+            if use_traj_predictions:
+                self.trunk[f'seq_pred_{b}'] = SeqPredictor(c_frame)
+                self.trunk[f'dist_pred_{b}'] = EdgeDistPredictor(c_z)
+                if traj_seqpair_predictor:
+                    self.trunk[f'seqpair_pred_{b}'] = SeqPairPredictor(c_z)
+
+            if b < num_blocks-1:
+                if self.rigid_embed_skip_sc:
+                    self.trunk[f'rigid_embed_skip_sc_{b}'] = nn.Sequential(
+                        LayerNorm(c_s),
+                        Linear(c_s, c_frame, bias=False, init='final')
+                    )
+                # No edge update on the last block.
+                self.trunk[f'edge_transition_{b}'] = ConditionedPairUpdate(
+                    c_s=c_s,
+                    c_z=c_z,
+                    c_hidden=c_z//4,
+                    no_heads=4,
+                    include_rel_quat=rel_quat_pair_updates
+                )
+
+        self.node_to_rigid_cond = Linear(c_s, c_frame*3, bias=False)
+
+        self.rigids_tfmr = ConditionedSequenceFrameTransformerUpdate(
+            c_s=c_s,
+            c_z=c_z,
+            c_frame=c_frame,
+            c_framepair=c_framepair,
+            num_heads=4, # num_heads,
+            num_qk_points=num_qk_points,
+            num_v_points=num_v_points,
+            block_q=block_q,
+            block_k=block_k,
+            n_blocks=rigid_transformer_num_blocks,
+            do_rigid_updates=True,
+            agg_rigid_embed=True,
+            broadcast_pairs=True,
+        )
+        if traj_framepair_predictor:
+            self.rigid_dist_pred = FramepairDistPredictor(c_framepair)
+
+        self.torsion_pred = TorsionAngles(c_s, 1)
+
+    @torch.no_grad()
+    def _construct_knn_graph(self, rigids):
+        trans = rigids.get_trans()
+        bb_trans = trans[..., 0, :]
+        dist_mat = torch.cdist(bb_trans, bb_trans)
+        _, res_edge_index = torch.topk(dist_mat, k=self.k, dim=-1, largest=False)
+        return res_edge_index
+
+    def forward(self, init_node_embed, edge_embed, input_feats):
+        node_mask = input_feats['res_mask'].type(torch.float32)
+        diffuse_mask = (1 - input_feats['fixed_mask'].type(torch.float32)) * node_mask
+        edge_mask = node_mask[..., None] * node_mask[..., None, :]
+        init_frames = input_feats['rigids_t'].type(torch.float32)
+        rigids_embed = input_feats['rigids_embed']
+        init_rigids = Rigid.from_tensor_7(torch.clone(init_frames))
+        bb_rigids = Rigid.from_tensor_7(torch.clone(init_frames[..., 0, :]))
+
+        n_batch = init_rigids.shape[0]
+        n_rigids = init_rigids.shape[1] * init_rigids.shape[2]
+        n_padding = (self.block_q - n_rigids % self.block_q) % self.block_q
+        n_attn_blocks = (n_rigids + n_padding) // self.block_q
+
+        indexing_matrix = get_indexing_matrix(
+            n_attn_blocks,
+            W=self.block_q,
+            H=self.block_k,
+            device=rigids_embed.device
+        )
+        to_queries = lambda x: x.view(n_batch, n_attn_blocks, self.block_q, -1)
+        to_keys = fn.partial(
+            single_to_keys, indexing_matrix=indexing_matrix, W=self.block_q, H=self.block_k
+        )
+        to_pairs = fn.partial(
+            pairs_to_framepairs, indexing_matrix=indexing_matrix, W=self.block_q, H=self.block_k
+        )
+
+        # Main trunk
+        rigids_skip = self.scale_rigids(init_rigids)
+        bb_rigids = self.scale_rigids(bb_rigids)
+        init_node_embed = init_node_embed * node_mask[..., None]
+        node_embed = init_node_embed * node_mask[..., None]
+        rigids_embed_skip = rigids_embed
+        framepair_embed_skip = input_feats['framepair_embed']
+
+        traj_data = {
+            b: {}
+            for b in range(self.num_blocks)
+        }
+
+        for b in range(self.num_blocks):
+            ipa_embed = self.trunk[f'ipa_{b}'](
+                s=node_embed,
+                z=edge_embed,
+                r=bb_rigids,
+                mask=node_mask)
+            node_embed = (node_embed + ipa_embed) * node_mask[..., None]
+
+            if self.force_flash_transformer:
+                seq_tfmr_out = self.trunk[f'tfmr_{b}'](
+                    node_embed, node_mask)
+            else:
+                seq_tfmr_out = self.trunk[f'tfmr_{b}'](
+                    node_embed, src_key_padding_mask=1 - node_mask)
+            node_embed = node_embed + self.trunk[f'post_tfmr_{b}'](seq_tfmr_out)
+            node_embed = node_embed * node_mask[..., None]
+
+            node_embed = node_embed + self.trunk[f'transition_{b}'](node_embed)
+            node_embed = node_embed * node_mask[..., None]
+
+
+            bb_rigid_update = self.trunk[f'bb_update_{b}'](
+                node_embed * diffuse_mask[..., None])
+            bb_rigids = bb_rigids.compose_q_update_vec(
+                bb_rigid_update * diffuse_mask[..., None])
+
+            if b < self.num_blocks-1:
+                edge_embed = self.trunk[f'edge_transition_{b}'](
+                    node_embed, edge_embed, bb_rigids, edge_mask)
+                edge_embed *= edge_mask[..., None]
+
+            if self.use_traj_predictions:
+                traj_data[b]['seq_logits'] = self.trunk[f"seq_pred_{b}"](rigids_embed)
+                traj_data[b]['dist_logits'] = self.trunk[f"dist_pred_{b}"](edge_embed)
+                # dummy entry
+                traj_data[b]['rigids'] = self.unscale_rigids(init_rigids)
+                traj_data[b]['bb_rigids'] = self.unscale_rigids(bb_rigids)
+                if self.traj_seqpair_predictor:
+                    traj_data[b]['seqpair_logits'] = self.trunk[f'seqpair_pred_{b}'](edge_embed)
+                if self.traj_framepair_predictor:
+                    traj_data[self.num_blocks-1]['framepair_logits_dict'] = {
+                        'logits': torch.zeros(
+                            [*framepair_embed_skip.shape[:-1], self.rigid_dist_pred.n_bins],
+                            device=framepair_embed_skip.device
+                        ),
+                        'to_queries': to_queries,
+                        'to_keys': to_keys,
+                        'n_padding': n_padding
+                    }
+
+        rigids_cond = self.node_to_rigid_cond(node_embed)
+        rigids_cond = rigids_cond.view(rigids_embed_skip.shape)
+
+        rigids_embed, node_embed, framepair_embed, curr_rigids = self.rigids_tfmr(
+            node_embed,
+            edge_embed,
+            rigids_skip,
+            rigids_embed_skip,
+            rigids_cond,
+            to_queries,
+            to_keys,
+            to_pairs,
+            framepair_embed=framepair_embed_skip
+        )
+        if self.traj_framepair_predictor:
+            traj_data[self.num_blocks-1]['framepair_logits_dict'] = {
+                'logits': self.rigid_dist_pred(framepair_embed),
+                'to_queries': to_queries,
+                'to_keys': to_keys,
+                'n_padding': n_padding
+            }
+
+        curr_rigids = self.unscale_rigids(curr_rigids)
+        _, psi_pred = self.torsion_pred(node_embed)
+        model_out = {
+            'psi': psi_pred,
+            'final_rigids': curr_rigids,
+            'node_embed': node_embed,
+            'traj_data': traj_data
+        }
+        return model_out
+
+
 
 class IpaMultiRigidDenoiser(nn.Module):
 
@@ -1511,6 +2134,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                  use_traj_predictions=False,
                  use_traj_framepair_predictor=False,
                  use_traj_seqpair_predictor=False,
+                 break_rigid_symmetry=True,
                  force_flash_transformer=False,
                  trans_preconditioning=False,
                  block_q=16,
@@ -1524,10 +2148,14 @@ class IpaMultiRigidDenoiser(nn.Module):
                  use_v2=False,
                  use_v3=False,
                  use_v4=False,
+                 use_v5=False,
+                 use_v6=False,
                  use_embedder_v2=False,
+                 use_embedder_sc_rigid_transformer=False,
                  rel_quat_pair_updates=False,
                  z_broadcast=False,
-                 compile_ipa=False
+                 compile_ipa=False,
+                 rigids_per_residue=3
                  ):
         super().__init__()
         # some compatibility code
@@ -1536,6 +2164,9 @@ class IpaMultiRigidDenoiser(nn.Module):
         self.knn_k = 10000
         self.lrange_logn_scale = 10000
         self.lrange_logn_offset = 10000
+
+        self.rigids_per_residue = rigids_per_residue
+        self.use_v5 = use_v5
 
         if use_v2:
             self.ipa_score = IpaScoreV2(
@@ -1622,6 +2253,46 @@ class IpaMultiRigidDenoiser(nn.Module):
                 z_broadcast=z_broadcast,
                 compile_ipa=compile_ipa
             )
+        elif use_v5:
+            self.ipa_score = IpaScoreV5(
+                c_s=c_s,
+                c_z=c_z,
+                c_hidden=c_hidden,
+                num_heads=num_heads,
+                num_qk_points=num_qk_points,
+                num_v_points=num_v_points,
+                num_blocks=num_blocks,
+                use_traj_predictions=use_traj_predictions,
+                coordinate_scaling=1 if trans_preconditioning else 0.1,
+                block_q=block_q,
+                block_k=block_k,
+                propagate_framepair_embed=propagate_framepair_embed,
+                rel_quat_pair_updates=rel_quat_pair_updates,
+            )
+        elif use_v6:
+            self.ipa_score = IpaScoreV6(
+                c_s=c_s,
+                c_z=c_z,
+                c_frame=c_frame,
+                c_framepair=c_framepair,
+                c_hidden=c_hidden,
+                num_heads=num_heads,
+                num_qk_points=num_qk_points,
+                num_v_points=num_v_points,
+                num_blocks=num_blocks,
+                use_traj_predictions=use_traj_predictions,
+                traj_framepair_predictor=use_traj_framepair_predictor,
+                traj_seqpair_predictor=use_traj_seqpair_predictor,
+                force_flash_transformer=force_flash_transformer,
+                coordinate_scaling=1 if trans_preconditioning else 0.1,
+                block_q=block_q,
+                block_k=block_k,
+                propagate_framepair_embed=propagate_framepair_embed,
+                use_knn=use_knn,
+                rigid_transformer_num_blocks=rigid_transformer_num_blocks,
+                rigid_embed_skip_sc=rigid_embed_skip_sc,
+                rel_quat_pair_updates=rel_quat_pair_updates,
+            )
         else:
             self.ipa_score = IpaScore(
                 c_s=c_s,
@@ -1651,14 +2322,28 @@ class IpaMultiRigidDenoiser(nn.Module):
             )
 
         self.use_embedder_v2 = use_embedder_v2
-        if use_embedder_v2:
+        if use_v5:
+            self.embedder = EmbedderForV5(
+                c_s=c_s,
+                c_z=c_z,
+                block_q=block_q,
+                block_k=block_k,
+                break_symmetry=break_rigid_symmetry,
+                rigids_per_residue=rigids_per_residue
+            )
+
+        elif use_embedder_v2:
             self.embedder = EmbedderV2(
                 c_s=c_s,
                 c_z=c_z,
                 c_frame=c_frame,
                 c_framepair=c_framepair,
+                # c_hidden=32,
                 block_q=block_q,
                 block_k=block_k,
+                break_symmetry=break_rigid_symmetry,
+                rigids_per_residue=rigids_per_residue,
+                use_sc_rigid_transformer=use_embedder_sc_rigid_transformer
             )
         else:
             self.embedder = Embedder(
@@ -1685,7 +2370,7 @@ class IpaMultiRigidDenoiser(nn.Module):
         fixed_mask = torch.zeros_like(res_mask).view(batch_size, -1)
 
         if self_condition is not None:
-            sc_rigids = self_condition['final_rigids'].view(batch_size, -1, 5)
+            sc_rigids = self_condition['final_rigids'].view(batch_size, -1, self.rigids_per_residue)
         else:
             sc_rigids = None
 
@@ -1700,7 +2385,17 @@ class IpaMultiRigidDenoiser(nn.Module):
         else:
             rigids_in = rigids_t
 
-        if self.use_embedder_v2:
+        if self.use_v5:
+            node_embed, edge_embed, rigids_embed = self.embedder(
+                seq_idx=seq_idx,
+                t=t,
+                rigids=rigids_in,
+                node_mask=res_mask.view(batch_size, -1),
+                fixed_mask=fixed_mask,
+                sc_rigids=sc_rigids,
+            )
+            framepair_embed = None
+        elif self.use_embedder_v2:
             node_embed, edge_embed, rigids_embed, framepair_embed = self.embedder(
                 seq_idx=seq_idx,
                 t=t,
@@ -1738,8 +2433,8 @@ class IpaMultiRigidDenoiser(nn.Module):
 
         rigids_out = rigids_out.translate(center[..., None, None, :])
         seq_logits = traj_data[max(traj_data.keys())]['seq_logits']
-        denoised_atom14_gt_seq = compute_atom14_from_frame5(rigids_out, res_mask, res_data['seq'].view(batch_size, -1))
-        denoised_atom14_pred_seq = compute_atom14_from_frame5(rigids_out, res_mask, seq_logits.argmax(dim=-1))
+        denoised_atom14_gt_seq = compute_atom14_from_cg_frames(rigids_out, res_mask, res_data['seq'].view(batch_size, -1))
+        denoised_atom14_pred_seq = compute_atom14_from_cg_frames(rigids_out, res_mask, seq_logits.argmax(dim=-1))
         psi = score_dict['psi'].view(-1, 2)
 
         ret = {}

@@ -29,6 +29,7 @@ from proteinzen.model.denoiser.protein.frames_seq_chi import DynamicGraphIpaFram
 from proteinzen.model.denoiser.protein.frames_seq_multichi import DynamicGraphIpaFrameSeqMultiChiDenoiser
 from proteinzen.model.denoiser.protein.dense_atom14 import IpaAtom10Denoiser
 from proteinzen.model.denoiser.protein.dense_atom14_v2 import IpaAtom10DenoiserV2
+from proteinzen.model.denoiser.protein.dense_atom14_v3 import IpaAtom10DenoiserV3
 from proteinzen.model.denoiser.protein.dense_multiframe import IpaMultiRigidDenoiser
 from proteinzen.model.denoiser.sidechain.ipmp_latent import IPMPDenoiser
 from proteinzen.model.denoiser.molecule.tfn_r3 import MoleculeDenoiser
@@ -269,7 +270,7 @@ def config_hydra_store():
     # model_store(TFNDenseLatentWrapper, name="densefm_protein")
     model_store(ChimeraDenseLatentWrapper, name="densefm_protein")
     model_store(IpaAtom10Denoiser, name="atom10fm_protein")
-    model_store(IpaAtom10DenoiserV2, name="denseatom10fm_protein")
+    model_store(IpaAtom10DenoiserV3, name="denseatom10fm_protein")
     model_store(DenseChimeraLatentWrapper, name="fulldensefm_protein")
     model_store(IpaMultiRigidDenoiser, name="multiframefm_protein")
     model_store(DynamicGraphIpaFrameSeqDenoiser, name="dirichlet_protein")

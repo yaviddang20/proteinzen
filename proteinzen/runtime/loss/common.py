@@ -1109,7 +1109,8 @@ def atomic_losses(batch,
                   use_sidechain_dists_mse_loss=True,
                   use_local_atomic_dist_loss=True,
                   use_sidechain_clash_loss=True,
-                  polar_upweight=False
+                  polar_upweight=False,
+                  sidechain_upweight=False,
 ):
     res_data = batch['residue']
 
@@ -1141,6 +1142,14 @@ def atomic_losses(batch,
 
     # pred_atom14 = _collect_from_seq(decoded_all_atom14, seq, seq_mask)
     # pred_chis = _collect_from_seq(decoded_all_chis, seq, seq_mask)
+    seqwise_weight = 1
+    if polar_upweight:
+        seqwise_weight = seqwise_weight * (res_data['polar_mask'].float()+1)[..., None]
+    if sidechain_upweight:
+        sidechain_weight = torch.ones(14, device=gt_atom14.device)
+        sidechain_weight[5:] += 1
+        seqwise_weight = seqwise_weight * sidechain_weight[None]
+
 
     atom14_mse = atom14_mse_loss(
         gt_atom14,
@@ -1151,8 +1160,21 @@ def atomic_losses(batch,
         atom14_alt_gt_mask,
         minimal_mask,
         no_bb=False,
-        seqwise_weight=(res_data['polar_mask'].float()+1 if polar_upweight else None)
+        seqwise_weight=seqwise_weight,
+        ignore_symmetry=True
     )
+    with torch.no_grad():
+        unscaled_atom14_mse = atom14_mse_loss(
+            gt_atom14,
+            alt_atom14,
+            pred_atom14_gt_seq,
+            res_data.batch,
+            atom14_gt_mask,
+            atom14_alt_gt_mask,
+            minimal_mask,
+            no_bb=False,
+            ignore_symmetry=True
+        )
     seq_loss = seq_cce_loss(
         seq,
         seq_logits,
@@ -1240,7 +1262,9 @@ def atomic_losses(batch,
         "seq_loss": seq_loss,
         "per_seq_recov": per_seq_recov,
         "atom14_mse": atom14_mse,
+        "unscaled_atom14_mse": unscaled_atom14_mse,
         "atom14_rmsd": atom14_rmsd,
+        "unscaled_atom14_rmsd": unscaled_atom14_mse.sqrt(),
         "sidechain_dists_mse": sidechain_dists_mse,
         "local_atomic_dist_loss": local_atomic_dist_loss,
         "scaled_local_atomic_dist_loss": scaled_local_atomic_dist_loss,

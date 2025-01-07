@@ -96,8 +96,13 @@ class MultiSE3Interpolant:
                  prealign_noise=True,
                  trans_preconditioning=False,
                  trans_preconditioning_std=16,
-                 rigids_per_res=5,
-                 lognorm_t_sched=False):
+                 rigids_per_res=3,#5,
+                 lognorm_t_sched=False,
+                 use_trans_sfm=False,
+                 trans_sfm_g=0.1,
+                 use_rot_sfm=False,
+                 rot_sfm_g=0.1
+    ):
         self._cfg = cfg
         self._rots_cfg = cfg.rots
         self._trans_cfg = cfg.trans
@@ -108,6 +113,10 @@ class MultiSE3Interpolant:
         self.trans_preconditioning = trans_preconditioning
         self.trans_preconditioning_std = trans_preconditioning_std
         self.lognorm_t_sched = lognorm_t_sched
+        self.use_trans_sfm = use_trans_sfm
+        self.trans_sfm_g = trans_sfm_g
+        self.use_rot_sfm = use_rot_sfm
+        self.rot_sfm_g = rot_sfm_g
 
         print(self.igso3)
 
@@ -141,17 +150,26 @@ class MultiSE3Interpolant:
 
 
     def _sample_trans_0(self, batch, device):
-        if self.trans_preconditioning_std:
+        if self.trans_preconditioning:
             trans_0 = _centered_gaussian(batch, self.rigids_per_res, device)
             trans_0 = trans_0 * self.trans_preconditioning_std
         else:
             trans_nm_0 = _centered_gaussian(batch, self.rigids_per_res, device)
-            trans_0 = trans_nm_0 * du.NM_TO_ANG_SCALE
+            # TODO: this is a typo but i'm keeping it so i can compare against previous training runs
+            trans_0 = trans_nm_0 * 16 # du.NM_TO_ANG_SCALE
 
         return trans_0.to(device)
 
-    def _corrupt_trans(self, trans_1, trans_0, t, res_mask):
+    def _corrupt_trans(self, trans_1, trans_0, t, res_mask, batch):
         trans_t = (1 - t[..., None, None]) * trans_0 + t[..., None, None] * trans_1
+
+        if self.use_trans_sfm:
+            g = self.trans_sfm_g
+            std = g * (t * (1-t)).sqrt()
+            # TODO: this is a typo but i'm keeping it so i can compare against previous training runs
+            scaling = self.trans_preconditioning_std if self.trans_preconditioning else 16 #du.NM_TO_ANG_SCALE
+            dW_trans = torch.randn_like(trans_0) * std[batch, None, None] * scaling
+            trans_t = trans_t + dW_trans
 
         trans_t = _trans_diffuse_mask(trans_t, trans_1, res_mask)
         return trans_t * res_mask[..., None, None]
@@ -164,9 +182,17 @@ class MultiSE3Interpolant:
         rotmats_0 = torch.einsum("...ij,...jk->...ik", rotmats_1, noisy_rotmats)
         return rotmats_0
 
-    def _corrupt_rotmats(self, rotmats_1, rotmats_0, t, res_mask):
+    def _corrupt_rotmats(self, rotmats_1, rotmats_0, t, res_mask, batch):
         rotmats_t = so3_utils.geodesic_t(t[..., None, None], rotmats_1, rotmats_0)
         identity = torch.eye(3, device=self._device)
+
+        if self.use_rot_sfm:
+            g = self.rot_sfm_g
+            std = g * (t * (1-t)).sqrt()
+            dB_rot = self.igso3.sample(std, self.rigids_per_res).to(rotmats_1.device)
+            dB_rot = dB_rot[batch]
+            rotmats_t = torch.einsum("...ij,...jk->...ik", rotmats_t, dB_rot)
+
         rotmats_t = rotmats_t * res_mask[..., None, None, None] + identity[None, None] * (
             ~res_mask[..., None, None, None]
         )
@@ -210,8 +236,8 @@ class MultiSE3Interpolant:
             )
             trans_0 = aligned_trans_0.view(trans_0.shape)
 
-        trans_t = self._corrupt_trans(trans_1, trans_0, nodewise_t, mask)
-        rotmats_t = self._corrupt_rotmats(rotmats_1, rotmats_0, nodewise_t, mask)
+        trans_t = self._corrupt_trans(trans_1, trans_0, nodewise_t, mask, res_data.batch)
+        rotmats_t = self._corrupt_rotmats(rotmats_1, rotmats_0, nodewise_t, mask, res_data.batch)
         rigids_t = ru.Rigid(
             rots=ru.Rotation(rot_mats=rotmats_t), trans=trans_t
         )
@@ -262,6 +288,14 @@ class MultiSE3Interpolant:
 
     def _trans_euler_step(self, d_t, t, trans_1, trans_t):
         trans_vf = (trans_1 - trans_t) / (1 - t)
+        if self.use_trans_sfm:
+            g = self.trans_sfm_g
+            std = g * (t * (1-t)).sqrt()
+            # TODO: this is a typo but i'm keeping it so i can compare against previous training runs
+            scaling = self.trans_preconditioning_std if self.trans_preconditioning else 16 #du.NM_TO_ANG_SCALE
+            dW_trans = torch.randn_like(trans_t) * std * scaling * torch.sqrt(d_t)
+            trans_t = trans_t + dW_trans
+
         return trans_t + trans_vf * d_t
 
     def _rots_euler_step(self, d_t, t, rotmats_1, rotmats_t):
@@ -273,4 +307,13 @@ class MultiSE3Interpolant:
             raise ValueError(
                 f"Unknown sample schedule {self._rots_cfg.sample_schedule}"
             )
-        return so3_utils.geodesic_t(scaling * d_t, rotmats_1, rotmats_t)
+        if self.use_rot_sfm:
+            rot_vf = so3_utils.calc_rot_vf(rotmats_t, rotmats_1) * scaling
+
+            g = self.rot_sfm_g
+            std = g * (t * (1-t)).sqrt()
+            dB_rot = torch.randn_like(rot_vf) * std * torch.sqrt(d_t)
+            mat_t = so3_utils.rotvec_to_rotmat(d_t * rot_vf + dB_rot)
+            return torch.einsum("...ij,...jk->...ik", rotmats_t, mat_t)
+        else:
+            return so3_utils.geodesic_t(scaling * d_t, rotmats_1, rotmats_t)

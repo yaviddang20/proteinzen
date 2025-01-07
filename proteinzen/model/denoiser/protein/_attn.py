@@ -602,6 +602,7 @@ class PairEmbedder(nn.Module):
 
 class Atom14PairEmbedder(nn.Module):
     def __init__(self,
+                 c_s,
                  c_z,
                  c_hidden,
                  num_rbf=39,
@@ -626,9 +627,13 @@ class Atom14PairEmbedder(nn.Module):
         self.c_a = (
             num_rbf
             + 3  # unit vecs
-            + 4 * (10 * 10)  # atom-atom distances
             + 4  # rel quat
         )
+
+        self.ln_node = LayerNorm(c_s*2)
+        self.lin_node = Linear(
+            c_s*2,
+            c_hidden, bias=False)
 
         # self.ln_relpos = LayerNorm(2*relpos_clip+1)
         self.lin_z_ij = Linear(2*relpos_clip+1, c_hidden)
@@ -678,7 +683,7 @@ class Atom14PairEmbedder(nn.Module):
         return torch.cat([quat_rel, unit_edge_dist_vecs, dist_features], dim=-1)
 
 
-    def forward(self, rigids, node_mask, sc_rigids=None):
+    def forward(self, node_embed, rigids, node_mask, sc_rigids=None):
         edge_mask = node_mask[..., None] & node_mask[..., None, :]
 
         node_idx = torch.arange(rigids.shape[-1], device=rigids.device)[None].expand(
@@ -694,12 +699,12 @@ class Atom14PairEmbedder(nn.Module):
 
         z = z + self.lin_a_ij(torch.cat([a_current, a_sc], dim=-1))
 
-        n_res = latent_features.shape[-2]
-        latent_pairs = torch.cat([
-            torch.tile(latent_features[..., None, :], (1, 1, n_res, 1)),
-            torch.tile(latent_features[..., None, :, :], (1, n_res, 1, 1)),
+        n_res = node_embed.shape[-2]
+        node_pairs = torch.cat([
+            torch.tile(node_embed[..., None, :], (1, 1, n_res, 1)),
+            torch.tile(node_embed[..., None, :, :], (1, n_res, 1, 1)),
         ], dim=-1)
-        z = z + self.lin_latent(self.ln_latent(latent_pairs))
+        z = z + self.lin_node(F.relu(self.ln_node(node_pairs)))
         z = z * edge_mask[..., None]
 
         mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf

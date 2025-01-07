@@ -208,7 +208,8 @@ class Embedder(nn.Module):
                  index_embed_size=32,
                  use_init_distogram=False,
                  break_sidechain_symmetry=False,
-                 use_atom14=False
+                 use_atom14=False,
+                 scale_atom10=False
     ):
         super(Embedder, self).__init__()
         self.c_atom = c_atom
@@ -276,6 +277,7 @@ class Embedder(nn.Module):
         self.atom_embedder = Linear(3, c_atom, bias=False)
         self.node_to_atom = Linear(c_s, c_atom, bias=False)
         self.use_atom14 = use_atom14
+        self.scale_atom10 = scale_atom10
 
         self.pos_embedder = Linear(n_atoms, c_atom, bias=False)
         self.break_sidechain_symmetry = break_sidechain_symmetry
@@ -333,6 +335,9 @@ class Embedder(nn.Module):
         else:
             atompos_local = noised_atom10_local
 
+        if self.scale_atom10:
+            atompos_local = atompos_local / 10
+
         atom10_dist_to_ca = torch.linalg.vector_norm(atompos_local, dim=-1)
         prot_t_embed = torch.cat([
             prot_t_embed,
@@ -364,10 +369,14 @@ class Embedder(nn.Module):
                 else:
                     sidechain_atoms = sc_atom14[..., 4:, :]
                 sidechain_atoms_local_frame = sc_rigids[..., None].invert_apply(sidechain_atoms)
+
+                if self.scale_atom10:
+                    sidechain_atoms_local_frame = sidechain_atoms_local_frame / 10
+
                 sidechain_atoms_dist_to_ca = torch.linalg.vector_norm(sidechain_atoms_local_frame, dim=-1)
                 node_feats += [
                     sidechain_atoms_local_frame.flatten(-2, -1),
-                    1/(1 + sidechain_atoms_dist_to_ca)  # TODO: this should be squared?
+                    1/(1 + sidechain_atoms_dist_to_ca ** 2)
                 ]
             else:
                 raise ValueError("we expect both sc_atom14 and sc_rigids at the same time")
@@ -586,7 +595,7 @@ class IpaScore(nn.Module):
         noised_atom10_local = input_feats['noised_atom10_local']
         atom_embed = input_feats['atom_embed']
         n_atoms = atom_embed.shape[1]
-        n_padding = (128 - n_atoms % 128) % 128
+        n_padding = (32 - n_atoms % 32) % 32
         atom_embed = F.pad(atom_embed, (0, 0, 0, n_padding), value=0)
         atom_res_idx = input_feats['atom_res_idx']
         atompos_mask = torch.ones_like(atom_res_idx, dtype=torch.bool)
@@ -597,7 +606,7 @@ class IpaScore(nn.Module):
 
         # Main trunk
         curr_rigids = self.scale_rigids(curr_rigids)
-        curr_atoms = noised_atom10_local
+        curr_atoms = self.scale_pos(noised_atom10_local)
         init_node_embed = init_node_embed * node_mask[..., None]
         node_embed = init_node_embed * node_mask[..., None]
 
@@ -649,10 +658,7 @@ class IpaScore(nn.Module):
             if self.update_atoms_from_res:
                 curr_atoms = curr_atoms + self.trunk[f'atom_update_from_res_{b}'](node_embed) * diffuse_mask[..., None, None]
 
-            if self.scale_atom10:
-                atompos = curr_rigids[..., None].apply(self.scale_pos(curr_atoms))
-            else:
-                atompos = curr_rigids[..., None].apply(curr_atoms)
+            atompos = curr_rigids[..., None].apply(curr_atoms)
 
             if self.use_atom14:
                 dummy_psi = torch.stack(
@@ -662,17 +668,10 @@ class IpaScore(nn.Module):
                     ], dim=-1
                 )
 
-                if self.scale_atom10:
-                    bb = compute_backbone(self.unscale_rigids(curr_rigids), dummy_psi)[-1][..., :4, :]
-                    atompos = torch.cat([
-                        self.scale_pos(bb), atompos
-                    ], dim=-2)
-
-                else:
-                    bb = compute_backbone(curr_rigids, dummy_psi)[-1][..., :4, :]
-                    atompos = torch.cat([
-                        bb, atompos
-                    ], dim=-2)
+                bb = compute_backbone(curr_rigids, dummy_psi)[-1][..., :4, :]
+                atompos = torch.cat([
+                    bb, atompos
+                ], dim=-2)
 
             atompos = atompos.view(curr_rigids.shape[0], -1, 3)
 
@@ -729,10 +728,15 @@ class IpaScore(nn.Module):
                 traj_data[b]['seq_logits'] = self.trunk[f"seq_pred_{b}"](atom_embed[..., :n_atoms, :], atom_res_idx[..., :n_atoms])
                 traj_data[b]['dist_logits'] = self.trunk[f"dist_pred_{b}"](edge_embed)
                 traj_data[b]['rigids'] = self.unscale_rigids(curr_rigids)
-                traj_data[b]['atom10_local'] = curr_atoms
+                if self.scale_atom10:
+                    traj_data[b]['atom10_local'] = self.unscale_pos(curr_atoms)
+                else:
+                    traj_data[b]['atom10_local'] = self.unscale_pos(curr_atoms)
 
         curr_rigids = self.unscale_rigids(curr_rigids)
         _, psi_pred = self.torsion_pred(node_embed)
+        if self.scale_atom10:
+            curr_atoms = self.unscale_pos(curr_atoms)
         curr_atom10 = curr_atoms.view(*curr_rigids.shape, 10, 3)
         model_out = {
             'psi': psi_pred,
@@ -760,8 +764,8 @@ class IpaAtom10DenoiserV2(nn.Module):
                  force_flash_transformer=False,
                  use_v2=False,
                  use_v3=False,
-                 atom10_preconditioning=False,
-                 trans_preconditioning=False,
+                 preconditioning=False,
+                 nonlocal_preconditioning=False,
                  break_sidechain_symmetry=False,
                  use_atom14=False,
                  broadcast_res_features=False,
@@ -794,7 +798,7 @@ class IpaAtom10DenoiserV2(nn.Module):
             num_blocks=num_blocks,
             use_traj_predictions=use_traj_predictions,
             force_flash_transformer=force_flash_transformer,
-            coordinate_scaling=1 if trans_preconditioning else 0.1,
+            coordinate_scaling=1 if preconditioning else 0.1,
             use_atom14=use_atom14,
             broadcast_res_features=broadcast_res_features,
             broadcast_edge_features=broadcast_edge_features,
@@ -814,8 +818,8 @@ class IpaAtom10DenoiserV2(nn.Module):
             use_atom14=use_atom14
         )
         self.c_s = c_s
-        self.atom10_preconditioning = atom10_preconditioning
-        self.trans_preconditioning = trans_preconditioning
+        self.preconditioning = preconditioning
+        self.nonlocal_preconditioning = nonlocal_preconditioning
 
     def forward(self, data, self_condition=None):
         res_data = data['residue']
@@ -852,13 +856,11 @@ class IpaAtom10DenoiserV2(nn.Module):
         noised_atom10_local = res_data['noised_atom10_local'].view([batch_size, -1, 10, 3])
 
         noised_atom10_local = noised_atom10_local - data['atom10_prior_offset'][None, None, None]
-        if self.atom10_preconditioning:
+        if self.preconditioning:
+            rigids_t = rigids_t.apply_trans_fn(lambda x: x * data['trans_c_in'][..., None, None])
             noised_atom10_local_in = noised_atom10_local * data['atom10_c_in'][..., None, None, None]
         else:
             noised_atom10_local_in = noised_atom10_local
-
-        if self.trans_preconditioning:
-            rigids_t = rigids_t.apply_trans_fn(lambda x: x * data['trans_c_in'][..., None, None])
 
         node_embed, edge_embed, atom_embed, atom_res_idx = self.embedder(
             noised_atom10_local=noised_atom10_local_in,
@@ -870,7 +872,6 @@ class IpaAtom10DenoiserV2(nn.Module):
             sc_rigids=sc_rigids,
             sc_atom14=sc_atom14
         )
-
 
         input_feats = {
             'fixed_mask': fixed_mask,
@@ -884,13 +885,11 @@ class IpaAtom10DenoiserV2(nn.Module):
 
         score_dict = self.ipa_score(node_embed, edge_embed, input_feats)
         rigids = score_dict['final_rigids']
-        if self.trans_preconditioning:
-            rigids = rigids.apply_trans_fn(lambda x: x * data['trans_c_out'][..., None, None] + rigids_t_original_scale.get_trans() * data['trans_c_skip'][..., None, None])
-
-        rigids = rigids.view(-1).translate(center)
         final_atom10_local = score_dict['final_atom10_local']
-        if self.atom10_preconditioning:
+        if self.preconditioning:
+            rigids = rigids.apply_trans_fn(lambda x: x * data['trans_c_out'][..., None, None] + rigids_t_original_scale.get_trans() * data['trans_c_skip'][..., None, None])
             final_atom10_local = final_atom10_local * data['atom10_c_out'][..., None, None, None] + noised_atom10_local * data['atom10_c_skip'][..., None, None, None]
+        rigids = rigids.view(-1).translate(center)
         final_atom10_local = final_atom10_local + data['atom10_prior_offset'][None, None, None]
         final_atom10_local = final_atom10_local.view(-1, 10, 3)
 

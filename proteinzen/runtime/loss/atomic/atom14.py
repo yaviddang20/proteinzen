@@ -10,7 +10,8 @@ def atom14_mse_loss(gt_atom14,
                     atom14_alt_gt_mask,
                     noising_mask,
                     no_bb=False,
-                    seqwise_weight=None):
+                    seqwise_weight=None,
+                    ignore_symmetry=False):
     gt_mask = atom14_gt_mask * noising_mask[..., None]
     alt_mask = atom14_alt_gt_mask * noising_mask[..., None]
     if no_bb:
@@ -21,19 +22,28 @@ def atom14_mse_loss(gt_atom14,
         pred_atom14 = pred_atom14[..., 4:, :]
 
 
-    gt_diff = torch.square(gt_atom14 - pred_atom14).sum(dim=-1) * gt_mask
-    alt_diff = torch.square(gt_atom14 - pred_atom14).sum(dim=-1) * alt_mask
+    if ignore_symmetry:
+        gt_diff = torch.square(gt_atom14 - pred_atom14).sum(dim=-1) * gt_mask
 
-    # we take the min mse per residue
-    gt_poswise_diff = gt_diff.sum(dim=-1)
-    alt_poswise_diff = alt_diff.sum(dim=-1)
-    choose_gt = (gt_poswise_diff < alt_poswise_diff)  # n_node
+        if seqwise_weight is not None:
+            gt_diff = gt_diff * seqwise_weight
 
-    min_diff = choose_gt[..., None] * gt_diff + (~choose_gt)[..., None] * alt_diff
-    if seqwise_weight is not None:
-        min_diff = min_diff * seqwise_weight[..., None]
+        return _nodewise_to_graphwise(gt_diff, batch, gt_mask)
 
-    return _nodewise_to_graphwise(min_diff, batch, gt_mask)
+    else:
+        gt_diff = torch.square(gt_atom14 - pred_atom14).sum(dim=-1) * gt_mask
+        alt_diff = torch.square(gt_atom14 - pred_atom14).sum(dim=-1) * alt_mask
+
+        # we take the min mse per residue
+        gt_poswise_diff = gt_diff.sum(dim=-1)
+        alt_poswise_diff = alt_diff.sum(dim=-1)
+        choose_gt = (gt_poswise_diff < alt_poswise_diff)  # n_node
+
+        min_diff = choose_gt[..., None] * gt_diff + (~choose_gt)[..., None] * alt_diff
+        if seqwise_weight is not None:
+            min_diff = min_diff * seqwise_weight
+
+        return _nodewise_to_graphwise(min_diff, batch, gt_mask)
 
 
 def chi_loss(gt_chi_vecs,

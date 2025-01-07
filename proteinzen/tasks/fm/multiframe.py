@@ -23,6 +23,7 @@ from proteinzen.stoch_interp.interpolate.multiframe import _centered_gaussian, _
 
 import proteinzen.stoch_interp.interpolate.utils as du
 from proteinzen.utils.framediff import all_atom
+from proteinzen.utils.coarse_grain import compute_atom14_from_cg_frames
 
 
 
@@ -37,22 +38,34 @@ class MultiFrameInterpolation(Task):
                  aux_loss_t_min=0.25,
                  use_fape=False,
                  use_fafe=False,
+                 use_fafe_l2=False,
                  scale_frame_aligned_errors=False,
                  scale_fape=False,
                  scale_fafe=False,
+                 fafe_weight=0.25,
                  polar_upweight=False,
+                 sidechain_upweight=False,
                  trans_preconditioning=False,
+                 rot_loss_exp_weighting=False,
+                 rot_vf_angle_loss_weight=0.5,
+                 rigids_traj_loss_scale=1
     ):
         super().__init__()
         self.frame_noiser = protein_noiser
         self.aux_loss_t_min = aux_loss_t_min
         self.use_fape = use_fape
         self.use_fafe = use_fafe
+        self.use_fafe_l2 = use_fafe_l2
         self.scale_frame_aligned_errors = scale_frame_aligned_errors
         self.scale_fape = scale_fape
         self.scale_fafe = scale_fafe
         self.polar_upweight = polar_upweight
+        self.sidechain_upweight = sidechain_upweight
         self.trans_preconditioning = trans_preconditioning
+        self.rot_loss_exp_weighting = rot_loss_exp_weighting
+        self.fafe_weight = fafe_weight
+        self.rot_vf_angle_loss_weight = rot_vf_angle_loss_weight
+        self.rigids_traj_loss_scale = rigids_traj_loss_scale
 
         self.rng = np.random.default_rng()
 
@@ -75,19 +88,21 @@ class MultiFrameInterpolation(Task):
             'all_atom_positions': torch.as_tensor(res_data['atom37']).double(),
             'all_atom_mask': torch.as_tensor(res_data['atom37_mask']).double()
         }
-        chain_feats = data_transforms.atom37_to_frames(chain_feats)
+        # chain_feats = data_transforms.atom37_to_frames(chain_feats)
+        chain_feats = data_transforms.atom37_to_cg_frames(chain_feats)
         chain_feats = data_transforms.atom37_to_torsion_angles(prefix="")(chain_feats)  # TODO: uncurry this
         chain_feats = data_transforms.make_atom14_masks(chain_feats)
         chain_feats = data_transforms.make_atom14_positions(chain_feats)
 
-        rigids_1 = ru.Rigid.from_tensor_4x4(chain_feats['rigidgroups_gt_frames'])[:, (0, 4, 5, 6, 7)]
+        # rigids_1 = ru.Rigid.from_tensor_4x4(chain_feats['rigidgroups_gt_frames'])[:, (0, 4, 5, 6, 7)]
+        rigids_1 = ru.Rigid.from_tensor_4x4(chain_feats['cg_groups_gt_frames'])[:, (0, 2, 3)]
 
         # compute bb frame features
         diffuse_mask = self._gen_diffuse_mask(res_data)
         res_data['res_noising_mask'] = diffuse_mask
         res_data['x'] = rigids_1.get_trans()  # for HeteroData's sake
         rigids_1_tensor_7 = rigids_1.to_tensor_7()
-        rigids_mask = chain_feats["torsion_angles_mask"][..., (0, 3, 4, 5, 6)]
+        rigids_mask = chain_feats["cg_groups_gt_exists"][:, (0, 2, 3)]
         rigids_mask[..., 0] = res_data['res_mask']
         rigids_1_tensor_7 = (
             rigids_1_tensor_7 * rigids_mask[..., None] +
@@ -159,7 +174,7 @@ class MultiFrameInterpolation(Task):
                 residue={
                     "res_mask": torch.ones(n, device=device).bool(),
                     "res_noising_mask": torch.ones(n, device=device).bool(),
-                    "seq": torch.full((n,), 20, device=device).long(),
+                    "seq": torch.full((n,), residue_constants.restype_order['R'], device=device).long(),
                     "num_nodes": n
                 }
             )
@@ -220,7 +235,8 @@ class MultiFrameInterpolation(Task):
                     pred_trans_1.detach().cpu(),
                     pred_rotmats_1.detach().cpu(),
                     denoiser_out['decoded_seq_logits'].detach().cpu().argmax(dim=-1),
-                    denoiser_out['denoised_atom14'].detach().cpu()
+                    denoiser_out['denoised_atom14'].detach().cpu(),
+                    denoiser_out['denoised_atom14_gt_seq'].detach().cpu()
                 )
             )
 
@@ -278,14 +294,16 @@ class MultiFrameInterpolation(Task):
         # # Convert trajectories to atom37.
         # atom37_traj = all_atom.transrotpsi_to_atom37(prot_traj, res_data.res_mask)
         # clean_atom37_traj = all_atom.transrotpsi_to_atom37(clean_traj, res_data.res_mask)
-        clean_trajs = zip(*[traj[-1].split(num_res) for traj in clean_traj])
-        clean_traj_seqs = zip(*[traj[-2].split(num_res) for traj in clean_traj])
+        clean_trajs = zip(*[traj[-2].split(num_res) for traj in clean_traj])
+        clean_traj_seqs = zip(*[traj[-3].split(num_res) for traj in clean_traj])
+        all_R_clean_trajs = zip(*[traj[-1].split(num_res) for traj in clean_traj])
         prot_trajs = zip(*[traj[-1].split(num_res) for traj in prot_traj])
 
         return {
             "samples": decoded_struct.split(num_res),
             "seqs": argmax_seq.split(num_res),
             "clean_trajs": clean_trajs,
+            "all_R_clean_trajs": all_R_clean_trajs,
             "clean_traj_seqs": clean_traj_seqs,
             "prot_trajs": prot_trajs,
             "inputs": inputs
@@ -298,13 +316,21 @@ class MultiFrameInterpolation(Task):
             t_norm_clip=0.9,
             square_aux_loss_time_factor=True,
             use_fafe=self.use_fafe,
+            use_fafe_l2=self.use_fafe_l2,
             polar_upweight=self.polar_upweight,
-            trans_preconditioning=self.trans_preconditioning
+            sidechain_upweight=self.sidechain_upweight,
+            trans_preconditioning=self.trans_preconditioning,
+            rot_exp_weighting=self.rot_loss_exp_weighting,
+            rot_vf_angle_loss_weight=self.rot_vf_angle_loss_weight
         )
 
         frame_vf_loss = (
             frame_fm_loss_dict["trans_vf_loss"] +
             frame_fm_loss_dict["rot_vf_loss"]
+        )
+        unscaled_frame_vf_loss = (
+            frame_fm_loss_dict["unscaled_trans_vf_loss"] +
+            frame_fm_loss_dict["unscaled_rot_vf_loss"]
         )
         bb_denoising_finegrain_loss = (
             frame_fm_loss_dict["scaled_pred_bb_mse"]
@@ -321,7 +347,8 @@ class MultiFrameInterpolation(Task):
             t_norm_clip=0.9,
             use_sidechain_dists_mse_loss=False,
             use_sidechain_clash_loss=False,
-            polar_upweight=self.polar_upweight
+            polar_upweight=self.polar_upweight,
+            sidechain_upweight=self.sidechain_upweight
         )
 
         atomic_loss = (
@@ -334,11 +361,11 @@ class MultiFrameInterpolation(Task):
 
         loss = (
             frame_vf_loss
-            + 0.25 * frame_fm_loss_dict[('scaled_fafe' if self.scale_frame_aligned_errors or self.scale_fafe else 'fafe')]
+            + self.fafe_weight * frame_fm_loss_dict[('scaled_fafe' if self.scale_frame_aligned_errors or self.scale_fafe else 'fafe')]
             + 0.25 * bb_denoising_finegrain_loss
             + atomic_loss
             + traj_loss_dict['traj_bb_loss']
-            + traj_loss_dict['traj_rigids_loss']
+            + traj_loss_dict['traj_rigids_loss'] * self.rigids_traj_loss_scale
             + traj_loss_dict['traj_pred_dist_loss'] * 0.5
             + traj_loss_dict['traj_pred_framepair_dist_loss'] * 0.5
             + traj_loss_dict['traj_seq_loss'] * 0.25
@@ -346,7 +373,7 @@ class MultiFrameInterpolation(Task):
         )
         loss = loss.mean()
 
-        loss_dict = {"loss": loss, "frame_vf_loss": frame_vf_loss}
+        loss_dict = {"loss": loss, "frame_vf_loss": frame_vf_loss, "unscaled_frame_vf_loss": unscaled_frame_vf_loss}
         loss_dict.update(frame_fm_loss_dict)
         loss_dict.update(atomic_loss_dict)
         loss_dict.update(traj_loss_dict)
