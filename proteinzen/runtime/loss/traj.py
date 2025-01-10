@@ -110,7 +110,8 @@ def traj_loss(
             data_k['seq_logits'].transpose(-1, -2),
             res_data['seq'].view(batch.num_graphs, -1),
             reduction="none"
-        ).sum(dim=-1) / res_mask.float().sum(dim=-1)
+        )
+        seq_loss_k = (seq_loss_k * res_mask).sum(dim=-1) / res_mask.float().sum(dim=-1)
 
         bb_loss += bb_loss_k * scale
         pred_dist_loss += dist_loss_k * scale
@@ -171,7 +172,8 @@ def traj_loss2(
             data_k['seq_logits'].transpose(-1, -2),
             res_data['seq'].view(batch.num_graphs, -1),
             reduction="none"
-        ).sum(dim=-1) / res_mask.float().sum(dim=-1)
+        )
+        seq_loss_k = (seq_loss_k * res_mask).sum(dim=-1) / res_mask.float().sum(dim=-1)
 
         bb_loss += bb_loss_k * scale
         pred_dist_loss += dist_loss_k * scale
@@ -309,7 +311,8 @@ def multiframe_traj_loss(
             data_k['seq_logits'].transpose(-1, -2),
             res_data['seq'].view(batch.num_graphs, -1),
             reduction="none"
-        ).sum(dim=-1) / res_mask.float().sum(dim=-1)
+        )
+        seq_loss_k = (seq_loss_k * res_mask).sum(dim=-1) / res_mask.float().sum(dim=-1)
 
         rigids_loss = rigids_loss + rigids_loss_k * scale
         pred_dist_loss = pred_dist_loss + dist_loss_k * scale
@@ -350,7 +353,8 @@ def multiframe_traj_loss(
                 seqpair_logits,
                 gt_pairwise_seq.long(),
                 reduction="none"
-            ).sum(dim=(-1, -2)) / edge_mask.float().sum(dim=(-1, -2))
+            )
+            seqpair_loss_k = (seqpair_loss_k * edge_mask).sum(dim=(-1, -2)) / edge_mask.float().sum(dim=(-1, -2))
             seqpair_loss = seqpair_loss + seqpair_loss_k * scale
         else:
             seqpair_loss = seqpair_loss + torch.zeros_like(rigids_loss_k)
@@ -362,4 +366,52 @@ def multiframe_traj_loss(
         "traj_pred_framepair_dist_loss": pred_framepair_dist_loss / n_layers,
         "traj_seq_loss": seq_loss / n_layers,
         "traj_seqpair_loss": seqpair_loss / n_layers,
+    }
+
+def atomic_traj_loss(
+    batch,
+    model_outputs,
+    traj_decay_factor=0.99,
+):
+    traj_data = model_outputs['traj_data']
+    n_layers = len(traj_data) + 1
+
+    res_data = batch['residue']
+    device = res_data['atom14'].device
+
+    gt_atom14 = res_data['atom14'].view(batch.num_graphs, -1, 14, 3)
+    gt_ca = gt_atom14[..., 1, :]
+    res_mask = res_data['res_mask'].view(batch.num_graphs, -1)
+    edge_mask = res_mask[..., None] & res_mask[..., None, :]
+    gt_dists = torch.cdist(gt_ca, gt_ca)
+
+    ca_loss = 0
+    pred_dist_loss = 0
+    seq_loss = 0
+    for k in range(n_layers-1):
+        data_k = traj_data[k]
+        scale = traj_decay_factor ** (n_layers - k)
+        ca_loss_k = torch.square(data_k['ca_pos'] - gt_ca).sum(dim=-1)
+        ca_loss_k = (ca_loss_k * res_mask).sum(dim=-1) / res_mask.float().sum(dim=-1)
+
+        dist_loss_k = interm_pred_dist_loss(
+            gt_dist=gt_dists,
+            dist_logits=data_k['dist_logits'],
+            edge_mask=edge_mask
+        )
+        seq_loss_k = F.cross_entropy(
+            data_k['seq_logits'].transpose(-1, -2),
+            res_data['seq'].view(batch.num_graphs, -1),
+            reduction="none"
+        )
+        seq_loss_k = (seq_loss_k * res_mask).sum(dim=-1) / res_mask.float().sum(dim=-1)
+
+        ca_loss += ca_loss_k * scale
+        pred_dist_loss += dist_loss_k * scale
+        seq_loss += seq_loss_k * scale
+
+    return {
+        "traj_ca_loss": ca_loss / (n_layers-1),
+        "traj_pred_dist_loss": pred_dist_loss / (n_layers-1),
+        "traj_seq_loss": seq_loss / (n_layers-1)
     }

@@ -10,13 +10,13 @@ import numpy as np
 
 from torch_geometric.nn import knn_graph
 import torch_geometric.utils as pygu
-import dgl
-import dgl.sparse
-from dgl.ops import u_mul_e_sum, u_dot_v, u_add_v
+# import dgl
+# import dgl.sparse
+# from dgl.ops import u_mul_e_sum, u_dot_v, u_add_v
 
 from proteinzen.model.modules.openfold.layers_v2 import (
     Linear, swish, ipa_point_weights_init_, permute_final_dims, flatten_final_dims, BackboneUpdate, LayerNorm,
-    AdaLN, ConditionedTransition)
+    AdaLN, ConditionedTransition, Transition)
 from proteinzen.utils.openfold import rigid_utils as ru
 
 
@@ -693,17 +693,231 @@ class ConditionedBlockInvariantPointAttention(nn.Module):
 
         return out.view(s.shape)
 
+
 class BlockAttentionPairBias(nn.Module):
     def __init__(
         self,
         c_s,
         c_z,
         num_heads=4,
+        inf=1e5
     ):
         super().__init__()
         self.c_s = c_s
         self.c_z = c_z
         self.num_heads = num_heads
+        self.c_hidden = c_s // num_heads
+        self.inf = inf
+
+        self.ln = LayerNorm(c_s)
+        self.lin_q = Linear(c_s, c_s, bias=False)
+        self.lin_kv = Linear(c_s, 2*c_s, bias=False)
+        self.lin_bias = nn.Sequential(
+            LayerNorm(c_z),
+            Linear(c_z, num_heads, bias=False)
+        )
+        self.lin_gate = Linear(c_s, c_s, bias=False)
+        self.lin_out = Linear(c_s, c_s, bias=False, init='final')
+
+    def forward(
+        self,
+        node_embed,
+        edge_embed,
+        to_queries,
+        to_keys,
+        node_mask
+    ):
+        q_mask = to_queries(node_mask[..., None].float())
+        k_mask = to_keys(node_mask[..., None].float()).transpose(-1, -2)
+        edge_mask = q_mask * k_mask
+
+        node_embed = self.ln(node_embed)
+
+        q_in = to_queries(node_embed)
+        kv_in = to_keys(node_embed)
+
+        q = self.lin_q(q_in)
+        q = q.unflatten(-1, (self.num_heads, self.c_hidden))
+        kv = self.lin_kv(kv_in)
+        kv = kv.unflatten(-1, (2 * self.num_heads, self.c_hidden))
+        k, v = kv.split(self.num_heads, dim=-2)
+
+        # n_batch x n_block x h x q x k
+        a = torch.einsum("...ihk,...jhk->...hij", q, k)
+        a = a / math.sqrt(self.c_hidden)
+        bias = self.lin_bias(edge_embed)
+        a = a + permute_final_dims(bias, (2, 0, 1))
+        a = a + (edge_mask - 1)[..., None, :, :] * self.inf
+        a = torch.softmax(a, dim=-1)
+
+        out = torch.einsum("...hij,...jhk->...ihk", a, v)
+        gate = torch.sigmoid(self.lin_gate(q_in))
+        out = flatten_final_dims(out, 2) * gate
+        out = self.lin_out(out.view(node_embed.shape))
+
+        return out
+
+
+class ConditionedBlockAttentionPairBias(nn.Module):
+    def __init__(
+        self,
+        c_s,
+        c_cond,
+        c_z,
+        num_heads=4,
+        inf=1e5
+    ):
+        super().__init__()
+        self.c_s = c_s
+        self.c_z = c_z
+        self.num_heads = num_heads
+        self.c_hidden = c_s // num_heads
+        self.inf = inf
+
+        self.adaln = AdaLN(c_s, c_cond)
+        self.lin_q = Linear(c_s, c_s, bias=False)
+        self.lin_kv = Linear(c_s, 2*c_s, bias=False)
+        self.lin_bias = nn.Sequential(
+            LayerNorm(c_z),
+            Linear(c_z, num_heads, bias=False)
+        )
+        self.lin_gate = Linear(c_s, c_s, bias=False)
+
+        self.lin_cond_gate = Linear(c_cond, c_s)
+        with torch.no_grad():
+            self.lin_cond_gate.bias.fill_(-2.0)
+
+        self.lin_out = Linear(c_s, c_s, bias=False, init='final')
+
+    def forward(
+        self,
+        node_embed,
+        cond_embed,
+        edge_embed,
+        to_queries,
+        to_keys,
+        node_mask
+    ):
+        q_mask = to_queries(node_mask[..., None].float())
+        k_mask = to_keys(node_mask[..., None].float()).transpose(-1, -2)
+        edge_mask = q_mask * k_mask
+
+        node_embed = self.adaln(node_embed, cond_embed)
+
+        q_in = to_queries(node_embed)
+        kv_in = to_keys(node_embed)
+
+        q = self.lin_q(q_in)
+        q = q.unflatten(-1, (self.num_heads, self.c_hidden))
+        kv = self.lin_kv(kv_in)
+        kv = kv.unflatten(-1, (2 * self.num_heads, self.c_hidden))
+        k, v = kv.split(self.num_heads, dim=-2)
+
+        # n_batch x n_block x h x q x k
+        a = torch.einsum("...ihk,...jhk->...hij", q, k)
+        a = a / math.sqrt(self.c_hidden)
+        bias = self.lin_bias(edge_embed)
+        a = a + permute_final_dims(bias, (2, 0, 1))
+        a = a + (edge_mask - 1)[..., None, :, :] * self.inf
+        a = torch.softmax(a, dim=-1)
+
+        out = torch.einsum("...hij,...jhk->...ihk", a, v)
+        gate = torch.sigmoid(self.lin_gate(q_in))
+        out = flatten_final_dims(out, 2) * gate
+        out = self.lin_out(out.view(node_embed.shape))
+
+        cond_gate = torch.sigmoid(self.lin_cond_gate(cond_embed))
+        out = out * cond_gate
+
+        return out
+
+
+class BlockTransformerPairBias(nn.Module):
+    def __init__(
+        self,
+        c_s,
+        c_cond,
+        c_z,
+        num_heads
+    ):
+        super().__init__()
+        self.c_s = c_s
+        self.c_z = c_z
+
+        self.attn = BlockAttentionPairBias(
+            c_s,
+            c_z,
+            num_heads
+        )
+        self.transition = GatherConditionedTransition(c_s, c_cond)
+
+    def forward(
+        self,
+        s,
+        rigids_embed,
+        framepair_embed,
+        to_queries,
+        to_keys,
+        rigids_mask,
+        rigids_to_res_idx
+    ):
+        update = self.attn(
+            rigids_embed,
+            framepair_embed,
+            to_queries,
+            to_keys,
+            rigids_mask
+        )
+        rigids_embed = rigids_embed + update * rigids_mask[..., None]
+
+        rigids_embed = rigids_embed + self.transition(rigids_embed, s, rigids_to_res_idx) * rigids_mask[..., None]
+
+        return rigids_embed
+
+
+class ConditionedBlockTransformerPairBias(nn.Module):
+    def __init__(
+        self,
+        c_s,
+        c_cond,
+        c_z,
+        num_heads
+    ):
+        super().__init__()
+        self.c_s = c_s
+        self.c_z = c_z
+
+        self.attn = ConditionedBlockAttentionPairBias(
+            c_s,
+            c_cond,
+            c_z,
+            num_heads
+        )
+        self.transition = ConditionedTransition(c_s, c_cond)
+
+    def forward(
+        self,
+        rigids_embed,
+        cond_rigids_embed,
+        framepair_embed,
+        to_queries,
+        to_keys,
+        rigids_mask,
+    ):
+        update = self.attn(
+            rigids_embed,
+            cond_rigids_embed,
+            framepair_embed,
+            to_queries,
+            to_keys,
+            rigids_mask
+        )
+        rigids_embed = rigids_embed + update * rigids_mask[..., None]
+
+        rigids_embed = rigids_embed + self.transition(rigids_embed, cond_rigids_embed) * rigids_mask[..., None]
+
+        return rigids_embed
+
 
 class SequenceFrameTransformerBlock(nn.Module):
     def __init__(self,
@@ -716,7 +930,8 @@ class SequenceFrameTransformerBlock(nn.Module):
                  block_q=32,
                  block_k=128,
                  inf=1e8,
-                 compile_ipa=False
+                 compile_ipa=False,
+                 add_vanilla_transformer=False,
                  ):
         super().__init__()
 
@@ -789,7 +1004,8 @@ class SequenceFrameTransformerUpdate(nn.Module):
         agg_rigid_embed=True,
         compile_ipa=False,
         framepair_init=False,
-        framepair_ffn=False
+        framepair_ffn=False,
+        add_vanilla_transformer=False,
     ):
         super().__init__()
         self.c_s = c_s
@@ -801,6 +1017,7 @@ class SequenceFrameTransformerUpdate(nn.Module):
         self.do_rigid_updates = do_rigid_updates
         self.agg_rigid_embed = agg_rigid_embed
         self.framepair_init = framepair_init
+        self.add_vanilla_transformer = add_vanilla_transformer
 
         if framepair_init:
             self.lin_framepair_dist_vec = Linear(3, c_framepair, bias=False)
@@ -849,6 +1066,14 @@ class SequenceFrameTransformerUpdate(nn.Module):
                 inf=inf,
                 compile_ipa=compile_ipa
             )
+            if self.add_vanilla_transformer:
+                self.trunk[f'vanilla_tfmr_{b}'] = BlockTransformerPairBias(
+                    c_s=c_frame,
+                    c_cond=c_s,
+                    c_z=c_framepair,
+                    num_heads=num_heads,
+                )
+
             if self.do_rigid_updates:
                 self.trunk[f'frame_update_{b}'] = BackboneUpdate(c_frame)
 
@@ -1022,6 +1247,16 @@ class SequenceFrameTransformerUpdate(nn.Module):
                 rigids_mask,
                 rigids_to_res_idx
             )
+            if self.add_vanilla_transformer:
+                rigids_embed_flat = self.trunk[f'vanilla_tfmr_{b}'](
+                    s=s,
+                    rigids_embed=rigids_embed_flat,
+                    framepair_embed=framepair_embed,
+                    to_queries=to_queries,
+                    to_keys=to_keys,
+                    rigids_mask=rigids_mask,
+                    rigids_to_res_idx=rigids_to_res_idx
+                )
             if self.do_rigid_updates:
                 # print(rigids_embed_flat)
                 rigids_update = self.trunk[f'frame_update_{b}'](rigids_embed_flat) * rigids_mask[..., None]
@@ -1134,7 +1369,8 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
         broadcast_pairs=False,
         agg_rigid_embed=True,
         compile_ipa=False,
-        framepair_init=False
+        framepair_init=False,
+        add_vanilla_transformer=False
     ):
         super().__init__()
         self.c_s = c_s
@@ -1146,6 +1382,8 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
         self.do_rigid_updates = do_rigid_updates
         self.agg_rigid_embed = agg_rigid_embed
         self.framepair_init = framepair_init
+        self.add_vanilla_transformer = add_vanilla_transformer
+
         if framepair_init:
             self.lin_framepair_dist_vec = Linear(3, c_framepair, bias=False)
             self.lin_framepair_dist = Linear(1, c_framepair, bias=False)
@@ -1187,6 +1425,14 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
                 inf=inf,
                 compile_ipa=compile_ipa
             )
+            if self.add_vanilla_transformer:
+                self.trunk[f'vanilla_tfmr_{b}'] = ConditionedBlockTransformerPairBias(
+                    c_s=c_frame,
+                    c_cond=c_s,
+                    c_z=c_framepair,
+                    num_heads=num_heads,
+                )
+
             if self.do_rigid_updates:
                 self.trunk[f'frame_update_{b}'] = BackboneUpdate(c_frame)
 
@@ -1360,6 +1606,16 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
                 to_keys,
                 rigids_mask,
             )
+            if self.add_vanilla_transformer:
+                rigids_embed_flat = self.trunk[f'vanilla_tfmr_{b}'](
+                    rigids_embed=rigids_embed_flat,
+                    cond_rigids_embed=cond_rigids_embed_flat,
+                    framepair_embed=framepair_embed,
+                    to_queries=to_queries,
+                    to_keys=to_keys,
+                    rigids_mask=rigids_mask,
+                )
+
             if self.do_rigid_updates:
                 # print(rigids_embed_flat)
                 rigids_update = self.trunk[f'frame_update_{b}'](rigids_embed_flat) * rigids_mask[..., None]

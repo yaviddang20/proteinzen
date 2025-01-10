@@ -10,9 +10,9 @@ import numpy as np
 
 from torch_geometric.nn import knn_graph
 import torch_geometric.utils as pygu
-import dgl
-import dgl.sparse
-from dgl.ops import u_mul_e_sum, u_dot_v, u_add_v
+# import dgl
+# import dgl.sparse
+# from dgl.ops import u_mul_e_sum, u_dot_v, u_add_v
 
 from proteinzen.model.modules.openfold.layers_v2 import (
     Linear, swish, ipa_point_weights_init_, permute_final_dims, flatten_final_dims, BackboneUpdate, LayerNorm,

@@ -312,6 +312,7 @@ class EmbedderV2(nn.Module):
                  break_symmetry=True,
                  rigids_per_residue=3,
                  use_sc_rigid_transformer=False,
+                 rigid_transformer_add_vanilla_transformer=False,
     ):
         super().__init__()
         self.c_s = c_s
@@ -345,7 +346,8 @@ class EmbedderV2(nn.Module):
             broadcast_singles=True,
             broadcast_pairs=True,
             framepair_init=True,
-            framepair_ffn=True
+            framepair_ffn=True,
+            add_vanilla_transformer=rigid_transformer_add_vanilla_transformer
         )
         self.use_sc_rigid_transformer = use_sc_rigid_transformer
         if use_sc_rigid_transformer:
@@ -362,7 +364,8 @@ class EmbedderV2(nn.Module):
                 broadcast_singles=True,
                 broadcast_pairs=True,
                 framepair_init=True,
-                framepair_ffn=True
+                framepair_ffn=True,
+                add_vanilla_transformer=rigid_transformer_add_vanilla_transformer
             )
             self.node_adaln = AdaLN(c_s, c_s)
             self.frame_adaln = AdaLN(c_frame, c_frame)
@@ -455,16 +458,22 @@ class EmbedderV2(nn.Module):
         )
 
         if self.use_sc_rigid_transformer:
-            sc_rigids_embed, sc_node_embed, sc_framepair_embed, _ = self.sc_frame_tfmr(
-                node_init,
-                edge_embed,
-                rigids,
-                rigids_init,
-                to_queries,
-                to_keys,
-                to_pairs,
-                framepair_embed=None
-            )
+            if sc_rigids is not None:
+                sc_rigids_embed, sc_node_embed, sc_framepair_embed, _ = self.sc_frame_tfmr(
+                    node_init,
+                    edge_embed,
+                    sc_rigids,
+                    rigids_init,
+                    to_queries,
+                    to_keys,
+                    to_pairs,
+                    framepair_embed=None
+                )
+            else:
+                sc_rigids_embed = torch.zeros_like(rigids_init)
+                sc_node_embed = torch.zeros_like(node_init)
+                sc_framepair_embed = torch.zeros_like(framepair_embed)
+
             node_embed = self.node_adaln(node_embed, sc_node_embed)
             rigids_embed = self.frame_adaln(rigids_embed, sc_rigids_embed)
             framepair_embed = self.framepair_adaln(framepair_embed, sc_framepair_embed)
@@ -1876,6 +1885,7 @@ class IpaScoreV6(nn.Module):
                  rigid_transformer_num_blocks=1,
                  rigid_transformer_rigid_updates=False,
                  rigid_embed_skip_sc=False,
+                 rigid_transformer_add_vanilla_transformer=False,
                  rel_quat_pair_updates=False,
                  ):
         super().__init__()
@@ -1978,6 +1988,7 @@ class IpaScoreV6(nn.Module):
             do_rigid_updates=True,
             agg_rigid_embed=True,
             broadcast_pairs=True,
+            add_vanilla_transformer=rigid_transformer_add_vanilla_transformer
         )
         if traj_framepair_predictor:
             self.rigid_dist_pred = FramepairDistPredictor(c_framepair)
@@ -2144,6 +2155,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                  rigid_transformer_num_blocks=1,
                  rigid_transformer_rigid_updates=False,
                  rigid_transformer_agg_embed=True,
+                 rigid_transformer_add_vanilla_transformer=False,
                  rigid_embed_skip_sc=False,
                  use_v2=False,
                  use_v3=False,
@@ -2290,6 +2302,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                 propagate_framepair_embed=propagate_framepair_embed,
                 use_knn=use_knn,
                 rigid_transformer_num_blocks=rigid_transformer_num_blocks,
+                rigid_transformer_add_vanilla_transformer=rigid_transformer_add_vanilla_transformer,
                 rigid_embed_skip_sc=rigid_embed_skip_sc,
                 rel_quat_pair_updates=rel_quat_pair_updates,
             )
@@ -2343,7 +2356,8 @@ class IpaMultiRigidDenoiser(nn.Module):
                 block_k=block_k,
                 break_symmetry=break_rigid_symmetry,
                 rigids_per_residue=rigids_per_residue,
-                use_sc_rigid_transformer=use_embedder_sc_rigid_transformer
+                use_sc_rigid_transformer=use_embedder_sc_rigid_transformer,
+                rigid_transformer_add_vanilla_transformer=rigid_transformer_add_vanilla_transformer
             )
         else:
             self.embedder = Embedder(

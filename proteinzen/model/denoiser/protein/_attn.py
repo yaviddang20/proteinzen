@@ -442,6 +442,92 @@ class ConditionedPairUpdate(nn.Module):
 
         return z
 
+# inspired by Pallatom
+class ConditionedPairUpdateV2(nn.Module):
+    def __init__(
+            self,
+            c_s,
+            c_z,
+            c_hidden,
+            c_cond=None,
+            no_heads=4,
+            num_rbf=39,
+            dropout=0.25,
+            rbf_min=3.25,
+            rbf_max=50.75,
+            inf=1e8,
+        ):
+        super().__init__()
+        self.no_heads = no_heads
+        self.c_hidden = c_hidden
+        self.num_rbf = num_rbf
+        self.NM_TO_ANG_SCALE = 10.0
+        self.D_min = rbf_min
+        self.D_max = rbf_max
+        self.inf = inf
+        if c_cond is None:
+            self.c_cond = c_s // 4
+
+        self.emb_rbf = nn.Sequential(
+            Linear(num_rbf, c_hidden, bias=False),
+            LayerNorm(c_hidden),
+            Linear(c_hidden, no_heads, bias=False)
+        )
+        self.ln_third_edge = LayerNorm(c_z)
+        self.emb_third_edge = Linear(c_z, no_heads, bias=False)
+
+        self.trig_attn_start = TriangleAttentionCore(c_z, self.c_hidden, self.no_heads, starting=True)
+        self.trig_bias_start = Linear(c_hidden, no_heads, bias=False)
+        self.trig_attn_end = TriangleAttentionCore(c_z, self.c_hidden, self.no_heads, starting=False)
+        self.trig_bias_end = Linear(c_hidden, no_heads, bias=False)
+        self.cond_proj = nn.Sequential(
+            LayerNorm(c_s),
+            Linear(c_s, self.c_cond, bias=False)
+        )
+        self.transition = ConditionedTransition(c_z, c_cond=self.c_cond*2)
+
+        self.dropout_row_layer = DropoutRowwise(dropout)
+        self.dropout_col_layer = DropoutColumnwise(dropout)
+        self.layer_norm_start = LayerNorm(c_z)
+        self.layer_norm_end = LayerNorm(c_z)
+
+    def forward(self, node_embed, edge_embed, coords, edge_mask):
+        # get pair bias from rbf of distance
+        distances = torch.cdist(coords, coords)
+        # [B, I, J, H]
+        dist_bias = self.emb_rbf(
+            _rbf(distances, D_min=self.D_min, D_max=self.D_max, D_count=self.num_rbf, device=distances.device)
+        )
+        # [B, I, 1, 1, J, H]
+        mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
+
+        third_edge = self.emb_third_edge(self.ln_third_edge(edge_embed))
+        edge_bias = dist_bias + third_edge
+
+        edge_bias = edge_bias.unsqueeze(-4)
+
+        z = edge_embed
+        z = z + self.trig_attn_start(
+            z,
+            edge_bias=permute_final_dims(edge_bias, (2, 0, 1)),
+            mask_bias=mask_bias
+        )
+        z = z + self.trig_attn_end(
+            z,
+            edge_bias=permute_final_dims(edge_bias, (2, 0, 1)),
+            mask_bias=mask_bias
+        )
+        # B x N x c_cond
+        cond = self.cond_proj(node_embed)
+        num_res = node_embed.shape[-2]
+        cond = torch.cat([
+            torch.tile(cond[..., None, :], (1, 1, num_res, 1)),
+            torch.tile(cond[..., None, :, :], (1, num_res, 1, 1))
+        ], dim=-1)
+        z = z + self.transition(z, cond)
+
+        return z
+
 
 def relpos(node_idx, clip=32):
     relpos_idx = torch.clip(
@@ -822,6 +908,108 @@ class MultiRigidPairEmbedder(nn.Module):
         a_current = self._featurize_rigids(rigids, distogram=False)
         if sc_rigids is not None:
             a_sc = self._featurize_rigids(sc_rigids, distogram=True)
+        else:
+            a_sc = torch.zeros_like(a_current)
+
+        z = z + self.lin_a_ij(torch.cat([a_current, a_sc], dim=-1))
+        z = z * edge_mask[..., None]
+
+        mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
+
+        for i in range(self.no_blocks):
+            z = z + self.dropout_row_layer(
+                self.trunk[f'mult_out_{i}'](z, edge_mask)
+            )
+            z = z + self.dropout_row_layer(
+                self.trunk[f'mult_in_{i}'](z, edge_mask)
+            )
+            edge_bias = self.trunk[f'edge_bias_{i}'](z)
+            edge_bias = permute_final_dims(edge_bias.unsqueeze(-4), (2, 0, 1))
+            z = z + self.dropout_row_layer(
+                self.trunk[f'attn_start_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
+            )
+            z = z + self.dropout_col_layer(
+                self.trunk[f'attn_end_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
+            )
+            z = z + self.trunk[f'transition_{i}'](z)
+
+        return self.final_layer(z) * edge_mask[..., None]
+
+
+class PairEmbedderV2(nn.Module):
+    def __init__(self,
+                 c_z=128,
+                 c_hidden=64,
+                 num_rbf=39,
+                 rbf_min=3.25,
+                 rbf_max=50.75,
+                 no_heads=4,
+                 no_blocks=2,
+                 relpos_clip=32,
+                 dropout=0.25,
+                 inf=1e9):
+        super().__init__()
+
+        self.c_z = c_z
+        self.c_hidden = c_hidden
+        self.D_min = rbf_min
+        self.D_max = rbf_max
+        self.num_rbf = num_rbf
+        self.relpos_clip = relpos_clip
+        self.no_blocks = no_blocks
+        self.inf = inf
+
+        self.c_a = num_rbf
+
+        # self.ln_relpos = LayerNorm(2*relpos_clip+1)
+        self.lin_z_ij = Linear(2*relpos_clip+1, c_hidden)
+
+        self.lin_a_ij = Linear(2 * self.c_a, c_hidden, bias=False)
+
+        c_head = c_hidden // no_heads
+
+        self.trunk = nn.ModuleDict()
+        self.dropout_row_layer = DropoutRowwise(dropout)
+        self.dropout_col_layer = DropoutColumnwise(dropout)
+        for i in range(no_blocks):
+            self.trunk[f'mult_out_{i}'] = TriangleMultiplicationOutgoing(c_hidden, c_hidden)
+            self.trunk[f'mult_in_{i}'] = TriangleMultiplicationIncoming(c_hidden, c_hidden)
+            self.trunk[f'edge_bias_{i}'] = nn.Sequential(
+                LayerNorm(c_hidden),
+                Linear(c_hidden, no_heads, bias=False)
+            )
+            self.trunk[f'attn_start_{i}'] = TriangleAttentionCore(c_hidden, c_head, no_heads, starting=True)
+            self.trunk[f'attn_end_{i}'] = TriangleAttentionCore(c_hidden, c_head, no_heads, starting=False)
+            self.trunk[f'transition_{i}'] = SwishTransition(c_hidden)
+
+        self.final_layer = nn.Sequential(
+            LayerNorm(c_hidden),
+            nn.ReLU(),
+            Linear(c_hidden, c_z, bias=False)
+        )
+
+    def _featurize_edges(self, X_ca, distogram=False):
+        edge_dist_vec = X_ca[..., None, :] - X_ca[..., None, : ,:]
+        edge_dist = torch.linalg.vector_norm(edge_dist_vec, dim=-1)
+        if distogram:
+            dist_features = calc_distogram(edge_dist, min_bin=self.D_min, max_bin=self.D_max, num_bins=self.num_rbf)
+        else:
+            dist_features = _rbf(edge_dist, D_min=self.D_min, D_max=self.D_max, D_count=self.num_rbf, device=edge_dist.device)
+
+        return dist_features
+
+
+    def forward(self, X_ca, node_mask, sc_X_ca=None):
+        edge_mask = node_mask[..., None] & node_mask[..., None, :]
+
+        node_idx = torch.arange(X_ca.shape[-2], device=X_ca.device)[None].expand(
+            X_ca.shape[0], -1
+        )
+        relpos_feats = relpos(node_idx, clip=self.relpos_clip)
+        z = self.lin_z_ij(relpos_feats)
+        a_current = self._featurize_edges(X_ca, distogram=False)
+        if sc_X_ca is not None:
+            a_sc = self._featurize_edges(sc_X_ca, distogram=True)
         else:
             a_sc = torch.zeros_like(a_current)
 

@@ -280,7 +280,7 @@ class MultiFrameInterpolation(Task):
         pred_trans_1 = pred_rigids.get_trans()
         pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
         decoded_struct = denoiser_out['denoised_atom14']
-        argmax_seq = denoiser_out['decoded_seq_logits'].detach().cpu().argmax(dim=-1)
+        argmax_seq = denoiser_out['decoded_seq_logits'].detach().cpu()[..., :-1].argmax(dim=-1)
 
         clean_traj.append(
             (
