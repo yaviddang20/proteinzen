@@ -1216,7 +1216,8 @@ class InvariantPointAttention(nn.Module):
         mask: torch.Tensor,
         _offload_inference: bool = False,
         _z_reference_list: Optional[Sequence[torch.Tensor]] = None,
-        flash_attn=False
+        flash_attn=False,
+        pts_cdist=False,
     ) -> torch.Tensor:
         """
         Args:
@@ -1416,29 +1417,45 @@ class InvariantPointAttention(nn.Module):
                 a *= math.sqrt(1.0 / (3 * self.c_hidden))
                 a += (math.sqrt(1.0 / 3) * permute_final_dims(b, (2, 0, 1)))
 
-                # [*, N_res, N_res, H, P_q, 3]
-                pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
-                pt_att = pt_displacement ** 2
+                if pts_cdist:
+                    pt_att = -2 * torch.einsum("...ahpd,...bhpd->...abh", q_pts, k_pts)
+                    q_pts_norm = torch.sum(q_pts ** 2, dim=(-1, -2))
+                    k_pts_norm = torch.sum(q_pts ** 2, dim=(-1, -2))
+                    pt_att += q_pts_norm[..., None, :]
+                    pt_att += k_pts_norm[..., None, :, :]
 
-                # [*, N_res, N_res, H, P_q]
-                pt_att = sum(torch.unbind(pt_att, dim=-1))
-                head_weights = self.softplus(self.head_weights).view(
-                    *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
-                )
-                head_weights = head_weights * math.sqrt(
-                    1.0 / (3 * (self.no_qk_points * 9.0 / 2))
-                )
-                pt_att = pt_att * head_weights
+                    head_weights = self.softplus(self.head_weights).view(
+                        *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
+                    )
+                    head_weights = head_weights * math.sqrt(
+                        1.0 / (3 * (self.no_qk_points * 9.0 / 2))
+                    )
+                    pt_att *= head_weights
 
-                # [*, N_res, N_res, H]
-                pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
+                else:
+                    # [*, N_res, N_res, H, P_q, 3]
+                    pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
+                    pt_att = pt_displacement ** 2
+
+                    # [*, N_res, N_res, H, P_q]
+                    pt_att = sum(torch.unbind(pt_att, dim=-1))
+                    head_weights = self.softplus(self.head_weights).view(
+                        *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
+                    )
+                    head_weights = head_weights * math.sqrt(
+                        1.0 / (3 * (self.no_qk_points * 9.0 / 2))
+                    )
+                    pt_att = pt_att * head_weights
+
+                    # [*, N_res, N_res, H]
+                    pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
+
+                    # [*, H, N_res, N_res]
+                    pt_att = permute_final_dims(pt_att, (2, 0, 1))
+
                 # [*, N_res, N_res]
                 square_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
                 square_mask = self.inf * (square_mask - 1)
-
-                # [*, H, N_res, N_res]
-                pt_att = permute_final_dims(pt_att, (2, 0, 1))
-
                 a = a + pt_att
                 a = a + square_mask.unsqueeze(-3)
                 a = self.softmax(a)

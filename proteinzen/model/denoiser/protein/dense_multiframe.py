@@ -13,6 +13,7 @@ import proteinzen.utils.openfold.rigid_utils as ru
 from proteinzen.utils.openfold.rigid_utils import Rigid, batchwise_center
 from proteinzen.utils.framediff.all_atom import compute_backbone
 from proteinzen.utils.coarse_grain import compute_atom14_from_cg_frames
+from proteinzen.stoch_interp.interpolate.so3_utils import geodesic_t, rotquat_to_rotvec, _rotquat_to_axis_angle
 
 from ._attn import ConditionedPairUpdate, MultiRigidPairEmbedder
 from ._frame_transformer import (
@@ -2148,6 +2149,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                  break_rigid_symmetry=True,
                  force_flash_transformer=False,
                  trans_preconditioning=False,
+                 rot_capping=False,
                  block_q=16,
                  block_k=64,
                  propagate_framepair_embed=False,
@@ -2167,7 +2169,8 @@ class IpaMultiRigidDenoiser(nn.Module):
                  rel_quat_pair_updates=False,
                  z_broadcast=False,
                  compile_ipa=False,
-                 rigids_per_residue=3
+                 rigids_per_residue=3,
+                 override_rigid_2=False,
                  ):
         super().__init__()
         # some compatibility code
@@ -2179,6 +2182,7 @@ class IpaMultiRigidDenoiser(nn.Module):
 
         self.rigids_per_residue = rigids_per_residue
         self.use_v5 = use_v5
+        self.override_rigid_2 = override_rigid_2
 
         if use_v2:
             self.ipa_score = IpaScoreV2(
@@ -2368,6 +2372,7 @@ class IpaMultiRigidDenoiser(nn.Module):
             )
         self.c_s = c_s
         self.trans_preconditioning = trans_preconditioning
+        self.rot_capping = rot_capping
 
     def forward(self, data, self_condition=None):
         res_data = data['residue']
@@ -2393,6 +2398,13 @@ class IpaMultiRigidDenoiser(nn.Module):
         rigids_t = rigids_t.view([t.shape[0], -1, rigids_t.shape[-1]])
         center = rigids_t.get_trans().mean(dim=(-2, -3))
         rigids_t = rigids_t.translate(-center[..., None, None, :])
+
+        if self.override_rigid_2:
+            tensor_7 = rigids_t.to_tensor_7()
+            tensor_7 = torch.cat([
+                tensor_7[..., :2, :], tensor_7[..., [1], :]
+            ], dim=-2)
+            rigids_t = Rigid.from_tensor_7(tensor_7)
 
         if self.trans_preconditioning:
             rigids_in = rigids_t.apply_trans_fn(lambda x: x * data['trans_c_in'][..., None, None, None])
@@ -2443,6 +2455,24 @@ class IpaMultiRigidDenoiser(nn.Module):
         if self.trans_preconditioning:
             rigids_out = rigids_out.apply_trans_fn(
                 lambda x: x * data['trans_c_out'][..., None, None, None] + rigids_t.get_trans() * data['trans_c_skip'][..., None, None, None]
+            )
+
+        if self.rot_capping:
+            rots_in = rigids_in.get_rots()
+            rots_out = rigids_out.get_rots()
+            rel_rot = rots_out.compose_q(rots_in.invert())
+            rel_rotquat = rel_rot.get_quats()
+            rel_rotvec = rotquat_to_rotvec(rel_rotquat.view(-1, 4)).view(*rel_rotquat.shape[:-1], -1)
+            angle = torch.linalg.vector_norm(rel_rotvec + 1e-8, dim=-1)
+            angle = angle.clamp(min=1e-8, max=torch.pi-1e-8)
+            capped_angle = torch.min(angle, torch.ones_like(angle) * torch.pi * (1-t)[..., None, None])
+            axis = F.normalize(rel_rotvec, dim=-1)
+            capped_rotquat = torch.cat([
+                torch.cos(capped_angle/2)[..., None], torch.sin(capped_angle/2)[..., None] * axis
+            ], dim=-1)
+            rigids_out = Rigid(
+                rots=ru.Rotation(quats=capped_rotquat),
+                trans=rigids_out.get_trans()
             )
 
         rigids_out = rigids_out.translate(center[..., None, None, :])

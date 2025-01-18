@@ -83,7 +83,10 @@ def angle_axis_rot_vf_loss(
         norm_scale,
         angle_loss_weight=0.5,
         seqwise_weight=None,
+        rot_cap_loss_weight=0.0,
         eps=1e-8):
+    pred_rot_abs_angle = torch.norm(pred_rot_vf, dim=-1)
+
     pred_rot_vf = pred_rot_vf / norm_scale[batch, None]
     ref_rot_vf = ref_rot_vf / norm_scale[batch, None]
 
@@ -103,6 +106,12 @@ def angle_axis_rot_vf_loss(
         dim=-1
     )
     rot_loss = angle_loss * angle_loss_weight + axis_loss
+
+    rot_cap = torch.pi * norm_scale[batch]
+    rot_cap_loss_select = pred_rot_abs_angle > rot_cap
+    rot_cap_loss = rot_cap_loss_select * (pred_rot_abs_angle - rot_cap) ** 2
+    rot_loss = rot_loss + rot_cap_loss_weight * rot_cap_loss
+
     if seqwise_weight is not None:
         rot_loss = rot_loss * seqwise_weight
     return _nodewise_to_graphwise(rot_loss, batch, res_mask)

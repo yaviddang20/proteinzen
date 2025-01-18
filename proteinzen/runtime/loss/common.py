@@ -1121,7 +1121,7 @@ def atomic_losses(batch,
 
     gt_atom14 = res_data['atom14_gt_positions']
     alt_atom14 = res_data['atom14_alt_gt_positions']
-    ref_atom14 = res_data['noised_atom14']
+    # ref_atom14 = res_data['noised_atom14']
 
     seq = res_data['seq']
     seq_mask = res_data['seq_mask']
@@ -1176,18 +1176,18 @@ def atomic_losses(batch,
             no_bb=False,
             ignore_symmetry=True
         )
-        ref_atom14_mse = atom14_mse_loss(
-            gt_atom14,
-            alt_atom14,
-            ref_atom14,
-            res_data.batch,
-            atom14_gt_mask,
-            atom14_alt_gt_mask,
-            minimal_mask,
-            no_bb=False,
-            seqwise_weight=seqwise_weight,
-            ignore_symmetry=True
-        )
+        # ref_atom14_mse = atom14_mse_loss(
+        #     gt_atom14,
+        #     alt_atom14,
+        #     ref_atom14,
+        #     res_data.batch,
+        #     atom14_gt_mask,
+        #     atom14_alt_gt_mask,
+        #     minimal_mask,
+        #     no_bb=False,
+        #     seqwise_weight=seqwise_weight,
+        #     ignore_symmetry=True
+        # )
     seq_loss = seq_cce_loss(
         seq,
         seq_logits,
@@ -1278,8 +1278,8 @@ def atomic_losses(batch,
         "unscaled_atom14_mse": unscaled_atom14_mse,
         "atom14_rmsd": atom14_rmsd,
         "unscaled_atom14_rmsd": unscaled_atom14_mse.sqrt(),
-        "ref_atom14_mse": ref_atom14_mse,
-        "ref_atom14_rmsd": ref_atom14_mse.sqrt(),
+        # "ref_atom14_mse": ref_atom14_mse,
+        # "ref_atom14_rmsd": ref_atom14_mse.sqrt(),
         "sidechain_dists_mse": sidechain_dists_mse,
         "local_atomic_dist_loss": local_atomic_dist_loss,
         "scaled_local_atomic_dist_loss": scaled_local_atomic_dist_loss,
@@ -1309,6 +1309,7 @@ def atom14_fm_losses(batch,
                   use_sidechain_clash_loss=True,
                   polar_upweight=False,
                   sidechain_upweight=False,
+                  preconditioning=False
 ):
     res_data = batch['residue']
 
@@ -1425,7 +1426,11 @@ def atom14_fm_losses(batch,
         local_atomic_dist_loss = torch.zeros_like(t)
 
     scaled_local_atomic_dist_loss = local_atomic_dist_loss / (norm_scale**2) * 0.01
-    scaled_atom14_mse = atom14_mse / (norm_scale**2) * 0.01
+
+    if preconditioning:
+        scaled_atom14_mse = atom14_mse * batch['loss_weighting']
+    else:
+        scaled_atom14_mse = atom14_mse / (norm_scale**2) * 0.01
 
     if use_smooth_lddt:
         smooth_lddt = smooth_lddt_loss(

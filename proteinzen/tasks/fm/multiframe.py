@@ -48,7 +48,11 @@ class MultiFrameInterpolation(Task):
                  trans_preconditioning=False,
                  rot_loss_exp_weighting=False,
                  rot_vf_angle_loss_weight=0.5,
-                 rigids_traj_loss_scale=1
+                 disable_rot_vf_time_scaling=False,
+                 rigids_traj_loss_scale=1,
+                 ignore_rigid_2_vf_loss=False,
+                 dummy_rigid_to_sidechain_rigid=False,
+                 rot_cap_loss_weight=0.0
     ):
         super().__init__()
         self.frame_noiser = protein_noiser
@@ -66,6 +70,10 @@ class MultiFrameInterpolation(Task):
         self.fafe_weight = fafe_weight
         self.rot_vf_angle_loss_weight = rot_vf_angle_loss_weight
         self.rigids_traj_loss_scale = rigids_traj_loss_scale
+        self.ignore_rigid_2_vf_loss = ignore_rigid_2_vf_loss
+        self.disable_rot_vf_time_scaling = disable_rot_vf_time_scaling
+        self.rot_cap_loss_weight = rot_cap_loss_weight
+        self.dummy_rigid_to_sidechain_rigid = dummy_rigid_to_sidechain_rigid
 
         self.rng = np.random.default_rng()
 
@@ -104,10 +112,19 @@ class MultiFrameInterpolation(Task):
         rigids_1_tensor_7 = rigids_1.to_tensor_7()
         rigids_mask = chain_feats["cg_groups_gt_exists"][:, (0, 2, 3)]
         rigids_mask[..., 0] = res_data['res_mask']
-        rigids_1_tensor_7 = (
-            rigids_1_tensor_7 * rigids_mask[..., None] +
-            rigids_1_tensor_7[..., 0:1, :] * (1 - rigids_mask[..., None].float())
-        )
+        if self.dummy_rigid_to_sidechain_rigid:
+            seq = res_data['seq']
+            mask_AG = (seq == residue_constants.restype_order['G']) | (seq == residue_constants.restype_order['A'])
+            dummy_rigid = rigids_1_tensor_7[..., 0, :] * mask_AG[..., None] + rigids_1_tensor_7[..., 1, :] * (~mask_AG[..., None])
+            rigids_1_tensor_7 = (
+                rigids_1_tensor_7 * rigids_mask[..., None] +
+                dummy_rigid[..., None, :] * (1 - rigids_mask[..., None].float())
+            )
+        else:
+            rigids_1_tensor_7 = (
+                rigids_1_tensor_7 * rigids_mask[..., None] +
+                rigids_1_tensor_7[..., 0:1, :] * (1 - rigids_mask[..., None].float())
+            )
         res_data['rigids_1'] = rigids_1_tensor_7
 
         # compute sidechain features
@@ -321,7 +338,10 @@ class MultiFrameInterpolation(Task):
             sidechain_upweight=self.sidechain_upweight,
             trans_preconditioning=self.trans_preconditioning,
             rot_exp_weighting=self.rot_loss_exp_weighting,
-            rot_vf_angle_loss_weight=self.rot_vf_angle_loss_weight
+            rot_vf_angle_loss_weight=self.rot_vf_angle_loss_weight,
+            ignore_rigid_2_vf_loss=self.ignore_rigid_2_vf_loss,
+            disable_rot_vf_time_scaling=self.disable_rot_vf_time_scaling,
+            rot_cap_loss_weight=self.rot_cap_loss_weight
         )
 
         frame_vf_loss = (

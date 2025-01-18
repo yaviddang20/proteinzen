@@ -72,11 +72,14 @@ class Atom14Interpolation(Task):
     def __init__(self,
                  protein_noiser: Atom14Interpolant,
                  aux_loss_t_min=0.25,
-                 traj_decay_factor=0.99):
+                 traj_decay_factor=0.99,
+                 preconditioning=False
+    ):
         super().__init__()
         self.atom_noiser = protein_noiser
         self.aux_loss_t_min = aux_loss_t_min
         self.traj_decay_factor = traj_decay_factor
+        self.preconditioning = preconditioning
 
         self.rng = np.random.default_rng()
 
@@ -182,6 +185,7 @@ class Atom14Interpolation(Task):
                     "res_noising_mask": torch.ones(n, device=device).bool(),
                     "seq": torch.zeros(n, device=device).long(),
                     "seq_mask": torch.ones(n, device=device).bool(),
+                    "atom14_mask": torch.ones((n, 14), device=device).bool(),
                     "num_nodes": n
                 }
             )
@@ -190,109 +194,63 @@ class Atom14Interpolation(Task):
         batch = Batch.from_data_list(data_list)
         res_data = batch['residue']
         # Set-up initial prior samples
-        trans_0 = (
-            _centered_gaussian(res_data.batch, device) * du.NM_TO_ANG_SCALE
-        )
-        rotmats_0 = _uniform_so3(total_num_res, device)
-        atom10_local_0 = torch.randn(total_num_res, 10, 3, device=device)
+
+        # TODO: this is jenk but i will fix it later
+        atom14_0 = (
+            _centered_gaussian(res_data.batch.repeat(14), device) * self.atom_noiser.prior_std
+        ).reshape(-1, 14, 3)
 
         seq_logits_0 = torch.randn(total_num_res, 20, device=device)
 
         # Set-up time
-        ts = torch.linspace(self.se3_noiser._cfg.min_t, 1.0, self.se3_noiser._sample_cfg.num_timesteps)
+        ts = torch.linspace(self.atom_noiser.min_t, 1.0, self.atom_noiser.num_timesteps)
         t_1 = ts[0]
 
         prot_traj = [(
-            trans_0,  # trans
-            rotmats_0,  # rot
-            atom10_local_0,
+            atom14_0,
             seq_logits_0
         )]
         clean_traj = []
         denoiser_out = None
         for t_2 in tqdm.tqdm(ts[1:]):
             # Run model.
-            trans_t_1, rotmats_t_1, atom10_local_t_1, _ = prot_traj[-1]
+            atom14_t_1, _ = prot_traj[-1]
 
-            res_data["trans_t"] = trans_t_1
-            res_data["rotmats_t"] = rotmats_t_1
-            res_data['rigids_t'] = ru.Rigid(
-                rots=ru.Rotation(rot_mats=rotmats_t_1),
-                trans=trans_t_1
-            ).to_tensor_7()
-            res_data['noised_atom10_local'] = atom10_local_t_1
+            res_data['noised_atom14'] = atom14_t_1
             t = torch.ones(batch.num_graphs, device=device) * t_1
             batch["t"] = t
-            if self.atom10_preconditioning:
-                atom10_var_scaling_dict = self.sidechain_noiser.var_scaling_factors(t)
-                batch['atom10_c_skip'] = atom10_var_scaling_dict['c_skip']
-                batch['atom10_c_in'] = atom10_var_scaling_dict['c_in']
-                batch['atom10_c_out'] = atom10_var_scaling_dict['c_out']
-                batch['atom10_loss_weighting'] = atom10_var_scaling_dict['loss_weighting']
-            batch['atom10_prior_offset'] = self.sidechain_noiser.get_prior_offset(device=trans_t_1.device)
-            if self.trans_preconditioning:
-                trans_var_scaling_dict = self.se3_noiser.var_scaling_factors(t)
-                batch['trans_c_skip'] = trans_var_scaling_dict['c_skip']
-                batch['trans_c_in'] = trans_var_scaling_dict['c_in']
-                batch['trans_c_out'] = trans_var_scaling_dict['c_out']
+            if model.preconditioning:
+                atom14_var_scaling_dict = self.atom_noiser.var_scaling_factors(t)
+                batch['c_skip'] = atom14_var_scaling_dict['c_skip']
+                batch['c_in'] = atom14_var_scaling_dict['c_in']
+                batch['c_out'] = atom14_var_scaling_dict['c_out']
+                batch['c_data'] = atom14_var_scaling_dict['c_data']
+                batch['loss_weighting'] = atom14_var_scaling_dict['loss_weighting']
 
             with torch.no_grad():
                 denoiser_out = model(batch, self_condition=denoiser_out)
 
                 # Process model output.
-                pred_rigids = denoiser_out['final_rigids']
-                pred_trans_1 = pred_rigids.get_trans()
-                pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
                 pred_seq_logits = denoiser_out["decoded_seq_logits"][..., :20]
-                pred_atom10_local = denoiser_out["denoised_atom10_local"].view(-1, 10, 3)
+                pred_atom14 = denoiser_out["denoised_atom14"].view(-1, 14, 3)
 
                 clean_traj.append(
                     (
-                        pred_trans_1.detach().cpu(),
-                        pred_rotmats_1.detach().cpu(),
-                        denoiser_out['denoised_atom14'].detach().cpu(),
+                        pred_atom14.detach().cpu(),
                         pred_seq_logits.detach().cpu()
                     )
                 )
 
             # Take reverse step
             d_t = t_2 - t_1
-            trans_t_2 = self.se3_noiser._trans_euler_step(d_t, t_1, pred_trans_1, trans_t_1)
-            rotmats_t_2 = self.se3_noiser._rots_euler_step(d_t, t_1, pred_rotmats_1, rotmats_t_1)
-
-            if self.sidechain_noiser.nonlocal_prior:
-                rigids_t_1 = ru.Rigid(
-                    rots=ru.Rotation(rot_mats=rotmats_t_1),
-                    trans=trans_t_1
-                )
-                rigids_t_2 = ru.Rigid(
-                    rots=ru.Rotation(rot_mats=rotmats_t_2),
-                    trans=trans_t_2
-                )
-                pred_atom10_global = pred_rigids[..., None].apply(pred_atom10_local)
-                atom10_global_t_1 = rigids_t_1[..., None].apply(atom10_local_t_1)
-                atom10_global_t_2 = self.sidechain_noiser._euler_step(
-                    d_t,
-                    t_1,
-                    x_1=pred_atom10_global,
-                    x_t=atom10_global_t_1
-                )
-                atom10_local_t_2 = rigids_t_2[..., None].invert_apply(atom10_global_t_2)
-            else:
-                atom10_local_t_2 = self.sidechain_noiser._euler_step(
-                    d_t,
-                    t_1,
-                    x_1=pred_atom10_local,
-                    x_t=atom10_local_t_1
-                )
-
+            atom14_t_2 = self.atom_noiser._euler_step(d_t, t_1, pred_atom14, atom14_t_1)
 
             prot_traj.append(
-                (trans_t_2,
-                 rotmats_t_2,
-                 atom10_local_t_2,
-                 pred_seq_logits.detach().cpu()
-                ))
+                (
+                    atom14_t_2,
+                    pred_seq_logits.detach().cpu()
+                )
+            )
             t_1 = t_2
 
             if not model.self_conditioning:
@@ -301,39 +259,28 @@ class Atom14Interpolation(Task):
         # We only integrated to min_t, so need to make a final step
         t_1 = ts[-1]
         # Run model.
-        trans_t_1, rotmats_t_1, atom10_local_t_1, _ = prot_traj[-1]
-        res_data["trans_t"] = trans_t_1
-        res_data["rotmats_t"] = rotmats_t_1
-        res_data['rigids_t'] = ru.Rigid(
-            rots=ru.Rotation(rot_mats=rotmats_t_1),
-            trans=trans_t_1
-        ).to_tensor_7()
-        res_data['noised_atom10_local'] = atom10_local_t_1
+        atom14_t_1, _ = prot_traj[-1]
+
+        res_data['noised_atom14'] = atom14_t_1
         t = torch.ones(batch.num_graphs, device=device) * t_1
         batch["t"] = t
-        if self.atom10_preconditioning:
-            atom10_var_scaling_dict = self.sidechain_noiser.var_scaling_factors(t)
-            batch['atom10_c_skip'] = atom10_var_scaling_dict['c_skip']
-            batch['atom10_c_in'] = atom10_var_scaling_dict['c_in']
-            batch['atom10_c_out'] = atom10_var_scaling_dict['c_out']
-            batch['atom10_loss_weighting'] = atom10_var_scaling_dict['loss_weighting']
-        if self.trans_preconditioning:
-            trans_var_scaling_dict = self.se3_noiser.var_scaling_factors(t)
-            batch['trans_c_skip'] = trans_var_scaling_dict['c_skip']
-            batch['trans_c_in'] = trans_var_scaling_dict['c_in']
-            batch['trans_c_out'] = trans_var_scaling_dict['c_out']
+        if model.preconditioning:
+            atom14_var_scaling_dict = self.atom_noiser.var_scaling_factors(t)
+            batch['c_skip'] = atom14_var_scaling_dict['c_skip']
+            batch['c_in'] = atom14_var_scaling_dict['c_in']
+            batch['c_out'] = atom14_var_scaling_dict['c_out']
+            batch['loss_weighting'] = atom14_var_scaling_dict['loss_weighting']
+            batch['c_data'] = atom14_var_scaling_dict['c_data']
 
         with torch.no_grad():
             denoiser_out = model(batch, self_condition=denoiser_out)
 
             # Process model output.
-            pred_rigids = denoiser_out['final_rigids']
-            pred_trans_1 = pred_rigids.get_trans()
-            pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
             pred_seq_logits = denoiser_out["decoded_seq_logits"][..., :20]
+            pred_atom14 = denoiser_out["denoised_atom14"].view(-1, 14, 3)
 
         argmax_seq = pred_seq_logits.argmax(dim=-1)
-        decoded_struct = denoiser_out['denoised_atom14']
+        decoded_struct = pred_atom14
 
         # decoded_struct = _collect_from_seq(all_atom14, argmax_seq, torch.ones_like(argmax_seq).bool())
 
@@ -342,10 +289,7 @@ class Atom14Interpolation(Task):
         clean_trajs = list(zip(*[traj[-2].split(num_res) for traj in clean_traj]))
         clean_traj_seqs = list(zip(*[traj[-1].argmax(dim=-1).split(num_res) for traj in clean_traj]))
         prot_traj_seqs = list(zip(*[traj[-1].split(num_res) for traj in prot_traj]))
-        prot_traj = all_atom.transrot_to_atom14(
-            [data[:2] for data in prot_traj], res_data.res_mask
-        )
-        prot_trajs = list(zip(*[traj.split(num_res) for traj in prot_traj]))
+        prot_trajs = list(zip(*[traj[-2].split(num_res) for traj in prot_traj]))
 
         return {
             "samples": decoded_struct.split(num_res),
@@ -369,17 +313,18 @@ class Atom14Interpolation(Task):
             use_sidechain_dists_mse_loss=False,
             use_local_atomic_dist_loss=False,
             use_sidechain_clash_loss=False,
+            preconditioning=self.preconditioning
         )
 
         atomic_loss = (
-            atomic_loss_dict["scaled_atom14_mse"] * 0.01
-            + atomic_loss_dict["seq_loss"]
+            atomic_loss_dict["scaled_atom14_mse"]
+            + atomic_loss_dict["seq_loss"] * 0.25
             + atomic_loss_dict["smooth_lddt"]
         )
 
         loss = (
             + atomic_loss
-            + traj_loss_dict['traj_ca_loss'] * 0.01
+            + traj_loss_dict['traj_ca_loss']
             + traj_loss_dict['traj_pred_dist_loss'] * 0.5
             + traj_loss_dict['traj_seq_loss'] * 0.25
         )

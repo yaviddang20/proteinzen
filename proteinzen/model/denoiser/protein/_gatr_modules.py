@@ -2,8 +2,8 @@
 # All rights reserved.
 """Self-attention layers."""
 
-from dataclasses import replace
-from typing import Literal, Optional, Sequence, Tuple, Union, Callable
+from dataclasses import dataclass, replace
+from typing import Literal, Optional, Sequence, Tuple, Union, Callable, Mapping, Any
 from warnings import warn
 
 import torch
@@ -13,23 +13,128 @@ from torch.utils.checkpoint import checkpoint as checkpoint_
 from xformers.ops import AttentionBias
 
 from gatr.layers.attention.attention import GeometricAttention
-from gatr.layers.attention.config import SelfAttentionConfig
+# from gatr.layers.attention.config import SelfAttentionConfig
 from gatr.layers.attention.positional_encoding import ApplyRotaryPositionalEncoding
 from gatr.layers.attention.qkv import MultiQueryQKVModule, QKVModule
 from gatr.layers.dropout import GradeDropout
 from gatr.layers.linear import EquiLinear
 from gatr.layers.layer_norm import EquiLayerNorm
-from ._geo_mlp import MLPConfig, GeoMLP
+from gatr.primitives.bilinear import geometric_product
+from gatr.primitives.dual import equivariant_join
 from gatr.primitives.nonlinearities import gated_sigmoid
 from gatr.utils.tensors import construct_reference_multivector
 
 from proteinzen.model.modules.openfold.layers_v2 import Linear, LayerNorm, permute_final_dims, flatten_final_dims
+from ._geo_mlp import MLPConfig, GeoMLP
+from ._gatr_primitives import weighted_geometric_product, weighted_equivariant_join
 
 
 def _flatten(tensor, start_dim, end_dim):
     """ Flatten dims of a tensor and return a view """
     new_shape = [*tensor.shape[:start_dim], -1, *tensor.shape[end_dim+1:]]
     return tensor.view(new_shape)
+
+
+@dataclass
+class SelfAttentionConfig:
+    """Configuration for attention.
+
+    Parameters
+    ----------
+    in_mv_channels : int
+        Number of input multivector channels.
+    out_mv_channels : int
+        Number of output multivector channels.
+    num_heads : int
+        Number of attention heads.
+    in_s_channels : int
+        Input scalar channels. If None, no scalars are expected nor returned.
+    out_s_channels : int
+        Output scalar channels. If None, no scalars are expected nor returned.
+    additional_qk_mv_channels : int
+        Whether additional multivector features for the keys and queries will be provided.
+    additional_qk_s_channels : int
+        Whether additional scalar features for the keys and queries will be provided.
+    normalizer : str
+        Normalizer function to use in sdp_dist attention
+    normalizer_eps : float
+        Small umerical constant for stability in the normalizer in sdp_dist attention
+    multi_query: bool
+        Whether to do multi-query attention
+    attention_type : {"scalar", "geometric", "sdp_dist"}
+        Whether the attention mechanism is based on the scalar product or also the join.
+    pos_encoding : bool
+        Whether to apply rotary positional embeddings along the item dimension to the scalar keys
+        and queries.
+    pos_enc_base : int
+        Base for the frequencies in the positional encoding.
+    output_init : str
+        Initialization scheme for final linear layer
+    increase_hidden_channels : int
+        Factor by which to increase the number of hidden channels (both multivectors and scalars)
+    dropout_prob : float or None
+        Dropout probability
+    """
+
+    multi_query: bool = True
+    in_mv_channels: Optional[int] = None
+    out_mv_channels: Optional[int] = None
+    in_s_channels: Optional[int] = None
+    out_s_channels: Optional[int] = None
+    num_heads: int = 8
+    additional_qk_mv_channels: int = 0
+    additional_qk_s_channels: int = 0
+    normalizer_eps: Optional[float] = 1e-3
+    pos_encoding: bool = False
+    pos_enc_base: int = 4096
+    output_init: str = "default"
+    checkpoint: bool = True
+    increase_hidden_mv_channels: int = 2
+    increase_hidden_s_channels: int = 2
+    dropout_prob: Optional[float] = None
+
+    def __post_init__(self):
+        """Type checking / conversion."""
+        if isinstance(self.dropout_prob, str) and self.dropout_prob.lower() in ["null", "none"]:
+            self.dropout_prob = None
+
+    @property
+    def hidden_mv_channels(self) -> Optional[int]:
+        """Returns the number of hidden multivector channels."""
+
+        if self.in_mv_channels is None:
+            return None
+
+        return max(self.increase_hidden_mv_channels * self.in_mv_channels // self.num_heads, 1)
+
+    @property
+    def hidden_s_channels(self) -> Optional[int]:
+        """Returns the number of hidden scalar channels."""
+
+        if self.in_s_channels is None:
+            return None
+
+        hidden_s_channels = max(
+            self.increase_hidden_s_channels * self.in_s_channels // self.num_heads, 4
+        )
+
+        # When using positional encoding, the number of scalar hidden channels needs to be even.
+        # It also should not be too small.
+        if self.pos_encoding:
+            hidden_s_channels = (hidden_s_channels + 1) // 2 * 2
+            hidden_s_channels = max(hidden_s_channels, 8)
+
+        return hidden_s_channels
+
+    @classmethod
+    def cast(cls, config: Any):
+        """Casts an object as SelfAttentionConfig."""
+        if isinstance(config, SelfAttentionConfig):
+            return config
+        if isinstance(config, Mapping):
+            return cls(**config)
+        raise ValueError(f"Can not cast {config} to {cls}")
+
 
 
 class EquiAdaLN(nn.Module):
@@ -77,6 +182,161 @@ class EquiAdaLN(nn.Module):
         return gated_mv + bias_mv, gated_s + bias_s
 
 
+class TwoInputGeometricBilinear(nn.Module):
+    """Geometric bilinear layer.
+
+    Pin-equivariant map between multivector tensors that constructs new geometric features via
+    geometric products and the equivariant join (based on a reference vector).
+
+    Parameters
+    ----------
+    in_mv_channels : int
+        Input multivector channels of `x`
+    out_mv_channels : int
+        Output multivector channels
+    hidden_mv_channels : int or None
+        Hidden MV channels. If None, uses out_mv_channels.
+    in_s_channels : int or None
+        Input scalar channels of `x`. If None, no scalars are expected nor returned.
+    out_s_channels : int or None
+        Output scalar channels. If None, no scalars are expected nor returned.
+    """
+
+    def __init__(
+        self,
+        in_mv_channels: int,
+        out_mv_channels: int,
+        hidden_mv_channels: Optional[int] = None,
+        in_s_channels: Optional[int] = None,
+        out_s_channels: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+
+        # Default options
+        if hidden_mv_channels is None:
+            hidden_mv_channels = out_mv_channels
+
+        out_mv_channels_each = hidden_mv_channels // 2
+        assert (
+            out_mv_channels_each * 2 == hidden_mv_channels
+        ), "GeometricBilinear needs even channel number"
+
+        # Linear projections for GP
+        self.linear_left = EquiLinear(
+            in_mv_channels,
+            out_mv_channels_each,
+            in_s_channels=in_s_channels,
+            out_s_channels=None,
+        )
+        self.linear_right = EquiLinear(
+            in_mv_channels,
+            out_mv_channels_each,
+            in_s_channels=in_s_channels,
+            out_s_channels=None,
+            initialization="almost_unit_scalar",
+        )
+
+        # Linear projections for join
+        self.linear_join_left = EquiLinear(
+            in_mv_channels, out_mv_channels_each, in_s_channels=in_s_channels, out_s_channels=None
+        )
+        self.linear_join_right = EquiLinear(
+            in_mv_channels, out_mv_channels_each, in_s_channels=in_s_channels, out_s_channels=None
+        )
+
+        # Output linear projection
+        self.linear_out = EquiLinear(
+            hidden_mv_channels,
+            out_mv_channels,
+            2*in_s_channels if in_s_channels is not None else None,
+            out_s_channels
+        )
+
+    def forward(
+        self,
+        multivectors_1: torch.Tensor,
+        multivectors_2: torch.Tensor,
+        scalars_1: torch.Tensor,
+        scalars_2: torch.Tensor,
+        reference_mv: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass.
+
+        Parameters
+        ----------
+        multivectors : torch.Tensor with shape (..., in_mv_channels, 16)
+            Input multivectors
+        scalars : torch.Tensor with shape (..., in_s_channels)
+            Input scalars
+        reference_mv : torch.Tensor with shape (..., 16)
+            Reference multivector for equivariant join.
+
+        Returns
+        -------
+        outputs_mv : torch.Tensor with shape (..., self.out_mv_channels, 16)
+            Output multivectors
+        output_s : None or torch.Tensor with shape (..., out_s_channels)
+            Output scalars.
+        """
+
+        # GP
+        left, _ = self.linear_left(multivectors_1, scalars=scalars_1)
+        right, _ = self.linear_right(multivectors_2, scalars=scalars_2)
+        gp_outputs = geometric_product(left, right)
+
+        # Equivariant join
+        left, _ = self.linear_join_left(multivectors_1, scalars=scalars_1)
+        right, _ = self.linear_join_right(multivectors_2, scalars=scalars_2)
+        join_outputs = equivariant_join(left, right, reference_mv)
+
+        # Output linear
+        outputs_mv = torch.cat((gp_outputs, join_outputs), dim=-2)
+        outputs_mv, outputs_s = self.linear_out(
+            outputs_mv,
+            scalars=torch.cat([scalars_1, scalars_2], dim=-1)
+        )
+
+        return outputs_mv, outputs_s
+
+
+class GeometricManyBodyProduct(nn.Module):
+    def __init__(self,
+                 config: SelfAttentionConfig):
+        super().__init__()
+
+        self.config = config
+        self.mv_channels = config.hidden_mv_channels
+
+        self.left_lin = EquiLinear(
+            in_mv_channels=self.mv_channels,
+            out_mv_channels=self.mv_channels,
+            in_s_channels=config.hidden_s_channels
+        )
+        self.right_lin = EquiLinear(
+            in_mv_channels=self.mv_channels,
+            out_mv_channels=self.mv_channels,
+            in_s_channels=config.hidden_s_channels
+        )
+
+        self.gp_weight = nn.Parameter(
+            torch.zeros((self.mv_channels, 16, 16, 16))
+        )
+        self.join_weight = nn.Parameter(
+            torch.zeros((self.mv_channels, 16, 16, 16))
+        )
+
+    def forward(self, o_mv, o_s, reference):
+        x_mv, _ = self.left_lin(o_mv, o_s)
+        y_mv, _ = self.right_lin(o_mv, o_s)
+
+        out_mv = (
+            weighted_geometric_product(self.gp_weight, x_mv, y_mv)
+            + weighted_equivariant_join(self.join_weight, x_mv, y_mv, reference)
+            + y_mv
+        )
+        return out_mv
+
+
 class SelfAttentionPairBias(nn.Module):
     """Geometric self-attention layer.
 
@@ -91,6 +351,7 @@ class SelfAttentionPairBias(nn.Module):
     def __init__(self,
                  config: SelfAttentionConfig,
                  c_z,
+                 many_body_expand=False,
                  inf=1e5
     ) -> None:
         super().__init__()
@@ -138,6 +399,19 @@ class SelfAttentionPairBias(nn.Module):
         else:
             self.dropout = None
 
+        self.many_body_expand = many_body_expand
+        if self.many_body_expand:
+            self.bilinear = TwoInputGeometricBilinear(
+                in_mv_channels=config.hidden_mv_channels,
+                out_mv_channels=config.hidden_mv_channels,
+                in_s_channels=config.hidden_s_channels,
+                out_s_channels=config.hidden_s_channels
+            )
+            self.mbp = GeometricManyBodyProduct(config)
+        else:
+            self.bilinear = None
+            self.mbp = None
+
     def forward(
         self,
         multivectors: torch.Tensor,
@@ -146,6 +420,7 @@ class SelfAttentionPairBias(nn.Module):
         scalars: Optional[torch.Tensor] = None,
         additional_qk_features_s: Optional[torch.Tensor] = None,
         attention_mask=None,
+        reference_mv=None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Computes forward pass on inputs with shape `(..., items, channels, 16)`.
 
@@ -204,6 +479,11 @@ class SelfAttentionPairBias(nn.Module):
         # Attention layer
         h_mv, h_s = self.attention(q_mv, k_mv, v_mv, q_s, k_s, v_s, attention_mask=attn_bias)
 
+        if self.many_body_expand:
+            assert reference_mv is not None
+            h_mv, _h_s = self.bilinear(h_mv, v_mv, h_s, v_s, reference_mv[:, None])
+            h_mv = self.mbp(h_mv, _h_s, reference_mv[:, None])
+
         h_mv = rearrange(
             h_mv, "... n_heads n_items hidden_channels x -> ... n_items (n_heads hidden_channels) x"
         )
@@ -256,6 +536,7 @@ class GATrPairBiasBlock(nn.Module):
         mlp: MLPConfig,
         dropout_prob: Optional[float] = None,
         checkpoint: Optional[Sequence[Literal["mlp", "attention"]]] = None,
+        many_body_expand=False
     ) -> None:
         super().__init__()
 
@@ -280,7 +561,11 @@ class GATrPairBiasBlock(nn.Module):
             output_init="small",
             dropout_prob=dropout_prob,
         )
-        self.attention = SelfAttentionPairBias(attention, c_z=z_channels)
+        self.attention = SelfAttentionPairBias(
+            attention,
+            c_z=z_channels,
+            many_body_expand=many_body_expand,
+        )
 
         # MLP block
         mlp = replace(
@@ -344,6 +629,7 @@ class GATrPairBiasBlock(nn.Module):
             additional_qk_features_mv=additional_qk_features_mv,
             additional_qk_features_s=additional_qk_features_s,
             attention_mask=attention_mask,
+            reference_mv=reference_mv,
         )
         if self._checkpoint_attn:
             h_mv, h_s = checkpoint_(self._attention_block, use_reentrant=False, **attn_kwargs)
@@ -375,6 +661,7 @@ class GATrPairBiasBlock(nn.Module):
         additional_qk_features_mv: Optional[torch.Tensor] = None,
         additional_qk_features_s: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        reference_mv = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Attention block."""
 
@@ -386,6 +673,7 @@ class GATrPairBiasBlock(nn.Module):
             additional_qk_features_mv=additional_qk_features_mv,
             additional_qk_features_s=additional_qk_features_s,
             attention_mask=attention_mask,
+            reference_mv=reference_mv
         )
         return h_mv, h_s
 
@@ -698,11 +986,7 @@ class CrossAttnQKVModule(nn.Module):
         q_inputs = to_queries(
             flatten_final_dims(inputs, 2)
         ).unflatten(-1, (self.num_mv_channels_in, 16))
-        kv_inputs = to_keys(
-            flatten_final_dims(inputs, 2)
-        ).unflatten(-1, (self.num_mv_channels_in, 16))
         q_scalars = to_queries(scalars)
-        kv_scalars = to_keys(scalars)
 
         q_mv, q_s = self.q_linear(
             q_inputs, q_scalars
@@ -725,32 +1009,61 @@ class CrossAttnQKVModule(nn.Module):
         else:
             q_s = None
 
+        # kv_inputs = to_keys(
+        #     flatten_final_dims(inputs, 2)
+        # ).unflatten(-1, (self.num_mv_channels_in, 16))
+        # kv_scalars = to_keys(scalars)
+
         kv_mv, kv_s = self.kv_linear(
-            kv_inputs, kv_scalars
+            inputs, scalars
         )  # (..., num_items, 3 * hidden_channels * num_heads, 16)
-        kv_mv = rearrange(
-            kv_mv,
+        kv_mv_blocks = to_keys(
+            flatten_final_dims(kv_mv, 2)
+        ).unflatten(-1, (-1, 16))
+        kv_s_blocks = to_keys(kv_s)
+        kv_mv_blocks = rearrange(
+            kv_mv_blocks,
             "... items (kv hidden num_heads) x -> kv ... num_heads items hidden x",
             num_heads=self.config.num_heads,
             hidden=self.config.hidden_mv_channels,
             kv=2,
         )
-        k_mv, v_mv = kv_mv  # each: (..., num_heads, num_items, num_channels, 16)
+        k_mv_blocks, v_mv_blocks = kv_mv_blocks  # each: (..., num_heads, num_items, num_channels, 16)
+        kv_mv_queries = rearrange(
+            to_queries(
+                flatten_final_dims(kv_mv, 2)
+            ).unflatten(-1, (-1, 16)),
+            "... items (kv hidden num_heads) x -> kv ... num_heads items hidden x",
+            num_heads=self.config.num_heads,
+            hidden=self.config.hidden_mv_channels,
+            kv=2,
+        )
+        v_mv_queries = kv_mv_queries[1]
 
         # Same, for optional scalar components
         if kv_s is not None:
-            kv_s = rearrange(
-                kv_s,
+            kv_s_blocks = rearrange(
+                kv_s_blocks,
                 "... items (kv hidden num_heads) -> kv ... num_heads items hidden",
                 num_heads=self.config.num_heads,
                 hidden=self.config.hidden_s_channels,
                 kv=2,
             )
-            k_s, v_s = kv_s  # each: (..., num_heads, num_items, num_channels)
-        else:
-            k_s, v_s = None, None
+            k_s_blocks, v_s_blocks = kv_s_blocks  # each: (..., num_heads, num_items, num_channels)
 
-        return q_mv, k_mv, v_mv, q_s, k_s, v_s
+            kv_s_queries = rearrange(
+                to_queries(kv_s),
+                "... items (kv hidden num_heads) -> kv ... num_heads items hidden",
+                num_heads=self.config.num_heads,
+                hidden=self.config.hidden_s_channels,
+                kv=2,
+            )
+            v_s_queries = kv_s_queries[1]
+        else:
+            k_s_blocks, v_s_blocks = None, None
+            v_s_queries = None
+
+        return q_mv, k_mv_blocks, v_mv_blocks, v_mv_queries, q_s, k_s_blocks, v_s_blocks, v_s_queries
 
 
 class CrossAttentionPairBias(nn.Module):
@@ -767,6 +1080,7 @@ class CrossAttentionPairBias(nn.Module):
     def __init__(self,
                  config: SelfAttentionConfig,
                  c_z,
+                 many_body_expand=False,
                  inf=1e5
     ) -> None:
         super().__init__()
@@ -814,6 +1128,19 @@ class CrossAttentionPairBias(nn.Module):
         else:
             self.dropout = None
 
+        self.many_body_expand = many_body_expand
+        if self.many_body_expand:
+            self.bilinear = TwoInputGeometricBilinear(
+                in_mv_channels=config.hidden_mv_channels,
+                out_mv_channels=config.hidden_mv_channels,
+                in_s_channels=config.hidden_s_channels,
+                out_s_channels=config.hidden_s_channels
+            )
+            self.mbp = GeometricManyBodyProduct(config)
+        else:
+            self.bilinear = None
+            self.mbp = None
+
     def forward(
         self,
         multivectors: torch.Tensor,
@@ -824,6 +1151,7 @@ class CrossAttentionPairBias(nn.Module):
         scalars: Optional[torch.Tensor] = None,
         additional_qk_features_s: Optional[torch.Tensor] = None,
         attention_mask=None,
+        reference_mv=None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Computes forward pass on inputs with shape `(..., items, channels, 16)`.
 
@@ -866,7 +1194,7 @@ class CrossAttentionPairBias(nn.Module):
             Output scalars, if scalars are provided. Otherwise None.
         """
         # Compute Q, K, V
-        q_mv, k_mv, v_mv, q_s, k_s, v_s = self.qkv_module(
+        q_mv, k_mv, v_mv, v_mv_queries, q_s, k_s, v_s, v_s_queries = self.qkv_module(
             multivectors,
             scalars,
             to_queries,
@@ -886,6 +1214,11 @@ class CrossAttentionPairBias(nn.Module):
 
         # Attention layer
         h_mv, h_s = self.attention(q_mv, k_mv, v_mv, q_s, k_s, v_s, attention_mask=attn_bias)
+
+        if self.many_body_expand:
+            assert reference_mv is not None
+            h_mv, _h_s = self.bilinear(h_mv, v_mv_queries, h_s, v_s_queries, reference_mv[:, None, None])
+            h_mv = self.mbp(h_mv, _h_s, reference_mv[:, None, None])
 
         h_mv = rearrange(
             h_mv, "... n_heads n_items hidden_channels x -> ... n_items (n_heads hidden_channels) x"
@@ -941,6 +1274,7 @@ class SequenceBlockGATrPairBiasBlock(nn.Module):
         mlp: MLPConfig,
         dropout_prob: Optional[float] = None,
         checkpoint: Optional[Sequence[Literal["mlp", "attention"]]] = None,
+        many_body_expand=False
     ) -> None:
         super().__init__()
 
@@ -965,7 +1299,11 @@ class SequenceBlockGATrPairBiasBlock(nn.Module):
             output_init="small",
             dropout_prob=dropout_prob,
         )
-        self.attention = CrossAttentionPairBias(attention, c_z=z_channels)
+        self.attention = CrossAttentionPairBias(
+            attention,
+            c_z=z_channels,
+            many_body_expand=many_body_expand
+        )
 
         # MLP block
         mlp = replace(
@@ -1030,6 +1368,7 @@ class SequenceBlockGATrPairBiasBlock(nn.Module):
             additional_qk_features_mv=additional_qk_features_mv,
             additional_qk_features_s=additional_qk_features_s,
             attention_mask=attention_mask,
+            reference_mv=reference_mv,
         )
         if self._checkpoint_attn:
             h_mv, h_s = checkpoint_(self._attention_block, use_reentrant=False, **attn_kwargs)
@@ -1063,6 +1402,7 @@ class SequenceBlockGATrPairBiasBlock(nn.Module):
         additional_qk_features_mv: Optional[torch.Tensor] = None,
         additional_qk_features_s: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        reference_mv = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Attention block."""
 
@@ -1076,6 +1416,7 @@ class SequenceBlockGATrPairBiasBlock(nn.Module):
             additional_qk_features_mv=additional_qk_features_mv,
             additional_qk_features_s=additional_qk_features_s,
             attention_mask=attention_mask,
+            reference_mv=reference_mv
         )
         return h_mv, h_s
 
@@ -1153,6 +1494,7 @@ class SequenceBlockGATrPairBias(nn.Module):
         checkpoint: Union[
             None, Sequence[Literal["block"]], Sequence[Literal["mlp", "attention"]]
         ] = None,
+        many_body_expand=False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -1210,6 +1552,7 @@ class SequenceBlockGATrPairBias(nn.Module):
                     mlp=mlp,
                     dropout_prob=dropout_prob,
                     checkpoint=checkpoint,
+                    many_body_expand=many_body_expand
                 )
                 for _ in range(num_blocks)
             ]
@@ -1350,6 +1693,7 @@ class SequenceBlockConditionedGATrPairBiasBlock(nn.Module):
         mlp: MLPConfig,
         dropout_prob: Optional[float] = None,
         checkpoint: Optional[Sequence[Literal["mlp", "attention"]]] = None,
+        many_body_expand=False,
     ) -> None:
         super().__init__()
 
@@ -1384,7 +1728,11 @@ class SequenceBlockConditionedGATrPairBiasBlock(nn.Module):
             output_init="small",
             dropout_prob=dropout_prob,
         )
-        self.attention = CrossAttentionPairBias(attention, c_z=z_channels)
+        self.attention = CrossAttentionPairBias(
+            attention,
+            c_z=z_channels,
+            many_body_expand=many_body_expand
+        )
 
         # MLP block
         mlp = replace(
@@ -1453,6 +1801,7 @@ class SequenceBlockConditionedGATrPairBiasBlock(nn.Module):
             additional_qk_features_mv=additional_qk_features_mv,
             additional_qk_features_s=additional_qk_features_s,
             attention_mask=attention_mask,
+            reference_mv=reference_mv
         )
         if self._checkpoint_attn:
             h_mv, h_s = checkpoint_(self._attention_block, use_reentrant=False, **attn_kwargs)
@@ -1494,6 +1843,7 @@ class SequenceBlockConditionedGATrPairBiasBlock(nn.Module):
         additional_qk_features_mv: Optional[torch.Tensor] = None,
         additional_qk_features_s: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        reference_mv = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Attention block."""
 
@@ -1512,6 +1862,7 @@ class SequenceBlockConditionedGATrPairBiasBlock(nn.Module):
             additional_qk_features_mv=additional_qk_features_mv,
             additional_qk_features_s=additional_qk_features_s,
             attention_mask=attention_mask,
+            reference_mv=reference_mv
         )
         return h_mv, h_s
 
@@ -1598,6 +1949,7 @@ class SequenceBlockConditionedGATrPairBias(nn.Module):
         checkpoint: Union[
             None, Sequence[Literal["block"]], Sequence[Literal["mlp", "attention"]]
         ] = None,
+        many_body_expand=False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -1657,6 +2009,7 @@ class SequenceBlockConditionedGATrPairBias(nn.Module):
                     mlp=mlp,
                     dropout_prob=dropout_prob,
                     checkpoint=checkpoint,
+                    many_body_expand=many_body_expand
                 )
                 for _ in range(num_blocks)
             ]

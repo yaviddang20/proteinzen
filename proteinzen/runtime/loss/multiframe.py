@@ -20,12 +20,16 @@ def multiframe_fm_loss(
     local_atomic_dist_r=6,
     square_aux_loss_time_factor=False,
     trans_preconditioning=False,
+    rot_preconditioning=False,
     use_fafe=False,
     use_fafe_l2=False,
     polar_upweight=False,
     sidechain_upweight=False,
     rot_exp_weighting=False,
     rot_vf_angle_loss_weight=0.5,
+    ignore_rigid_2_vf_loss=False,
+    disable_rot_vf_time_scaling=False,
+    rot_cap_loss_weight=0.
 ):
     res_data = batch['residue']
     res_mask = res_data['res_mask']
@@ -45,6 +49,9 @@ def multiframe_fm_loss(
             trans=noised_frames._trans.to(device)
         )
     total_mask = total_mask[..., None].expand([-1, noised_frames.shape[-1]])
+    if ignore_rigid_2_vf_loss:
+        total_mask = total_mask.contiguous()
+        total_mask[..., -1] = False
 
     denoised_frames = denoiser_outputs['final_rigids']
     gt_frames = ru.Rigid.from_tensor_7(res_data['rigids_1'].to(device))
@@ -91,9 +98,10 @@ def multiframe_fm_loss(
             gt_rot_vf,
             res_data.batch,
             total_mask,
-            norm_scale[..., None],
+            (norm_scale[..., None] if not disable_rot_vf_time_scaling else torch.ones_like(norm_scale[..., None])),
             seqwise_weight=seqwise_weight,
-            angle_loss_weight=rot_vf_angle_loss_weight
+            angle_loss_weight=rot_vf_angle_loss_weight,
+            rot_cap_loss_weight=rot_cap_loss_weight
         )
         with torch.no_grad():
             unscaled_rot_vf_loss = angle_axis_rot_vf_loss(
@@ -108,7 +116,7 @@ def multiframe_fm_loss(
         unscaled_rot_vf_loss = rot_vf_loss
         rot_vf_loss = rot_vf_loss * seqwise_weight
         rot_vf_loss = _nodewise_to_graphwise(rot_vf_loss, res_data.batch, total_mask)
-        rot_vf_loss = rot_vf_loss / (norm_scale ** 2)
+        rot_vf_loss = rot_vf_loss / ((norm_scale ** 2) if not disable_rot_vf_time_scaling else 1)
         unscaled_rot_vf_loss = _nodewise_to_graphwise(unscaled_rot_vf_loss, res_data.batch, total_mask)
         unscaled_rot_vf_loss = unscaled_rot_vf_loss / (norm_scale ** 2)
 
@@ -118,11 +126,11 @@ def multiframe_fm_loss(
     trans_1_pred = denoised_frames.get_trans()
     trans_1 = gt_frames.get_trans()
     if trans_preconditioning:
-        trans_vf_loss = torch.square(trans_1_pred - trans_1).sum(dim=-1) / (nodewise_norm_scale[..., None] ** 2)
-        unscaled_trans_vf_loss = trans_vf_loss
+        trans_vf_loss = torch.square(trans_1_pred - trans_1).sum(dim=-1)
+        unscaled_trans_vf_loss = trans_vf_loss / (nodewise_norm_scale[..., None] ** 2) * 0.01
         trans_vf_loss = trans_vf_loss * seqwise_weight
         trans_vf_loss = _nodewise_to_graphwise(trans_vf_loss, res_data.batch, total_mask) * batch['trans_loss_weighting']
-        unscaled_trans_vf_loss = _nodewise_to_graphwise(unscaled_trans_vf_loss, res_data.batch, total_mask) * batch['trans_loss_weighting']
+        unscaled_trans_vf_loss = _nodewise_to_graphwise(unscaled_trans_vf_loss, res_data.batch, total_mask)
     else:
         trans_vf_loss = torch.square(trans_1_pred - trans_1).sum(dim=-1) / (nodewise_norm_scale[..., None] ** 2)
         unscaled_trans_vf_loss = trans_vf_loss

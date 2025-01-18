@@ -268,7 +268,8 @@ class MultiSE3Interpolant:
         # the denoiser target but you should check this math
         # old: c_out = (1-t) * sig_1 * sig_0 / torch.sqrt(var_t)
         c_skip = t * sig_1**2 / (var_t)
-        c_out = sig_1 * sig_0 / torch.sqrt(var_t)
+        # c_out = sig_1 * sig_0 / torch.sqrt(var_t)
+        c_out = (1-t) * sig_1 * sig_0 / torch.sqrt(var_t)
         c_in = 1 / torch.sqrt(var_t)
         loss_weighting = 1 / (c_out ** 2)
         return {

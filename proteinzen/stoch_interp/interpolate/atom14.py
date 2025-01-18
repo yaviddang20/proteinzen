@@ -16,12 +16,14 @@ class Atom14Interpolant:
                  min_t=1e-2,
                  prior_std=16,
                  sig_data=16,
-                 lognorm_t_sched=False
+                 lognorm_t_sched=False,
+                 num_timesteps=200,
         ):
         self.min_t = min_t
         self.prior_std = prior_std
         self.sig_data = sig_data
         self.lognorm_t_sched = lognorm_t_sched
+        self.num_timesteps = num_timesteps
 
     def sample_t(self, num_batch, device):
         if self.lognorm_t_sched:
@@ -46,6 +48,7 @@ class Atom14Interpolant:
             "c_skip": t * sig_1**2 / (var_t),
             "c_out": (1-t) * sig_1 * sig_0 / torch.sqrt(var_t),
             "c_in": 1 / torch.sqrt(var_t),
+            "c_data": self.prior_std,
             "loss_weighting": (var_t) / ((1-t) * sig_1 * sig_0)**2
         }
 
@@ -81,6 +84,7 @@ class Atom14Interpolant:
         batch['c_skip'] = var_scaling_dict['c_skip']
         batch['c_in'] = var_scaling_dict['c_in']
         batch['c_out'] = var_scaling_dict['c_out']
+        batch['c_data'] = self.prior_std
         batch['loss_weighting'] = var_scaling_dict['loss_weighting']
 
         return batch

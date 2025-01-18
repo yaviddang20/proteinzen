@@ -372,9 +372,10 @@ def atomic_traj_loss(
     batch,
     model_outputs,
     traj_decay_factor=0.99,
+    preconditioning=False
 ):
     traj_data = model_outputs['traj_data']
-    n_layers = len(traj_data) + 1
+    n_layers = len(traj_data)
 
     res_data = batch['residue']
     device = res_data['atom14'].device
@@ -388,7 +389,7 @@ def atomic_traj_loss(
     ca_loss = 0
     pred_dist_loss = 0
     seq_loss = 0
-    for k in range(n_layers-1):
+    for k in range(n_layers):
         data_k = traj_data[k]
         scale = traj_decay_factor ** (n_layers - k)
         ca_loss_k = torch.square(data_k['ca_pos'] - gt_ca).sum(dim=-1)
@@ -410,8 +411,9 @@ def atomic_traj_loss(
         pred_dist_loss += dist_loss_k * scale
         seq_loss += seq_loss_k * scale
 
+    ca_loss_weight = batch['loss_weighting'] if preconditioning else 0.01
     return {
-        "traj_ca_loss": ca_loss / (n_layers-1),
-        "traj_pred_dist_loss": pred_dist_loss / (n_layers-1),
-        "traj_seq_loss": seq_loss / (n_layers-1)
+        "traj_ca_loss": ca_loss * ca_loss_weight / n_layers,
+        "traj_pred_dist_loss": pred_dist_loss / n_layers,
+        "traj_seq_loss": seq_loss / n_layers,
     }

@@ -7,7 +7,6 @@ import copy
 import functools as fn
 
 from proteinzen.model.modules.openfold.layers_v2 import Linear, ConditionedTransition, Transition, LayerNorm, AdaLN
-from gatr.layers.attention.config import SelfAttentionConfig
 from gatr.layers.linear import EquiLinear
 from gatr.interface.point import embed_point
 from gatr.interface.plane import embed_oriented_plane, extract_oriented_plane
@@ -18,7 +17,7 @@ from ._attn import ConditionedPairUpdateV2, PairEmbedderV2
 from ._frame_transformer import (
     get_indexing_matrix, single_to_keys, pairs_to_framepairs,
 )
-from ._gatr_modules import GATrPairBiasBlock, SequenceBlockGATrPairBias, SequenceBlockConditionedGATrPairBias, EquiAdaLN
+from ._gatr_modules import GATrPairBiasBlock, SequenceBlockGATrPairBias, SequenceBlockConditionedGATrPairBias, EquiAdaLN, SelfAttentionConfig
 from ._geo_mlp import MLPConfig
 
 
@@ -276,6 +275,7 @@ class Embedder(nn.Module):
                  n_tfmr_blocks=3,
                  n_pair_embed_blocks=2,
                  index_embed_size=32,
+                 many_body_expand=False,
                  atoms_per_res=14
     ):
         super().__init__()
@@ -313,7 +313,8 @@ class Embedder(nn.Module):
             c_z=c_atompair,
             num_blocks=n_tfmr_blocks,
             attention=attention_config,
-            mlp=mlp_config
+            mlp=mlp_config,
+            many_body_expand=many_body_expand
         )
         self.proj_atom_to_node = EquiLinear(
             in_mv_channels=c_atom_mv,
@@ -337,7 +338,8 @@ class Embedder(nn.Module):
             c_z=c_atompair,
             num_blocks=n_tfmr_blocks,
             attention=attention_config,
-            mlp=mlp_config
+            mlp=mlp_config,
+            many_body_expand=many_body_expand
         )
         self.sc_proj_atom_to_node = EquiLinear(
             in_mv_channels=c_atom_mv,
@@ -435,7 +437,7 @@ class Embedder(nn.Module):
             torch.relu(node_init[..., None, :])
         ).tile((1, 1, self.atoms_per_res, 1))
         atom_init = atom_init + self.pos_embedder(
-            torch.tensor([0] + [1 for _ in range(self.atoms_per_res-1)], device=atom_init.device)
+            torch.arange(self.atoms_per_res, device=atom_init.device)
         )[None, None]
         atom_to_res_idx = seq_idx[..., None].tile((1, 1, self.atoms_per_res))
         atom_mask = node_mask[..., None].tile((1, 1, self.atoms_per_res))
@@ -445,7 +447,8 @@ class Embedder(nn.Module):
             plane_mv = embed_oriented_plane(-points, points)
             trans_mv = embed_translation(points)
             # print("plane mv", plane_mv[0, 0, 0])
-            return point_mv + plane_mv
+            # print(point_mv[0, 0, 0], plane_mv[0, 0, 0], trans_mv[0, 0, 0])
+            return point_mv + plane_mv # + trans_mv
 
         # atom_mv = embed_point(noisy_atom14)[..., None, :] + embed_translation(noisy_atom14)[..., None, :]
         atom_mv = coord_to_mv(noisy_atom14)[..., None, :]
@@ -456,7 +459,7 @@ class Embedder(nn.Module):
         atom_to_res_idx = to_flat(atom_to_res_idx, dims=(-1, -2))
         atom_mask = to_flat(atom_mask, dims=(-1, -2))
 
-        flat_atom_init = flat_atom_init.clone()
+        # flat_atom_init = flat_atom_init.clone()
         atompair_embed, atompair_mask = self.atompair_init(
             flat_atom_init,
             flat_atompos,
@@ -467,7 +470,7 @@ class Embedder(nn.Module):
             to_keys,
         )
 
-        flat_atom_init = flat_atom_init.clone()
+        # flat_atom_init = flat_atom_init.clone()
         flat_atom_mv, flat_atom_s = self.atom_gatr(
             multivectors=flat_atom_mv,
             scalars=flat_atom_init,
@@ -476,7 +479,7 @@ class Embedder(nn.Module):
             to_keys=to_keys,
             attention_mask=atompair_mask,
         )
-        flat_atom_init = flat_atom_init.clone()
+        # flat_atom_init = flat_atom_init.clone()
 
         atom_mv = to_res_batch(flat_atom_mv, dim=-3)
         atom_s = to_res_batch(flat_atom_s, dim=-2)
@@ -491,6 +494,10 @@ class Embedder(nn.Module):
             flat_sc_atom_mv = to_flat(sc_atom_mv, dims=(-3, -4))
             flat_sc_atompos = to_flat(sc_atom14, dims=(-2, -3))
 
+            # it's not clear why we have to do this
+            # i think atom_gatr does someting in-place somewhere down the line
+            # but i haven't been able to find it yet
+            flat_atom_init = flat_atom_init.clone()
             sc_atompair_embed, _ = self.sc_atompair_init(
                 flat_atom_init,
                 flat_sc_atompos,
@@ -500,7 +507,6 @@ class Embedder(nn.Module):
                 to_queries,
                 to_keys,
             )
-            flat_atom_init = flat_atom_init.clone()
 
             flat_sc_atom_mv, flat_sc_atom_s = self.sc_atom_gatr(
                 multivectors=flat_sc_atom_mv,
@@ -510,7 +516,7 @@ class Embedder(nn.Module):
                 to_keys=to_keys,
                 attention_mask=atompair_mask,
             )
-            flat_atom_init = flat_atom_init.clone()
+            # flat_atom_init = flat_atom_init.clone()
 
             sc_atom_mv = to_res_batch(flat_sc_atom_mv, dim=-3)
             sc_atom_s = to_res_batch(flat_sc_atom_s, dim=-2)
@@ -583,6 +589,7 @@ class GATrDenoiser(nn.Module):
                  num_blocks=4,
                  use_traj_predictions=False,
                  atom_gatr_num_blocks=3,
+                 many_body_expand=False
                  ):
         super().__init__()
         # self.diffuser = diffuser
@@ -597,7 +604,8 @@ class GATrDenoiser(nn.Module):
                 s_channels=c_s,
                 z_channels=c_z,
                 attention=node_attention_config,
-                mlp=node_mlp_config
+                mlp=node_mlp_config,
+                many_body_expand=many_body_expand
             )
             tfmr_layer = torch.nn.TransformerEncoderLayer(
                 d_model=c_s,
@@ -664,7 +672,8 @@ class GATrDenoiser(nn.Module):
             cond_s_channels=c_atom_s,
             num_blocks=atom_gatr_num_blocks,
             attention=atom_attention_config,
-            mlp=atom_mlp_config
+            mlp=atom_mlp_config,
+            many_body_expand=many_body_expand
         )
         self.atom_update = AtomPositionUpdate(c_atom_mv, c_atom_s)
         self.seq_pred = SeqPredictorFromAtoms(c_atom_s, c_hidden=c_s)
@@ -787,7 +796,7 @@ class GATrDenoiser(nn.Module):
             # reference_mv=atom_ref_mv
         )
         atompos_update = self.atom_update(atom_mv, atom_s) * atom_mask[..., None]
-        print(atompos_update[0, 0], atom_mask[0, 0])
+        # print(atompos_update[0, 0], atom_mask[0, 0])
         atom14_update = to_res_batch(atompos_update, dim=-2)
         pred_atom14 = noisy_atom14 + atom14_update
         seq_logits = self.seq_pred(to_res_batch(atom_s, dim=-2))
@@ -810,10 +819,13 @@ class GATrAtom14Denoiser(nn.Module):
                  c_atom_mv=4,
                  c_atom_s=128-4*16,
                  c_atompair=16,
+                 res_hidden_mv_increase_factor=2,
+                 atom_hidden_mv_increase_factor=2,
                  use_traj_predictions=False,
                  num_blocks=8,
                  atom_gatr_num_blocks=3,
                  preconditioning=False,
+                 many_body_expand=False,
                  block_q=32,
                  block_k=128,
                  ):
@@ -827,34 +839,21 @@ class GATrAtom14Denoiser(nn.Module):
 
         self.num_blocks = num_blocks
 
+        # the rest of the values are filled in by the model inits
         node_attention_config = SelfAttentionConfig(
             multi_query=False,
-            in_mv_channels=c_mv,
-            out_mv_channels=c_mv,
-            in_s_channels=c_s,
-            out_s_channels=c_s,
-            num_heads=16,
-            output_init="unit_scalar",
+            num_heads=8,
             checkpoint=False,
+            increase_hidden_mv_channels=res_hidden_mv_increase_factor
         )
-        node_mlp_config = MLPConfig(
-            mv_channels=c_mv,
-            s_channels=c_s,
-        )
+        node_mlp_config = MLPConfig()
         atom_attention_config = SelfAttentionConfig(
             multi_query=False,
-            in_mv_channels=c_atom_mv,
-            out_mv_channels=c_atom_mv,
-            in_s_channels=c_atom_s,
-            out_s_channels=c_atom_s,
             num_heads=4,
-            output_init="unit_scalar",
             checkpoint=False,
+            increase_hidden_mv_channels=atom_hidden_mv_increase_factor
         )
-        atom_mlp_config = MLPConfig(
-            mv_channels=c_atom_mv,
-            s_channels=c_atom_s,
-        )
+        atom_mlp_config = MLPConfig()
 
         self.denoiser = GATrDenoiser(
             node_attention_config,
@@ -870,6 +869,7 @@ class GATrAtom14Denoiser(nn.Module):
             num_blocks=num_blocks,
             use_traj_predictions=use_traj_predictions,
             atom_gatr_num_blocks=atom_gatr_num_blocks,
+            many_body_expand=many_body_expand
         )
 
         self.embedder = Embedder(
@@ -886,6 +886,7 @@ class GATrAtom14Denoiser(nn.Module):
             block_q=block_q,
             block_k=block_k,
             n_tfmr_blocks=atom_gatr_num_blocks,
+            many_body_expand=many_body_expand
         )
         self.preconditioning = preconditioning
 
@@ -904,7 +905,10 @@ class GATrAtom14Denoiser(nn.Module):
         fixed_mask = torch.zeros_like(res_mask).view(batch_size, -1)
 
         if self_condition is not None:
-            sc_atom14 = self_condition['pred_atom14'] / 10
+            if self.preconditioning:
+                sc_atom14 = self_condition['pred_atom14'] / data['c_data']
+            else:
+                sc_atom14 = self_condition['pred_atom14'] / 10
         else:
             sc_atom14 = None
 
@@ -943,8 +947,12 @@ class GATrAtom14Denoiser(nn.Module):
         atom14_out = score_dict['pred_atom14']
         if self.preconditioning:
             atom14_out = atom14_out * data['c_out'][..., None, None, None] + atom14_t * data['c_skip'][..., None, None, None]
+            for _, traj in traj_data.items():
+                traj['ca_pos'] = traj['ca_pos'] * data['c_out'][..., None, None] + atom14_t[..., 1, :] * data['c_skip'][..., None, None]
         else:
             atom14_out = atom14_out * 10
+            for _, traj in traj_data.items():
+                traj['ca_pos'] = traj['ca_pos'] * 10
 
         atom14_out = atom14_out + center[..., None, None, :]
         seq_logits = score_dict['seq_logits']
