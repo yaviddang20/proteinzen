@@ -8,6 +8,7 @@ import torch.nn as nn
 from typing import Optional, Callable, List, Sequence, Union
 import torch.nn.functional as F
 
+from opt_kernels.torch.warp_ipa import fused_ipa_kernel
 from proteinzen.utils.openfold.rigid_utils import Rigid
 from .layers_v2 import LayerNorm
 
@@ -19,6 +20,7 @@ if deepspeed_is_installed:
 
 if ds4s_is_installed:
     from deepspeed.ops.deepspeed4science import DS4Sci_EvoformerAttention
+
 
 def permute_final_dims(tensor: torch.Tensor, inds: List[int]):
     zero_index = -1 * len(inds)
@@ -1064,7 +1066,8 @@ class InvariantPointAttention(nn.Module):
         pre_ln=False,
         lin_bias=True,
         final_init='final',
-        use_compile_path=False
+        use_compile_path=False,
+        use_fused_kernel=False
     ):
         """
         Args:
@@ -1092,6 +1095,7 @@ class InvariantPointAttention(nn.Module):
         self.inf = inf
         self.eps = eps
         self.use_compile_path = use_compile_path
+        self.use_fused_kernel = use_fused_kernel
 
         # These linear layers differ from their specifications in the
         # supplement. There, they lack bias and use Glorot initialization.
@@ -1126,6 +1130,51 @@ class InvariantPointAttention(nn.Module):
             self.pre_ln_s = LayerNorm(c_s)
             self.pre_ln_z = LayerNorm(c_z)
 
+    def _pts_bias(
+        self,
+        q_pts,
+        k_pts,
+        pts_cdist=False
+    ):
+        if pts_cdist:
+            # we can do a lot of these operations in-place which saves us a small chunk of memory
+            pt_att = -2 * torch.einsum("...ahpd,...bhpd->...abh", q_pts, k_pts)
+            q_pts_norm = torch.sum(q_pts ** 2, dim=(-1, -2))
+            k_pts_norm = torch.sum(k_pts ** 2, dim=(-1, -2))
+            pt_att += q_pts_norm[..., None, :]
+            pt_att += k_pts_norm[..., None, :, :]
+
+            head_weights = self.softplus(self.head_weights).view(
+                *((1,) * len(pt_att.shape[:-1]) + (-1,))
+            )
+            head_weights = head_weights * math.sqrt(
+                1.0 / (3 * (self.no_qk_points * 9.0 / 2))
+            )
+            pt_att *= head_weights
+            pt_att *= -0.5
+        else:
+            # [*, N_res, N_res, H, P_q, 3]
+            pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
+            pt_att = pt_displacement ** 2
+
+            # [*, N_res, N_res, H, P_q]
+            pt_att = sum(torch.unbind(pt_att, dim=-1))
+            head_weights = self.softplus(self.head_weights).view(
+                *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
+            )
+            head_weights = head_weights * math.sqrt(
+                1.0 / (3 * (self.no_qk_points * 9.0 / 2))
+            )
+            pt_att = pt_att * head_weights
+
+            # [*, N_res, N_res, H]
+            pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
+
+        # [*, H, N_res, N_res]
+        pt_att = permute_final_dims(pt_att, (2, 0, 1))
+
+        return pt_att
+
     # @torch.compile()
     def _attn(
         self,
@@ -1136,7 +1185,8 @@ class InvariantPointAttention(nn.Module):
         k_pts,
         v_pts,
         z,
-        mask
+        mask,
+        pts_cdist=False
     ):
         # [*, N_res, N_res, H]
         b = self.linear_b(z)
@@ -1149,22 +1199,7 @@ class InvariantPointAttention(nn.Module):
         a *= math.sqrt(1.0 / (3 * self.c_hidden))
         a += (math.sqrt(1.0 / 3) * permute_final_dims(b, (2, 0, 1)))
 
-        # [*, N_res, N_res, H, P_q, 3]
-        pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
-        pt_att = pt_displacement ** 2
-
-        # [*, N_res, N_res, H, P_q]
-        pt_att = sum(torch.unbind(pt_att, dim=-1))
-        head_weights = self.softplus(self.head_weights).view(
-            *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
-        )
-        head_weights = head_weights * math.sqrt(
-            1.0 / (3 * (self.no_qk_points * 9.0 / 2))
-        )
-        pt_att = pt_att * head_weights
-
-        # [*, N_res, N_res, H]
-        pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
+        pt_att = self._pts_bias(q_pts, k_pts, pts_cdist=pts_cdist)
         # [*, N_res, N_res]
         square_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
         square_mask = self.inf * (square_mask - 1)
@@ -1217,7 +1252,7 @@ class InvariantPointAttention(nn.Module):
         _offload_inference: bool = False,
         _z_reference_list: Optional[Sequence[torch.Tensor]] = None,
         flash_attn=False,
-        pts_cdist=False,
+        pts_cdist=True,
     ) -> torch.Tensor:
         """
         Args:
@@ -1266,10 +1301,10 @@ class InvariantPointAttention(nn.Module):
         q_pts = torch.stack(q_pts, dim=-1)
         q_pts = r[..., None].apply(q_pts)
 
-        # [*, N_res, H, P_q, 3]
-        q_pts = q_pts.view(
-            q_pts.shape[:-2] + (self.no_heads, self.no_qk_points, 3)
-        )
+        # # [*, N_res, H, P_q, 3]
+        # q_pts = q_pts.view(
+        #     q_pts.shape[:-2] + (self.no_heads, self.no_qk_points, 3)
+        # )
 
         # [*, N_res, H * (P_q + P_v) * 3]
         kv_pts = self.linear_kv_points(s)
@@ -1279,19 +1314,31 @@ class InvariantPointAttention(nn.Module):
         kv_pts = torch.stack(kv_pts, dim=-1)
         kv_pts = r[..., None].apply(kv_pts)
 
-        # [*, N_res, H, (P_q + P_v), 3]
-        kv_pts = kv_pts.view(kv_pts.shape[:-2] + (self.no_heads, -1, 3))
+        # # [*, N_res, H, (P_q + P_v), 3]
+        # kv_pts = kv_pts.view(kv_pts.shape[:-2] + (self.no_heads, -1, 3))
 
-        # [*, N_res, H, P_q/P_v, 3]
-        k_pts, v_pts = torch.split(
-            kv_pts, [self.no_qk_points, self.no_v_points], dim=-2
-        )
+        # # [*, N_res, H, P_q/P_v, 3]
+        # k_pts, v_pts = torch.split(
+        #     kv_pts, [self.no_qk_points, self.no_v_points], dim=-2
+        # )
 
         ##########################
         # Compute attention scores
         ##########################
         if self.use_compile_path:
-            o, o_pt, o_pair = self._attn(q, k, v, q_pts, k_pts, v_pts, z, mask)
+            # [*, N_res, H, P_q, 3]
+            q_pts = q_pts.view(
+                q_pts.shape[:-2] + (self.no_heads, self.no_qk_points, 3)
+            )
+            # [*, N_res, H, (P_q + P_v), 3]
+            kv_pts = kv_pts.view(kv_pts.shape[:-2] + (self.no_heads, -1, 3))
+
+            # [*, N_res, H, P_q/P_v, 3]
+            k_pts, v_pts = torch.split(
+                kv_pts, [self.no_qk_points, self.no_v_points], dim=-2
+            )
+
+            o, o_pt, o_pair = self._attn(q, k, v, q_pts, k_pts, v_pts, z, mask, pts_cdist=pts_cdist)
             o_pt = r[..., None, None].invert_apply(o_pt)
 
             # [*, N_res, H * P_v]
@@ -1303,8 +1350,65 @@ class InvariantPointAttention(nn.Module):
             o_pt = o_pt.reshape(*o_pt.shape[:-3], -1, 3)
 
             o_feats = [o, *torch.unbind(o_pt, dim=-1), o_pt_norm_feats, o_pair]
+        elif self.use_fused_kernel:
+            # [*, N_res, N_res, H]
+            b = permute_final_dims(self.linear_b(z[0]), (2, 0, 1))
+            pair_z = self.down_z(z[0])
 
+            # [*, N_res, H * P_q / H * P_v, 3]
+            k_pts, v_pts = torch.split(
+                kv_pts, [self.no_heads * self.no_qk_points, self.no_heads * self.no_v_points], dim=-2
+            )
+            # [*, H * P_q, N_res,  3]
+            q = q.transpose(-2, -3)
+            k = k.transpose(-2, -3)
+            v = v.transpose(-2, -3)
+            q_pts = q_pts.transpose(-2, -3)
+            k_pts = k_pts.transpose(-2, -3)
+            v_pts = v_pts.transpose(-2, -3)
+
+            square_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
+            square_mask = self.inf * (square_mask - 1)
+
+            head_weights = self.softplus(self.head_weights)
+
+            # BHLD, B(HP)LD, BHLDp
+            o, o_pt, o_pair = fused_ipa_kernel(
+                q,
+                q_pts,
+                k,
+                k_pts,
+                v,
+                v_pts,
+                z_attn_bias=b + square_mask.unsqueeze(-3),
+                z_out_bias=pair_z,
+                pts_bias_scale=head_weights,
+                n_qk_pts=self.no_qk_points,
+                n_v_pts=self.no_v_points
+            )
+            # [*, N_res, H * P_v, 3]
+            o_pt = r[..., None].invert_apply(o_pt.transpose(-2, -3))
+
+            # [*, N_res, H * P_v]
+            o_pt_norm_feats = torch.sqrt(torch.sum(o_pt ** 2, dim=-1) + self.eps)
+
+            o = flatten_final_dims(o.transpose(-2, -3), 2)
+            o_pair = flatten_final_dims(o_pair.transpose(-2, -3), 2)
+
+            o_feats = [o, *torch.unbind(o_pt, dim=-1), o_pt_norm_feats, o_pair]
         else:
+            # [*, N_res, H, P_q, 3]
+            q_pts = q_pts.view(
+                q_pts.shape[:-2] + (self.no_heads, self.no_qk_points, 3)
+            )
+            # [*, N_res, H, (P_q + P_v), 3]
+            kv_pts = kv_pts.view(kv_pts.shape[:-2] + (self.no_heads, -1, 3))
+
+            # [*, N_res, H, P_q/P_v, 3]
+            k_pts, v_pts = torch.split(
+                kv_pts, [self.no_qk_points, self.no_v_points], dim=-2
+            )
+
             # [*, N_res, N_res, H]
             b = self.linear_b(z[0])
 
@@ -1312,41 +1416,22 @@ class InvariantPointAttention(nn.Module):
                 z[0] = z[0].cpu()
 
             if flash_attn:
-                # TODO: i need to validate the performance/speed of this implementation
-                # since this does some weird stuff to make use of scaled_dot_product_attention
-                # raise NotImplementedError()
                 q = permute_final_dims(q, (1, 0, 2))  # [*, H, N_res, C_hidden]
                 k = permute_final_dims(k, (1, 0, 2))  # [*, H, N_res, C_hidden]
                 scale = math.sqrt(1.0 / (3 * self.c_hidden))
 
-                bias = 0
-                bias += (math.sqrt(1.0 / 3) * permute_final_dims(b, (2, 0, 1)))
+                bias = (math.sqrt(1.0 / 3) * permute_final_dims(b, (2, 0, 1)))
 
-                # [*, N_res, N_res, H, P_q, 3]
-                pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
-                pt_att = pt_displacement ** 2
-
-                # [*, N_res, N_res, H, P_q]
-                pt_att = sum(torch.unbind(pt_att, dim=-1))
-                head_weights = self.softplus(self.head_weights).view(
-                    *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
-                )
-                head_weights = head_weights * math.sqrt(
-                    1.0 / (3 * (self.no_qk_points * 9.0 / 2))
-                )
-                pt_att = pt_att * head_weights
-
-                # [*, N_res, N_res, H]
-                pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
+                pt_att = self._pts_bias(q_pts, k_pts, pts_cdist=pts_cdist)
                 # [*, N_res, N_res]
                 square_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
                 square_mask = self.inf * (square_mask - 1)
 
-                # [*, H, N_res, N_res]
-                pt_att = permute_final_dims(pt_att, (2, 0, 1))
-
-                bias = bias + pt_att
-                bias = bias + square_mask.unsqueeze(-3)
+                # bias += pt_att
+                # bias = bias + square_mask.unsqueeze(-3)
+                pt_att += bias
+                pt_att += square_mask.unsqueeze(-3)
+                bias = pt_att
 
                 v_in = [
                     v.transpose(-2, -3),  # [*, H, N_res, C_hidden]
@@ -1367,13 +1452,14 @@ class InvariantPointAttention(nn.Module):
                 # print(q.shape, k.shape, bias.shape)
                 v_in = torch.cat(v_in, dim=-1)
 
-                v_out = F.scaled_dot_product_attention(
-                    query=q,
-                    key=k,
-                    value=v_in,
-                    attn_mask=bias,
-                    scale=scale
-                )
+                with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=False, enable_mem_efficient=True):
+                    v_out = F.scaled_dot_product_attention(
+                        query=q,
+                        key=k,
+                        value=v_in,
+                        attn_mask=bias,
+                        scale=scale
+                    )
 
                 ################
                 # Compute output
@@ -1417,42 +1503,7 @@ class InvariantPointAttention(nn.Module):
                 a *= math.sqrt(1.0 / (3 * self.c_hidden))
                 a += (math.sqrt(1.0 / 3) * permute_final_dims(b, (2, 0, 1)))
 
-                if pts_cdist:
-                    pt_att = -2 * torch.einsum("...ahpd,...bhpd->...abh", q_pts, k_pts)
-                    q_pts_norm = torch.sum(q_pts ** 2, dim=(-1, -2))
-                    k_pts_norm = torch.sum(q_pts ** 2, dim=(-1, -2))
-                    pt_att += q_pts_norm[..., None, :]
-                    pt_att += k_pts_norm[..., None, :, :]
-
-                    head_weights = self.softplus(self.head_weights).view(
-                        *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
-                    )
-                    head_weights = head_weights * math.sqrt(
-                        1.0 / (3 * (self.no_qk_points * 9.0 / 2))
-                    )
-                    pt_att *= head_weights
-
-                else:
-                    # [*, N_res, N_res, H, P_q, 3]
-                    pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
-                    pt_att = pt_displacement ** 2
-
-                    # [*, N_res, N_res, H, P_q]
-                    pt_att = sum(torch.unbind(pt_att, dim=-1))
-                    head_weights = self.softplus(self.head_weights).view(
-                        *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
-                    )
-                    head_weights = head_weights * math.sqrt(
-                        1.0 / (3 * (self.no_qk_points * 9.0 / 2))
-                    )
-                    pt_att = pt_att * head_weights
-
-                    # [*, N_res, N_res, H]
-                    pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
-
-                    # [*, H, N_res, N_res]
-                    pt_att = permute_final_dims(pt_att, (2, 0, 1))
-
+                pt_att = self._pts_bias(q_pts, k_pts, pts_cdist=pts_cdist)
                 # [*, N_res, N_res]
                 square_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
                 square_mask = self.inf * (square_mask - 1)

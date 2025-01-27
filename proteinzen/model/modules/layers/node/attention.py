@@ -329,6 +329,7 @@ class FlashTransformerEncoderLayer(nn.Module):
         #     update = F.scaled_dot_product_attention(
         #         q, k, v, attn_mask=x_mask
         #     )
+        print(q.is_contiguous(), k.is_contiguous(), v.is_contiguous(), x_mask.is_contiguous())
         update = F.scaled_dot_product_attention(
             q, k, v, attn_mask=x_mask[..., None, :, None]
         )

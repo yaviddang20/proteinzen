@@ -16,6 +16,7 @@ from rdkit.Geometry import rdGeometry
 
 from torchmetrics import Metric
 from torchmetrics.utilities import dim_zero_cat
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 
 from proteinzen.tasks import TaskList
@@ -23,6 +24,7 @@ from proteinzen.data.io.atom91 import atom91_to_pdb
 from proteinzen.runtime.optim import get_std_opt
 
 from .utils import gen_pbar_str
+from .ema import EMAModel
 
 class MedianMetric(Metric):
     is_differentiable = False
@@ -697,6 +699,9 @@ class ProteinModule(L.LightningModule):
                  finetune_seq_head=False,
                  use_amp=False,
                  use_cosine_lr_sched=False,
+                 use_ema=False,
+                 ema_decay=0.999,
+                 use_posthoc_ema=False,
     ):
         super().__init__()
         self._log = logging.getLogger(__name__)
@@ -706,8 +711,22 @@ class ProteinModule(L.LightningModule):
         self.use_amp = use_amp
         self.use_cosine_lr_sched = use_cosine_lr_sched
         self.finetune_seq_head = finetune_seq_head
+        self.use_ema = use_ema
+        self.use_posthoc_ema = use_posthoc_ema
         if self.use_amp:
             torch.set_float32_matmul_precision("medium")
+
+        if use_ema:
+            self.ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(ema_decay))
+        else:
+            self.ema = None
+
+        if use_posthoc_ema:
+            self.ema_long = EMAModel(model, gamma=6.94)
+            self.ema_short = EMAModel(model, gamma=16.97)
+        else:
+            self.ema_long = None
+            self.ema_short = None
 
 
         self.freeze_encoder = freeze_encoder
@@ -737,6 +756,15 @@ class ProteinModule(L.LightningModule):
 
     def training_step(self, batch):
         task: TaskList = batch.task
+
+        if self.ema is not None and self.global_step > 0:
+            self.ema.update_parameters(self.model)
+        if self.ema_long is not None and self.global_step > 0:
+            self.ema_long.update_parameters(self.model, self.global_step-1)
+        if self.ema_short is not None and self.global_step > 0:
+            self.ema_short.update_parameters(self.model, self.global_step-1)
+
+
         if self.use_amp:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 outputs = task.run_evals(self.model, batch)
@@ -944,7 +972,11 @@ class ProteinModule(L.LightningModule):
 
     def test_step(self, batch, batch_idx):
         task: TaskList = batch.task
-        sample_outputs = task.run_predicts(self.model, batch)
+        if self.use_ema:
+            sample_outputs = task.run_predicts(self.ema, batch)
+        else:
+            sample_outputs = task.run_predicts(self.model, batch)
+
         sample_loss_dict = task.compile_task_losses(batch, sample_outputs)
         sample_log_dict = tree.map_structure(
             lambda x: torch.mean(x) if torch.is_tensor(x) else x,
@@ -966,7 +998,10 @@ class ProteinModule(L.LightningModule):
 
     def predict_step(self, batch, batch_idx):
         task: TaskList = batch['task']
-        outputs = task.run_predicts(self.model, batch)
+        if self.use_ema:
+            outputs = task.run_predicts(self.ema.module, batch)
+        else:
+            outputs = task.run_predicts(self.model, batch)
         return outputs
 
 

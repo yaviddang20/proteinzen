@@ -15,6 +15,8 @@ from proteinzen.utils.framediff.all_atom import compute_backbone
 from proteinzen.utils.coarse_grain import compute_atom14_from_cg_frames
 from proteinzen.stoch_interp.interpolate.so3_utils import geodesic_t, rotquat_to_rotvec, _rotquat_to_axis_angle
 
+from opt_kernels.torch.warp_ipa import BLOCK_SIZE
+
 from ._attn import ConditionedPairUpdate, MultiRigidPairEmbedder
 from ._frame_transformer import (
     SequenceFrameTransformerUpdate, ConditionedSequenceFrameTransformerUpdate,
@@ -314,6 +316,7 @@ class EmbedderV2(nn.Module):
                  rigids_per_residue=3,
                  use_sc_rigid_transformer=False,
                  rigid_transformer_add_vanilla_transformer=False,
+                 rigid_transformer_add_full_transformer=False,
     ):
         super().__init__()
         self.c_s = c_s
@@ -348,7 +351,8 @@ class EmbedderV2(nn.Module):
             broadcast_pairs=True,
             framepair_init=True,
             framepair_ffn=True,
-            add_vanilla_transformer=rigid_transformer_add_vanilla_transformer
+            add_vanilla_transformer=rigid_transformer_add_vanilla_transformer,
+            add_full_transformer=rigid_transformer_add_full_transformer
         )
         self.use_sc_rigid_transformer = use_sc_rigid_transformer
         if use_sc_rigid_transformer:
@@ -503,12 +507,16 @@ class IpaScore(nn.Module):
                  propagate_framepair_embed=False,
                  use_knn=False,
                  k=30,
+                 rigid_transformer_use_conditioned=False,
                  rigid_transformer_num_blocks=1,
                  rigid_transformer_rigid_updates=False,
                  rigid_transformer_agg_embed=True,
+                 rigid_transformer_add_vanilla_transformer=False,
+                 rigid_transformer_add_full_transformer=False,
                  rel_quat_pair_updates=False,
                  z_broadcast=False,
-                 compile_ipa=False
+                 compile_ipa=False,
+                 use_fused_ipa_kernel=False,
                  ):
         super().__init__()
         # self.diffuser = diffuser
@@ -519,6 +527,8 @@ class IpaScore(nn.Module):
         self.propagate_framepair_embed = propagate_framepair_embed
         self.rigid_transformer_rigid_updates = rigid_transformer_rigid_updates
         self.use_knn = use_knn
+        self.use_fused_ipa_kernel = use_fused_ipa_kernel
+        self.use_conditioned_rigid_transformer = rigid_transformer_use_conditioned
         self.k = k
 
         self.scale_pos = lambda x: x * coordinate_scaling
@@ -541,7 +551,8 @@ class IpaScore(nn.Module):
                 num_qk_points=num_qk_points,
                 num_v_points=num_v_points,
                 pre_ln=True,
-                lin_bias=False
+                lin_bias=False,
+                use_fused_kernel=use_fused_ipa_kernel
             )
             if compile_ipa:
                 self.trunk[f'ipa_{b}'].compile()
@@ -583,21 +594,45 @@ class IpaScore(nn.Module):
                 c=c_s,
             )
 
-            self.trunk[f'rigids_tfmr_{b}'] = SequenceFrameTransformerUpdate(
-                c_s=c_s,
-                c_z=c_z,
-                c_frame=c_frame,
-                c_framepair=c_framepair,
-                num_heads=4, # num_heads,
-                num_qk_points=num_qk_points,
-                num_v_points=num_v_points,
-                block_q=block_q,
-                block_k=block_k,
-                n_blocks=rigid_transformer_num_blocks,
-                do_rigid_updates=rigid_transformer_rigid_updates,
-                agg_rigid_embed=rigid_transformer_agg_embed,
-                broadcast_pairs=z_broadcast
-            )
+            if self.use_conditioned_rigid_transformer:
+                self.trunk[f'node_to_rigid_cond_{b}'] = Linear(c_s, c_frame*3, bias=False)
+                self.trunk[f'rigids_tfmr_{b}'] = ConditionedSequenceFrameTransformerUpdate(
+                    c_s=c_s,
+                    c_z=c_z,
+                    c_frame=c_frame,
+                    c_framepair=c_framepair,
+                    num_heads=4, # num_heads,
+                    num_qk_points=num_qk_points,
+                    num_v_points=num_v_points,
+                    block_q=block_q,
+                    block_k=block_k,
+                    n_blocks=rigid_transformer_num_blocks,
+                    do_rigid_updates=rigid_transformer_rigid_updates,
+                    agg_rigid_embed=rigid_transformer_agg_embed,
+                    broadcast_pairs=z_broadcast,
+                    add_vanilla_transformer=rigid_transformer_add_vanilla_transformer,
+                    add_full_transformer=rigid_transformer_add_full_transformer,
+                )
+
+            else:
+                self.trunk[f'rigids_tfmr_{b}'] = SequenceFrameTransformerUpdate(
+                    c_s=c_s,
+                    c_z=c_z,
+                    c_frame=c_frame,
+                    c_framepair=c_framepair,
+                    num_heads=4, # num_heads,
+                    num_qk_points=num_qk_points,
+                    num_v_points=num_v_points,
+                    block_q=block_q,
+                    block_k=block_k,
+                    n_blocks=rigid_transformer_num_blocks,
+                    do_rigid_updates=rigid_transformer_rigid_updates,
+                    agg_rigid_embed=rigid_transformer_agg_embed,
+                    broadcast_pairs=z_broadcast,
+                    add_vanilla_transformer=rigid_transformer_add_vanilla_transformer,
+                    add_full_transformer=rigid_transformer_add_full_transformer,
+                )
+
             if not rigid_transformer_rigid_updates:
                 self.trunk[f'rigids_update_{b}'] = BackboneUpdate(c_frame)
 
@@ -702,16 +737,30 @@ class IpaScore(nn.Module):
             node_embed = node_embed + self.trunk[f'transition_{b}'](node_embed)
             node_embed = node_embed * node_mask[..., None]
 
-            rigids_embed, node_embed, framepair_embed, rigids_out = self.trunk[f'rigids_tfmr_{b}'](
-                node_embed,
-                edge_embed,
-                curr_rigids,
-                rigids_embed,
-                to_queries,
-                to_keys,
-                to_pairs,
-                framepair_embed=framepair_embed
-            )
+            if self.use_conditioned_rigid_transformer:
+                cond_rigids_embed = self.trunk[f'node_to_rigid_cond_{b}'](node_embed).view(rigids_embed.shape)
+                rigids_embed, node_embed, framepair_embed, rigids_out = self.trunk[f'rigids_tfmr_{b}'](
+                    node_embed,
+                    edge_embed,
+                    curr_rigids,
+                    rigids_embed,
+                    cond_rigids_embed,
+                    to_queries,
+                    to_keys,
+                    to_pairs,
+                    framepair_embed=framepair_embed
+                )
+            else:
+                rigids_embed, node_embed, framepair_embed, rigids_out = self.trunk[f'rigids_tfmr_{b}'](
+                    node_embed,
+                    edge_embed,
+                    curr_rigids,
+                    rigids_embed,
+                    to_queries,
+                    to_keys,
+                    to_pairs,
+                    framepair_embed=framepair_embed
+                )
             if not self.propagate_framepair_embed:
                 framepair_embed = input_feats['framepair_embed']
 
@@ -2158,6 +2207,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                  rigid_transformer_rigid_updates=False,
                  rigid_transformer_agg_embed=True,
                  rigid_transformer_add_vanilla_transformer=False,
+                 rigid_transformer_add_full_transformer=False,
                  rigid_embed_skip_sc=False,
                  use_v2=False,
                  use_v3=False,
@@ -2171,6 +2221,8 @@ class IpaMultiRigidDenoiser(nn.Module):
                  compile_ipa=False,
                  rigids_per_residue=3,
                  override_rigid_2=False,
+                 use_fused_ipa_kernel=False,
+                 v1_use_conditioned_rigid_transformer=False
                  ):
         super().__init__()
         # some compatibility code
@@ -2183,6 +2235,7 @@ class IpaMultiRigidDenoiser(nn.Module):
         self.rigids_per_residue = rigids_per_residue
         self.use_v5 = use_v5
         self.override_rigid_2 = override_rigid_2
+        self.use_fused_ipa_kernel = use_fused_ipa_kernel
 
         if use_v2:
             self.ipa_score = IpaScoreV2(
@@ -2330,12 +2383,16 @@ class IpaMultiRigidDenoiser(nn.Module):
                 block_k=block_k,
                 propagate_framepair_embed=propagate_framepair_embed,
                 use_knn=use_knn,
+                rigid_transformer_use_conditioned=v1_use_conditioned_rigid_transformer,
                 rigid_transformer_num_blocks=rigid_transformer_num_blocks,
                 rigid_transformer_rigid_updates=rigid_transformer_rigid_updates,
                 rigid_transformer_agg_embed=rigid_transformer_agg_embed,
+                rigid_transformer_add_vanilla_transformer=rigid_transformer_add_vanilla_transformer,
+                rigid_transformer_add_full_transformer=rigid_transformer_add_full_transformer,
                 rel_quat_pair_updates=rel_quat_pair_updates,
                 z_broadcast=z_broadcast,
-                compile_ipa=compile_ipa
+                compile_ipa=compile_ipa,
+                use_fused_ipa_kernel=use_fused_ipa_kernel
             )
 
         self.use_embedder_v2 = use_embedder_v2
@@ -2361,7 +2418,8 @@ class IpaMultiRigidDenoiser(nn.Module):
                 break_symmetry=break_rigid_symmetry,
                 rigids_per_residue=rigids_per_residue,
                 use_sc_rigid_transformer=use_embedder_sc_rigid_transformer,
-                rigid_transformer_add_vanilla_transformer=rigid_transformer_add_vanilla_transformer
+                rigid_transformer_add_vanilla_transformer=rigid_transformer_add_vanilla_transformer,
+                rigid_transformer_add_full_transformer=rigid_transformer_add_full_transformer
             )
         else:
             self.embedder = Embedder(
@@ -2410,6 +2468,26 @@ class IpaMultiRigidDenoiser(nn.Module):
             rigids_in = rigids_t.apply_trans_fn(lambda x: x * data['trans_c_in'][..., None, None, None])
         else:
             rigids_in = rigids_t
+
+        if self.use_fused_ipa_kernel:
+            n_nodes = rigids_in.shape[1]
+            n_padding = 0 if n_nodes % BLOCK_SIZE == 0 else (BLOCK_SIZE - (n_nodes % BLOCK_SIZE))
+            if n_padding > 0:
+                seq_idx = F.pad(seq_idx, (0, n_padding))
+                res_mask = res_mask.view(batch_size, -1)
+                res_mask = F.pad(res_mask, (0, n_padding))
+                fixed_mask = F.pad(fixed_mask, (0, n_padding))
+                rigids_t7 = rigids_in.to_tensor_7()
+                padding = torch.tensor([1, 0, 0, 0, 0, 0, 0], dtype=rigids_t7.dtype, device=rigids_t7.device)
+                padding = padding.view(1, 1, 1, 7).expand(batch_size, n_padding, self.rigids_per_residue, -1)
+                rigids_t7 = torch.cat([rigids_t7, padding], dim=1)
+                rigids_in = Rigid.from_tensor_7(rigids_t7)
+                if sc_rigids is not None:
+                    sc_rigids_t7 = sc_rigids.to_tensor_7()
+                    sc_rigids_t7 = torch.cat([sc_rigids_t7, padding], dim=1)
+                    sc_rigids = Rigid.from_tensor_7(sc_rigids_t7)
+        else:
+            n_padding = 0
 
         if self.use_v5:
             node_embed, edge_embed, rigids_embed = self.embedder(
@@ -2477,16 +2555,37 @@ class IpaMultiRigidDenoiser(nn.Module):
 
         rigids_out = rigids_out.translate(center[..., None, None, :])
         seq_logits = traj_data[max(traj_data.keys())]['seq_logits']
+
+        if n_padding > 0:
+            rigids_out = rigids_out[:, :-n_padding]
+            # this is a jenk way of making the underlying storage contiguous
+            rigids_out = Rigid.from_tensor_7(rigids_out.to_tensor_7())
+            seq_logits = seq_logits[:, :-n_padding]
+            psi = score_dict['psi'][:, :-n_padding].reshape(-1, 2)
+
+            for traj_b in traj_data.values():
+                traj_b['seq_logits'] = traj_b['seq_logits'][:, :-n_padding]
+                traj_b['dist_logits'] = traj_b['dist_logits'][..., :-n_padding, :-n_padding, :]
+                traj_b['rigids'] = Rigid.from_tensor_7(traj_b['rigids'][:, :-n_padding].to_tensor_7())
+                if 'framepair_logits_dict' in traj_b:
+                    raise NotImplementedError()
+                    # traj_b['framepair_logits_dict']['logits'] =
+                if 'seqpair_logits' in traj_b:
+                    traj_b['seqpair_logits'] = traj_b['seqpair_logits'][..., :-n_padding, :-n_padding, :]
+            res_mask = res_mask[:, :-n_padding].contiguous()
+        else:
+            psi = score_dict['psi'].view(-1, 2)
+
         denoised_atom14_gt_seq = compute_atom14_from_cg_frames(rigids_out, res_mask, res_data['seq'].view(batch_size, -1))
         denoised_atom14_pred_seq = compute_atom14_from_cg_frames(rigids_out, res_mask, seq_logits.argmax(dim=-1))
-        psi = score_dict['psi'].view(-1, 2)
 
         ret = {}
         ret['denoised_frames'] = rigids_out.view(-1, rigids_out.shape[-1])
         ret['final_rigids'] = rigids_out.view(-1, rigids_out.shape[-1])
         ret['denoised_atom14'] = denoised_atom14_pred_seq.flatten(0, 1)
         ret['denoised_atom14_gt_seq'] = denoised_atom14_gt_seq.flatten(0, 1)
-        ret['denoised_bb'] = compute_backbone(rigids_out[..., 0], score_dict['psi'], impute_O=True)[-1][..., :5, :].flatten(0, 1)
+        _psi = score_dict['psi'][:, :-n_padding] if n_padding > 0 else score_dict['psi']
+        ret['denoised_bb'] = compute_backbone(rigids_out[..., 0], _psi, impute_O=True)[-1][..., :5, :].flatten(0, 1)
         ret['psi'] = psi
         ret['traj_data'] = traj_data
         ret['decoded_seq_logits'] = seq_logits.flatten(0, 1)

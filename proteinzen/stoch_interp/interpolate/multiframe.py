@@ -98,6 +98,8 @@ class MultiSE3Interpolant:
                  trans_preconditioning_std=16,
                  rigids_per_res=3,#5,
                  lognorm_t_sched=False,
+                 lognorm_mu=0.0,
+                 lognorm_sig=1.0,
                  use_trans_sfm=False,
                  trans_sfm_g=0.1,
                  use_rot_sfm=False,
@@ -113,6 +115,8 @@ class MultiSE3Interpolant:
         self.trans_preconditioning = trans_preconditioning
         self.trans_preconditioning_std = trans_preconditioning_std
         self.lognorm_t_sched = lognorm_t_sched
+        self.lognorm_mu = lognorm_mu
+        self.lognorm_sig = lognorm_sig
         self.use_trans_sfm = use_trans_sfm
         self.trans_sfm_g = trans_sfm_g
         self.use_rot_sfm = use_rot_sfm
@@ -134,15 +138,8 @@ class MultiSE3Interpolant:
 
     def sample_t(self, num_batch):
         if self.lognorm_t_sched:
-            lognorm_mu, lognorm_sig = -1.2, 1.5
-            ln_sig = lognorm_mu + torch.randn(num_batch, device=self._device).float() * lognorm_sig
-            # below is the actual math, but it turns out
-            # the conversion is sig_data independent :o
-            # ---
-            # sig_data = 16
-            # sig = sig_data * torch.exp(ln_sig)
-            # t = sig_data / (sig + sig_data)
-            t = 1 / (1 + torch.exp(ln_sig))
+            ln_sig = self.lognorm_mu + torch.randn(num_batch, device=self._device).float() * self.lognorm_sig
+            t = torch.sigmoid(ln_sig)
             return t
         else:
             t = torch.rand(num_batch, device=self._device).float()
@@ -300,6 +297,14 @@ class MultiSE3Interpolant:
         return trans_t + trans_vf * d_t
 
     def _rots_euler_step(self, d_t, t, rotmats_1, rotmats_t):
+        # scaling = 1 / (1 - t)
+        # rot_vf = so3_utils.calc_rot_vf(rotmats_t, rotmats_1)
+        # rot_angle = torch.linalg.vector_norm(rot_vf, dim=-1)
+        # rot_angle = torch.min(torch.pi * (1 - t), rot_angle)
+        # rot_vf = torch.nn.functional.normalize(rot_vf, dim=-1) * rot_angle[..., None]
+        # mat_t = so3_utils.rotvec_to_rotmat(d_t * rot_vf * scaling)
+        # return torch.einsum("...ij,...jk->...ik", rotmats_t, mat_t)
+
         if self._rots_cfg.sample_schedule == "linear":
             scaling = 1 / (1 - t.clip(max=0.9))
         elif self._rots_cfg.sample_schedule == "exp":

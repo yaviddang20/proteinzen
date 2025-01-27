@@ -14,6 +14,7 @@ import torch_geometric.utils as pygu
 # import dgl.sparse
 # from dgl.ops import u_mul_e_sum, u_dot_v, u_add_v
 
+from proteinzen.model.modules.layers.node.attention import FlashTransformerEncoder
 from proteinzen.model.modules.openfold.layers_v2 import (
     Linear, swish, ipa_point_weights_init_, permute_final_dims, flatten_final_dims, BackboneUpdate, LayerNorm,
     AdaLN, ConditionedTransition, Transition)
@@ -205,6 +206,48 @@ class BlockInvariantPointAttention(nn.Module):
         self.ln_s = LayerNorm(c_s)
         self.ln_z = LayerNorm(c_z)
 
+    def _pts_bias(
+        self,
+        q_pts,
+        k_pts,
+        pts_cdist=False
+    ):
+        if pts_cdist:
+            # we can do a lot of these operations in-place which saves us a small chunk of memory
+            pt_att = -2 * torch.einsum("...ahpd,...bhpd->...abh", q_pts, k_pts)
+            q_pts_norm = torch.sum(q_pts ** 2, dim=(-1, -2))
+            k_pts_norm = torch.sum(k_pts ** 2, dim=(-1, -2))
+            pt_att += q_pts_norm[..., None, :]
+            pt_att += k_pts_norm[..., None, :, :]
+
+            head_weights = self.softplus(self.head_weights).view(
+                *((1,) * len(pt_att.shape[:-1]) + (-1,))
+            )
+            head_weights = head_weights * math.sqrt(
+                1.0 / (3 * (self.no_qk_points * 9.0 / 2))
+            )
+            pt_att *= head_weights
+            pt_att *= -0.5
+        else:
+            # [*, N_res, N_res, H, P_q, 3]
+            pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
+            pt_att = pt_displacement ** 2
+
+            # [*, N_res, N_res, H, P_q]
+            pt_att = sum(torch.unbind(pt_att, dim=-1))
+            head_weights = self.softplus(self.head_weights).view(
+                *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
+            )
+            head_weights = head_weights * math.sqrt(
+                1.0 / (3 * (self.no_qk_points * 9.0 / 2))
+            )
+            pt_att = pt_att * head_weights
+
+            # [*, N_res, N_res, H]
+            pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
+
+        return pt_att
+
     def forward(
         self,
         s: torch.Tensor,
@@ -213,6 +256,7 @@ class BlockInvariantPointAttention(nn.Module):
         s_mask: torch.Tensor,
         to_queries: Callable,
         to_keys: Callable,
+        pts_cdist=True
     ) -> torch.Tensor:
         """
         Args:
@@ -340,22 +384,23 @@ class BlockInvariantPointAttention(nn.Module):
         a *= math.sqrt(1.0 / (3 * self.c_hidden))
         a += math.sqrt(1.0 / 3) * b
 
-        # [*, N_block, block_Q, block_K, H, P_q, 3]
-        pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
-        pt_att = pt_displacement ** 2
+        # # [*, N_block, block_Q, block_K, H, P_q, 3]
+        # pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
+        # pt_att = pt_displacement ** 2
 
-        # [*, N_block, block_Q, block_K, H, P_q]
-        pt_att = sum(torch.unbind(pt_att, dim=-1))
-        head_weights = self.softplus(self.head_weights).view(
-            *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
-        )
-        head_weights = head_weights * math.sqrt(
-            1.0 / (3 * (self.no_qk_points * 9.0 / 2))
-        )
-        pt_att = pt_att * head_weights
+        # # [*, N_block, block_Q, block_K, H, P_q]
+        # pt_att = sum(torch.unbind(pt_att, dim=-1))
+        # head_weights = self.softplus(self.head_weights).view(
+        #     *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
+        # )
+        # head_weights = head_weights * math.sqrt(
+        #     1.0 / (3 * (self.no_qk_points * 9.0 / 2))
+        # )
+        # pt_att = pt_att * head_weights
 
-        # [*, N_block, block_Q, block_K, H]
-        pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
+        # # [*, N_block, block_Q, block_K, H]
+        # pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
+        pt_att = self._pts_bias(q_pts, k_pts, pts_cdist=pts_cdist)
         # [*, N_block, block_Q, block_K]
         attn_mask = to_queries(s_mask[..., None].float()) * to_keys(s_mask[..., None].float()).transpose(-1, -2)
         attn_mask = self.inf * (attn_mask - 1)
@@ -490,6 +535,48 @@ class ConditionedBlockInvariantPointAttention(nn.Module):
         self.adaln_s = AdaLN(c_s, c_cond)
         self.ln_z = LayerNorm(c_z)
 
+    def _pts_bias(
+        self,
+        q_pts,
+        k_pts,
+        pts_cdist=False
+    ):
+        if pts_cdist:
+            # we can do a lot of these operations in-place which saves us a small chunk of memory
+            pt_att = -2 * torch.einsum("...ahpd,...bhpd->...abh", q_pts, k_pts)
+            q_pts_norm = torch.sum(q_pts ** 2, dim=(-1, -2))
+            k_pts_norm = torch.sum(k_pts ** 2, dim=(-1, -2))
+            pt_att += q_pts_norm[..., None, :]
+            pt_att += k_pts_norm[..., None, :, :]
+
+            head_weights = self.softplus(self.head_weights).view(
+                *((1,) * len(pt_att.shape[:-1]) + (-1,))
+            )
+            head_weights = head_weights * math.sqrt(
+                1.0 / (3 * (self.no_qk_points * 9.0 / 2))
+            )
+            pt_att *= head_weights
+            pt_att *= -0.5
+        else:
+            # [*, N_res, N_res, H, P_q, 3]
+            pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
+            pt_att = pt_displacement ** 2
+
+            # [*, N_res, N_res, H, P_q]
+            pt_att = sum(torch.unbind(pt_att, dim=-1))
+            head_weights = self.softplus(self.head_weights).view(
+                *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
+            )
+            head_weights = head_weights * math.sqrt(
+                1.0 / (3 * (self.no_qk_points * 9.0 / 2))
+            )
+            pt_att = pt_att * head_weights
+
+            # [*, N_res, N_res, H]
+            pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
+
+        return pt_att
+
     def forward(
         self,
         s: torch.Tensor,
@@ -498,7 +585,8 @@ class ConditionedBlockInvariantPointAttention(nn.Module):
         r: ru.Rigid,
         s_mask: torch.Tensor,
         to_queries: Callable,
-        to_keys: Callable
+        to_keys: Callable,
+        pts_cdist=True
     ) -> torch.Tensor:
         """
         Args:
@@ -626,22 +714,23 @@ class ConditionedBlockInvariantPointAttention(nn.Module):
         a *= math.sqrt(1.0 / (3 * self.c_hidden))
         a += math.sqrt(1.0 / 3) * b
 
-        # [*, N_block, block_Q, block_K, H, P_q, 3]
-        pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
-        pt_att = pt_displacement ** 2
+        # # [*, N_block, block_Q, block_K, H, P_q, 3]
+        # pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
+        # pt_att = pt_displacement ** 2
 
-        # [*, N_block, block_Q, block_K, H, P_q]
-        pt_att = sum(torch.unbind(pt_att, dim=-1))
-        head_weights = self.softplus(self.head_weights).view(
-            *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
-        )
-        head_weights = head_weights * math.sqrt(
-            1.0 / (3 * (self.no_qk_points * 9.0 / 2))
-        )
-        pt_att = pt_att * head_weights
+        # # [*, N_block, block_Q, block_K, H, P_q]
+        # pt_att = sum(torch.unbind(pt_att, dim=-1))
+        # head_weights = self.softplus(self.head_weights).view(
+        #     *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
+        # )
+        # head_weights = head_weights * math.sqrt(
+        #     1.0 / (3 * (self.no_qk_points * 9.0 / 2))
+        # )
+        # pt_att = pt_att * head_weights
 
-        # [*, N_block, block_Q, block_K, H]
-        pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
+        # # [*, N_block, block_Q, block_K, H]
+        # pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
+        pt_att = self._pts_bias(q_pts, k_pts, pts_cdist=pts_cdist)
         # [*, N_block, block_Q, block_K]
         attn_mask = to_queries(s_mask[..., None].float()) * to_keys(s_mask[..., None].float()).transpose(-1, -2)
         attn_mask = self.inf * (attn_mask - 1)
@@ -1006,6 +1095,7 @@ class SequenceFrameTransformerUpdate(nn.Module):
         framepair_init=False,
         framepair_ffn=False,
         add_vanilla_transformer=False,
+        add_full_transformer=False
     ):
         super().__init__()
         self.c_s = c_s
@@ -1018,6 +1108,7 @@ class SequenceFrameTransformerUpdate(nn.Module):
         self.agg_rigid_embed = agg_rigid_embed
         self.framepair_init = framepair_init
         self.add_vanilla_transformer = add_vanilla_transformer
+        self.add_full_transformer = add_full_transformer
 
         if framepair_init:
             self.lin_framepair_dist_vec = Linear(3, c_framepair, bias=False)
@@ -1072,6 +1163,15 @@ class SequenceFrameTransformerUpdate(nn.Module):
                     c_cond=c_s,
                     c_z=c_framepair,
                     num_heads=num_heads,
+                )
+            if self.add_full_transformer:
+                self.trunk[f'full_tfmr_{b}'] = FlashTransformerEncoder(
+                    h_dim=c_frame,
+                    no_heads=num_heads,
+                    h_ff=c_frame,
+                    n_layers=2,
+                    ln_first=True,
+                    bias=False
                 )
 
             if self.do_rigid_updates:
@@ -1257,6 +1357,11 @@ class SequenceFrameTransformerUpdate(nn.Module):
                     rigids_mask=rigids_mask,
                     rigids_to_res_idx=rigids_to_res_idx
                 )
+            if self.add_full_transformer:
+                rigids_embed_flat = self.trunk[f'full_tfmr_{b}'](
+                    rigids_embed_flat,
+                    rigids_mask,
+                )
             if self.do_rigid_updates:
                 # print(rigids_embed_flat)
                 rigids_update = self.trunk[f'frame_update_{b}'](rigids_embed_flat) * rigids_mask[..., None]
@@ -1370,7 +1475,8 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
         agg_rigid_embed=True,
         compile_ipa=False,
         framepair_init=False,
-        add_vanilla_transformer=False
+        add_vanilla_transformer=False,
+        add_full_transformer=False
     ):
         super().__init__()
         self.c_s = c_s
@@ -1383,6 +1489,7 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
         self.agg_rigid_embed = agg_rigid_embed
         self.framepair_init = framepair_init
         self.add_vanilla_transformer = add_vanilla_transformer
+        self.add_full_transformer = add_full_transformer
 
         if framepair_init:
             self.lin_framepair_dist_vec = Linear(3, c_framepair, bias=False)
@@ -1431,6 +1538,15 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
                     c_cond=c_s,
                     c_z=c_framepair,
                     num_heads=num_heads,
+                )
+            if self.add_full_transformer:
+                self.trunk[f'full_tfmr_{b}'] = FlashTransformerEncoder(
+                    h_dim=c_frame,
+                    no_heads=num_heads,
+                    h_ff=c_frame,
+                    n_layers=2,
+                    ln_first=True,
+                    bias=False
                 )
 
             if self.do_rigid_updates:
@@ -1614,6 +1730,11 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
                     to_queries=to_queries,
                     to_keys=to_keys,
                     rigids_mask=rigids_mask,
+                )
+            if self.add_full_transformer:
+                rigids_embed_flat = self.trunk[f'full_tfmr_{b}'](
+                    rigids_embed_flat,
+                    rigids_mask,
                 )
 
             if self.do_rigid_updates:

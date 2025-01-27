@@ -122,7 +122,7 @@ class Experiment:
                         atom91, atom91_mask = atom14_to_atom91(seq, atom14)
                         atom91_to_pdb(seq, atom91, f"len_{sample_len}_protein_{sample_id}")
 
-                    # clean_trajs = batch['clean_trajs']
+                    # clean_trajs = batch['all_R_clean_trajs']
                     # clean_traj_seqs = batch['clean_traj_seqs']
                     # prot_trajs = batch['prot_trajs']
                     # for clean_traj, clean_seq, prot_traj, sample_id in zip(clean_trajs, clean_traj_seqs, prot_trajs, sample_ids):
@@ -135,8 +135,8 @@ class Experiment:
                     #         clean = clean_traj[i]
                     #         # seq = clean_seq[i].argmax(dim=-1)
                     #         seq = clean_seq[i]
-                    #         print("".join([restypes[j] for j in seq.tolist()]))
-                    #         seq = "".join(["W" for _ in seq.tolist()])
+                    #         # print("".join([restypes[j] for j in seq.tolist()]))
+                    #         seq = "".join(["R" for _ in seq.tolist()])
                     #         # seq = "".join([restypes[j] for j in seq.tolist()])
                     #         # prot = prot_traj[i]
                     #         sample_len = clean.shape[0]
@@ -184,7 +184,7 @@ class Experiment:
 def main(model,
          corrupter,
          datamodule,
-         # lmodule,
+         lmodule,
          experiment,
          tasks,
          zen_cfg):
@@ -195,7 +195,8 @@ def main(model,
     # datamodule and optim are all partial'd __init__s
     # so we instantiate instances of each
     # model = lmodule(model, experiment['optim'])
-    model = BackboneModule(model, experiment['optim'])
+    # model = BackboneModule(model, experiment['optim'])
+    model = lmodule(model, experiment['optim'])
     task_sampler = single_task_sampler(tasks(corrupter))
 
     # corrupter._sample_cfg.num_timesteps = 200
@@ -204,7 +205,15 @@ def main(model,
         corrupter.se3_noiser._sample_cfg.num_timesteps = 200
         # corrupter.se3_noiser._rots_cfg.exp_rate = 5
     else:
-        corrupter._sample_cfg.num_timesteps = 200
+        if hasattr(corrupter, "_sample_cfg"):
+            corrupter._sample_cfg.num_timesteps = 200
+        # corrupter.use_rot_sfm = True
+        # corrupter.use_trans_sfm = True
+        # corrupter.rot_sfm_g = 0.5
+        # corrupter.trans_sfm_g = 0.5
+        # corrupter._rots_cfg.sample_schedule = 'linear'
+        # corrupter._rots_cfg.sample_schedule = 'test'
+        # corrupter._rots_cfg.exp_rate = 5
     # corrupter.se3_noiser._sample_cfg.num_timesteps = 500
     # corrupter._sample_cfg.num_timesteps = 200
     # corrupter._rots_cfg.exp_rate = 5

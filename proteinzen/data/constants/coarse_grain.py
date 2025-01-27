@@ -44,8 +44,8 @@ from proteinzen.utils.openfold import rigid_utils
 coarse_grain_sidechain_groups = {
     "ALA": {2: [], 3: []},
     "ARG": {
-        2: ["CB", "CG", "CD"],
-        3: ["NE", "NH1", "NH2", "CZ"]
+        2: ["NE", "NH1", "NH2", "CZ"],
+        3: ["CB", "CG", "CD"],
     },
     "ASN": {
         2: ["CG", "ND2", "OD1"],
@@ -73,16 +73,16 @@ coarse_grain_sidechain_groups = {
         3: []
     },
     "ILE": {
-        2: ["CB", "CG1", "CG2"],
-        3: ["CB", "CG1", "CD1"]
+        2: ["CB", "CG1", "CD1"],
+        3: ["CB", "CG1", "CG2"],
     },
     "LEU": {
         2: ["CG", "CD1", "CD2"],
         3: []
     },
     "LYS": {
-        2: ["CB", "CG", "CD"],
-        3: ["CD", "CE", "NZ"]
+        2: ["CD", "CE", "NZ"],
+        3: ["CB", "CG", "CD"],
     },
     "MET": {
         2: ["CG", "SD", "CE"],
@@ -135,8 +135,8 @@ coarse_grain_sidechain_groups = {
 coarse_grain_sidechain_axes = {
     "ALA": {2: [], 3: []},
     "ARG": {
-        2: ["CB", "CG", "CD"],
-        3: ["NH1", "CZ", "NH2"]
+        2: ["NH1", "CZ", "NH2"],
+        3: ["CB", "CG", "CD"],
     },
     "ASN": {
         2: ["CG", "ND2", "OD1"],
@@ -168,16 +168,16 @@ coarse_grain_sidechain_axes = {
         3: []
     },
     "ILE": {
-        2: ["CG2", "CB", "CG1"],
-        3: ["CB", "CG1", "CD1"]
+        2: ["CB", "CG1", "CD1"],
+        3: ["CG2", "CB", "CG1"],
     },
     "LEU": {
         2: ["CD1", "CG", "CD2"],
         3: []
     },
     "LYS": {
-        2: ["CB", "CG", "CD"],
-        3: ["CD", "CE", "NZ"]
+        2: ["CD", "CE", "NZ"],
+        3: ["CB", "CG", "CD"],
     },
     "MET": {
         2: ["CG", "SD", "CE"],
