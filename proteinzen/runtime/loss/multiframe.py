@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 
+from proteinzen.data.openfold.residue_constants import restypes
 from proteinzen.utils.openfold import rigid_utils as ru
 from proteinzen.model.utils.graph import batchwise_to_nodewise, get_data_lens
 
@@ -92,6 +93,8 @@ def multiframe_fm_loss(
         sidechain_weight = torch.tensor([1] + [2 for _ in range(noised_frames.shape[-1]-1)], device=t.device)
         seqwise_weight = seqwise_weight * sidechain_weight[None]
 
+    seqwise_loss = {}
+
     if sep_rot_loss:
         rot_vf_loss = angle_axis_rot_vf_loss(
             pred_rot_vf,
@@ -111,6 +114,14 @@ def multiframe_fm_loss(
                 total_mask,
                 norm_scale[..., None],
             )
+            for i in range(19):
+                seqwise_loss[f"zzz_unscaled_rot_vf_loss_{restypes[i]}"] = angle_axis_rot_vf_loss(
+                    pred_rot_vf,
+                    gt_rot_vf,
+                    res_data.batch,
+                    total_mask * (res_data['seq'] == i)[..., None],
+                    norm_scale[..., None],
+                )
     else:
         rot_vf_loss = torch.square(pred_rot_vf - gt_rot_vf).sum(dim=-1)
         unscaled_rot_vf_loss = rot_vf_loss
@@ -119,6 +130,10 @@ def multiframe_fm_loss(
         rot_vf_loss = rot_vf_loss / ((norm_scale ** 2) if not disable_rot_vf_time_scaling else 1)
         unscaled_rot_vf_loss = _nodewise_to_graphwise(unscaled_rot_vf_loss, res_data.batch, total_mask)
         unscaled_rot_vf_loss = unscaled_rot_vf_loss / (norm_scale ** 2)
+        for i in range(19):
+            _unscaled_rot_vf_loss = _nodewise_to_graphwise(unscaled_rot_vf_loss, res_data.batch, total_mask * (res_data['seq'] == i)[..., None])
+            _unscaled_rot_vf_loss = _unscaled_rot_vf_loss / (norm_scale ** 2)
+            seqwise_loss[f"zzz_unscaled_rot_vf_loss_{restypes[i]}"] = _unscaled_rot_vf_loss
 
     if rot_exp_weighting:
         rot_vf_loss = 10 * rot_vf_loss * (norm_scale ** 2)
@@ -130,6 +145,12 @@ def multiframe_fm_loss(
         unscaled_trans_vf_loss = trans_vf_loss / (nodewise_norm_scale[..., None] ** 2) * 0.01
         trans_vf_loss = trans_vf_loss * seqwise_weight
         trans_vf_loss = _nodewise_to_graphwise(trans_vf_loss, res_data.batch, total_mask) * batch['trans_loss_weighting']
+
+        with torch.no_grad():
+            for i in range(19):
+                seqwise_loss[f"zzz_unscaled_trans_vf_loss_{restypes[i]}"] = _nodewise_to_graphwise(
+                    unscaled_trans_vf_loss, res_data.batch, total_mask * (res_data['seq'] == i)[..., None])
+
         unscaled_trans_vf_loss = _nodewise_to_graphwise(unscaled_trans_vf_loss, res_data.batch, total_mask)
     else:
         trans_vf_loss = torch.square(trans_1_pred - trans_1).sum(dim=-1) / (nodewise_norm_scale[..., None] ** 2)
@@ -137,6 +158,12 @@ def multiframe_fm_loss(
         trans_vf_loss = trans_vf_loss * seqwise_weight
         trans_vf_loss = _nodewise_to_graphwise(trans_vf_loss, res_data.batch, total_mask)
         trans_vf_loss *= 0.01  # Angstroms to nm
+
+        with torch.no_grad():
+            for i in range(19):
+                seqwise_loss[f"zzz_unscaled_trans_vf_loss_{restypes[i]}"] = _nodewise_to_graphwise(
+                    unscaled_trans_vf_loss, res_data.batch, total_mask * (res_data['seq'] == i)[..., None]) * 0.01
+
         unscaled_trans_vf_loss = _nodewise_to_graphwise(unscaled_trans_vf_loss, res_data.batch, total_mask)
         unscaled_trans_vf_loss *= 0.01  # Angstroms to nm
 
@@ -195,8 +222,7 @@ def multiframe_fm_loss(
 
     scaled_fafe = fafe / (norm_scale ** 2)
 
-
-    return {
+    ret = {
         "rot_vf_loss": rot_vf_loss,
         "trans_vf_loss": trans_vf_loss,
         "unscaled_rot_vf_loss": unscaled_rot_vf_loss,
@@ -210,6 +236,8 @@ def multiframe_fm_loss(
         "fafe": fafe,
         "scaled_fafe": scaled_fafe
     }
+    ret.update(seqwise_loss)
+    return ret
 
 
 # adapted in part from https://github.com/mooninrain/FAFE/blob/main/losses/fafe.py

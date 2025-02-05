@@ -15,10 +15,13 @@ import torch_geometric.utils as pygu
 # from dgl.ops import u_mul_e_sum, u_dot_v, u_add_v
 
 from proteinzen.model.modules.layers.node.attention import FlashTransformerEncoder
+from proteinzen.model.modules.openfold.layers import _deepspeed_evo_attn
 from proteinzen.model.modules.openfold.layers_v2 import (
     Linear, swish, ipa_point_weights_init_, permute_final_dims, flatten_final_dims, BackboneUpdate, LayerNorm,
     AdaLN, ConditionedTransition, Transition)
 from proteinzen.utils.openfold import rigid_utils as ru
+
+from ._attn import evoformer_supported
 
 
 class GatherAdaLN(nn.Module):
@@ -143,7 +146,9 @@ class BlockInvariantPointAttention(nn.Module):
         final_init='final',
         block_Q=32,
         block_K=128,
-        use_compile_path=False
+        use_compile_path=False,
+        use_out_gating=False,
+        ablate_down_z=False
     ):
         """
         Args:
@@ -173,6 +178,8 @@ class BlockInvariantPointAttention(nn.Module):
         self.block_Q = block_Q
         self.block_K = block_K
         self.use_compile_path = use_compile_path
+        self.use_out_gating = use_out_gating
+        self.ablate_down_z = ablate_down_z
 
         # These linear layers differ from their specifications in the
         # supplement. There, they lack bias and use Glorot initialization.
@@ -205,6 +212,10 @@ class BlockInvariantPointAttention(nn.Module):
 
         self.ln_s = LayerNorm(c_s)
         self.ln_z = LayerNorm(c_z)
+        if use_out_gating:
+            self.out_gate = Linear(self.c_s, self.no_heads * concat_out_dim, bias=False)
+        else:
+            self.out_gate = None
 
     def _pts_bias(
         self,
@@ -440,15 +451,308 @@ class BlockInvariantPointAttention(nn.Module):
 
         # [*, N_block, block_Q, H * C_z // 4]
         o_pair = flatten_final_dims(o_pair, 2)
+        if self.ablate_down_z:
+            o_pair = torch.zeros_like(o_pair)
 
         o_feats = [o, o_pt, o_pt_norm_feats, o_pair]
+        o_feats = torch.cat(
+            o_feats, dim=-1
+        ).to(dtype=z.dtype)
+
+        if self.out_gate is not None:
+            gate = self.out_gate(q_in)
+            o_feats = o_feats * torch.sigmoid(gate)
 
         # [*, N_block, block_Q, C_s]
-        out = self.linear_out(
-            torch.cat(
-                o_feats, dim=-1
-            ).to(dtype=z.dtype)
+        out = self.linear_out(o_feats)
+
+        return out.view(s.shape)
+
+def gen_block_mask_mod(block_Q, block_K):
+    def mask_mod(batch, head, q_idx, k_idx):
+        block_idx = q_idx // block_Q
+        subset_center = block_Q / 2 + block_idx * block_Q
+        return torch.abs(q_idx - subset_center) < block_Q/2 & torch.abs(k_idx - subset_center) < block_K/2
+    return mask_mod
+
+
+class FlexBlockInvariantPointAttention(nn.Module):
+    """
+    Implements Algorithm 22.
+    """
+    def __init__(
+        self,
+        c_s,
+        c_z,
+        c_hidden,
+        num_heads,
+        num_qk_points,
+        num_v_points,
+        inf: float = 1e5,
+        eps: float = 1e-8,
+        final_init='final',
+        block_Q=32,
+        block_K=128,
+        use_compile_path=False,
+        use_out_gating=False,
+        ablate_down_z=False
+    ):
+        """
+        Args:
+            c_s:
+                Single representation channel dimension
+            c_z:
+                Pair representation channel dimension
+            c_hidden:
+                Hidden channel dimension
+            no_heads:
+                Number of attention heads
+            no_qk_points:
+                Number of query/key points to generate
+            no_v_points:
+                Number of value points to generate
+        """
+        super().__init__()
+
+        self.c_s = c_s
+        self.c_z = c_z
+        self.c_hidden = c_hidden
+        self.no_heads = num_heads
+        self.no_qk_points = num_qk_points
+        self.no_v_points = num_v_points
+        self.inf = inf
+        self.eps = eps
+        self.block_Q = block_Q
+        self.block_K = block_K
+        self.use_compile_path = use_compile_path
+        self.use_out_gating = use_out_gating
+        self.ablate_down_z = ablate_down_z
+
+        # These linear layers differ from their specifications in the
+        # supplement. There, they lack bias and use Glorot initialization.
+        # Here as in the official source, they have bias and use the default
+        # Lecun initialization.
+        hc = self.c_hidden * self.no_heads
+        self.linear_q = Linear(self.c_s, hc, bias=False)
+        self.linear_k = Linear(self.c_s, hc, bias=False)
+        self.linear_v = Linear(self.c_s, hc, bias=False)
+
+        hpq = self.no_heads * self.no_qk_points * 3
+        self.linear_q_points = Linear(self.c_s, hpq, bias=False)
+
+        hpkv = self.no_heads * (self.no_qk_points + self.no_v_points) * 3
+        self.linear_kv_points = Linear(self.c_s, hpkv, bias=False)
+
+        self.linear_b = Linear(self.c_z, self.no_heads, bias=False)
+        self.down_z = Linear(self.c_z, self.c_z // 4, bias=False)
+
+        self.head_weights = nn.Parameter(torch.zeros((self.no_heads)))
+        ipa_point_weights_init_(self.head_weights)
+
+        concat_out_dim =  (
+            self.c_hidden + self.no_v_points * 4
         )
+        self.linear_out = Linear(self.no_heads * concat_out_dim, self.c_s, init=final_init, bias=False)
+
+        self.softmax = nn.Softmax(dim=-1)
+        self.softplus = nn.Softplus()
+
+        self.ln_s = LayerNorm(c_s)
+        self.ln_z = LayerNorm(c_z)
+        if use_out_gating:
+            self.out_gate = Linear(self.c_s, self.no_heads * concat_out_dim, bias=False)
+        else:
+            self.out_gate = None
+
+    def _pts_bias(
+        self,
+        q_pts,
+        k_pts,
+        pts_cdist=False
+    ):
+        if pts_cdist:
+            # we can do a lot of these operations in-place which saves us a small chunk of memory
+            pt_att = -2 * torch.einsum("...ahpd,...bhpd->...abh", q_pts, k_pts)
+            q_pts_norm = torch.sum(q_pts ** 2, dim=(-1, -2))
+            k_pts_norm = torch.sum(k_pts ** 2, dim=(-1, -2))
+            pt_att += q_pts_norm[..., None, :]
+            pt_att += k_pts_norm[..., None, :, :]
+
+            head_weights = self.softplus(self.head_weights).view(
+                *((1,) * len(pt_att.shape[:-1]) + (-1,))
+            )
+            head_weights = head_weights * math.sqrt(
+                1.0 / (3 * (self.no_qk_points * 9.0 / 2))
+            )
+            pt_att *= head_weights
+            pt_att *= -0.5
+        else:
+            # [*, N_res, N_res, H, P_q, 3]
+            pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
+            pt_att = pt_displacement ** 2
+
+            # [*, N_res, N_res, H, P_q]
+            pt_att = sum(torch.unbind(pt_att, dim=-1))
+            head_weights = self.softplus(self.head_weights).view(
+                *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
+            )
+            head_weights = head_weights * math.sqrt(
+                1.0 / (3 * (self.no_qk_points * 9.0 / 2))
+            )
+            pt_att = pt_att * head_weights
+
+            # [*, N_res, N_res, H]
+            pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
+
+        return pt_att
+
+    def forward(
+        self,
+        s: torch.Tensor,
+        z: torch.Tensor,
+        r: ru.Rigid,
+        s_mask: torch.Tensor,
+        to_queries: Callable,
+        to_keys: Callable,
+        block_mask
+    ) -> torch.Tensor:
+        """
+        Args:
+            s:
+                [*, N_res, C_s] single representation
+            z:
+                [*, N_res, N_res, C_z] pair representation
+            r:
+                [*, N_res] transformation object
+            mask:
+                [*, N_res] mask
+        Returns:
+            [*, N_res, C_s] single representation update
+        """
+        s = self.ln_s(s)
+        z = self.ln_z(z)
+
+        #######################################
+        # Generate scalar and point activations
+        #######################################
+        # [*, N_res, H * C_hidden]
+        q = self.linear_q(s)
+        # [*, N_res, H * C_hidden]
+        k = self.linear_k(s)
+        # [*, N_res, H * C_hidden]
+        v = self.linear_v(s)
+
+        # [*, N_res, H, C_hidden]
+        q = q.view(q.shape[:-1] + (self.no_heads, -1))
+
+        # [*, N_res, H, C_hidden]
+        k = k.view(k.shape[:-1] + (self.no_heads, -1))
+        # [*, N_res, H, C_hidden]
+        v = v.view(v.shape[:-1] + (self.no_heads, -1))
+
+        # [*, N_res, H * P_q * 3]
+        q_pts = self.linear_q_points(s)
+        # [*, N_res, H * P_q, 3]
+        q_pts = q_pts.view(q_pts.shape[:-1] + (self.no_heads * self.no_qk_points, 3))
+        q_pts = r[..., None].apply(q_pts)
+        # [*, N_res, H, P_q, 3]
+        q_pts = q_pts.view(
+            q_pts.shape[:-2] + (self.no_heads, self.no_qk_points, 3)
+        )
+
+        # [*, N_res, H * (P_q + P_v) * 3]
+        kv_pts = self.linear_kv_points(s)
+        # [*, N_res, H * (P_q + P_v), 3]
+        kv_pts = kv_pts.view(kv_pts.shape[:-1] + (-1, 3))
+        kv_pts = r[..., None].apply(kv_pts)
+
+        # [*, N_res, H, (P_q + P_v), 3]
+        kv_pts = kv_pts.view(kv_pts.shape[:-2] + (self.no_heads, -1, 3))
+
+        # [*, N_res, H, P_q/P_v, 3]
+        k_pts, v_pts = torch.split(
+            kv_pts, [self.no_qk_points, self.no_v_points], dim=-2
+        )
+
+        ##########################
+        # Compute attention scores
+        ##########################
+        # [*, N_block, block_Q, block_K, H]
+        b = self.linear_b(z)
+        # [*, N_block, block_Q, block_K]
+        attn_mask = to_queries(s_mask[..., None].float()) * to_keys(s_mask[..., None].float()).transpose(-1, -2)
+        attn_mask = self.inf * (attn_mask - 1)
+
+        b += attn_mask[..., None]
+
+        head_weights = self.softplus(self.head_weights)
+        head_weights = head_weights * math.sqrt(
+            1.0 / (3 * (self.no_qk_points * 9.0 / 2))
+        )
+
+        v_in = [
+            v.transpose(-2, -3),  # [*, H, N_res, C_hidden]
+            flatten_final_dims(v_pts, 2).transpose(-2, -3),  # [*, H, N_res, P_v * 3]
+        ]
+
+        split_lens = [t.shape[-1] for t in v_in]
+        v_in = torch.cat(v_in, dim=-1)
+
+        def score_mod(
+            score,
+            batch,
+            head,
+            q_idx,
+            k_idx
+        ):
+            block_idx = q_idx // self.block_Q
+            subset_center = self.block_Q / 2 + block_idx * self.block_Q
+            min_block_k_idx = subset_center - self.block_K / 2
+            block_q_idx = q_idx % self.block_Q
+            block_k_idx = k_idx - min_block_k_idx
+            bias = b[batch, block_idx, block_q_idx, block_k_idx, head]
+            pt_bias = torch.sum(
+                (q_pts[batch, q_idx, head] - k_pts[batch, k_idx, head]) ** 2
+            )
+            return math.sqrt(1/self.c_hidden) * score + bias + head_weights[head] * pt_bias
+
+        v_out = torch.nn.attention.flex_attention(
+            q.transpose(-2, -3),
+            k.transpose(-2, -3),
+            v_in,
+            score_mod=score_mod,
+            block_mask=block_mask
+        )
+        o, o_pt = v_out.split(split_lens, dim=-1)
+
+        # [*, N_res, H * C_hidden]
+        o = flatten_final_dims(o.transpose(-2, -3), 2)
+
+        # [*, N_res, H, P_v, 3]
+        n_res = v.shape[1]
+        o_pt = o_pt.transpose(-2, -3).view(o_pt.shape[0], n_res, self.no_heads, -1, 3)
+        o_pt = r[..., None, None].invert_apply(o_pt)
+
+        # [*, N_res, H * P_v]
+        o_pt_dists = torch.sqrt(torch.sum(o_pt ** 2, dim=-1) + self.eps)
+        o_pt_norm_feats = flatten_final_dims(
+            o_pt_dists, 2)
+
+        # [*, N_res, H * P_v, 3]
+        o_pt = o_pt.reshape(*o_pt.shape[:-3], -1, 3)
+
+        o_feats = [o, *torch.unbind(o_pt, dim=-1), o_pt_norm_feats]
+
+        o_feats = torch.cat(
+            o_feats, dim=-1
+        ).to(dtype=z.dtype)
+
+        if self.out_gate is not None:
+            gate = self.out_gate(s)
+            o_feats = o_feats * torch.sigmoid(gate)
+
+        # [*, N_block, block_Q, C_s]
+        out = self.linear_out(o_feats)
 
         return out.view(s.shape)
 
@@ -471,7 +775,10 @@ class ConditionedBlockInvariantPointAttention(nn.Module):
         final_init='final',
         block_Q=32,
         block_K=128,
-        use_compile_path=False
+        use_compile_path=False,
+        use_out_gating=False,
+        use_cond_gating=False,
+        ablate_down_z=False
     ):
         """
         Args:
@@ -502,6 +809,9 @@ class ConditionedBlockInvariantPointAttention(nn.Module):
         self.block_Q = block_Q
         self.block_K = block_K
         self.use_compile_path = use_compile_path
+        self.use_out_gating = use_out_gating
+        self.use_cond_gating = use_cond_gating
+        self.ablate_down_z = ablate_down_z
 
         # These linear layers differ from their specifications in the
         # supplement. There, they lack bias and use Glorot initialization.
@@ -534,6 +844,16 @@ class ConditionedBlockInvariantPointAttention(nn.Module):
 
         self.adaln_s = AdaLN(c_s, c_cond)
         self.ln_z = LayerNorm(c_z)
+        if use_out_gating:
+            self.out_gate = Linear(self.c_s, self.no_heads * concat_out_dim, bias=False)
+        else:
+            self.out_gate = None
+        if use_cond_gating:
+            self.cond_gate = Linear(self.c_cond, self.c_s)
+            with torch.no_grad():
+                self.cond_gate.bias.fill_(-2.0)
+        else:
+            self.cond_gate = None
 
     def _pts_bias(
         self,
@@ -770,17 +1090,27 @@ class ConditionedBlockInvariantPointAttention(nn.Module):
 
         # [*, N_block, block_Q, H * C_z // 4]
         o_pair = flatten_final_dims(o_pair, 2)
+        if self.ablate_down_z:
+            o_pair = torch.zeros_like(o_pair)
 
         o_feats = [o, o_pt, o_pt_norm_feats, o_pair]
+        o_feats = torch.cat(
+            o_feats, dim=-1
+        ).to(dtype=z.dtype)
+
+        if self.out_gate is not None:
+            gate = self.out_gate(q_in)
+            o_feats = o_feats * torch.sigmoid(gate)
 
         # [*, N_block, block_Q, C_s]
-        out = self.linear_out(
-            torch.cat(
-                o_feats, dim=-1
-            ).to(dtype=z.dtype)
-        )
+        out = self.linear_out(o_feats)
+        out = out.view(s.shape)
 
-        return out.view(s.shape)
+        if self.cond_gate is not None:
+            cond_gate = self.cond_gate(cond)
+            out = out * torch.sigmoid(cond_gate)
+
+        return out
 
 
 class BlockAttentionPairBias(nn.Module):
@@ -1021,6 +1351,8 @@ class SequenceFrameTransformerBlock(nn.Module):
                  inf=1e8,
                  compile_ipa=False,
                  add_vanilla_transformer=False,
+                 use_ipa_gating=False,
+                 ablate_ipa_down_z=False
                  ):
         super().__init__()
 
@@ -1042,7 +1374,9 @@ class SequenceFrameTransformerBlock(nn.Module):
             num_v_points=num_v_points,
             block_Q=block_q,
             block_K=block_k,
-            use_compile_path=compile_ipa
+            use_compile_path=compile_ipa,
+            use_out_gating=use_ipa_gating,
+            ablate_down_z=ablate_ipa_down_z
         )
 
         self.transition = GatherConditionedTransition(c_frame, c_s)
@@ -1095,7 +1429,9 @@ class SequenceFrameTransformerUpdate(nn.Module):
         framepair_init=False,
         framepair_ffn=False,
         add_vanilla_transformer=False,
-        add_full_transformer=False
+        add_full_transformer=False,
+        use_ipa_gating=False,
+        ablate_ipa_down_z=False
     ):
         super().__init__()
         self.c_s = c_s
@@ -1155,7 +1491,9 @@ class SequenceFrameTransformerUpdate(nn.Module):
                 block_q=block_q,
                 block_k=block_k,
                 inf=inf,
-                compile_ipa=compile_ipa
+                compile_ipa=compile_ipa,
+                use_ipa_gating=use_ipa_gating,
+                ablate_ipa_down_z=ablate_ipa_down_z
             )
             if self.add_vanilla_transformer:
                 self.trunk[f'vanilla_tfmr_{b}'] = BlockTransformerPairBias(
@@ -1245,6 +1583,7 @@ class SequenceFrameTransformerUpdate(nn.Module):
         inv_q_rigids = q_rigids[..., None].invert()
         k_rigids = k_rigids[..., None, :]
 
+        # TODO: this is wrong... also fix this in conditioned version
         rel_rot = inv_q_rigids.get_rots().compose_q(k_rigids.get_rots())
         rel_trans = rel_rot.apply(k_rigids.get_trans()) + inv_q_rigids.get_trans()
         rel_dist = torch.sum(rel_trans ** 2, dim=-1, keepdim=True)
@@ -1401,7 +1740,9 @@ class ConditionedSequenceFrameTransformerBlock(nn.Module):
                  block_q=32,
                  block_k=128,
                  inf=1e8,
-                 compile_ipa=False
+                 compile_ipa=False,
+                 use_ipa_gating=False,
+                 ablate_ipa_down_z=False
                  ):
         super().__init__()
 
@@ -1424,7 +1765,10 @@ class ConditionedSequenceFrameTransformerBlock(nn.Module):
             num_v_points=num_v_points,
             block_Q=block_q,
             block_K=block_k,
-            use_compile_path=compile_ipa
+            use_compile_path=compile_ipa,
+            use_out_gating=use_ipa_gating,
+            use_cond_gating=use_ipa_gating,
+            ablate_down_z=ablate_ipa_down_z
         )
         self.transition = ConditionedTransition(c_frame, c_frame)
 
@@ -1476,7 +1820,9 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
         compile_ipa=False,
         framepair_init=False,
         add_vanilla_transformer=False,
-        add_full_transformer=False
+        add_full_transformer=False,
+        use_ipa_gating=False,
+        ablate_ipa_down_z=False,
     ):
         super().__init__()
         self.c_s = c_s
@@ -1530,12 +1876,14 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
                 block_q=block_q,
                 block_k=block_k,
                 inf=inf,
-                compile_ipa=compile_ipa
+                compile_ipa=compile_ipa,
+                use_ipa_gating=use_ipa_gating,
+                ablate_ipa_down_z=ablate_ipa_down_z
             )
             if self.add_vanilla_transformer:
                 self.trunk[f'vanilla_tfmr_{b}'] = ConditionedBlockTransformerPairBias(
                     c_s=c_frame,
-                    c_cond=c_s,
+                    c_cond=c_frame,
                     c_z=c_framepair,
                     num_heads=num_heads,
                 )

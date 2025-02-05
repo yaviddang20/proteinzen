@@ -21,7 +21,7 @@ if deepspeed_is_installed:
 try:
     cuda_major, cuda_minor = torch.cuda.get_device_capability(device=None)
     if cuda_major >= 7:
-        evoformer_supported = False #True
+        evoformer_supported = True
     else:
         evoformer_supported = False
 except RuntimeError:
@@ -271,7 +271,8 @@ class PairUpdate(nn.Module):
             dropout=0.25,
             rbf_min=3.25,
             rbf_max=50.75,
-            inf=1e8
+            inf=1e8,
+            include_rel_quat=False
         ):
         super().__init__()
         self.no_heads = no_heads
@@ -281,12 +282,20 @@ class PairUpdate(nn.Module):
         self.D_min = rbf_min / self.NM_TO_ANG_SCALE
         self.D_max = rbf_max / self.NM_TO_ANG_SCALE
         self.inf = inf
+        self.include_rel_quat = include_rel_quat
 
-        self.emb_rbf = nn.Sequential(
-            Linear(num_rbf, c_hidden, bias=False),
-            LayerNorm(c_hidden),
-            Linear(c_hidden, no_heads, bias=False)
-        )
+        if include_rel_quat:
+            self.emb_rbf = nn.Sequential(
+                Linear(num_rbf + 4, c_hidden, bias=False),
+                LayerNorm(c_hidden),
+                Linear(c_hidden, no_heads, bias=False)
+            )
+        else:
+            self.emb_rbf = nn.Sequential(
+                Linear(num_rbf, c_hidden, bias=False),
+                LayerNorm(c_hidden),
+                Linear(c_hidden, no_heads, bias=False)
+            )
         self.ln_third_edge = LayerNorm(c_z)
         self.emb_third_edge = Linear(c_z, no_heads, bias=False)
 
@@ -306,10 +315,22 @@ class PairUpdate(nn.Module):
         coords = rigids.get_trans()
         distances = torch.cdist(coords, coords)
 
-        # [B, I, J, H]
-        dist_bias = self.emb_rbf(
-            _rbf(distances, D_min=self.D_min, D_max=self.D_max, D_count=self.num_rbf, device=distances.device)
-        )
+        if self.include_rel_quat:
+            rots = rigids.get_rots()
+            rel_quats = rots[..., None, :].compose_q(rots[..., None].invert())
+            # [B, I, J, H]
+            dist_bias = self.emb_rbf(
+                torch.cat([
+                    _rbf(distances, D_min=self.D_min, D_max=self.D_max, D_count=self.num_rbf, device=distances.device),
+                    rel_quats.get_quats()
+                ], dim=-1)
+            )
+
+        else:
+            # [B, I, J, H]
+            dist_bias = self.emb_rbf(
+                _rbf(distances, D_min=self.D_min, D_max=self.D_max, D_count=self.num_rbf, device=distances.device)
+            )
         # [B, I, 1, 1, J, H]
         mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
 

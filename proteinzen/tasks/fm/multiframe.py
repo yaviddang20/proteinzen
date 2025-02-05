@@ -46,13 +46,17 @@ class MultiFrameInterpolation(Task):
                  polar_upweight=False,
                  sidechain_upweight=False,
                  trans_preconditioning=False,
+                 rot_preconditioning=False,
                  rot_loss_exp_weighting=False,
                  rot_vf_angle_loss_weight=0.5,
                  disable_rot_vf_time_scaling=False,
                  rigids_traj_loss_scale=1,
+                 bb_traj_loss_scale=1,
                  ignore_rigid_2_vf_loss=False,
                  dummy_rigid_to_sidechain_rigid=False,
-                 rot_cap_loss_weight=0.0
+                 rot_cap_loss_weight=0.0,
+                 cg_version=2,
+                 resolve_sidechain_ambiguity=False
     ):
         super().__init__()
         self.frame_noiser = protein_noiser
@@ -66,14 +70,18 @@ class MultiFrameInterpolation(Task):
         self.polar_upweight = polar_upweight
         self.sidechain_upweight = sidechain_upweight
         self.trans_preconditioning = trans_preconditioning
+        self.rot_preconditioning = rot_preconditioning
         self.rot_loss_exp_weighting = rot_loss_exp_weighting
         self.fafe_weight = fafe_weight
         self.rot_vf_angle_loss_weight = rot_vf_angle_loss_weight
         self.rigids_traj_loss_scale = rigids_traj_loss_scale
+        self.bb_traj_loss_scale = bb_traj_loss_scale
         self.ignore_rigid_2_vf_loss = ignore_rigid_2_vf_loss
         self.disable_rot_vf_time_scaling = disable_rot_vf_time_scaling
         self.rot_cap_loss_weight = rot_cap_loss_weight
         self.dummy_rigid_to_sidechain_rigid = dummy_rigid_to_sidechain_rigid
+        self.cg_version = cg_version
+        self.resolve_sidechain_ambiguity = resolve_sidechain_ambiguity
 
         self.rng = np.random.default_rng()
 
@@ -84,6 +92,44 @@ class MultiFrameInterpolation(Task):
 
     def _gen_diffuse_mask(self, data: HeteroData):
         return torch.ones_like(data['res_mask']).bool()
+
+    def _resolve_symmetry(self, data, chain_feats):
+        res_data = data['residue']
+        alt_atom37 = torch.zeros_like(res_data['atom37'])
+        alt_atom37.scatter_add_(
+            src=chain_feats['atom14_alt_gt_positions'] * chain_feats['atom14_alt_gt_exists'][..., None],
+            index=chain_feats['residx_atom14_to_atom37'][..., None].expand(*chain_feats['residx_atom14_to_atom37'].shape, 3),
+            dim=-2,
+        )
+        alt_chain_feats = {
+            'aatype': torch.as_tensor(res_data['seq']).long(),
+            'all_atom_positions': alt_atom37.double(),
+            'all_atom_mask': torch.as_tensor(res_data['atom37_mask']).double()
+        }
+        alt_chain_feats = data_transforms.atom37_to_cg_frames(alt_chain_feats, cg_version=self.cg_version)
+
+        # rigids_1 = ru.Rigid.from_tensor_4x4(chain_feats['rigidgroups_gt_frames'])[:, (0, 4, 5, 6, 7)]
+        rigids_1 = ru.Rigid.from_tensor_4x4(chain_feats['cg_groups_gt_frames'])[:, (0, 2, 3)]
+        alt_rigids_1 = ru.Rigid.from_tensor_4x4(alt_chain_feats['cg_groups_gt_frames'])[:, (0, 2, 3)]
+
+        reconstructed_atom14 = compute_atom14_from_cg_frames(rigids_1, res_data['res_mask'], res_data['seq'], cg_version=self.cg_version)
+        alt_reconstructed_atom14 = compute_atom14_from_cg_frames(alt_rigids_1, res_data['res_mask'], res_data['seq'], cg_version=self.cg_version)
+        gt_diff = torch.sum(
+            chain_feats['atom14_gt_exists'][..., None] *
+            (reconstructed_atom14 - chain_feats['atom14_gt_positions']) ** 2, dim=(-1, -2)
+        )
+        alt_diff = torch.sum(
+            chain_feats['atom14_gt_exists'][..., None] *
+            (alt_reconstructed_atom14 - chain_feats['atom14_gt_positions']) ** 2, dim=(-1, -2)
+        )
+        select_alt = alt_diff < gt_diff
+        print(select_alt.long().sum(), gt_diff.sum(), alt_diff.sum())
+        tensor_4x4 = (
+            chain_feats['cg_groups_gt_frames'] * (~select_alt[..., None, None, None])
+            + alt_chain_feats['cg_groups_gt_frames'] * (select_alt[..., None, None, None])
+        )
+        return ru.Rigid.from_tensor_4x4(tensor_4x4)[:, (0, 2, 3)]
+
 
     def process_input(self, data: HeteroData):
         data = copy.deepcopy(data)
@@ -97,13 +143,16 @@ class MultiFrameInterpolation(Task):
             'all_atom_mask': torch.as_tensor(res_data['atom37_mask']).double()
         }
         # chain_feats = data_transforms.atom37_to_frames(chain_feats)
-        chain_feats = data_transforms.atom37_to_cg_frames(chain_feats)
+        chain_feats = data_transforms.atom37_to_cg_frames(chain_feats, cg_version=self.cg_version)
         chain_feats = data_transforms.atom37_to_torsion_angles(prefix="")(chain_feats)  # TODO: uncurry this
         chain_feats = data_transforms.make_atom14_masks(chain_feats)
         chain_feats = data_transforms.make_atom14_positions(chain_feats)
 
-        # rigids_1 = ru.Rigid.from_tensor_4x4(chain_feats['rigidgroups_gt_frames'])[:, (0, 4, 5, 6, 7)]
-        rigids_1 = ru.Rigid.from_tensor_4x4(chain_feats['cg_groups_gt_frames'])[:, (0, 2, 3)]
+        if self.resolve_sidechain_ambiguity:
+            rigids_1 = self._resolve_symmetry(data, chain_feats)
+        else:
+            rigids_1 = ru.Rigid.from_tensor_4x4(chain_feats['cg_groups_gt_frames'])[:, (0, 2, 3)]
+
 
         # compute bb frame features
         diffuse_mask = self._gen_diffuse_mask(res_data)
@@ -182,6 +231,8 @@ class MultiFrameInterpolation(Task):
                     # device='cpu'):
         self.frame_noiser.set_device(device)
         # model.self_conditioning = False
+        # if self.rot_preconditioning:
+        #     self.frame_noiser._rots_cfg.sample_schedule = 'linear'
 
         num_res = inputs['num_res']
         total_num_res = sum(num_res)
@@ -336,7 +387,7 @@ class MultiFrameInterpolation(Task):
             use_fafe_l2=self.use_fafe_l2,
             polar_upweight=self.polar_upweight,
             sidechain_upweight=self.sidechain_upweight,
-            trans_preconditioning=self.trans_preconditioning,
+            # trans_preconditioning=self.trans_preconditioning,
             rot_exp_weighting=self.rot_loss_exp_weighting,
             rot_vf_angle_loss_weight=self.rot_vf_angle_loss_weight,
             ignore_rigid_2_vf_loss=self.ignore_rigid_2_vf_loss,
@@ -384,7 +435,7 @@ class MultiFrameInterpolation(Task):
             + self.fafe_weight * frame_fm_loss_dict[('scaled_fafe' if self.scale_frame_aligned_errors or self.scale_fafe else 'fafe')]
             + 0.25 * bb_denoising_finegrain_loss
             + atomic_loss
-            + traj_loss_dict['traj_bb_loss']
+            + traj_loss_dict['traj_bb_loss'] * self.bb_traj_loss_scale
             + traj_loss_dict['traj_rigids_loss'] * self.rigids_traj_loss_scale
             + traj_loss_dict['traj_pred_dist_loss'] * 0.5
             + traj_loss_dict['traj_pred_framepair_dist_loss'] * 0.5

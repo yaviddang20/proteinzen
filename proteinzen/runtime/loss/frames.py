@@ -107,10 +107,10 @@ def angle_axis_rot_vf_loss(
     )
     rot_loss = angle_loss * angle_loss_weight + axis_loss
 
-    rot_cap = torch.pi * norm_scale[batch]
-    rot_cap_loss_select = pred_rot_abs_angle > rot_cap
-    rot_cap_loss = rot_cap_loss_select * (pred_rot_abs_angle - rot_cap) ** 2
-    rot_loss = rot_loss + rot_cap_loss_weight * rot_cap_loss
+    if rot_cap_loss_weight > 0:
+        angle_overestimate = (pred_rot_angle > gt_rot_angle)
+        angle_loss = (gt_rot_angle - pred_rot_angle)**2
+        rot_loss = rot_loss + rot_cap_loss_weight * (angle_loss * angle_overestimate).sum(dim=-1)
 
     if seqwise_weight is not None:
         rot_loss = rot_loss * seqwise_weight

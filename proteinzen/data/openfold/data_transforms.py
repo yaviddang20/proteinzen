@@ -22,6 +22,11 @@ import torch
 
 from . import residue_constants as rc
 from proteinzen.data.constants import coarse_grain as cg
+from proteinzen.data.constants import _coarse_grain_v3 as cg_v3
+from proteinzen.data.constants import _coarse_grain_v4 as cg_v4
+from proteinzen.data.constants import _coarse_grain_v5 as cg_v5
+from proteinzen.data.constants import _coarse_grain_v6 as cg_v6
+from proteinzen.data.constants import _coarse_grain_v7 as cg_v7
 from proteinzen.utils.openfold.rigid_utils import Rotation, Rigid
 from proteinzen.utils.openfold.tensor_utils import (
     tree_map,
@@ -380,7 +385,21 @@ def atom37_to_frames(protein, eps=1e-8):
     return protein
 
 
-def atom37_to_cg_frames(protein, eps=1e-8):
+def atom37_to_cg_frames(protein, eps=1e-8, cg_version=2):
+    if cg_version == 2:
+        _cg = cg
+    elif cg_version == 3:
+        _cg = cg_v3
+    elif cg_version == 4:
+        _cg = cg_v4
+    elif cg_version == 5:
+        _cg = cg_v5
+    elif cg_version == 6:
+        _cg = cg_v6
+    elif cg_version == 7:
+        _cg = cg_v7
+    else:
+        raise ValueError(f"unable to find cg version {cg_version}, available versions are [2, 3, 4, 5, 6, 7]")
     aatype = protein["aatype"]
     all_atom_positions = protein["all_atom_positions"]
     all_atom_mask = protein["all_atom_mask"]
@@ -394,8 +413,8 @@ def atom37_to_cg_frames(protein, eps=1e-8):
     for restype, restype_letter in enumerate(rc.restypes):
         resname = rc.restype_1to3[restype_letter]
         for cg_group in [2, 3]:
-            if cg.cg_group_mask[resname][cg_group]:
-                names = cg.coarse_grain_sidechain_axes[resname][cg_group]
+            if _cg.cg_group_mask[resname][cg_group]:
+                names = _cg.coarse_grain_sidechain_axes[resname][cg_group]
                 restype_cg_group_base_atom_names[
                     restype, cg_group, :
                 ] = names
