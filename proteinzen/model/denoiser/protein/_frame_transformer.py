@@ -1350,7 +1350,6 @@ class SequenceFrameTransformerBlock(nn.Module):
                  block_k=128,
                  inf=1e8,
                  compile_ipa=False,
-                 add_vanilla_transformer=False,
                  use_ipa_gating=False,
                  ablate_ipa_down_z=False
                  ):
@@ -1448,6 +1447,7 @@ class SequenceFrameTransformerUpdate(nn.Module):
 
         if framepair_init:
             self.lin_framepair_dist_vec = Linear(3, c_framepair, bias=False)
+            self.lin_framepair_rel_quat = Linear(4, c_framepair, bias=False)
             self.lin_framepair_dist = Linear(1, c_framepair, bias=False)
             self.lin_same_res = Linear(1, c_framepair, bias=False)
 
@@ -1580,17 +1580,16 @@ class SequenceFrameTransformerUpdate(nn.Module):
             rots=ru.Rotation(quats=k_rots)
         )
 
-        inv_q_rigids = q_rigids[..., None].invert()
-        k_rigids = k_rigids[..., None, :]
-
-        # TODO: this is wrong... also fix this in conditioned version
-        rel_rot = inv_q_rigids.get_rots().compose_q(k_rigids.get_rots())
-        rel_trans = rel_rot.apply(k_rigids.get_trans()) + inv_q_rigids.get_trans()
+        rel_quat = k_rigids[..., None, :].get_rots().compose_q(q_rigids[..., None].invert().get_rots())
+        rel_quat = rel_quat.get_quats()
+        # rel_trans = k_rigids[..., None, :].get_trans() - q_rigids[..., None].get_trans()
+        rel_trans = q_rigids[..., None].invert_apply(k_rigids[..., None, :].get_trans())
         rel_dist = torch.sum(rel_trans ** 2, dim=-1, keepdim=True)
 
         v_lm = to_queries(rigids_to_res_idx[..., None].float())[..., None, :].long() == to_keys(rigids_to_res_idx[..., None].float())[..., None, :, :].long()
         v_lm = v_lm.float()
         framepair_embed = self.lin_framepair_dist_vec(rel_trans) * v_lm
+        framepair_embed = framepair_embed + self.lin_framepair_rel_quat(rel_quat) * v_lm
         framepair_embed = framepair_embed + self.lin_framepair_dist(1 / (1 + rel_dist)) * v_lm
         framepair_embed = framepair_embed + self.lin_same_res(v_lm) * v_lm
         framepair_mask = to_queries(rigids_mask[..., None].float())[..., None, :].bool() & to_keys(rigids_mask[..., None].float())[..., None, :, :].bool()
@@ -1839,6 +1838,7 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
 
         if framepair_init:
             self.lin_framepair_dist_vec = Linear(3, c_framepair, bias=False)
+            self.lin_framepair_rel_quat = Linear(4, c_framepair, bias=False)
             self.lin_framepair_dist = Linear(1, c_framepair, bias=False)
             self.lin_same_res = Linear(1, c_framepair, bias=False)
 
@@ -1965,16 +1965,16 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
             rots=ru.Rotation(quats=k_rots)
         )
 
-        inv_q_rigids = q_rigids[..., None].invert()
-        k_rigids = k_rigids[..., None, :]
-
-        rel_rot = inv_q_rigids.get_rots().compose_q(k_rigids.get_rots())
-        rel_trans = rel_rot.apply(k_rigids.get_trans()) + inv_q_rigids.get_trans()
+        rel_quat = k_rigids[..., None, :].get_rots().compose_q(q_rigids[..., None].invert().get_rots())
+        rel_quat = rel_quat.get_quats()
+        # rel_trans = k_rigids.get_trans()[..., None, :] - q_rigids[..., None].get_trans()
+        rel_trans = q_rigids[..., None].invert_apply(k_rigids[..., None, :].get_trans())
         rel_dist = torch.sum(rel_trans ** 2, dim=-1, keepdim=True)
 
         v_lm = to_queries(rigids_to_res_idx[..., None].float())[..., None, :].long() == to_keys(rigids_to_res_idx[..., None].float())[..., None, :, :].long()
         v_lm = v_lm.float()
         framepair_embed = self.lin_framepair_dist_vec(rel_trans) * v_lm
+        framepair_embed = framepair_embed + self.lin_framepair_rel_quat(rel_quat) * v_lm
         framepair_embed = framepair_embed + self.lin_framepair_dist(1 / (1 + rel_dist)) * v_lm
         framepair_embed = framepair_embed + self.lin_same_res(v_lm) * v_lm
         framepair_mask = to_queries(rigids_mask[..., None].float())[..., None, :].bool() & to_keys(rigids_mask[..., None].float())[..., None, :, :].bool()

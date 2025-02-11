@@ -21,7 +21,7 @@ if deepspeed_is_installed:
 try:
     cuda_major, cuda_minor = torch.cuda.get_device_capability(device=None)
     if cuda_major >= 7:
-        evoformer_supported = True
+        evoformer_supported = False #True
     else:
         evoformer_supported = False
 except RuntimeError:

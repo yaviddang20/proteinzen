@@ -8,7 +8,8 @@ from proteinzen.data.constants import (
     _coarse_grain_v4 as cg_v4,
     _coarse_grain_v5 as cg_v5,
     _coarse_grain_v6 as cg_v6,
-    _coarse_grain_v7 as cg_v7
+    _coarse_grain_v7 as cg_v7,
+    _coarse_grain_v8 as cg_v8,
 )
 
 from .framediff.all_atom import adjust_oxygen_pos
@@ -36,6 +37,7 @@ cg_version_constants = {
     5: _gen_version_dict(cg_v5),
     6: _gen_version_dict(cg_v6),
     7: _gen_version_dict(cg_v7),
+    8: _gen_version_dict(cg_v8),
 }
 
 

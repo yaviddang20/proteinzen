@@ -26,6 +26,7 @@ class PdbDataset(data.Dataset):
             min_num_res=30,
             max_num_res=500,
             min_percent_ordered=None,
+            max_resolution=5.0,
             subset=None,
             split=None,
             use_tmpdir=False,
@@ -39,6 +40,7 @@ class PdbDataset(data.Dataset):
         self.subset = subset
         self.split = split
         self.min_percent_ordered = min_percent_ordered
+        self.max_resolution = max_resolution
         self.use_tmpdir = use_tmpdir
         self.cache_dir = cache_dir
         self.normalize_cache = normalize_cache
@@ -52,6 +54,9 @@ class PdbDataset(data.Dataset):
         self.raw_csv = pdb_csv
         pdb_csv = pdb_csv[pdb_csv.modeled_seq_len <= self.max_num_res]
         pdb_csv = pdb_csv[pdb_csv.modeled_seq_len >= self.min_num_res]
+        if "resolution" in pdb_csv.columns:
+            # a resolution filter for structures which have resolutions
+            pdb_csv = pdb_csv[(pdb_csv.resolution <= self.max_resolution) | pdb_csv.resolution.isna()]
         if self.subset is not None:
             pdb_csv = pdb_csv.iloc[:self.subset]
 

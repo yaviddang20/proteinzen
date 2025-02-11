@@ -509,6 +509,7 @@ class IpaScore(nn.Module):
                  traj_framepair_predictor=False,
                  traj_seqpair_predictor=False,
                  force_flash_transformer=False,
+                 transformer_pair_bias=False,
                  block_q=32,
                  block_k=128,
                  propagate_framepair_embed=False,
@@ -525,6 +526,7 @@ class IpaScore(nn.Module):
                  compile_ipa=False,
                  use_fused_ipa_kernel=False,
                  use_ipa_gating=False,
+                 time_condition_ipa=False,
                  ablate_ipa_down_z=False,
                  ):
         super().__init__()
@@ -533,11 +535,13 @@ class IpaScore(nn.Module):
         self.traj_framepair_predictor = traj_framepair_predictor
         self.traj_seqpair_predictor = traj_seqpair_predictor
         self.force_flash_transformer = force_flash_transformer
+        self.transformer_pair_bias = transformer_pair_bias
         self.propagate_framepair_embed = propagate_framepair_embed
         self.rigid_transformer_rigid_updates = rigid_transformer_rigid_updates
         self.use_knn = use_knn
         self.use_fused_ipa_kernel = use_fused_ipa_kernel
         self.use_conditioned_rigid_transformer = rigid_transformer_use_conditioned
+        self.time_condition_ipa = time_condition_ipa
         self.k = k
 
         self.scale_pos = lambda x: x * coordinate_scaling
@@ -551,20 +555,34 @@ class IpaScore(nn.Module):
         self.block_q = block_q
         self.block_k = block_k
 
+        self.time_embed = GaussianRandomFourierBasis(n_basis=128, c_out=c_s)
+
         for b in range(num_blocks):
-            self.trunk[f'ipa_{b}'] = InvariantPointAttention(
-                c_s=c_s,
-                c_z=c_z,
-                c_hidden=c_hidden,
-                num_heads=num_heads,
-                num_qk_points=num_qk_points,
-                num_v_points=num_v_points,
-                pre_ln=True,
-                lin_bias=False,
-                use_fused_kernel=use_fused_ipa_kernel,
-                use_out_gating=use_ipa_gating,
-                ablate_down_z=ablate_ipa_down_z
-            )
+            if self.time_condition_ipa:
+                self.trunk[f'ipa_{b}'] = ConditionedInvariantPointAttention(
+                    c_s=c_s,
+                    c_cond=c_s,
+                    c_z=c_z,
+                    c_hidden=c_hidden,
+                    num_heads=num_heads,
+                    num_qk_points=num_qk_points,
+                    num_v_points=num_v_points,
+                )
+
+            else:
+                self.trunk[f'ipa_{b}'] = InvariantPointAttention(
+                    c_s=c_s,
+                    c_z=c_z,
+                    c_hidden=c_hidden,
+                    num_heads=num_heads,
+                    num_qk_points=num_qk_points,
+                    num_v_points=num_v_points,
+                    pre_ln=True,
+                    lin_bias=False,
+                    use_fused_kernel=use_fused_ipa_kernel,
+                    use_out_gating=use_ipa_gating,
+                    ablate_down_z=ablate_ipa_down_z
+                )
             if compile_ipa:
                 self.trunk[f'ipa_{b}'].compile()
 
@@ -587,6 +605,14 @@ class IpaScore(nn.Module):
                     dropout=0.0,
                     ln_first=True,
                     dtype=None
+                )
+            elif transformer_pair_bias:
+                self.trunk[f'tfmr_{b}'] = ConditionedTransformerPairBias(
+                    c_s=c_s,
+                    c_cond=c_s,
+                    c_z=c_z,
+                    no_heads=4,
+                    n_layers=2
                 )
             else:
                 tfmr_layer = torch.nn.TransformerEncoderLayer(
@@ -687,6 +713,9 @@ class IpaScore(nn.Module):
         rigids_embed = input_feats['rigids_embed']
         curr_rigids = Rigid.from_tensor_7(torch.clone(init_frames))
 
+        time_embed = self.time_embed(input_feats['t'])
+        time_embed = time_embed[:, None].expand(-1, node_mask.shape[1], -1)
+
         n_batch = curr_rigids.shape[0]
         n_rigids = curr_rigids.shape[1] * curr_rigids.shape[2]
         n_padding = (self.block_q - n_rigids % self.block_q) % self.block_q
@@ -718,11 +747,19 @@ class IpaScore(nn.Module):
 
         framepair_embed = input_feats['framepair_embed']
         for b in range(self.num_blocks):
-            ipa_embed = self.trunk[f'ipa_{b}'](
-                s=node_embed,
-                z=edge_embed,
-                r=curr_rigids[..., 0],
-                mask=node_mask)
+            if self.time_condition_ipa:
+                ipa_embed = self.trunk[f'ipa_{b}'](
+                    s=node_embed,
+                    cond=time_embed,
+                    z=edge_embed,
+                    r=curr_rigids[..., 0],
+                    mask=node_mask)
+            else:
+                ipa_embed = self.trunk[f'ipa_{b}'](
+                    s=node_embed,
+                    z=edge_embed,
+                    r=curr_rigids[..., 0],
+                    mask=node_mask)
             node_embed = (node_embed + ipa_embed) * node_mask[..., None]
 
             if self.use_knn:
@@ -743,6 +780,9 @@ class IpaScore(nn.Module):
             if self.force_flash_transformer:
                 seq_tfmr_out = self.trunk[f'tfmr_{b}'](
                     node_embed, node_mask)
+            elif self.transformer_pair_bias:
+                seq_tfmr_out = self.trunk[f'tfmr_{b}'](
+                    node_embed, time_embed, edge_embed, node_mask)
             else:
                 seq_tfmr_out = self.trunk[f'tfmr_{b}'](
                     node_embed, src_key_padding_mask=1 - node_mask)
@@ -2228,6 +2268,7 @@ class IpaScoreV7(nn.Module):
                  transformer_pair_bias=False,
                  block_q=32,
                  block_k=128,
+                 propagate_rigids=False,
                  propagate_framepair_embed=False,
                  use_knn=False,
                  k=30,
@@ -2251,6 +2292,7 @@ class IpaScoreV7(nn.Module):
         self.traj_seqpair_predictor = traj_seqpair_predictor
         self.force_flash_transformer = force_flash_transformer
         self.transformer_pair_bias = transformer_pair_bias
+        self.propagate_rigids = propagate_rigids
         self.propagate_framepair_embed = propagate_framepair_embed
         self.rigid_transformer_rigid_updates = rigid_transformer_rigid_updates
         self.use_knn = use_knn
@@ -2402,7 +2444,7 @@ class IpaScoreV7(nn.Module):
 
         # Main trunk
         curr_rigids = self.scale_rigids(curr_rigids)
-        rigids_skip = curr_rigids
+        # rigids_skip = curr_rigids
         bb_rigids = curr_rigids[..., 0]
         node_embed = init_node_embed * node_mask[..., None]
         cond_rigids_skip = self.node_skip_to_rigid_cond(node_embed)[..., None, :].expand(-1, -1, curr_rigids.shape[-1], -1)
@@ -2443,7 +2485,7 @@ class IpaScoreV7(nn.Module):
             rigids_embed, node_embed, framepair_embed, rigids_out = self.trunk[f'rigids_tfmr_{b}'](
                 node_embed,
                 edge_embed,
-                rigids_skip,
+                curr_rigids, #rigids_skip,
                 rigids_embed_skip,
                 cond_rigids_embed,
                 to_queries,
@@ -2451,6 +2493,8 @@ class IpaScoreV7(nn.Module):
                 to_pairs,
                 framepair_embed=framepair_embed_skip
             )
+            if self.propagate_rigids:
+                curr_rigids = rigids_out
 
             bb_rigid_update = self.trunk[f'bb_update_{b}'](
                 node_embed * diffuse_mask[..., None])
@@ -2536,6 +2580,8 @@ class IpaMultiRigidDenoiser(nn.Module):
                  override_rigid_2=False,
                  use_fused_ipa_kernel=False,
                  v1_use_conditioned_rigid_transformer=False,
+                 v1_time_condition_ipa=False,
+                 v7_propagate_rigids=False,
                  use_ipa_gating=False,
                  ablate_ipa_down_z=False,
                  cg_version=2
@@ -2698,6 +2744,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                 coordinate_scaling=1 if trans_preconditioning else 0.1,
                 block_q=block_q,
                 block_k=block_k,
+                propagate_rigids=v7_propagate_rigids,
                 propagate_framepair_embed=propagate_framepair_embed,
                 use_knn=use_knn,
                 rigid_transformer_use_conditioned=v1_use_conditioned_rigid_transformer,
@@ -2726,6 +2773,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                 traj_framepair_predictor=use_traj_framepair_predictor,
                 traj_seqpair_predictor=use_traj_seqpair_predictor,
                 force_flash_transformer=force_flash_transformer,
+                transformer_pair_bias=transformer_pair_bias,
                 coordinate_scaling=1 if trans_preconditioning else 0.1,
                 block_q=block_q,
                 block_k=block_k,
@@ -2742,7 +2790,8 @@ class IpaMultiRigidDenoiser(nn.Module):
                 compile_ipa=compile_ipa,
                 use_fused_ipa_kernel=use_fused_ipa_kernel,
                 use_ipa_gating=use_ipa_gating,
-                ablate_ipa_down_z=ablate_ipa_down_z
+                ablate_ipa_down_z=ablate_ipa_down_z,
+                time_condition_ipa=v1_time_condition_ipa
             )
 
         self.use_embedder_v2 = use_embedder_v2
@@ -2886,17 +2935,17 @@ class IpaMultiRigidDenoiser(nn.Module):
         rigids_out = score_dict['final_rigids']
         if self.trans_preconditioning:
             rigids_out = rigids_out.apply_trans_fn(
-                lambda x: x * data['trans_c_out'][..., None, None, None] + rigids_t.get_trans() * data['trans_c_skip'][..., None, None, None]
+                lambda x: (x - rigids_in.get_trans()) * data['trans_c_out'][..., None, None, None] + rigids_t.get_trans() * data['trans_c_skip'][..., None, None, None]
             )
             for traj_b in traj_data.values():
                 traj_b_rigids = traj_b['rigids']
                 traj_b['rigids'] = traj_b_rigids.apply_trans_fn(
-                    lambda x: x * data['trans_c_out'][..., None, None, None] + rigids_t.get_trans() * data['trans_c_skip'][..., None, None, None]
+                    lambda x: (x - rigids_in.get_trans()) * data['trans_c_out'][..., None, None, None] + rigids_t.get_trans() * data['trans_c_skip'][..., None, None, None]
                 )
                 if 'bb_rigids' in traj_b:
                     traj_b_bb_rigids = traj_b['bb_rigids']
-                    traj_b['rigids'] = traj_b_bb_rigids.apply_trans_fn(
-                        lambda x: x * data['trans_c_out'][..., None, None, None] + rigids_t[..., 0].get_trans() * data['trans_c_skip'][..., None, None, None]
+                    traj_b['bb_rigids'] = traj_b_bb_rigids.apply_trans_fn(
+                        lambda x: (x - rigids_in[..., 0].get_trans()) * data['trans_c_out'][..., None, None] + rigids_t[..., 0].get_trans() * data['trans_c_skip'][..., None, None]
                     )
 
         if self.rot_preconditioning:
@@ -2905,7 +2954,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                 rel_rotquat = rel_rot.get_quats()
                 rel_rotvec = rotquat_to_rotvec(rel_rotquat.view(-1, 4)).view(*rel_rotquat.shape[:-1], -1)
                 angle = torch.linalg.vector_norm(rel_rotvec + 1e-8, dim=-1)
-                scaled_angle = angle * (1 - t[..., None, None])
+                scaled_angle = angle * (1 - t.view(*t.shape, *[1 for _ in range(angle.dim() - t.dim())]))
                 axis = F.normalize(rel_rotvec, dim=-1)
                 scaled_rotquat = torch.cat([
                     torch.cos(scaled_angle/2)[..., None], torch.sin(scaled_angle/2)[..., None] * axis
@@ -2930,7 +2979,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                     traj_b_bb_rigids = traj_b['bb_rigids']
                     traj_b['bb_rigids'] = Rigid(
                         rots=scale_rot(rots_in[..., 0], traj_b_bb_rigids.get_rots()),
-                        trans=traj_b_rigids[..., 0].get_trans()
+                        trans=traj_b_bb_rigids.get_trans()
                     )
 
 

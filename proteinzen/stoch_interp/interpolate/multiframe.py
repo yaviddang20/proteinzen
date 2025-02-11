@@ -268,7 +268,8 @@ class MultiSE3Interpolant:
         # c_out = sig_1 * sig_0 / torch.sqrt(var_t)
         c_out = (1-t) * sig_1 * sig_0 / torch.sqrt(var_t)
         c_in = 1 / torch.sqrt(var_t)
-        loss_weighting = 1 / (c_out ** 2)
+        # loss_weighting = 1 / (c_out ** 2)
+        loss_weighting = 1 / (3 * 18 * (sig_1 ** 2))
         return {
             "c_skip": c_skip,
             "c_out": c_out,
@@ -305,8 +306,13 @@ class MultiSE3Interpolant:
         # mat_t = so3_utils.rotvec_to_rotmat(d_t * rot_vf * scaling)
         # return torch.einsum("...ij,...jk->...ik", rotmats_t, mat_t)
 
+        rot_vf = so3_utils.calc_rot_vf(rotmats_t, rotmats_1) / (1 - t)
+        rot_vf_norm = torch.linalg.vector_norm(rot_vf, dim=-1)
+        print(t, rot_vf_norm.mean(), rot_vf_norm.mean() * 10 * (1-t))
+
         if self._rots_cfg.sample_schedule == "linear":
-            scaling = 1 / (1 - t.clip(max=0.9))
+            # scaling = 1 / (1 - t.clip(max=0.9))
+            scaling = 1 / (1 - t)
         elif self._rots_cfg.sample_schedule == "exp":
             scaling = self._rots_cfg.exp_rate
         else:

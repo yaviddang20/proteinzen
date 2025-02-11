@@ -141,8 +141,8 @@ def multiframe_fm_loss(
     trans_1_pred = denoised_frames.get_trans()
     trans_1 = gt_frames.get_trans()
     if trans_preconditioning:
-        trans_vf_loss = torch.square(trans_1_pred - trans_1).sum(dim=-1)
-        unscaled_trans_vf_loss = trans_vf_loss / (nodewise_norm_scale[..., None] ** 2) * 0.01
+        trans_vf_loss = torch.square(trans_1_pred - trans_1).sum(dim=-1) / (nodewise_norm_scale[..., None] ** 2)
+        unscaled_trans_vf_loss = trans_vf_loss * 0.01
         trans_vf_loss = trans_vf_loss * seqwise_weight
         trans_vf_loss = _nodewise_to_graphwise(trans_vf_loss, res_data.batch, total_mask) * batch['trans_loss_weighting']
 
@@ -209,7 +209,7 @@ def multiframe_fm_loss(
                 frame_mask=res_mask.view(batch_size, -1).repeat_interleave(denoised_frames.shape[-1], dim=-1),
                 framepair_weight=framepair_weight
             )
-            scaled_fafe = fafe / (norm_scale ** 2)
+            scaled_fafe = fafe / norm_scale
         else:
             fafe = fafe_loss(
                 pred_frames=denoised_frames.view(batch_size, -1),
@@ -331,6 +331,6 @@ def fafe_loss_l2(
     ) / torch.clamp(mask.sum(dim=(-2, -1)), min=1)
 
 
-    return trans_dist_loss / trans_scale**2 + rot_dist_loss / rot_scale**2
+    return torch.sqrt(trans_dist_loss / trans_scale**2 + rot_dist_loss / rot_scale**2)
 
 

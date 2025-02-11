@@ -42,6 +42,7 @@ class MultiFrameInterpolation(Task):
                  scale_frame_aligned_errors=False,
                  scale_fape=False,
                  scale_fafe=False,
+                 # fafe_weight=1/18.,#0.25,
                  fafe_weight=0.25,
                  polar_upweight=False,
                  sidechain_upweight=False,
@@ -231,8 +232,8 @@ class MultiFrameInterpolation(Task):
                     # device='cpu'):
         self.frame_noiser.set_device(device)
         # model.self_conditioning = False
-        # if self.rot_preconditioning:
-        #     self.frame_noiser._rots_cfg.sample_schedule = 'linear'
+        if self.rot_preconditioning:
+            self.frame_noiser._rots_cfg.sample_schedule = 'linear'
 
         num_res = inputs['num_res']
         total_num_res = sum(num_res)
@@ -387,7 +388,7 @@ class MultiFrameInterpolation(Task):
             use_fafe_l2=self.use_fafe_l2,
             polar_upweight=self.polar_upweight,
             sidechain_upweight=self.sidechain_upweight,
-            # trans_preconditioning=self.trans_preconditioning,
+            trans_preconditioning=self.trans_preconditioning,
             rot_exp_weighting=self.rot_loss_exp_weighting,
             rot_vf_angle_loss_weight=self.rot_vf_angle_loss_weight,
             ignore_rigid_2_vf_loss=self.ignore_rigid_2_vf_loss,
@@ -397,15 +398,15 @@ class MultiFrameInterpolation(Task):
 
         frame_vf_loss = (
             frame_fm_loss_dict["trans_vf_loss"] +
-            frame_fm_loss_dict["rot_vf_loss"]
+            frame_fm_loss_dict["rot_vf_loss"] # / 3
         )
         unscaled_frame_vf_loss = (
             frame_fm_loss_dict["unscaled_trans_vf_loss"] +
             frame_fm_loss_dict["unscaled_rot_vf_loss"]
         )
         bb_denoising_finegrain_loss = (
-            frame_fm_loss_dict["scaled_pred_bb_mse"]
-            + frame_fm_loss_dict["scaled_dist_mat_loss"]
+            frame_fm_loss_dict["scaled_pred_bb_mse"] # / (18 * 3)
+            + frame_fm_loss_dict["scaled_dist_mat_loss"] # / (18 * 3)
         ) * (inputs['t'] > self.aux_loss_t_min)
 
         traj_loss_dict = multiframe_traj_loss(inputs, outputs, traj_decay_factor=0.99)
@@ -423,8 +424,8 @@ class MultiFrameInterpolation(Task):
         )
 
         atomic_loss = (
-            atomic_loss_dict["scaled_atom14_mse"]
-            + atomic_loss_dict["seq_loss"]
+            atomic_loss_dict["scaled_atom14_mse"] # * 1/(18 * 3)
+            + atomic_loss_dict["seq_loss"] # / np.log(20)
             + atomic_loss_dict["smooth_lddt"]
             + atomic_loss_dict[('scaled_fape' if self.scale_frame_aligned_errors or self.scale_fape else 'fape')]
         )
@@ -432,19 +433,19 @@ class MultiFrameInterpolation(Task):
 
         loss = (
             frame_vf_loss
-            + self.fafe_weight * frame_fm_loss_dict[('scaled_fafe' if self.scale_frame_aligned_errors or self.scale_fafe else 'fafe')]
+            + self.fafe_weight * frame_fm_loss_dict[('scaled_fafe' if self.scale_frame_aligned_errors or self.scale_fafe else 'fafe')] # / 2
             + 0.25 * bb_denoising_finegrain_loss
             + atomic_loss
             + traj_loss_dict['traj_bb_loss'] * self.bb_traj_loss_scale
             + traj_loss_dict['traj_rigids_loss'] * self.rigids_traj_loss_scale
-            + traj_loss_dict['traj_pred_dist_loss'] * 0.5
-            + traj_loss_dict['traj_pred_framepair_dist_loss'] * 0.5
-            + traj_loss_dict['traj_seq_loss'] * 0.25
+            + traj_loss_dict['traj_pred_dist_loss'] * 0.5 # / np.log(64)
+            + traj_loss_dict['traj_pred_framepair_dist_loss'] * 0.5 # / np.log(64)
+            + traj_loss_dict['traj_seq_loss'] * 0.25  # / np.log(20)
             + traj_loss_dict['traj_seqpair_loss'] * 0.25
         )
-        loss = loss.mean()
+        loss = loss.mean() # / 12
 
-        loss_dict = {"loss": loss, "frame_vf_loss": frame_vf_loss, "unscaled_frame_vf_loss": unscaled_frame_vf_loss}
+        loss_dict = {"loss": loss, "frame_vf_loss": frame_vf_loss, "frame_vf_loss_unscaled": unscaled_frame_vf_loss}
         loss_dict.update(frame_fm_loss_dict)
         loss_dict.update(atomic_loss_dict)
         loss_dict.update(traj_loss_dict)

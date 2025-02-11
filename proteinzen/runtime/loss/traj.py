@@ -39,6 +39,7 @@ def interm_rigid_loss(
             device=res_batch.device)
         )
     return 0.01 * trans_loss + rot_loss
+    # return 1/(256*3) * trans_loss + rot_loss / 3
 
 
 def interm_pred_dist_loss(
@@ -212,6 +213,7 @@ def interm_multirigid_loss(
             device=res_batch.device)
         )
     return 0.01 * trans_loss + rot_loss
+    # return 1/(256 * 3) * trans_loss + rot_loss / 3
 
 
 def interm_pred_framepair_dist_loss(
