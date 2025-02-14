@@ -312,6 +312,7 @@ def fafe_loss_l2(
     mask = mask * (1 - torch.eye(frame_mask.shape[-1], device=mask.device))[None]
 
     trans_dist = torch.linalg.vector_norm(pred_framepairs.get_trans() - gt_framepairs.get_trans(), dim=-1)
+    clamp_mask = trans_dist > dist_clamp
     trans_dist = trans_dist.clamp(max=dist_clamp)
     rot_dist = geodesic_dist(pred_framepairs.get_rots().get_rot_mats(), gt_framepairs.get_rots().get_rot_mats())
 
@@ -323,10 +324,9 @@ def fafe_loss_l2(
         dim=(-2, -1),
     ) / mask.sum(dim=(-2, -1))
 
-    # clamp_mask = trans_dist > dist_clamp
-    # rotpair_mask = mask * clamp_mask
+    rotpair_mask = mask * clamp_mask
     rot_dist_loss = torch.sum(
-        rot_dist**2 * mask,
+        rot_dist**2 * rotpair_mask,
         dim=(-2, -1),
     ) / torch.clamp(mask.sum(dim=(-2, -1)), min=1)
 

@@ -43,10 +43,10 @@ class TaskList:
 
         return outputs
 
-    def run_predicts(self, model, inputs: HeteroData):
+    def run_predicts(self, model, inputs: HeteroData, device=None):
         outputs = {}
         for task in self.task_list:
-            outputs.update(task.run_predict(model, inputs))
+            outputs.update(task.run_predict(model, inputs, device=device))
 
         return outputs
 

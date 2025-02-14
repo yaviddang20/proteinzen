@@ -184,7 +184,8 @@ class FramediffDataModule(L.LightningDataModule):
             normalize_cache_path=(
                 None if not normalize_cache
                 else os.path.join(cache_dir, "latent_stats.pt")
-            )
+            ),
+            batch_by_edge_fn=batch_by_edge_fn
         )
 
     def build_dataloader(self, x):
@@ -267,10 +268,20 @@ class FramediffDataModule(L.LightningDataModule):
                 batch = batch[0]
                 batch['task'] = self.task_sampler.sample_task()
                 return batch
+            rank = self.trainer.local_rank
+            num_replicas = self.trainer.num_devices
 
             return DataLoader(
                 self.predict_dataset,
                 shuffle=False,
+                sampler=torch.utils.data.distributed.DistributedSampler(
+                    self.predict_dataset,
+                    num_replicas=num_replicas,
+                    rank=rank,
+                    shuffle=False,
+                    seed=0,
+                    drop_last=False
+                ),
                 collate_fn=collate_fn,
                 batch_size=1
             )

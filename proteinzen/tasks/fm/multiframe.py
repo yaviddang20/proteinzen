@@ -232,8 +232,8 @@ class MultiFrameInterpolation(Task):
                     # device='cpu'):
         self.frame_noiser.set_device(device)
         # model.self_conditioning = False
-        if self.rot_preconditioning:
-            self.frame_noiser._rots_cfg.sample_schedule = 'linear'
+        # if model.rot_preconditioning:
+        #     self.frame_noiser._rots_cfg.sample_schedule = 'linear'
 
         num_res = inputs['num_res']
         total_num_res = sum(num_res)

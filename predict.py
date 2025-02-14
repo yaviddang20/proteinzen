@@ -10,6 +10,7 @@ import hydra
 from hydra_zen import zen, load_from_yaml
 import omegaconf
 import torch
+import numpy as np
 
 from lightning import LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers.wandb import WandbLogger
@@ -223,8 +224,21 @@ def main(model,
     # corrupter.sidechain_noiser.sample_sched = 'sigmoid'
     # corrupter.sidechain_noiser.sample_c = 10
 
+    if hasattr(model.model, "lrange_logn_scale") and model.model.lrange_logn_scale > 0:
+        _model = model.model
+        def batch_by_edge_fn(n):
+            lrange = round(
+                max(_model.lrange_k, _model.lrange_logn_scale * np.log2(n) + _model.lrange_logn_offset)
+            )
+            knn = _model.knn_k
+            edges_per_node = min(lrange+knn, n)
+            return edges_per_node * n
+        datamodule_inst = datamodule(task_sampler=task_sampler, batch_by_edge_fn=batch_by_edge_fn)
+    else:
+        datamodule_inst = datamodule(task_sampler=task_sampler)
 
-    datamodule_inst = datamodule(task_sampler=task_sampler)
+    # datamodule_inst = datamodule(task_sampler=task_sampler)
+
     exp = Experiment(
         model=model,
         datamodule=datamodule_inst,
@@ -282,7 +296,8 @@ if __name__ == '__main__':
 
     cfg = load_from_yaml(config_path)
     cfg['experiment']['warm_start'] = ckpt_path
-    cfg['datamodule']['batch_size'] = 2000
+    # cfg['datamodule']['batch_size'] = 2000
+    cfg['datamodule']['batch_size'] = 10 * 300 * 300
     # if 'compatibility_mode' not in cfg['model']:
     #     cfg['model']['compatibility_mode'] = True
 
@@ -314,6 +329,7 @@ if __name__ == '__main__':
     if cfg['domain']['domain'] in ["protein", "protein_multichi"]:
         if args.debug:
             print("debug")
+            cfg['datamodule']['batch_size'] = 300 * 300
             cfg['datamodule']['sample_lengths'] = {
                 60: 5,
                 # 70: 5,

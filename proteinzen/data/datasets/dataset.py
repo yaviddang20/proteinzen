@@ -182,7 +182,8 @@ class LengthDataset(data.Dataset):
             lengths: Dict[int, int],
             batch_size: int = 3000,
             same_length_per_batch=False,
-            normalize_cache_path=None
+            normalize_cache_path=None,
+            batch_by_edge_fn=None,
         ):
         self._log = logging.getLogger(__name__)
         self.lengths = lengths
@@ -199,7 +200,11 @@ class LengthDataset(data.Dataset):
         sample_id = 0
         for sample_l, num_samples in self.lengths.items():
             for _ in range(num_samples):
-                if sum(current_batch) >= self.batch_size:
+                if batch_by_edge_fn is not None:
+                    current_batch_size = sum([batch_by_edge_fn(l) for l in current_batch])
+                else:
+                    current_batch_size = sum(current_batch)
+                if current_batch_size >= self.batch_size:
                     self.batches.append(current_batch)
                     self.sample_ids.append(current_sample_ids)
                     current_batch = []
@@ -217,6 +222,7 @@ class LengthDataset(data.Dataset):
             self.batches.append(current_batch)
         if len(current_sample_ids) > 0:
             self.sample_ids.append(current_sample_ids)
+
 
     def __len__(self):
         return len(self.batches)

@@ -7,7 +7,7 @@ import copy
 
 import functools as fn
 
-from proteinzen.model.modules.layers.node.attention import FlashTransformerEncoder, ConditionedTransformerPairBias
+from proteinzen.model.modules.layers.node.attention import FlashTransformerEncoder, ConditionedTransformerPairBias, TransformerPairBias
 from proteinzen.model.modules.openfold.layers import InvariantPointAttention, MemoryEfficientInvariantPointAttention
 from proteinzen.model.modules.openfold.layers_v2 import Linear, ConditionedInvariantPointAttention, ConditionedTransition, BackboneUpdate, TorsionAngles, Transition, LayerNorm, AdaLN
 import proteinzen.utils.openfold.rigid_utils as ru
@@ -528,6 +528,7 @@ class IpaScore(nn.Module):
                  use_ipa_gating=False,
                  time_condition_ipa=False,
                  ablate_ipa_down_z=False,
+                 no_time_condition=False,
                  ):
         super().__init__()
         # self.diffuser = diffuser
@@ -542,6 +543,7 @@ class IpaScore(nn.Module):
         self.use_fused_ipa_kernel = use_fused_ipa_kernel
         self.use_conditioned_rigid_transformer = rigid_transformer_use_conditioned
         self.time_condition_ipa = time_condition_ipa
+        self.no_time_condition = no_time_condition
         self.k = k
 
         self.scale_pos = lambda x: x * coordinate_scaling
@@ -607,13 +609,21 @@ class IpaScore(nn.Module):
                     dtype=None
                 )
             elif transformer_pair_bias:
-                self.trunk[f'tfmr_{b}'] = ConditionedTransformerPairBias(
-                    c_s=c_s,
-                    c_cond=c_s,
-                    c_z=c_z,
-                    no_heads=4,
-                    n_layers=2
-                )
+                if self.no_time_condition:
+                    self.trunk[f'tfmr_{b}'] = TransformerPairBias(
+                        c_s=c_s,
+                        c_z=c_z,
+                        no_heads=4,
+                        n_layers=2
+                    )
+                else:
+                    self.trunk[f'tfmr_{b}'] = ConditionedTransformerPairBias(
+                        c_s=c_s,
+                        c_cond=c_s,
+                        c_z=c_z,
+                        no_heads=4,
+                        n_layers=2
+                    )
             else:
                 tfmr_layer = torch.nn.TransformerEncoderLayer(
                     d_model=c_s,
@@ -781,8 +791,12 @@ class IpaScore(nn.Module):
                 seq_tfmr_out = self.trunk[f'tfmr_{b}'](
                     node_embed, node_mask)
             elif self.transformer_pair_bias:
-                seq_tfmr_out = self.trunk[f'tfmr_{b}'](
-                    node_embed, time_embed, edge_embed, node_mask)
+                if self.no_time_condition:
+                    seq_tfmr_out = self.trunk[f'tfmr_{b}'](
+                        node_embed, edge_embed, node_mask)
+                else:
+                    seq_tfmr_out = self.trunk[f'tfmr_{b}'](
+                        node_embed, time_embed, edge_embed, node_mask)
             else:
                 seq_tfmr_out = self.trunk[f'tfmr_{b}'](
                     node_embed, src_key_padding_mask=1 - node_mask)
@@ -2581,6 +2595,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                  use_fused_ipa_kernel=False,
                  v1_use_conditioned_rigid_transformer=False,
                  v1_time_condition_ipa=False,
+                 v1_no_time_condition=False,
                  v7_propagate_rigids=False,
                  use_ipa_gating=False,
                  ablate_ipa_down_z=False,
@@ -2791,7 +2806,8 @@ class IpaMultiRigidDenoiser(nn.Module):
                 use_fused_ipa_kernel=use_fused_ipa_kernel,
                 use_ipa_gating=use_ipa_gating,
                 ablate_ipa_down_z=ablate_ipa_down_z,
-                time_condition_ipa=v1_time_condition_ipa
+                time_condition_ipa=v1_time_condition_ipa,
+                no_time_condition=v1_no_time_condition
             )
 
         self.use_embedder_v2 = use_embedder_v2

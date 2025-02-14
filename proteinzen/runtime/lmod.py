@@ -999,9 +999,9 @@ class ProteinModule(L.LightningModule):
     def predict_step(self, batch, batch_idx):
         task: TaskList = batch['task']
         if self.use_ema:
-            outputs = task.run_predicts(self.ema.module, batch)
+            outputs = task.run_predicts(self.ema.module, batch, device=self.device)
         else:
-            outputs = task.run_predicts(self.model, batch)
+            outputs = task.run_predicts(self.model, batch, device=self.device)
         return outputs
 
 
