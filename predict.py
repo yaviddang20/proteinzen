@@ -123,63 +123,67 @@ class Experiment:
                         atom91, atom91_mask = atom14_to_atom91(seq, atom14)
                         atom91_to_pdb(seq, atom91, f"len_{sample_len}_protein_{sample_id}")
 
-                    # clean_trajs = batch['all_R_clean_trajs']
-                    # clean_traj_seqs = batch['clean_traj_seqs']
-                    # prot_trajs = batch['prot_trajs']
-                    # for clean_traj, clean_seq, prot_traj, sample_id in zip(clean_trajs, clean_traj_seqs, prot_trajs, sample_ids):
-                    #     sample_len = len(clean_seq[0])
-                    #     clean_traj_name = f"clean_traj_len_{sample_len}_protein_{sample_id}.pdb"
-                    #     prot_traj_name = f"prot_traj_len_{sample_len}_protein_{sample_id}.pdb"
-                    #     clean_models = []
-                    #     prot_models = []
-                    #     for i, _ in enumerate(clean_traj):
-                    #         clean = clean_traj[i]
-                    #         # seq = clean_seq[i].argmax(dim=-1)
-                    #         seq = clean_seq[i]
-                    #         # print("".join([restypes[j] for j in seq.tolist()]))
-                    #         seq = "".join(["R" for _ in seq.tolist()])
-                    #         # seq = "".join([restypes[j] for j in seq.tolist()])
-                    #         # prot = prot_traj[i]
-                    #         sample_len = clean.shape[0]
-                    #         clean_atom91, _ = atom14_to_atom91(seq, clean.numpy(force=True))
-                    #         clean_chain = atom91_to_chain(
-                    #             seq,
-                    #             clean_atom91,
-                    #             "A"
-                    #         )
-                    #         all_ala = "".join(["A" for _ in range(sample_len)])
-                    #         # prot_atom91, _ = atom14_to_atom91(all_ala, prot.numpy(force=True))
-                    #         # prot_chain = atom91_to_chain(
-                    #         #     all_ala,
-                    #         #     prot_atom91,
-                    #         #     "A"
-                    #         # )
-                    #         clean_model = chains_to_model([clean_chain], model_id=i)
-                    #         # prot_model = chains_to_model([prot_chain], model_id=i)
-                    #         clean_models.append(clean_model)
-                    #         # prot_models.append(prot_model)
-                    #     save_struct(models_to_struct(reversed(clean_models)), clean_traj_name)
-                    #     # save_struct(models_to_struct(reversed(prot_models)), prot_traj_name)
-                    # for i, sample in enumerate(samples):
-                    #     sample_len = sample.shape[0]
-                    #     sample_id = sample_ids[i]
-                    #     for key in [
-                    #         "clean_trajs",
-                    #         "clean_traj_seqs",
-                    #         "prot_trajs",
-                    #         "prot_traj_seqs",
-                    #     ]:
-                    #         print(key, len(list(batch[key])), i)
+                    if self._cfg.save_traj:
+                        clean_trajs = batch['clean_trajs'] # batch['all_R_clean_trajs']
+                        clean_traj_seqs = batch['clean_traj_seqs']
+                        prot_trajs = batch['prot_trajs']
+                        for clean_traj, clean_seq, prot_traj, sample_id in zip(clean_trajs, clean_traj_seqs, prot_trajs, sample_ids):
+                            sample_len = len(clean_seq[0])
+                            clean_traj_name = f"clean_traj_len_{sample_len}_protein_{sample_id}.pdb"
+                            prot_traj_name = f"prot_traj_len_{sample_len}_protein_{sample_id}.pdb"
+                            clean_models = []
+                            prot_models = []
+                            for i, _ in enumerate(clean_traj):
+                                clean = clean_traj[i]
+                                # seq = clean_seq[i].argmax(dim=-1)
+                                seq = clean_seq[i]
+                                # print("".join([restypes[j] for j in seq.tolist()]))
+                                # seq = "".join(["R" for _ in seq.tolist()])
+                                seq = "".join([restypes[j] for j in seq.tolist()])
+                                # prot = prot_traj[i]
+                                clean_atom91, _ = atom14_to_atom91(seq, clean.numpy(force=True))
+                                clean_chain = atom91_to_chain(
+                                    seq,
+                                    clean_atom91,
+                                    "A"
+                                )
+                                clean_model = chains_to_model([clean_chain], model_id=i)
+                                clean_models.append(clean_model)
+                            save_struct(models_to_struct(reversed(clean_models)), clean_traj_name)
 
-                    #     data = {
-                    #         key: batch[key][i] for key in [
-                    #             "clean_trajs",
-                    #             "clean_traj_seqs",
-                    #             "prot_trajs",
-                    #             "prot_traj_seqs",
-                    #         ]
-                    #     }
-                    #     torch.save(data, f"len_{sample_len}_protein_{sample_id}_traj_data.pt")
+                            for i, _ in enumerate(clean_traj):
+                                prot = prot_traj[i]
+                                seq = "".join(["R" for _ in range(sample_len)])
+                                # all_ala = "".join(["A" for _ in range(sample_len)])
+                                prot_atom91, _ = atom14_to_atom91(seq, prot.numpy(force=True))
+                                prot_chain = atom91_to_chain(
+                                    seq,
+                                    prot_atom91,
+                                    "A"
+                                )
+                                prot_model = chains_to_model([prot_chain], model_id=i)
+                                prot_models.append(prot_model)
+                            save_struct(models_to_struct(reversed(prot_models)), prot_traj_name)
+                        # for i, sample in enumerate(samples):
+                        #     sample_len = sample.shape[0]
+                        #     sample_id = sample_ids[i]
+                        #     for key in [
+                        #         "clean_trajs",
+                        #         "clean_traj_seqs",
+                        #         "prot_trajs",
+                        #         "prot_traj_seqs",
+                        #     ]:
+                        #         print(key, len(list(batch[key])), i)
+
+                        #     data = {
+                        #         key: batch[key][i] for key in [
+                        #             "clean_trajs",
+                        #             "clean_traj_seqs",
+                        #             "prot_trajs",
+                        #             "prot_traj_seqs",
+                        #         ]
+                        #     }
+                        #     torch.save(data, f"len_{sample_len}_protein_{sample_id}_traj_data.pt")
 
 
 def main(model,
@@ -297,9 +301,10 @@ if __name__ == '__main__':
     cfg = load_from_yaml(config_path)
     cfg['experiment']['warm_start'] = ckpt_path
     # cfg['datamodule']['batch_size'] = 2000
-    cfg['datamodule']['batch_size'] = 10 * 300 * 300
+    cfg['datamodule']['batch_size'] = 6 * 300 * 300
     # if 'compatibility_mode' not in cfg['model']:
     #     cfg['model']['compatibility_mode'] = True
+    cfg['save_traj'] = args.save_traj
 
     if cfg['domain']['domain'] == "backbone":
         if args.debug:

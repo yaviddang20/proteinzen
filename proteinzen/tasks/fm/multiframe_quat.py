@@ -17,9 +17,9 @@ from proteinzen.utils.openfold import rigid_utils as ru
 from proteinzen.tasks import Task
 
 from proteinzen.runtime.loss.common import atomic_losses
-from proteinzen.runtime.loss.multiframe import multiframe_fm_loss
+from proteinzen.runtime.loss.multiframe import multiframe_quat_fm_loss
 from proteinzen.runtime.loss.traj import multiframe_traj_loss
-from proteinzen.stoch_interp.interpolate.multiframe import _centered_gaussian, _uniform_so3, MultiSE3Interpolant
+from proteinzen.stoch_interp.interpolate.multiframe_quat import _centered_gaussian, _uniform_so3, MultiSE3Interpolant
 
 import proteinzen.stoch_interp.interpolate.utils as du
 from proteinzen.utils.framediff import all_atom
@@ -290,7 +290,7 @@ class MultiFrameInterpolation(Task):
             trans_0 = (
                 _centered_gaussian(res_data.batch, self.frame_noiser.rigids_per_res, device) * du.NM_TO_ANG_SCALE
             )
-        rotmats_0 = _uniform_so3(total_num_res, self.frame_noiser.rigids_per_res, device)
+        rotquats_0 = _uniform_so3(total_num_res, self.frame_noiser.rigids_per_res, device)
 
         # Set-up time
         ts = torch.linspace(self.frame_noiser._cfg.min_t, 1.0, self.frame_noiser._sample_cfg.num_timesteps)
@@ -301,10 +301,10 @@ class MultiFrameInterpolation(Task):
 
         prot_traj = [(
             trans_0,  # trans
-            rotmats_0,  # rot
+            rotquats_0,  # rot
             torch.ones((total_num_res, 21), device=device).float(),  # seq logits
             compute_atom14_from_cg_frames(
-                ru.Rigid(ru.Rotation(rot_mats=rotmats_0), trans_0),
+                ru.Rigid(ru.Rotation(quats=rotquats_0), trans_0),
                 res_data.res_mask,
                 res_data.seq,
                 cg_version=self.cg_version
@@ -315,11 +315,11 @@ class MultiFrameInterpolation(Task):
 
         for t_2 in tqdm.tqdm(ts[1:]):
             # Run model.
-            trans_t_1, rotmats_t_1, _, _ = prot_traj[-1]
+            trans_t_1, rotquats_t_1, _, _ = prot_traj[-1]
             res_data["trans_t"] = trans_t_1
-            res_data["rotmats_t"] = rotmats_t_1
+            res_data["rotquats_t"] = rotquats_t_1
             res_data['rigids_t'] = ru.Rigid(
-                rots=ru.Rotation(rot_mats=rotmats_t_1),
+                rots=ru.Rotation(quats=rotquats_t_1),
                 trans=trans_t_1
             ).to_tensor_7()
             t = torch.ones(batch.num_graphs, device=device) * t_1
@@ -335,12 +335,12 @@ class MultiFrameInterpolation(Task):
             # Process model output.
             pred_rigids = denoiser_out['final_rigids']
             pred_trans_1 = pred_rigids.get_trans()
-            pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
+            pred_rotquats_1 = pred_rigids.get_rots().get_quats()
 
             clean_traj.append(
                 (
                     pred_trans_1.detach().cpu(),
-                    pred_rotmats_1.detach().cpu(),
+                    pred_rotquats_1.detach().cpu(),
                     denoiser_out['decoded_seq_logits'].detach().cpu().argmax(dim=-1),
                     denoiser_out['denoised_atom14'].detach().cpu(),
                     denoiser_out['denoised_atom14_gt_seq'].detach().cpu()
@@ -350,14 +350,14 @@ class MultiFrameInterpolation(Task):
             # Take reverse step
             d_t = t_2 - t_1
             trans_t_2 = self.frame_noiser._trans_euler_step(d_t, t_1, pred_trans_1, trans_t_1)
-            rotmats_t_2 = self.frame_noiser._rots_euler_step(d_t, t_1, pred_rotmats_1, rotmats_t_1)
+            rotquats_t_2 = self.frame_noiser._rots_quats_euler_step(d_t, t_1, pred_rotquats_1, rotquats_t_1)
 
             prot_traj.append(
                 (trans_t_2,
-                 rotmats_t_2,
+                 rotquats_t_2,
                  denoiser_out["decoded_seq_logits"].argmax(dim=-1).detach().cpu(),
                  compute_atom14_from_cg_frames(
-                     ru.Rigid(ru.Rotation(rot_mats=rotmats_t_2), trans_t_2),
+                     ru.Rigid(ru.Rotation(quats=rotquats_t_2), trans_t_2),
                      res_data.res_mask,
                      res_data.seq,
                      cg_version=self.cg_version
@@ -371,11 +371,11 @@ class MultiFrameInterpolation(Task):
 
         # We only integrated to min_t, so need to make a final step
         t_1 = ts[-1]
-        trans_t_1, rotmats_t_1, _, _ = prot_traj[-1]
+        trans_t_1, rotquats_t_1, _, _ = prot_traj[-1]
         res_data["trans_t"] = trans_t_1
-        res_data["rotmats_t"] = rotmats_t_1
+        res_data["rotquats_t"] = rotquats_t_1
         res_data['rigids_t'] = ru.Rigid(
-            rots=ru.Rotation(rot_mats=rotmats_t_1),
+            rots=ru.Rotation(quats=rotquats_t_1),
             trans=trans_t_1
         ).to_tensor_7()
         t = torch.ones(batch.num_graphs, device=device) * t_1
@@ -391,14 +391,14 @@ class MultiFrameInterpolation(Task):
         # Process model output.
         pred_rigids = denoiser_out['final_rigids']
         pred_trans_1 = pred_rigids.get_trans()
-        pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
+        pred_rotquats_1 = pred_rigids.get_rots().get_quats()
         decoded_struct = denoiser_out['denoised_atom14']
         argmax_seq = denoiser_out['decoded_seq_logits'].detach().cpu()[..., :-1].argmax(dim=-1)
 
         clean_traj.append(
             (
                 pred_trans_1.detach().cpu(),
-                pred_rotmats_1.detach().cpu(),
+                pred_rotquats_1.detach().cpu(),
                 denoiser_out['decoded_seq_logits'].detach().cpu().argmax(dim=-1),
                 denoiser_out['denoised_atom14'].detach().cpu(),
                 denoiser_out['denoised_atom14_gt_seq'].detach().cpu()
@@ -425,7 +425,7 @@ class MultiFrameInterpolation(Task):
 
 
     def compute_loss(self, inputs, outputs: Dict):
-        frame_fm_loss_dict = multiframe_fm_loss(
+        frame_fm_loss_dict = multiframe_quat_fm_loss(
             inputs, outputs, sep_rot_loss=self.sep_rot_loss,
             t_norm_clip=self.t_norm_clip,
             square_aux_loss_time_factor=True,

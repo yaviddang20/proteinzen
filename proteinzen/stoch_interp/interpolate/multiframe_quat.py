@@ -51,10 +51,10 @@ def _centered_gaussian(batch, rigids_per_res, device):
 
 def _uniform_so3(num_res, rigids_per_res, device):
     return torch.tensor(
-        Rotation.random(num_res * rigids_per_res).as_matrix(),
+        Rotation.random(num_res * rigids_per_res).as_quat(),
         device=device,
         dtype=torch.float32,
-    ).reshape(num_res, rigids_per_res, 3, 3)
+    ).reshape(num_res, rigids_per_res, 4)
 
 
 def _trans_diffuse_mask(trans_t, trans_1, diffuse_mask):
@@ -64,6 +64,11 @@ def _trans_diffuse_mask(trans_t, trans_1, diffuse_mask):
 def _rots_diffuse_mask(rotmats_t, rotmats_1, diffuse_mask):
     return rotmats_t * diffuse_mask[..., None, None, None] + rotmats_1 * (
         ~diffuse_mask[..., None, None, None]
+    )
+
+def _rotquat_diffuse_mask(rotmats_t, rotmats_1, diffuse_mask):
+    return rotmats_t * diffuse_mask[..., None, None] + rotmats_1 * (
+        ~diffuse_mask[..., None, None]
     )
 
 @dataclasses.dataclass
@@ -184,23 +189,16 @@ class MultiSE3Interpolant:
         rotmats_0 = torch.einsum("...ij,...jk->...ik", rotmats_1, noisy_rotmats)
         return rotmats_0
 
-    def _corrupt_rotmats(self, rotmats_1, rotmats_0, t, res_mask, batch):
-        rotmats_t = so3_utils.geodesic_t(t[..., None, None], rotmats_1, rotmats_0)
-        identity = torch.eye(3, device=self._device)
+    def _corrupt_rotquats(self, rotquats_1, rotquats_0, t, res_mask, batch):
+        rotquats_t = so3_utils.quaternion_slerp_exp(t[..., None], rotquats_1, rotquats_0)
+        identity = torch.tensor([1, 0, 0, 0], device=self._device, dtype=rotquats_t.dtype)
+        # print(rotquats_t.shape)
 
-        if self.use_rot_sfm:
-            g = self.rot_sfm_g
-            std = g * (t * (1-t)).sqrt()
-            dB_rot = self.igso3.sample(std, self.rigids_per_res).to(rotmats_1.device)
-            dB_rot = dB_rot[batch]
-            rotmats_t = torch.einsum("...ij,...jk->...ik", rotmats_t, dB_rot)
-
-        rotmats_t = rotmats_t * res_mask[..., None, None, None] + identity[None, None] * (
-            ~res_mask[..., None, None, None]
+        rotquats_t = rotquats_t * res_mask[..., None, None] + identity[None, None] * (
+            ~res_mask[..., None, None]
         )
-
-        return _rots_diffuse_mask(rotmats_t, rotmats_1, res_mask)
-
+        # print(rotquats_t.shape)
+        return _rotquat_diffuse_mask(rotquats_t, rotquats_1, res_mask)
 
     @torch.no_grad()
     def corrupt_batch(self, batch: HeteroData):
@@ -230,6 +228,8 @@ class MultiSE3Interpolant:
         nodewise_t = batchwise_to_nodewise(t, res_data.batch)
 
         rotmats_0 = self._sample_rotmats_0(rotmats_1)
+        rotquats_0 = ru.rot_to_quat(rotmats_0)
+        rotquats_1 = ru.rot_to_quat(rotmats_1)
         trans_0 = self._sample_trans_0(res_data.batch, trans_1.device)
 
         if self.prealign_noise:
@@ -242,12 +242,13 @@ class MultiSE3Interpolant:
             trans_0 = aligned_trans_0.view(trans_0.shape)
 
         trans_t = self._corrupt_trans(trans_1, trans_0, nodewise_t, mask, res_data.batch)
-        rotmats_t = self._corrupt_rotmats(rotmats_1, rotmats_0, nodewise_t, mask, res_data.batch)
+        rotquats_t = self._corrupt_rotquats(rotquats_1, rotquats_0, nodewise_t, mask, res_data.batch)
+        # print(rotquats_0.shape, rotquats_1.shape, rotquats_t.shape)
         rigids_t = ru.Rigid(
-            rots=ru.Rotation(rot_mats=rotmats_t), trans=trans_t
+            rots=ru.Rotation(quats=rotquats_t), trans=trans_t
         )
         res_data["rigids_t"] = rigids_t.to_tensor_7()
-        res_data["rotmats_t"] = rotmats_t
+        res_data["rotquats_t"] = rotquats_t
         res_data["trans_t"] = trans_t
 
         var_scaling_dict = self.var_scaling_factors(t)
@@ -337,3 +338,15 @@ class MultiSE3Interpolant:
             return torch.einsum("...ij,...jk->...ik", rotmats_t, mat_t)
         else:
             return so3_utils.geodesic_t(scaling * d_t, rotmats_1, rotmats_t)
+
+
+    def _rots_quats_euler_step(self, d_t, t, rotquats_1, rotquats_t):
+        if self._rots_cfg.sample_schedule == 'linear':
+            scaling = 1 / (1 - t)
+        elif self._rots_cfg.sample_schedule == 'exp':
+            scaling = self._rots_cfg.exp_rate
+        else:
+            raise ValueError(
+                f'Unknown sample schedule {self._rots_cfg.sample_schedule}')
+        return so3_utils.quaternion_slerp_exp(
+            scaling * d_t, rotquats_1, rotquats_t)

@@ -1,4 +1,4 @@
-from proteinzen.model.modules.openfold.layers import Linear, flatten_final_dims, ipa_point_weights_init_, _deepspeed_evo_attn
+from proteinzen.model.modules.openfold.layers import Linear, flatten_final_dims, ipa_point_weights_init_, _deepspeed_evo_attn, Dropout
 from proteinzen.model.denoiser.protein._attn import DropoutRowwise, evoformer_supported
 from proteinzen.model.modules.openfold.layers_v2 import LayerNorm, Transition, permute_final_dims, AdaLN
 from proteinzen.utils.openfold.rigid_utils import Rigid
@@ -401,6 +401,7 @@ class TransformerPairBiasLayer(nn.Module):
                  c_z,
                  no_heads,
                  dropout=0.1,
+                 row_dropout=0.0,
                  inf=1e8
 
     ):
@@ -418,6 +419,7 @@ class TransformerPairBiasLayer(nn.Module):
         self.ln_s = LayerNorm(c_s)
         self.ln_z = LayerNorm(c_z)
         self.dropout = nn.Dropout(dropout)
+        self.row_dropout = Dropout(row_dropout, -2)
 
         self.ffn = Transition(c_s, n=2)
 
@@ -472,7 +474,7 @@ class TransformerPairBiasLayer(nn.Module):
             update = update.transpose(-2, -3).flatten(-2, -1)
         out_gate = self.out_gate(_x)
         update = self.lin_out(update * torch.sigmoid(out_gate))
-        x = x + self.dropout(update)
+        x = x + self.row_dropout(self.dropout(update))
 
         x = x + self.ffn(x) * x_mask[..., None]
 
@@ -486,6 +488,7 @@ class TransformerPairBias(nn.Module):
                  no_heads,
                  n_layers,
                  dropout=0.1,
+                 row_dropout=0.0
     ):
         super().__init__()
         self.layers = nn.ModuleList(
@@ -495,6 +498,7 @@ class TransformerPairBias(nn.Module):
                     c_z,
                     no_heads=no_heads,
                     dropout=dropout,
+                    row_dropout=row_dropout,
                 )
                 for _ in range(n_layers)
             ]
@@ -518,6 +522,7 @@ class ConditionedTransformerPairBiasLayer(nn.Module):
                  c_z,
                  no_heads,
                  dropout=0.1,
+                 row_dropout=0.0,
                  inf=1e8
 
     ):
@@ -538,6 +543,7 @@ class ConditionedTransformerPairBiasLayer(nn.Module):
         self.ln_s = AdaLN(c_s, c_cond)
         self.ln_z = LayerNorm(c_z)
         self.dropout = nn.Dropout(dropout)
+        self.row_dropout = Dropout(row_dropout, -2)
 
         self.ffn = Transition(c_s, n=2)
 
@@ -594,7 +600,7 @@ class ConditionedTransformerPairBiasLayer(nn.Module):
         cond_gate = self.cond_gate(cond)
         update = self.lin_out(update * torch.sigmoid(out_gate))
         update = update * torch.sigmoid(cond_gate)
-        x = x + self.dropout(update)
+        x = x + self.row_dropout(self.dropout(update))
 
         x = x + self.ffn(x) * x_mask[..., None]
 
@@ -609,6 +615,7 @@ class ConditionedTransformerPairBias(nn.Module):
                  no_heads,
                  n_layers,
                  dropout=0.1,
+                 row_dropout=0.0,
     ):
         super().__init__()
         self.layers = nn.ModuleList(
@@ -619,6 +626,7 @@ class ConditionedTransformerPairBias(nn.Module):
                     c_z,
                     no_heads=no_heads,
                     dropout=dropout,
+                    row_dropout=row_dropout,
                 )
                 for _ in range(n_layers)
             ]

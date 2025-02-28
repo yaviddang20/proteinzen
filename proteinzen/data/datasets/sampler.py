@@ -110,6 +110,7 @@ class ClusteredBatchSampler:
                  num_replicas=1,
                  rank=0,
                  seed=0,
+                 afdb_frac=0.75
                  ):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -118,6 +119,7 @@ class ClusteredBatchSampler:
         self.clusters = self.dataset.csv.cluster.unique()
         self.dataset.csv['iloc'] = list(range(len(dataset.csv)))
         self.batch_by_edge_fn = batch_by_edge_fn
+        self.afdb_frac = afdb_frac
 
         self.num_replicas = num_replicas
         self.rank = rank
@@ -140,8 +142,15 @@ class ClusteredBatchSampler:
             if df['is_af2_struct'].any():
                 real_clusters = df[~df['is_af2_struct']].cluster.unique()
                 af_clusters = df[df['is_af2_struct']].cluster.unique()
-                # sample at least 25% real data
-                num_af_clusters = min(len(real_clusters)*3, len(af_clusters))
+                # # sample at least 25% real data
+                # num_af_clusters = min(len(real_clusters)*3, len(af_clusters))
+
+                # subsample number of afdb samples per epoch
+                num_af_clusters = min(
+                    int(len(real_clusters) * (self.afdb_frac / (1 - self.afdb_frac))),
+                    len(af_clusters)
+                )
+
                 subsample_af_clusters = g.choice(af_clusters, size=num_af_clusters, replace=False)
                 clusters = np.concatenate([real_clusters, subsample_af_clusters])
             else:
@@ -344,6 +353,7 @@ class ClusteredLengthBatchSampler:
                  num_replicas=1,
                  rank=0,
                  seed=0,
+                 afdb_frac=0.75
                  ):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -355,6 +365,7 @@ class ClusteredLengthBatchSampler:
         if max_num_per_batch is None:
             max_num_per_batch = batch_size
         self.max_num_per_batch = max_num_per_batch
+        self.afdb_frac = afdb_frac
 
         self.num_replicas = num_replicas
         self.rank = rank
@@ -376,8 +387,11 @@ class ClusteredLengthBatchSampler:
         if df['is_af2_struct'].any():
             real_clusters = df[~df['is_af2_struct']].cluster.unique()
             af_clusters = df[df['is_af2_struct']].cluster.unique()
-            # sample at least 25% real data
-            num_af_clusters = min(len(real_clusters)*3, len(af_clusters))
+            # subsample number of afdb samples per epoch
+            num_af_clusters = min(
+                int(len(real_clusters) * (self.afdb_frac / (1 - self.afdb_frac))),
+                len(af_clusters)
+            )
             subsample_af_clusters = g.choice(af_clusters, size=num_af_clusters, replace=False)
             clusters = np.concatenate([real_clusters, subsample_af_clusters])
         else:

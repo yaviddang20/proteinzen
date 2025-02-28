@@ -1380,3 +1380,195 @@ def generate_dlog_igso3_lookup_table(
         tol=tol,
     )
     return dlog_igso
+
+### From QFlow / ReQFlow
+# quaternion utilities
+def quaternion_conjugate(q):
+    """
+    Compute the conjugate of a quaternion.
+
+    Args:
+    - q: [N, 4], (w, x, y, z), the input quaternion.
+
+    Returns:
+    - q_conj: [N, 4], the conjugate of the input quaternion.
+    """
+    q_conj = q.clone()
+    q_conj[:, 1:] = -q_conj[:, 1:]
+    return q_conj
+
+def quaternion_conjugate_batch(q):
+    """
+    Conjugate for shape [..., 4].
+    """
+    qc = q.clone()
+    qc[..., 1:] = -qc[..., 1:]
+    return qc
+
+def quaternion_mul(q1, q2):
+    """
+    Multiply two quaternions.
+
+    Args:
+    - q1: [N, 4], (w, x, y, z), the first quaternion.
+    - q2: [N, 4], (w, x, y, z), the second quaternion.
+
+    Returns:
+    - q_mult: [N, 4], the product of q1 and q2.
+    """
+    w1, x1, y1, z1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
+    w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
+
+    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+
+    q_mult = torch.stack([w, x, y, z], dim=1)
+    return q_mult
+
+def quaternion_mul_batch(q1, q2):
+    """
+    Multiply two batches of quaternions.
+
+    Args:
+    - q1: [B, N, 4], (w, x, y, z), the first batch of quaternions.
+    - q2: [B, N, 4], (w, x, y, z), the second batch of quaternions.
+
+    Returns:
+    - q_mult: [B, N, 4], the product of q1 and q2.
+    """
+    # Extract individual components
+    w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
+    w2, x2, y2, z2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
+
+    # Compute the product
+    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+
+    # Stack the results
+    q_mult = torch.stack([w, x, y, z], dim=-1)
+    return q_mult
+
+def ensure_shortest_path(qA, qB):
+    """
+    Ensure qA->qB slerp uses the shortest path by flipping qB if dot(qA, qB)<0.
+
+    Args:
+      qA: [N, 4] (or any batch shape [...,4])
+      qB: [N, 4] (or same batch shape [...,4])
+
+    Returns:
+      qB_fixed: [N,4], possibly flipped so dot(qA, qB_fixed) >= 0
+    """
+    # Remove keepdim=True here
+    cos_theta = torch.sum(qA * qB, dim=-1)  # shape [N]
+    mask = cos_theta < 0  # shape [N]
+
+    qB_fixed = qB.clone()
+    qB_fixed[mask] = -qB_fixed[mask]  # now works because mask is [N]
+    return qB_fixed
+
+def quaternion_slerp_exp(t: torch.Tensor, q1: torch.Tensor, q0: torch.Tensor):
+    """
+    Compute the SLERP angular velocity field wt and the corresponding interpolated quaternion qt
+    for the given quaternions q0 and q1 using exponential and logarithmic mapping in batch.
+
+    Args:
+    - q0: [B, N, 4], (w, x, y, z), the start quaternion.
+    - q1: [B, N, 4], (w, x, y, z), the end quaternion.
+    - t: [B, N], the interpolation parameter for each element.
+
+    Returns:
+    - qt: [B, N, 4], (w, x, y, z), the interpolated quaternion at the corresponding time t.
+    """
+    # Ensure the input quaternions are unit quaternions.
+    q0 = q0 / q0.norm(dim=-1, keepdim=True)
+    q1 = q1 / q1.norm(dim=-1, keepdim=True)
+
+    # Compute the dot product to obtain cos(theta).
+    cos_theta = torch.sum(q0 * q1, dim=-1)  # Shape: [B, N]
+
+    # Check for cos_theta < 0 and adjust the quaternions to select the shortest path.
+    mask = cos_theta < 0
+    q1_adjusted = q1.clone()
+    q1_adjusted[mask] = -q1_adjusted[mask]
+
+    # Compute the relative quaternion q_rel = q0^(-1) * q1_adjusted.
+    q0_conj = quaternion_conjugate_batch(q0)  # Shape: [B, N, 4]
+    q_rel = quaternion_mul_batch(q0_conj, q1_adjusted)  # Shape: [B, N, 4]
+
+    # Compute the logarithm of the relative quaternion.
+    epsilon = 1e-6
+    q_rel_w = torch.clamp(q_rel[..., 0], -1.0 + epsilon, 1.0 - epsilon)  # Shape: [B, N]
+    phi = 2 * torch.acos(q_rel_w)  # Shape: [B, N]
+    sin_phi_over_2 = torch.sin(phi / 2)  # Shape: [B, N]
+    sin_phi_over_2_clamped = sin_phi_over_2.clone()
+    sin_phi_over_2_clamped[sin_phi_over_2_clamped.abs() < epsilon] = epsilon  # Shape: [B, N]
+
+    # Compute the rotation axis u.
+    u = q_rel[..., 1:] / sin_phi_over_2_clamped.unsqueeze(-1)  # Shape: [B, N, 3]
+
+    # Compute the exponential to get the interpolated quaternion qt.
+    phi_t = t * phi  # Shape: [B, N]
+    sin_phi_t_over_2 = torch.sin(phi_t / 2).unsqueeze(-1)  # Shape: [B, N, 1]
+    sin_phi_t_over_2_clamped = sin_phi_t_over_2.clone()
+    sin_phi_t_over_2_clamped[sin_phi_t_over_2_clamped.abs() < epsilon] = epsilon  # Shape: [B, N, 1]
+    qt_der = torch.cos(phi_t / 2).unsqueeze(-1)  # Shape: [B, N, 1]
+    qt_xyz = sin_phi_t_over_2_clamped * u  # Shape: [B, N, 3]
+    qt_rel = torch.cat([qt_der, qt_xyz], dim=-1)  # Shape: [B, N, 4]
+    qt_rel = qt_rel / qt_rel.norm(dim=-1, keepdim=True)  # Normalize to ensure unit quaternion
+
+    # Compute the interpolated quaternion qt = q0 * qt_rel
+    qt = quaternion_mul_batch(q0, qt_rel)  # Shape: [B, N, 4]
+
+    # Compute angular velocity w.
+    w = u * phi.unsqueeze(-1)  # Shape: [B, N, 3]
+
+    # Ensure the interpolated quaternion is unit.
+    qt = qt / qt.norm(dim=-1, keepdim=True)  # Shape: [B, N, 4]
+
+    return qt
+
+def calc_quat_wt_qt_q1(qt: torch.Tensor, q1: torch.Tensor, epsilon: float = 1e-6) -> torch.Tensor:
+    """
+    Calculate the rotation change vector wt given the current quaternion qt and the end quaternion q1.
+
+    Args:
+        qt (torch.Tensor): the current quaternion, shape [B, N, 4], in [w, x, y, z] format.
+        q1 (torch.Tensor): the end quaternion, shape [B, N, 4], in [w, x, y, z] format.
+        epsilon (float, optional): Small value for numerical stability. Defaults to 1e-6.
+
+    Returns:
+        torch.Tensor: Rotation change vectors, shape [B, N, 3].
+    """
+    # Normalize the input quaternions to ensure they are unit quaternions
+    qt = qt / qt.norm(dim=-1, keepdim=True)
+    q1 = q1 / q1.norm(dim=-1, keepdim=True)
+
+    # Ensure the interpolation takes the shortest path
+    q1 = ensure_shortest_path(qt, q1)  # Shape: [B, N, 4]
+
+    # Compute the relative quaternion: q_rel = qt^{-1} * q1
+    q_rel = quaternion_mul_batch(quaternion_conjugate_batch(qt), q1)  # Shape: [B, N, 4]
+
+    # Extract the scalar part of the relative quaternion and compute the rotation angle phi_t
+    q_rel_w = torch.clamp(q_rel[..., 0], -1.0 + epsilon, 1.0 - epsilon)  # Shape: [B, N]
+    phi_t = 2 * torch.acos(q_rel_w)  # Shape: [B, N]
+
+    # Compute sin(phi_t / 2) and clamp for numerical stability
+    sin_phi_t_over_2 = torch.sin(phi_t / 2)  # Shape: [B, N]
+    sin_phi_t_over_2_clamped = sin_phi_t_over_2.clamp(min=epsilon)  # Shape: [B, N]
+
+    # Expand dimensions to match for broadcasting
+    sin_phi_t_over_2_clamped = sin_phi_t_over_2_clamped[..., None]  # Shape: [B, N, 1]
+
+    # Compute the rotation axis u by normalizing the vector part of q_rel
+    u = q_rel[..., 1:] / sin_phi_t_over_2_clamped  # Shape: [B, N, 3]
+
+    # Compute the rotation change vector wt = u * phi_t
+    wt = u * phi_t[..., None]  # Shape: [B, N, 3]
+
+    return wt

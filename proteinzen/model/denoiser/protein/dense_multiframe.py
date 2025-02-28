@@ -8,7 +8,7 @@ import copy
 import functools as fn
 
 from proteinzen.model.modules.layers.node.attention import FlashTransformerEncoder, ConditionedTransformerPairBias, TransformerPairBias
-from proteinzen.model.modules.openfold.layers import InvariantPointAttention, MemoryEfficientInvariantPointAttention
+from proteinzen.model.modules.openfold.layers import InvariantPointAttention, MemoryEfficientInvariantPointAttention, Dropout
 from proteinzen.model.modules.openfold.layers_v2 import Linear, ConditionedInvariantPointAttention, ConditionedTransition, BackboneUpdate, TorsionAngles, Transition, LayerNorm, AdaLN
 import proteinzen.utils.openfold.rigid_utils as ru
 from proteinzen.utils.openfold.rigid_utils import Rigid, batchwise_center
@@ -24,6 +24,7 @@ from ._frame_transformer import (
     get_indexing_matrix, single_to_keys, single_to_weighted_keys, pairs_to_framepairs,
     KnnFrameTransformerUpdate, KnnInvariantPointAttention
 )
+from ._frame_memory import FrameMemory, FrameMemoryRetrieval
 from ._v5_helper import BroadcastZInvariantPointAttention
 
 def get_index_embedding(indices, embed_size, max_len=2056):
@@ -528,7 +529,12 @@ class IpaScore(nn.Module):
                  use_ipa_gating=False,
                  time_condition_ipa=False,
                  ablate_ipa_down_z=False,
+                 ipa_row_dropout_r=0.,
+                 tfmr_row_dropout_r=0.,
                  no_time_condition=False,
+                 use_frame_memory=False,
+                 cg_version=2,
+                 ablate_res_ipa=False
                  ):
         super().__init__()
         # self.diffuser = diffuser
@@ -544,6 +550,8 @@ class IpaScore(nn.Module):
         self.use_conditioned_rigid_transformer = rigid_transformer_use_conditioned
         self.time_condition_ipa = time_condition_ipa
         self.no_time_condition = no_time_condition
+        self.use_frame_memory = use_frame_memory
+        self.ablate_res_ipa = ablate_res_ipa
         self.k = k
 
         self.scale_pos = lambda x: x * coordinate_scaling
@@ -559,34 +567,47 @@ class IpaScore(nn.Module):
 
         self.time_embed = GaussianRandomFourierBasis(n_basis=128, c_out=c_s)
 
+        if self.use_frame_memory:
+            self.frame_memory = FrameMemory(c_frame, cg_version=cg_version)
+
+
         for b in range(num_blocks):
-            if self.time_condition_ipa:
-                self.trunk[f'ipa_{b}'] = ConditionedInvariantPointAttention(
-                    c_s=c_s,
-                    c_cond=c_s,
-                    c_z=c_z,
-                    c_hidden=c_hidden,
-                    num_heads=num_heads,
-                    num_qk_points=num_qk_points,
-                    num_v_points=num_v_points,
+            if use_frame_memory:
+                self.trunk[f'mem_retrieval_{b}'] = FrameMemoryRetrieval(
+                    c_frame,
+                    num_heads=4
                 )
 
-            else:
-                self.trunk[f'ipa_{b}'] = InvariantPointAttention(
-                    c_s=c_s,
-                    c_z=c_z,
-                    c_hidden=c_hidden,
-                    num_heads=num_heads,
-                    num_qk_points=num_qk_points,
-                    num_v_points=num_v_points,
-                    pre_ln=True,
-                    lin_bias=False,
-                    use_fused_kernel=use_fused_ipa_kernel,
-                    use_out_gating=use_ipa_gating,
-                    ablate_down_z=ablate_ipa_down_z
-                )
-            if compile_ipa:
-                self.trunk[f'ipa_{b}'].compile()
+            if not ablate_res_ipa:
+                if self.time_condition_ipa:
+                    self.trunk[f'ipa_{b}'] = ConditionedInvariantPointAttention(
+                        c_s=c_s,
+                        c_cond=c_s,
+                        c_z=c_z,
+                        c_hidden=c_hidden,
+                        num_heads=num_heads,
+                        num_qk_points=num_qk_points,
+                        num_v_points=num_v_points,
+                    )
+
+                else:
+                    self.trunk[f'ipa_{b}'] = InvariantPointAttention(
+                        c_s=c_s,
+                        c_z=c_z,
+                        c_hidden=c_hidden,
+                        num_heads=num_heads,
+                        num_qk_points=num_qk_points,
+                        num_v_points=num_v_points,
+                        pre_ln=True,
+                        lin_bias=False,
+                        use_fused_kernel=use_fused_ipa_kernel,
+                        use_out_gating=use_ipa_gating,
+                        ablate_down_z=ablate_ipa_down_z
+                    )
+                if compile_ipa:
+                    self.trunk[f'ipa_{b}'].compile()
+
+                self.trunk[f'ipa_row_dropout_{b}'] = Dropout(ipa_row_dropout_r, -2)
 
             if self.use_knn:
                 self.trunk[f'knn_ipa_{b}'] = KnnInvariantPointAttention(
@@ -614,7 +635,8 @@ class IpaScore(nn.Module):
                         c_s=c_s,
                         c_z=c_z,
                         no_heads=4,
-                        n_layers=2
+                        n_layers=2,
+                        row_dropout=tfmr_row_dropout_r,
                     )
                 else:
                     self.trunk[f'tfmr_{b}'] = ConditionedTransformerPairBias(
@@ -622,7 +644,8 @@ class IpaScore(nn.Module):
                         c_cond=c_s,
                         c_z=c_z,
                         no_heads=4,
-                        n_layers=2
+                        n_layers=2,
+                        row_dropout=tfmr_row_dropout_r,
                     )
             else:
                 tfmr_layer = torch.nn.TransformerEncoderLayer(
@@ -706,6 +729,8 @@ class IpaScore(nn.Module):
                 )
 
         self.torsion_pred = TorsionAngles(c_s, 1)
+        if not self.use_traj_predictions:
+            self.seq_pred = SeqPredictor(c_frame)
 
     @torch.no_grad()
     def _construct_knn_graph(self, rigids):
@@ -755,22 +780,37 @@ class IpaScore(nn.Module):
             for b in range(self.num_blocks)
         }
 
+        if self.use_frame_memory:
+            frame_memory, memory_mask = self.frame_memory()
+        else:
+            frame_memory, memory_mask = None, None
+
         framepair_embed = input_feats['framepair_embed']
         for b in range(self.num_blocks):
-            if self.time_condition_ipa:
-                ipa_embed = self.trunk[f'ipa_{b}'](
-                    s=node_embed,
-                    cond=time_embed,
-                    z=edge_embed,
-                    r=curr_rigids[..., 0],
-                    mask=node_mask)
-            else:
-                ipa_embed = self.trunk[f'ipa_{b}'](
-                    s=node_embed,
-                    z=edge_embed,
-                    r=curr_rigids[..., 0],
-                    mask=node_mask)
-            node_embed = (node_embed + ipa_embed) * node_mask[..., None]
+
+            if self.use_frame_memory:
+                rigids_embed = self.trunk[f'mem_retrieval_{b}'](
+                    rigids_embed,
+                    frame_memory,
+                    node_mask[..., None].expand(-1, -1, rigids_embed.shape[-2]),
+                    memory_mask
+                )
+
+            if not self.ablate_res_ipa:
+                if self.time_condition_ipa:
+                    ipa_embed = self.trunk[f'ipa_{b}'](
+                        s=node_embed,
+                        cond=time_embed,
+                        z=edge_embed,
+                        r=curr_rigids[..., 0],
+                        mask=node_mask)
+                else:
+                    ipa_embed = self.trunk[f'ipa_{b}'](
+                        s=node_embed,
+                        z=edge_embed,
+                        r=curr_rigids[..., 0],
+                        mask=node_mask)
+                node_embed = (node_embed + ipa_embed) * node_mask[..., None]
 
             if self.use_knn:
                 edge_index = self._construct_knn_graph(curr_rigids)
@@ -860,13 +900,20 @@ class IpaScore(nn.Module):
                 if self.traj_seqpair_predictor:
                     traj_data[b]['seqpair_logits'] = self.trunk[f'seqpair_pred_{b}'](edge_embed)
 
+        if self.use_traj_predictions:
+            seq_logits = self.trunk[f"seq_pred_{self.num_blocks-1}"](rigids_embed)
+        else:
+            seq_logits = self.seq_pred(rigids_embed)
+
+
         curr_rigids = self.unscale_rigids(curr_rigids)
         _, psi_pred = self.torsion_pred(node_embed)
         model_out = {
             'psi': psi_pred,
             'final_rigids': curr_rigids,
             'node_embed': node_embed,
-            'traj_data': traj_data
+            'traj_data': traj_data,
+            'seq_logits': seq_logits
         }
         return model_out
 
@@ -2596,9 +2643,13 @@ class IpaMultiRigidDenoiser(nn.Module):
                  v1_use_conditioned_rigid_transformer=False,
                  v1_time_condition_ipa=False,
                  v1_no_time_condition=False,
+                 v1_use_frame_memory=False,
+                 v1_ablate_res_ipa=False,
                  v7_propagate_rigids=False,
                  use_ipa_gating=False,
                  ablate_ipa_down_z=False,
+                 ipa_row_dropout_r=0.,
+                 tfmr_row_dropout_r=0.,
                  cg_version=2
                  ):
         super().__init__()
@@ -2807,7 +2858,12 @@ class IpaMultiRigidDenoiser(nn.Module):
                 use_ipa_gating=use_ipa_gating,
                 ablate_ipa_down_z=ablate_ipa_down_z,
                 time_condition_ipa=v1_time_condition_ipa,
-                no_time_condition=v1_no_time_condition
+                ipa_row_dropout_r=ipa_row_dropout_r,
+                tfmr_row_dropout_r=tfmr_row_dropout_r,
+                no_time_condition=v1_no_time_condition,
+                use_frame_memory=v1_use_frame_memory,
+                ablate_res_ipa=v1_ablate_res_ipa,
+                cg_version=cg_version
             )
 
         self.use_embedder_v2 = use_embedder_v2
@@ -2850,6 +2906,7 @@ class IpaMultiRigidDenoiser(nn.Module):
         self.rot_preconditioning = rot_preconditioning
         self.rot_capping = rot_capping
         self.cg_version = cg_version
+        self.use_traj_predictions = use_traj_predictions
 
     def forward(self, data, self_condition=None):
         res_data = data['residue']
@@ -2954,10 +3011,11 @@ class IpaMultiRigidDenoiser(nn.Module):
                 lambda x: (x - rigids_in.get_trans()) * data['trans_c_out'][..., None, None, None] + rigids_t.get_trans() * data['trans_c_skip'][..., None, None, None]
             )
             for traj_b in traj_data.values():
-                traj_b_rigids = traj_b['rigids']
-                traj_b['rigids'] = traj_b_rigids.apply_trans_fn(
-                    lambda x: (x - rigids_in.get_trans()) * data['trans_c_out'][..., None, None, None] + rigids_t.get_trans() * data['trans_c_skip'][..., None, None, None]
-                )
+                if 'rigids' in traj_b:
+                    traj_b_rigids = traj_b['rigids']
+                    traj_b['rigids'] = traj_b_rigids.apply_trans_fn(
+                        lambda x: (x - rigids_in.get_trans()) * data['trans_c_out'][..., None, None, None] + rigids_t.get_trans() * data['trans_c_skip'][..., None, None, None]
+                    )
                 if 'bb_rigids' in traj_b:
                     traj_b_bb_rigids = traj_b['bb_rigids']
                     traj_b['bb_rigids'] = traj_b_bb_rigids.apply_trans_fn(
@@ -2986,11 +3044,12 @@ class IpaMultiRigidDenoiser(nn.Module):
                 trans=rigids_out.get_trans()
             )
             for traj_b in traj_data.values():
-                traj_b_rigids = traj_b['rigids']
-                traj_b['rigids'] = Rigid(
-                    rots=scale_rot(rots_in, traj_b_rigids.get_rots()),
-                    trans=traj_b_rigids.get_trans()
-                )
+                if 'rigids' in traj_b:
+                    traj_b_rigids = traj_b['rigids']
+                    traj_b['rigids'] = Rigid(
+                        rots=scale_rot(rots_in, traj_b_rigids.get_rots()),
+                        trans=traj_b_rigids.get_trans()
+                    )
                 if 'bb_rigids' in traj_b:
                     traj_b_bb_rigids = traj_b['bb_rigids']
                     traj_b['bb_rigids'] = Rigid(
@@ -3018,7 +3077,10 @@ class IpaMultiRigidDenoiser(nn.Module):
             )
 
         rigids_out = rigids_out.translate(center[..., None, None, :])
-        seq_logits = traj_data[max(traj_data.keys())]['seq_logits']
+        if self.use_traj_predictions:
+            seq_logits = traj_data[max(traj_data.keys())]['seq_logits']
+        else:
+            seq_logits = score_dict['seq_logits']
 
         if n_padding > 0:
             rigids_out = rigids_out[:, :-n_padding]

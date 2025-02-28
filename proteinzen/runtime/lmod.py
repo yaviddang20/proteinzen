@@ -699,6 +699,8 @@ class ProteinModule(L.LightningModule):
                  finetune_seq_head=False,
                  use_amp=False,
                  use_cosine_lr_sched=False,
+                 cosine_warmup_steps=0,
+                 cosine_total_steps=1e6,
                  use_ema=False,
                  ema_decay=0.999,
                  use_posthoc_ema=False,
@@ -710,6 +712,8 @@ class ProteinModule(L.LightningModule):
         self.val_dir = val_dir
         self.use_amp = use_amp
         self.use_cosine_lr_sched = use_cosine_lr_sched
+        self.cosine_warmup_steps = cosine_warmup_steps
+        self.cosine_total_steps = cosine_total_steps
         self.finetune_seq_head = finetune_seq_head
         self.use_ema = use_ema
         self.use_posthoc_ema = use_posthoc_ema
@@ -1048,8 +1052,8 @@ class ProteinModule(L.LightningModule):
             if self.use_cosine_lr_sched:
                 scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
                     optimizer,
-                    num_warmup_steps=0,
-                    num_training_steps=int(1e6),
+                    num_warmup_steps=self.cosine_warmup_steps,
+                    num_training_steps=int(self.cosine_total_steps),
                     num_cycles=1
                 )
                 return {

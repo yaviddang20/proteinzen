@@ -24,6 +24,8 @@ def multiframe_fm_loss(
     rot_preconditioning=False,
     use_fafe=False,
     use_fafe_l2=False,
+    square_fafe_l2=False,
+    square_fafe_scale=True,
     polar_upweight=False,
     sidechain_upweight=False,
     rot_exp_weighting=False,
@@ -128,12 +130,13 @@ def multiframe_fm_loss(
         rot_vf_loss = rot_vf_loss * seqwise_weight
         rot_vf_loss = _nodewise_to_graphwise(rot_vf_loss, res_data.batch, total_mask)
         rot_vf_loss = rot_vf_loss / ((norm_scale ** 2) if not disable_rot_vf_time_scaling else 1)
-        unscaled_rot_vf_loss = _nodewise_to_graphwise(unscaled_rot_vf_loss, res_data.batch, total_mask)
-        unscaled_rot_vf_loss = unscaled_rot_vf_loss / (norm_scale ** 2)
-        for i in range(19):
-            _unscaled_rot_vf_loss = _nodewise_to_graphwise(unscaled_rot_vf_loss, res_data.batch, total_mask * (res_data['seq'] == i)[..., None])
-            _unscaled_rot_vf_loss = _unscaled_rot_vf_loss / (norm_scale ** 2)
-            seqwise_loss[f"zzz_unscaled_rot_vf_loss_{restypes[i]}"] = _unscaled_rot_vf_loss
+        with torch.no_grad():
+            for i in range(19):
+                _unscaled_rot_vf_loss = _nodewise_to_graphwise(unscaled_rot_vf_loss, res_data.batch, total_mask * (res_data['seq'] == i)[..., None])
+                _unscaled_rot_vf_loss = _unscaled_rot_vf_loss / (norm_scale ** 2)
+                seqwise_loss[f"zzz_unscaled_rot_vf_loss_{restypes[i]}"] = _unscaled_rot_vf_loss
+            unscaled_rot_vf_loss = _nodewise_to_graphwise(unscaled_rot_vf_loss, res_data.batch, total_mask)
+            unscaled_rot_vf_loss = unscaled_rot_vf_loss / (norm_scale ** 2)
 
     if rot_exp_weighting:
         rot_vf_loss = 10 * rot_vf_loss * (norm_scale ** 2)
@@ -209,18 +212,232 @@ def multiframe_fm_loss(
                 frame_mask=res_mask.view(batch_size, -1).repeat_interleave(denoised_frames.shape[-1], dim=-1),
                 framepair_weight=framepair_weight
             )
-            scaled_fafe = fafe / norm_scale
+            if square_fafe_l2:
+                fafe = fafe ** 2
+            # scaled_fafe = fafe / norm_scale
         else:
             fafe = fafe_loss(
                 pred_frames=denoised_frames.view(batch_size, -1),
                 gt_frames=gt_frames.view(batch_size, -1),
                 frame_mask=res_mask.view(batch_size, -1).repeat_interleave(denoised_frames.shape[-1], dim=-1),
             )
-            scaled_fafe = fafe / norm_scale
+            # scaled_fafe = fafe / norm_scale
     else:
         fafe = torch.zeros(batch_size, device=res_mask.device)
 
-    scaled_fafe = fafe / (norm_scale ** 2)
+    if square_fafe_scale:
+        scaled_fafe = fafe / (norm_scale ** 2)
+    else:
+        scaled_fafe = fafe / norm_scale
+
+    ret = {
+        "rot_vf_loss": rot_vf_loss,
+        "trans_vf_loss": trans_vf_loss,
+        "unscaled_rot_vf_loss": unscaled_rot_vf_loss,
+        "unscaled_trans_vf_loss": unscaled_trans_vf_loss,
+        "pred_trans_mse": pred_frame_trans_mse,
+        "pred_bb_mse": backbone_mse,
+        "scaled_pred_bb_mse": scaled_backbone_mse,
+        "ref_trans_mse": ref_frame_trans_mse,
+        "dist_mat_loss": dist_mat_loss,
+        "scaled_dist_mat_loss": scaled_dist_mat_loss,
+        "fafe": fafe,
+        "scaled_fafe": scaled_fafe
+    }
+    ret.update(seqwise_loss)
+    return ret
+
+
+def multiframe_quat_fm_loss(
+    batch,
+    denoiser_outputs,
+    t_norm_clip=0.9,
+    sep_rot_loss=True,
+    local_atomic_dist_r=6,
+    square_aux_loss_time_factor=False,
+    trans_preconditioning=False,
+    rot_preconditioning=False,
+    use_fafe=False,
+    use_fafe_l2=False,
+    square_fafe_l2=False,
+    square_fafe_scale=True,
+    polar_upweight=False,
+    sidechain_upweight=False,
+    rot_exp_weighting=False,
+    rot_vf_angle_loss_weight=0.5,
+    ignore_rigid_2_vf_loss=False,
+    disable_rot_vf_time_scaling=False,
+    rot_cap_loss_weight=0.
+):
+    res_data = batch['residue']
+    res_mask = res_data['res_mask']
+    noising_mask = res_data['res_noising_mask']
+    mask = res_mask & noising_mask
+    res_batch = res_data.batch
+    device = res_mask.device
+    total_mask = res_mask & noising_mask
+
+    if isinstance(res_data['rigids_t'], torch.Tensor):
+        noised_frames = ru.Rigid.from_tensor_7(res_data['rigids_t'].to(device))
+    else:
+        noised_frames = res_data['rigids_t']
+        dtype = noised_frames._trans.dtype
+        noised_frames = ru.Rigid(
+            rots=noised_frames._rots.to(device=device, dtype=dtype),
+            trans=noised_frames._trans.to(device)
+        )
+    total_mask = total_mask[..., None].expand([-1, noised_frames.shape[-1]])
+    if ignore_rigid_2_vf_loss:
+        total_mask = total_mask.contiguous()
+        total_mask[..., -1] = False
+
+    denoised_frames = denoiser_outputs['final_rigids']
+    gt_frames = ru.Rigid.from_tensor_7(res_data['rigids_1'].to(device))
+
+    gt_frame_trans = gt_frames.get_trans()
+    pred_frame_trans = denoised_frames.get_trans()
+    ref_frame_trans = noised_frames.get_trans()
+    pred_frame_trans_se = torch.square(gt_frame_trans - pred_frame_trans).sum(dim=-1)
+    pred_frame_trans_mse = _nodewise_to_graphwise(pred_frame_trans_se, res_batch, total_mask)
+    ref_frame_trans_se = torch.square(gt_frame_trans - ref_frame_trans).sum(dim=-1)
+    ref_frame_trans_mse = _nodewise_to_graphwise(ref_frame_trans_se, res_batch, total_mask)
+
+    bb = res_data['atom37'][:, (0, 1, 2, 4, 3)]
+    bb_mask = res_data['atom37_mask'][:, (0, 1, 2, 4, 3)].bool()
+    denoised_bb = denoiser_outputs['denoised_bb']
+    backbone_mse = torch.square(denoised_bb - bb).sum(dim=-1)
+    backbone_mse = _nodewise_to_graphwise(backbone_mse, res_batch, bb_mask & mask[..., None])
+
+    t = batch['t']
+    batch_size = t.shape[0]
+    norm_scale = 1 - torch.min(
+        t, torch.as_tensor(t_norm_clip)
+    )
+    t = batchwise_to_nodewise(t, res_data.batch)
+    nodewise_norm_scale = 1 - torch.min(
+        t, torch.as_tensor(t_norm_clip)
+    )
+    rotquats_t = noised_frames.get_rots().get_quats()
+    rotquats_1_pred = denoised_frames.get_rots().get_quats()
+    rotquats_1 = gt_frames.get_rots().get_quats()
+    pred_rots_quat_vf = so3_fm_utils.calc_quat_wt_qt_q1(
+            rotquats_t, rotquats_1_pred)
+    gt_rots_quat_vf = so3_fm_utils.calc_quat_wt_qt_q1(
+            rotquats_t, rotquats_1)
+
+    seqwise_weight = 1
+    if polar_upweight:
+        seqwise_weight = seqwise_weight * (res_data["polar_mask"].float() + 1)[..., None]
+    if sidechain_upweight:
+        sidechain_weight = torch.tensor([1] + [2 for _ in range(noised_frames.shape[-1]-1)], device=t.device)
+        seqwise_weight = seqwise_weight * sidechain_weight[None]
+
+    seqwise_loss = {}
+
+    rot_vf_loss = torch.square(pred_rots_quat_vf - gt_rots_quat_vf).sum(dim=-1)
+    unscaled_rot_vf_loss = rot_vf_loss
+    rot_vf_loss = rot_vf_loss * seqwise_weight
+    rot_vf_loss = _nodewise_to_graphwise(rot_vf_loss, res_data.batch, total_mask)
+    rot_vf_loss = rot_vf_loss / ((norm_scale ** 2) if not disable_rot_vf_time_scaling else 1)
+    with torch.no_grad():
+        for i in range(19):
+            _unscaled_rot_vf_loss = _nodewise_to_graphwise(unscaled_rot_vf_loss, res_data.batch, total_mask * (res_data['seq'] == i)[..., None])
+            _unscaled_rot_vf_loss = _unscaled_rot_vf_loss / (norm_scale ** 2)
+            seqwise_loss[f"zzz_unscaled_rot_vf_loss_{restypes[i]}"] = _unscaled_rot_vf_loss
+        unscaled_rot_vf_loss = _nodewise_to_graphwise(unscaled_rot_vf_loss, res_data.batch, total_mask)
+        unscaled_rot_vf_loss = unscaled_rot_vf_loss / (norm_scale ** 2)
+
+    if rot_exp_weighting:
+        rot_vf_loss = 10 * rot_vf_loss * (norm_scale ** 2)
+
+    trans_1_pred = denoised_frames.get_trans()
+    trans_1 = gt_frames.get_trans()
+    if trans_preconditioning:
+        trans_vf_loss = torch.square(trans_1_pred - trans_1).sum(dim=-1) / (nodewise_norm_scale[..., None] ** 2)
+        unscaled_trans_vf_loss = trans_vf_loss * 0.01
+        trans_vf_loss = trans_vf_loss * seqwise_weight
+        trans_vf_loss = _nodewise_to_graphwise(trans_vf_loss, res_data.batch, total_mask) * batch['trans_loss_weighting']
+
+        with torch.no_grad():
+            for i in range(19):
+                seqwise_loss[f"zzz_unscaled_trans_vf_loss_{restypes[i]}"] = _nodewise_to_graphwise(
+                    unscaled_trans_vf_loss, res_data.batch, total_mask * (res_data['seq'] == i)[..., None])
+
+        unscaled_trans_vf_loss = _nodewise_to_graphwise(unscaled_trans_vf_loss, res_data.batch, total_mask)
+    else:
+        trans_vf_loss = torch.square(trans_1_pred - trans_1).sum(dim=-1) / (nodewise_norm_scale[..., None] ** 2)
+        unscaled_trans_vf_loss = trans_vf_loss
+        trans_vf_loss = trans_vf_loss * seqwise_weight
+        trans_vf_loss = _nodewise_to_graphwise(trans_vf_loss, res_data.batch, total_mask)
+        trans_vf_loss *= 0.01  # Angstroms to nm
+
+        with torch.no_grad():
+            for i in range(19):
+                seqwise_loss[f"zzz_unscaled_trans_vf_loss_{restypes[i]}"] = _nodewise_to_graphwise(
+                    unscaled_trans_vf_loss, res_data.batch, total_mask * (res_data['seq'] == i)[..., None]) * 0.01
+
+        unscaled_trans_vf_loss = _nodewise_to_graphwise(unscaled_trans_vf_loss, res_data.batch, total_mask)
+        unscaled_trans_vf_loss *= 0.01  # Angstroms to nm
+
+    dist_mat_loss = framediff_local_atomic_context_loss(
+        denoised_bb,
+        bb,
+        res_batch,
+        res_mask,
+        r=local_atomic_dist_r
+    )
+
+    if square_aux_loss_time_factor:
+        scaled_dist_mat_loss = dist_mat_loss / (norm_scale ** 2) * 0.01
+        scaled_backbone_mse = backbone_mse / (norm_scale ** 2) * 0.01
+    else:
+        # this seems to work well
+        scaled_dist_mat_loss = dist_mat_loss / norm_scale * 0.01
+        scaled_backbone_mse = backbone_mse / norm_scale * 0.01
+
+    if use_fafe:
+        seqwise_weight = 1
+        if polar_upweight:
+            polar_mask = res_data['polar_mask'].float().view(batch_size, -1)
+            seqwise_weight = seqwise_weight * (polar_mask+1)[..., None].expand(-1, -1, gt_frames.shape[-1])
+        if sidechain_upweight:
+            polar_mask = res_data['polar_mask'].float().view(batch_size, -1)
+            sidechain_weight = torch.ones(gt_frames.shape[-1], device=device)
+            sidechain_weight[1:] += 1
+            sidechain_weight = sidechain_weight[None, None].expand(*polar_mask.shape[:2], -1)
+            seqwise_weight = seqwise_weight * sidechain_weight
+
+
+        if isinstance(seqwise_weight, torch.Tensor):
+            seqwise_weight = seqwise_weight.view(batch_size, -1)
+            framepair_weight = seqwise_weight[..., None] * seqwise_weight[..., None, :]
+        else:
+            framepair_weight = seqwise_weight
+
+        if use_fafe_l2:
+            fafe = fafe_loss_l2(
+                pred_frames=denoised_frames.view(batch_size, -1),
+                gt_frames=gt_frames.view(batch_size, -1),
+                frame_mask=res_mask.view(batch_size, -1).repeat_interleave(denoised_frames.shape[-1], dim=-1),
+                framepair_weight=framepair_weight
+            )
+            if square_fafe_l2:
+                fafe = fafe ** 2
+            # scaled_fafe = fafe / norm_scale
+        else:
+            fafe = fafe_loss(
+                pred_frames=denoised_frames.view(batch_size, -1),
+                gt_frames=gt_frames.view(batch_size, -1),
+                frame_mask=res_mask.view(batch_size, -1).repeat_interleave(denoised_frames.shape[-1], dim=-1),
+            )
+            # scaled_fafe = fafe / norm_scale
+    else:
+        fafe = torch.zeros(batch_size, device=res_mask.device)
+
+    if square_fafe_scale:
+        scaled_fafe = fafe / (norm_scale ** 2)
+    else:
+        scaled_fafe = fafe / norm_scale
 
     ret = {
         "rot_vf_loss": rot_vf_loss,

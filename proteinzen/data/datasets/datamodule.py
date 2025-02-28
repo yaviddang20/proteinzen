@@ -123,7 +123,8 @@ class FramediffDataModule(L.LightningDataModule):
                  predict_on_train=False,
                  cache_dir=None,
                  normalize_cache=False,
-                 use_val_split=False
+                 use_val_split=False,
+                 afdb_frac=0.75
                  ):
         super().__init__()
         self.data_dir = data_dir
@@ -135,6 +136,7 @@ class FramediffDataModule(L.LightningDataModule):
         self.batch_by_edge_fn = batch_by_edge_fn
         self.max_num_per_batch = max_num_per_batch
         self.predict_on_train = predict_on_train
+        self.afdb_frac = afdb_frac
 
         self.sample_lengths = sample_lengths
         csv = "filtered_metadata.csv"
@@ -175,7 +177,7 @@ class FramediffDataModule(L.LightningDataModule):
                 max_resolution=max_resolution,
                 use_tmpdir=use_tmpdir,
                 cache_dir=cache_dir,
-                normalize_cache=normalize_cache
+                normalize_cache=normalize_cache,
             )
         self.predict_dataset = LengthDataset(
             self.sample_lengths,
@@ -202,7 +204,8 @@ class FramediffDataModule(L.LightningDataModule):
                     rank=rank,
                     num_replicas=num_replicas,
                     batch_by_edge_fn=self.batch_by_edge_fn,
-                    max_num_per_batch=self.max_num_per_batch
+                    max_num_per_batch=self.max_num_per_batch,
+                    afdb_frac=self.afdb_frac,
                 ),
                 collate_fn=collate_fn,
                 shuffle=False
@@ -235,7 +238,8 @@ class FramediffDataModule(L.LightningDataModule):
                     batch_size=self.batch_size,
                     batch_by_edge_fn=self.batch_by_edge_fn,
                     rank=rank,
-                    num_replicas=num_replicas
+                    num_replicas=num_replicas,
+                    afdb_frac=self.afdb_frac,
                 ),
                 collate_fn=collate_fn,
                 shuffle=False
@@ -278,7 +282,7 @@ class FramediffDataModule(L.LightningDataModule):
                     self.predict_dataset,
                     num_replicas=num_replicas,
                     rank=rank,
-                    shuffle=False,
+                    shuffle=True, #False,
                     seed=0,
                     drop_last=False
                 ),
