@@ -45,6 +45,7 @@ class MultiFrameInterpolation(Task):
                  scale_fafe=False,
                  square_fafe_l2=False,
                  square_fafe_scale=True,
+                 fafe_l2_block_mask_size=1,
                  # fafe_weight=1/18.,#0.25,
                  fafe_weight=0.25,
                  polar_upweight=False,
@@ -70,6 +71,7 @@ class MultiFrameInterpolation(Task):
                  seq_loss_weight=1.0,
                  use_traj_losses=True,
                  polar_residues_v2=False,
+                 downweight_K=False
     ):
         super().__init__()
         self.frame_noiser = protein_noiser
@@ -77,6 +79,7 @@ class MultiFrameInterpolation(Task):
         self.use_fape = use_fape
         self.use_fafe = use_fafe
         self.use_fafe_l2 = use_fafe_l2
+        self.fafe_l2_block_mask_size = fafe_l2_block_mask_size
         self.scale_frame_aligned_errors = scale_frame_aligned_errors
         self.scale_fape = scale_fape
         self.square_fafe_scale = square_fafe_scale
@@ -106,6 +109,7 @@ class MultiFrameInterpolation(Task):
         self.smooth_lddt_weight = smooth_lddt_weight
         self.seq_loss_weight = seq_loss_weight
         self.use_traj_losses = use_traj_losses
+        self.downweight_K = downweight_K
 
         self.rng = np.random.default_rng()
 
@@ -440,7 +444,9 @@ class MultiFrameInterpolation(Task):
             rot_vf_angle_loss_weight=self.rot_vf_angle_loss_weight,
             ignore_rigid_2_vf_loss=self.ignore_rigid_2_vf_loss,
             disable_rot_vf_time_scaling=self.disable_rot_vf_time_scaling,
-            rot_cap_loss_weight=self.rot_cap_loss_weight
+            rot_cap_loss_weight=self.rot_cap_loss_weight,
+            fafe_l2_block_mask_size=self.fafe_l2_block_mask_size,
+            downweight_K=self.downweight_K
         )
 
         frame_vf_loss = (

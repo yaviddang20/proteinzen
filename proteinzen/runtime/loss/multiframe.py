@@ -32,7 +32,9 @@ def multiframe_fm_loss(
     rot_vf_angle_loss_weight=0.5,
     ignore_rigid_2_vf_loss=False,
     disable_rot_vf_time_scaling=False,
-    rot_cap_loss_weight=0.
+    rot_cap_loss_weight=0.,
+    fafe_l2_block_mask_size=1,
+    downweight_K=False
 ):
     res_data = batch['residue']
     res_mask = res_data['res_mask']
@@ -91,6 +93,8 @@ def multiframe_fm_loss(
     seqwise_weight = 1
     if polar_upweight:
         seqwise_weight = seqwise_weight * (res_data["polar_mask"].float() + 1)[..., None]
+        if downweight_K:
+            seqwise_weight[res_data.seq == restypes.index("K")] = 0.5
     if sidechain_upweight:
         sidechain_weight = torch.tensor([1] + [2 for _ in range(noised_frames.shape[-1]-1)], device=t.device)
         seqwise_weight = seqwise_weight * sidechain_weight[None]
@@ -210,7 +214,8 @@ def multiframe_fm_loss(
                 pred_frames=denoised_frames.view(batch_size, -1),
                 gt_frames=gt_frames.view(batch_size, -1),
                 frame_mask=res_mask.view(batch_size, -1).repeat_interleave(denoised_frames.shape[-1], dim=-1),
-                framepair_weight=framepair_weight
+                framepair_weight=framepair_weight,
+                block_diag_size=fafe_l2_block_mask_size
             )
             if square_fafe_l2:
                 fafe = fafe ** 2
@@ -511,6 +516,7 @@ def fafe_loss_l2(
     trans_scale: float = 20.0,
     dist_clamp: float | None = 20.,
     eps_so3: float = 1e-6,
+    block_diag_size=1,
 ):
     def geodesic_dist(rots1, rots2):
         R_diff = torch.einsum("...ij,...jk->...ik", rots1.transpose(-2, -1), rots2)
@@ -526,7 +532,14 @@ def fafe_loss_l2(
     gt_framepairs = gt_frames[..., None].invert().compose(gt_frames[..., None, :])
     pred_framepairs = pred_frames[..., None].invert().compose(pred_frames[..., None, :])
     mask = frame_mask[..., None] * frame_mask[..., None, :]
-    mask = mask * (1 - torch.eye(frame_mask.shape[-1], device=mask.device))[None]
+    # mask diagonal
+    if block_diag_size == 1:
+        mask = mask * (1 - torch.eye(frame_mask.shape[-1], device=mask.device))[None]
+    else:
+        assert mask.shape[-1] % block_diag_size == 0
+        repeats = mask.shape[-1] // block_diag_size
+        block_mask = torch.block_diag(*[torch.ones(block_diag_size, block_diag_size) for _ in range(repeats)])
+        mask = mask * (1 - block_mask.to(mask.device))[None]
 
     trans_dist = torch.linalg.vector_norm(pred_framepairs.get_trans() - gt_framepairs.get_trans(), dim=-1)
     clamp_mask = trans_dist > dist_clamp

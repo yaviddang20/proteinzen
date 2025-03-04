@@ -33,7 +33,7 @@ def center_random_aug(trans, mask, batch):
         reduce='sum'
     )
     div_factor = pygu.scatter(
-        mask.float(),
+        mask[mask].float(),
         index=masked_batch,
         dim=0,
         dim_size=int(batch.max().item() + 1),
