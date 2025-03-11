@@ -51,10 +51,10 @@ def _centered_gaussian(batch, rigids_per_res, device):
 
 def _uniform_so3(num_res, rigids_per_res, device):
     return torch.tensor(
-        Rotation.random(num_res * rigids_per_res).as_quat(),
+        Rotation.random(num_res * rigids_per_res).as_matrix(),
         device=device,
         dtype=torch.float32,
-    ).reshape(num_res, rigids_per_res, 4)
+    ).reshape(num_res, rigids_per_res, 3, 3)
 
 
 def _trans_diffuse_mask(trans_t, trans_1, diffuse_mask):
@@ -64,11 +64,6 @@ def _trans_diffuse_mask(trans_t, trans_1, diffuse_mask):
 def _rots_diffuse_mask(rotmats_t, rotmats_1, diffuse_mask):
     return rotmats_t * diffuse_mask[..., None, None, None] + rotmats_1 * (
         ~diffuse_mask[..., None, None, None]
-    )
-
-def _rotquat_diffuse_mask(rotmats_t, rotmats_1, diffuse_mask):
-    return rotmats_t * diffuse_mask[..., None, None] + rotmats_1 * (
-        ~diffuse_mask[..., None, None]
     )
 
 @dataclasses.dataclass
@@ -94,7 +89,86 @@ class SE3InterpolantConfig:
     self_condition=True
 
 
-class MultiSE3Interpolant:
+# from genie2
+def compute_frenet_frames(coords, chains, mask, eps=1e-10):
+    """
+    Construct Frenet-Serret frames based on a sequence of coordinates.
+
+    Since the Frenet-Serret frame is constructed based on three consecutive
+    residues, for each chain, the rotational component of its first residue
+    is assigned with the rotational component of its second residue; and the
+    rotational component of its last residue is assigned with the rotational
+    component of its second last residue.
+
+    Args:
+        coords:
+            [B, N, 3] Per-residue atom positions.
+        chains:
+            [B, N] Per-residue chain indices.
+        mask:
+            [B, N] Residue mask.
+        eps:
+            Epsilon for computational stability. Default to 1e-10.
+
+    Returns:
+        rots:
+            [B, N, 3, 3] Rotational components for the constructed frames.
+    """
+
+    # [B, N-1, 3]
+    t = coords[:, 1:] - coords[:, :-1]
+    t_norm = torch.sqrt(eps + torch.sum(t ** 2, dim=-1))
+    t = t / t_norm.unsqueeze(-1)
+
+    # [B, N-2, 3]
+    b = torch.cross(t[:, :-1], t[:, 1:], dim=-1)
+    b_norm = torch.sqrt(eps + torch.sum(b ** 2, dim=-1))
+    b = b / b_norm.unsqueeze(-1)
+
+    # [B, N-2, 3]
+    n = torch.cross(b, t[:, 1:], dim=-1)
+
+    # [B, N-2, 3, 3]
+    tbn = torch.stack([t[:, 1:], b, n], dim=-1)
+
+    # Construct rotation matrices
+    rots = []
+    for i in range(mask.shape[0]):
+        rots_ = torch.eye(3).unsqueeze(0).repeat(mask.shape[1], 1, 1)
+        length = torch.sum(mask[i]).int()
+        rots_[1:length-1] = tbn[i, :length-2]
+
+        # Handle start of chain
+        for j in range(length):
+            if j == 0 or chains[i][j] != chains[i][j-1]:
+                rots_[j] = rots_[j+1]
+
+        # Handle end of chain
+        for j in range(length):
+            if j == length - 1 or chains[i][j] != chains[i][j+1]:
+                rots_[j] = rots_[j-1]
+
+        # Update
+        rots.append(rots_)
+
+    # [B, N, 3, 3]
+    rots = torch.stack(rots, dim=0).to(coords.device)
+
+    return rots
+
+def compute_frenet_frames_flat(coords, res_mask, batch, rigids_per_res=3):
+    bb_coords = coords[..., 0, :]
+    rots = []
+    for i in range(batch.max() + 1):
+        select = (batch == i)
+        _bb_coords = bb_coords[select]
+        _rots = compute_frenet_frames(_bb_coords[None], torch.zeros_like(select, dtype=torch.int64)[None], res_mask[select][None])
+        rots.append(_rots.squeeze(0)[..., None, :, :].expand(-1, rigids_per_res, -1, -1))
+
+    return torch.cat(rots, dim=0)
+
+
+class GenieLikeInterpolant:
     def __init__(self,
                  cfg,
                  separate_ot=True,
@@ -129,16 +203,7 @@ class MultiSE3Interpolant:
         self.rot_sfm_g = rot_sfm_g
         self.shift_time_scale = shift_time_scale
 
-        print(self.igso3)
-
         self.rigids_per_res = rigids_per_res
-
-    @property
-    def igso3(self):
-        if self._igso3 is None:
-            sigma_grid = torch.linspace(0.1, 1.5, 1000)
-            self._igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=".cache")
-        return self._igso3
 
     def set_device(self, device):
         self._device = device
@@ -181,25 +246,6 @@ class MultiSE3Interpolant:
         trans_t = _trans_diffuse_mask(trans_t, trans_1, res_mask)
         return trans_t * res_mask[..., None, None]
 
-
-    def _sample_rotmats_0(self, rotmats_1):
-        num_res = rotmats_1.shape[0]
-        noisy_rotmats = self.igso3.sample(torch.tensor([1.5]), num_res * self.rigids_per_res).to(rotmats_1.device)
-        noisy_rotmats = noisy_rotmats.squeeze(0).view(num_res, self.rigids_per_res, 3, 3).float()
-        rotmats_0 = torch.einsum("...ij,...jk->...ik", rotmats_1, noisy_rotmats)
-        return rotmats_0
-
-    def _corrupt_rotquats(self, rotquats_1, rotquats_0, t, res_mask, batch):
-        rotquats_t = so3_utils.quaternion_slerp_exp(t[..., None], rotquats_1, rotquats_0)
-        identity = torch.tensor([1, 0, 0, 0], device=self._device, dtype=rotquats_t.dtype)
-        # print(rotquats_t.shape)
-
-        rotquats_t = rotquats_t * res_mask[..., None, None] + identity[None, None] * (
-            ~res_mask[..., None, None]
-        )
-        # print(rotquats_t.shape)
-        return _rotquat_diffuse_mask(rotquats_t, rotquats_1, res_mask)
-
     @torch.no_grad()
     def corrupt_batch(self, batch: HeteroData):
         res_data = batch["residue"]
@@ -207,8 +253,6 @@ class MultiSE3Interpolant:
         rigids_1 = ru.Rigid.from_tensor_7(res_data["rigids_1"])
         # [N, 5, 3]
         trans_1 = rigids_1.get_trans()
-        # [N, 5, 3, 3]
-        rotmats_1 = rigids_1.get_rots().get_rot_mats()
 
         # [N]
         res_mask = res_data["res_mask"]
@@ -227,9 +271,6 @@ class MultiSE3Interpolant:
 
         nodewise_t = batchwise_to_nodewise(t, res_data.batch)
 
-        rotmats_0 = self._sample_rotmats_0(rotmats_1)
-        rotquats_0 = ru.rot_to_quat(rotmats_0)
-        rotquats_1 = ru.rot_to_quat(rotmats_1)
         trans_0 = self._sample_trans_0(res_data.batch, trans_1.device)
 
         if self.prealign_noise:
@@ -242,13 +283,12 @@ class MultiSE3Interpolant:
             trans_0 = aligned_trans_0.view(trans_0.shape)
 
         trans_t = self._corrupt_trans(trans_1, trans_0, nodewise_t, mask, res_data.batch)
-        rotquats_t = self._corrupt_rotquats(rotquats_1, rotquats_0, nodewise_t, mask, res_data.batch)
-        # print(rotquats_0.shape, rotquats_1.shape, rotquats_t.shape)
+        rotmats_t = compute_frenet_frames_flat(trans_t, res_mask, res_data.batch)
         rigids_t = ru.Rigid(
-            rots=ru.Rotation(quats=rotquats_t), trans=trans_t
+            rots=ru.Rotation(rot_mats=rotmats_t), trans=trans_t
         )
         res_data["rigids_t"] = rigids_t.to_tensor_7()
-        res_data["rotquats_t"] = rotquats_t
+        res_data["rotmats_t"] = rotmats_t
         res_data["trans_t"] = trans_t
 
         var_scaling_dict = self.var_scaling_factors(t)
@@ -286,14 +326,6 @@ class MultiSE3Interpolant:
             "loss_weighting": loss_weighting
         }
 
-    def rot_sample_kappa(self, t):
-        if self._rots_cfg.sample_schedule == "exp":
-            return 1 - torch.exp(-t * self._rots_cfg.exp_rate)
-        elif self._rots_cfg.sample_schedule == "linear":
-            return t
-        else:
-            raise ValueError(f"Invalid schedule: {self._rots_cfg.sample_schedule}")
-
     def _trans_euler_step(self, d_t, t, trans_1, trans_t):
         trans_vf = (trans_1 - trans_t) / (1 - t)
         if self.use_trans_sfm:
@@ -305,52 +337,3 @@ class MultiSE3Interpolant:
             trans_t = trans_t + dW_trans
 
         return trans_t + trans_vf * d_t
-
-    def _rots_euler_step(self, d_t, t, rotmats_1, rotmats_t):
-        # scaling = 1 / (1 - t)
-        # rot_vf = so3_utils.calc_rot_vf(rotmats_t, rotmats_1)
-        # rot_angle = torch.linalg.vector_norm(rot_vf, dim=-1)
-        # rot_angle = torch.min(torch.pi * (1 - t), rot_angle)
-        # rot_vf = torch.nn.functional.normalize(rot_vf, dim=-1) * rot_angle[..., None]
-        # mat_t = so3_utils.rotvec_to_rotmat(d_t * rot_vf * scaling)
-        # return torch.einsum("...ij,...jk->...ik", rotmats_t, mat_t)
-
-        rot_vf = so3_utils.calc_rot_vf(rotmats_t, rotmats_1) / (1 - t)
-        rot_vf_norm = torch.linalg.vector_norm(rot_vf, dim=-1)
-        print(t, rot_vf_norm.mean(), rot_vf_norm.mean() * 10 * (1-t))
-
-        if self._rots_cfg.sample_schedule == "linear":
-            # scaling = 1 / (1 - t.clip(max=0.9))
-            scaling = 1 / (1 - t) * 5 #self._rots_cfg.exp_rate
-        elif self._rots_cfg.sample_schedule == "exp":
-            scaling = self._rots_cfg.exp_rate
-        else:
-            raise ValueError(
-                f"Unknown sample schedule {self._rots_cfg.sample_schedule}"
-            )
-        if self.use_rot_sfm:
-            rot_vf = so3_utils.calc_rot_vf(rotmats_t, rotmats_1) * scaling
-
-            g = self.rot_sfm_g
-            std = g * (t * (1-t)).sqrt()
-            dB_rot = torch.randn_like(rot_vf) * std * torch.sqrt(d_t)
-            mat_t = so3_utils.rotvec_to_rotmat(d_t * rot_vf + dB_rot)
-            return torch.einsum("...ij,...jk->...ik", rotmats_t, mat_t)
-        else:
-            return so3_utils.geodesic_t(scaling * d_t, rotmats_1, rotmats_t)
-
-
-    def _rots_quats_euler_step(self, d_t, t, rotquats_1, rotquats_t):
-        if self._rots_cfg.sample_schedule == 'linear':
-            scaling = 1 / (1 - t)
-        elif self._rots_cfg.sample_schedule == 'exp':
-            scaling = self._rots_cfg.exp_rate
-        else:
-            raise ValueError(
-                f'Unknown sample schedule {self._rots_cfg.sample_schedule}')
-        return so3_utils.quaternion_slerp_exp(
-            scaling * d_t,
-            # d_t / (1 - t),
-            rotquats_1,
-            rotquats_t
-        )

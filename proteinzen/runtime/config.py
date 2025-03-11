@@ -15,6 +15,7 @@ from proteinzen.stoch_interp.interpolate.atom14 import Atom14Interpolant
 from proteinzen.stoch_interp.interpolate.atom14_nonequiv import Atom14Interpolant as NonEquivAtom14Interpolant
 from proteinzen.stoch_interp.interpolate.se3 import SE3Interpolant, SE3InterpolantConfig
 from proteinzen.stoch_interp.interpolate.multiframe import MultiSE3Interpolant
+from proteinzen.stoch_interp.interpolate.multiframe_genie import GenieLikeInterpolant
 from proteinzen.stoch_interp.interpolate.multiframe_quat import MultiSE3Interpolant as QuatMultiSE3Interpolant
 from proteinzen.stoch_interp.interpolate.protein import (
     ProteinInterpolant, ProteinDirichletInterpolant,
@@ -55,6 +56,7 @@ from proteinzen.tasks.fm.atom14 import Atom14Interpolation
 from proteinzen.tasks.fm.atom14_nonequiv import Atom14Interpolation as NonEquivAtom14Interpolation
 from proteinzen.tasks.fm.protein_dense import DenseProteinInterpolation
 from proteinzen.tasks.fm.multiframe import MultiFrameInterpolation
+from proteinzen.tasks.fm.multiframe_genie import GenieLikeInterpolation
 from proteinzen.tasks.fm.multiframe_quat import MultiFrameInterpolation as QuatMultiFrameInterpolation
 from proteinzen.tasks.fm.molecule import HarmonicFlowMatching, TorsionalFlowMatching
 from proteinzen.tasks.fm.sidechain import DirichletFlowMatching
@@ -106,6 +108,7 @@ def config_hydra_store():
     paradigm_store({"paradigm": "denseatom10fm"}, name="denseatom10fm")
     paradigm_store({"paradigm": "fulldensefm"}, name="fulldensefm")
     paradigm_store({"paradigm": "multiframefm"}, name="multiframefm")
+    paradigm_store({"paradigm": "multiframefm_genie"}, name="multiframefm_genie")
     paradigm_store({"paradigm": "multiframe_quat_fm"}, name="multiframe_quat_fm")
     paradigm_store({"paradigm": "dirichlet"}, name="dirichlet")
     paradigm_store({"paradigm": "fisher"}, name="fisher")
@@ -153,6 +156,10 @@ def config_hydra_store():
         MultiSE3Interpolant,
         cfg=builds(SE3InterpolantConfig),
         name="multiframefm_protein")
+    corruption_store(
+        GenieLikeInterpolant,
+        cfg=builds(SE3InterpolantConfig),
+        name="multiframefm_genie_protein")
     corruption_store(
         QuatMultiSE3Interpolant,
         cfg=builds(SE3InterpolantConfig),
@@ -296,6 +303,7 @@ def config_hydra_store():
     model_store(IpaAtom10DenoiserV3, name="denseatom10fm_protein")
     model_store(DenseChimeraLatentWrapper, name="fulldensefm_protein")
     model_store(IpaMultiRigidDenoiser, name="multiframefm_protein")
+    model_store(IpaMultiRigidDenoiser, name="multiframefm_genie_protein")
     model_store(IpaMultiRigidDenoiser, name="multiframe_quat_fm_protein")
     model_store(DynamicGraphIpaFrameSeqDenoiser, name="dirichlet_protein")
     model_store(DynamicGraphIpaFrameSeqDenoiser, name="fisher_protein")
@@ -329,6 +337,7 @@ def config_hydra_store():
     task_store(pbuilds(ProteinAtom10Interpolation), name="atom10fm_protein")
     task_store(pbuilds(ProteinAtom10Interpolation), name="denseatom10fm_protein")
     task_store(pbuilds(MultiFrameInterpolation), name="multiframefm_protein")
+    task_store(pbuilds(GenieLikeInterpolation), name="multiframefm_genie_protein")
     task_store(pbuilds(QuatMultiFrameInterpolation), name="multiframe_quat_fm_protein")
     task_store(pbuilds(BackboneFrameInterpolation), name="fm_bb")
     task_store(pbuilds(ProteinInterpolation), name="fm_protein")

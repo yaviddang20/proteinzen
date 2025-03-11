@@ -261,6 +261,7 @@ def one_hot(cat_feats, max_val):
     one_hot_mat = torch.eye(max_val+1)
     return one_hot_mat[cat_feats]
 
+
 def featurize_props(mol_props: Dict, center=True):
     mol_props = tree.map_structure(
         torch.as_tensor,

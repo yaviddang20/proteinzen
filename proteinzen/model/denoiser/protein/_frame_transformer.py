@@ -148,7 +148,8 @@ class BlockInvariantPointAttention(nn.Module):
         block_K=128,
         use_compile_path=False,
         use_out_gating=False,
-        ablate_down_z=False
+        ablate_down_z=False,
+        use_qk_norm=False
     ):
         """
         Args:
@@ -180,6 +181,11 @@ class BlockInvariantPointAttention(nn.Module):
         self.use_compile_path = use_compile_path
         self.use_out_gating = use_out_gating
         self.ablate_down_z = ablate_down_z
+        self.use_qk_norm = use_qk_norm
+
+        if self.use_qk_norm:
+            self.q_norm = LayerNorm(self.c_hidden)
+            self.k_norm = LayerNorm(self.c_hidden)
 
         # These linear layers differ from their specifications in the
         # supplement. There, they lack bias and use Glorot initialization.
@@ -358,6 +364,10 @@ class BlockInvariantPointAttention(nn.Module):
         k = k.view(k.shape[:-1] + (self.no_heads, -1))
         # [*, N_block, block_K, H, C_hidden]
         v = v.view(v.shape[:-1] + (self.no_heads, -1))
+
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         # [*, N_block, block_Q, H * P_q * 3]
         q_pts = self.linear_q_points(q_in)
@@ -1351,7 +1361,8 @@ class SequenceFrameTransformerBlock(nn.Module):
                  inf=1e8,
                  compile_ipa=False,
                  use_ipa_gating=False,
-                 ablate_ipa_down_z=False
+                 ablate_ipa_down_z=False,
+                 use_qk_norm=False
                  ):
         super().__init__()
 
@@ -1375,7 +1386,8 @@ class SequenceFrameTransformerBlock(nn.Module):
             block_K=block_k,
             use_compile_path=compile_ipa,
             use_out_gating=use_ipa_gating,
-            ablate_down_z=ablate_ipa_down_z
+            ablate_down_z=ablate_ipa_down_z,
+            use_qk_norm=use_qk_norm
         )
 
         self.transition = GatherConditionedTransition(c_frame, c_s)
@@ -1430,7 +1442,9 @@ class SequenceFrameTransformerUpdate(nn.Module):
         add_vanilla_transformer=False,
         add_full_transformer=False,
         use_ipa_gating=False,
-        ablate_ipa_down_z=False
+        ablate_ipa_down_z=False,
+        use_qk_norm=False,
+
     ):
         super().__init__()
         self.c_s = c_s
@@ -1493,7 +1507,8 @@ class SequenceFrameTransformerUpdate(nn.Module):
                 inf=inf,
                 compile_ipa=compile_ipa,
                 use_ipa_gating=use_ipa_gating,
-                ablate_ipa_down_z=ablate_ipa_down_z
+                ablate_ipa_down_z=ablate_ipa_down_z,
+                use_qk_norm=use_qk_norm
             )
             if self.add_vanilla_transformer:
                 self.trunk[f'vanilla_tfmr_{b}'] = BlockTransformerPairBias(

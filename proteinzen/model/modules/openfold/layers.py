@@ -1069,7 +1069,8 @@ class InvariantPointAttention(nn.Module):
         use_compile_path=False,
         use_fused_kernel=False,
         use_out_gating=False,
-        ablate_down_z=False
+        ablate_down_z=False,
+        use_qk_norm=False,
     ):
         """
         Args:
@@ -1100,6 +1101,11 @@ class InvariantPointAttention(nn.Module):
         self.use_fused_kernel = use_fused_kernel
         self.use_out_gating = use_out_gating
         self.ablate_down_z = ablate_down_z
+        self.use_qk_norm = use_qk_norm
+
+        if self.use_qk_norm:
+            self.q_norm = LayerNorm(self.c_hidden)
+            self.k_norm = LayerNorm(self.c_hidden)
 
         # These linear layers differ from their specifications in the
         # supplement. There, they lack bias and use Glorot initialization.
@@ -1300,6 +1306,10 @@ class InvariantPointAttention(nn.Module):
 
         # [*, N_res, H, C_hidden]
         k, v = torch.split(kv, self.c_hidden, dim=-1)
+
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         # [*, N_res, H * P_q * 3]
         q_pts = self.linear_q_points(s)

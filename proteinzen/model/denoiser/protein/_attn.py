@@ -99,6 +99,7 @@ class TriangleAttentionCore(nn.Module):
         no_heads: int,
         gating: bool = True,
         starting=True,
+        use_qk_norm=False,
     ):
         """
         Args:
@@ -122,6 +123,7 @@ class TriangleAttentionCore(nn.Module):
         self.no_heads = no_heads
         self.gating = gating
         self.starting = starting
+        self.use_qk_norm = use_qk_norm
 
         # DISCREPANCY: c_hidden is not the per-head channel dimension, as
         # stated in the supplement, but the overall channel dimension.
@@ -139,6 +141,10 @@ class TriangleAttentionCore(nn.Module):
             self.c_hidden * self.no_heads, self.c_z, init="final",
             bias=False
         )
+
+        if self.use_qk_norm:
+            self.q_norm = LayerNorm(self.c_hidden)
+            self.k_norm = LayerNorm(self.c_hidden)
 
         self.linear_g = None
         if self.gating:
@@ -166,6 +172,10 @@ class TriangleAttentionCore(nn.Module):
         q = q.view(q.shape[:-1] + (self.no_heads, -1))
         k = k.view(k.shape[:-1] + (self.no_heads, -1))
         v = v.view(v.shape[:-1] + (self.no_heads, -1))
+
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         # [*, H, Q/K, C_hidden]
         q = q.transpose(-2, -3)
@@ -369,7 +379,8 @@ class ConditionedPairUpdate(nn.Module):
             rbf_min=3.25,
             rbf_max=50.75,
             inf=1e8,
-            include_rel_quat=False
+            include_rel_quat=False,
+            use_qk_norm=False
         ):
         super().__init__()
         self.no_heads = no_heads
@@ -398,9 +409,9 @@ class ConditionedPairUpdate(nn.Module):
         self.ln_third_edge = LayerNorm(c_z)
         self.emb_third_edge = Linear(c_z, no_heads, bias=False)
 
-        self.trig_attn_start = TriangleAttentionCore(c_z, self.c_hidden, self.no_heads, starting=True)
+        self.trig_attn_start = TriangleAttentionCore(c_z, self.c_hidden, self.no_heads, starting=True, use_qk_norm=use_qk_norm)
         self.trig_bias_start = Linear(c_hidden, no_heads, bias=False)
-        self.trig_attn_end = TriangleAttentionCore(c_z, self.c_hidden, self.no_heads, starting=False)
+        self.trig_attn_end = TriangleAttentionCore(c_z, self.c_hidden, self.no_heads, starting=False, use_qk_norm=use_qk_norm)
         self.trig_bias_end = Linear(c_hidden, no_heads, bias=False)
         self.cond_proj = nn.Sequential(
             LayerNorm(c_s),
@@ -847,7 +858,9 @@ class MultiRigidPairEmbedder(nn.Module):
                  no_blocks=2,
                  relpos_clip=32,
                  dropout=0.25,
-                 inf=1e9):
+                 inf=1e9,
+                 use_qk_norm=False
+    ):
         super().__init__()
 
         self.c_z = c_z
@@ -882,8 +895,8 @@ class MultiRigidPairEmbedder(nn.Module):
                 LayerNorm(c_hidden),
                 Linear(c_hidden, no_heads, bias=False)
             )
-            self.trunk[f'attn_start_{i}'] = TriangleAttentionCore(c_hidden, c_head, no_heads, starting=True)
-            self.trunk[f'attn_end_{i}'] = TriangleAttentionCore(c_hidden, c_head, no_heads, starting=False)
+            self.trunk[f'attn_start_{i}'] = TriangleAttentionCore(c_hidden, c_head, no_heads, starting=True, use_qk_norm=use_qk_norm)
+            self.trunk[f'attn_end_{i}'] = TriangleAttentionCore(c_hidden, c_head, no_heads, starting=False, use_qk_norm=use_qk_norm)
             self.trunk[f'transition_{i}'] = SwishTransition(c_hidden)
 
         self.final_layer = nn.Sequential(
@@ -913,18 +926,19 @@ class MultiRigidPairEmbedder(nn.Module):
         return torch.cat([quat_rel, unit_edge_dist_vecs, dist_features], dim=-1)
 
 
-    def forward(self, rigids, node_mask, sc_rigids=None):
+    def forward(self, rigids, node_mask, seq_idx, chain_idx, sc_rigids=None):
         edge_mask = node_mask[..., None] & node_mask[..., None, :]
+        same_chain_mask = (chain_idx[..., None] == chain_idx[..., None, :])
 
         # we only use the bb rigid to featurize here
         rigids = rigids[..., 0]
         if sc_rigids is not None:
             sc_rigids = sc_rigids[..., 0]
 
-        node_idx = torch.arange(rigids.shape[-1], device=rigids.device)[None].expand(
-            rigids.shape[0], -1
-        )
-        relpos_feats = relpos(node_idx, clip=self.relpos_clip)
+        relpos_feats = relpos(seq_idx, clip=self.relpos_clip)
+        relpos_feats = relpos_feats * same_chain_mask[..., None]
+        # relpos_feats[~same_chain_mask][..., -1] += 1
+
         z = self.lin_z_ij(relpos_feats)
         a_current = self._featurize_rigids(rigids, distogram=False)
         if sc_rigids is not None:

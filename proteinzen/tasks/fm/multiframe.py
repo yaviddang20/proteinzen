@@ -71,6 +71,8 @@ class MultiFrameInterpolation(Task):
                  seq_loss_weight=1.0,
                  use_traj_losses=True,
                  polar_residues_v2=False,
+                 polar_residues_v3=False,
+                 polar_residues_v4=False,
                  downweight_K=False
     ):
         super().__init__()
@@ -118,6 +120,16 @@ class MultiFrameInterpolation(Task):
                 residue_constants.restype_order[i]
                 for i in ['C', 'E', 'H', 'Q', 'R', 'S', 'T']
             ])
+        elif polar_residues_v3:
+            self.polar_residues = torch.tensor([
+                residue_constants.restype_order[i]
+                for i in ['C', 'D', 'E', 'H', 'Q', 'R', 'S', 'T']
+            ])
+        elif polar_residues_v4:
+            self.polar_residues = torch.tensor([
+                residue_constants.restype_order[i]
+                for i in ['C', 'D', 'E', 'H', 'P', 'Q', 'R', 'S', 'T']
+            ])
         else:
             self.polar_residues = torch.tensor([
                 residue_constants.restype_order[i]
@@ -125,7 +137,9 @@ class MultiFrameInterpolation(Task):
             ])
 
     def _gen_diffuse_mask(self, data: HeteroData):
-        return torch.ones_like(data['res_mask']).bool()
+        rigids_noising_mask = torch.ones_like(data['rigids_mask']).bool()
+        res_noising_mask = torch.ones_like(data['res_mask']).bool()
+        return res_noising_mask, rigids_noising_mask
 
     def _resolve_symmetry(self, data, chain_feats):
         res_data = data['residue']
@@ -174,7 +188,7 @@ class MultiFrameInterpolation(Task):
         chain_feats = {
             'aatype': torch.as_tensor(res_data['seq']).long(),
             'all_atom_positions': torch.as_tensor(res_data['atom37']).double(),
-            'all_atom_mask': torch.as_tensor(res_data['atom37_mask']).double()
+            'all_atom_mask': torch.as_tensor(res_data['atom37_mask']).double(),
         }
         # chain_feats = data_transforms.atom37_to_frames(chain_feats)
         chain_feats = data_transforms.atom37_to_cg_frames(chain_feats, cg_version=self.cg_version)
@@ -189,12 +203,15 @@ class MultiFrameInterpolation(Task):
 
 
         # compute bb frame features
-        diffuse_mask = self._gen_diffuse_mask(res_data)
-        res_data['res_noising_mask'] = diffuse_mask
+        rigids_mask = chain_feats["cg_groups_gt_exists"][:, (0, 2, 3)]
+        rigids_mask *= res_data['res_mask'][..., None]
+        res_data['rigids_mask'] = rigids_mask
+        res_noising_mask, rigids_noising_mask = self._gen_diffuse_mask(res_data)
+        res_data['res_noising_mask'] = res_noising_mask
+        res_data['rigids_noising_mask'] = rigids_noising_mask
         res_data['x'] = rigids_1.get_trans()  # for HeteroData's sake
         rigids_1_tensor_7 = rigids_1.to_tensor_7()
-        rigids_mask = chain_feats["cg_groups_gt_exists"][:, (0, 2, 3)]
-        rigids_mask[..., 0] = res_data['res_mask']
+
         if self.dummy_rigid_to_sidechain_rigid:
             seq = res_data['seq']
             mask_AG = (seq == residue_constants.restype_order['G']) | (seq == residue_constants.restype_order['A'])
@@ -276,7 +293,11 @@ class MultiFrameInterpolation(Task):
                 residue={
                     "res_mask": torch.ones(n, device=device).bool(),
                     "res_noising_mask": torch.ones(n, device=device).bool(),
+                    "rigids_mask": torch.ones((n, 3), device=device).bool(),
+                    "rigids_noising_mask": torch.ones((n, 3), device=device).bool(),
                     "seq": torch.full((n,), residue_constants.restype_order['R'], device=device).long(),
+                    "chain_idx": torch.zeros(n, device=device),
+                    # "chain_idx": torch.cat([torch.zeros(n//2, device=device), torch.ones(n//2, device=device)], dim=0),
                     "num_nodes": n
                 }
             )

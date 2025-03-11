@@ -884,6 +884,25 @@ class ProteinModule(L.LightningModule):
             # self._log.info(gen_pbar_str(loss_dict))
             return loss_dict
 
+    def on_before_optimizer_step(self, optimizer):
+        with torch.no_grad():
+            norms = [torch.linalg.vector_norm(p.grad.view(-1), dim=-1) for _, p in self.model.named_parameters() if p.grad is not None]
+            total_norm = torch.linalg.vector_norm(
+                torch.stack(norms, dim=0),
+                dim=0
+            )
+
+        self.log(
+            "grad_norm",
+            total_norm,
+            prog_bar=False,
+            logger=True,
+            on_step=None,
+            on_epoch=True,
+            batch_size=1,
+            sync_dist=False
+        )
+
     def validation_step(self, batch, batch_idx):
         task: TaskList = batch.task
         outputs = task.run_evals(self.model, batch)
