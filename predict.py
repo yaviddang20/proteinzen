@@ -207,11 +207,11 @@ def main(model,
     # corrupter._sample_cfg.num_timesteps = 200
     # corrupter._sample_cfg.num_timesteps = 500
     if hasattr(corrupter, "se3_noiser"):
-        corrupter.se3_noiser._sample_cfg.num_timesteps = 200
+        corrupter.se3_noiser._sample_cfg.num_timesteps = 400
         # corrupter.se3_noiser._rots_cfg.exp_rate = 5
     else:
         if hasattr(corrupter, "_sample_cfg"):
-            corrupter._sample_cfg.num_timesteps = 200
+            corrupter._sample_cfg.num_timesteps = 400
         # corrupter.use_rot_sfm = True
         # corrupter.use_trans_sfm = True
         # corrupter.rot_sfm_g = 0.5
@@ -301,7 +301,7 @@ if __name__ == '__main__':
     cfg = load_from_yaml(config_path)
     cfg['experiment']['warm_start'] = ckpt_path
     # cfg['datamodule']['batch_size'] = 2000
-    cfg['datamodule']['batch_size'] = 6 * 300 * 300
+    cfg['datamodule']['batch_size'] = 450 * 300
     # if 'compatibility_mode' not in cfg['model']:
     #     cfg['model']['compatibility_mode'] = True
     cfg['save_traj'] = args.save_traj
@@ -309,15 +309,24 @@ if __name__ == '__main__':
     if cfg['domain']['domain'] == "backbone":
         if args.debug:
             print("debug")
+            # cfg['datamodule']['sample_lengths'] = {
+            #     # 60: 1
+            #     60: 5,
+            #     # 70: 5,
+            #     # 80: 5,
+            #     # 90: 5,
+            #     # 100: 5,
+            #     # 110: 5,
+            #     # 120: 5
+            # }
             cfg['datamodule']['sample_lengths'] = {
-                # 60: 1
-                60: 5,
-                # 70: 5,
-                # 80: 5,
-                # 90: 5,
-                # 100: 5,
-                # 110: 5,
-                # 120: 5
+                60: 10,
+                70: 10,
+                80: 10,
+                90: 10,
+                100: 10,
+                110: 10,
+                120: 10
             }
         else:
             if cfg['datamodule']['max_len'] == 128:
@@ -334,19 +343,36 @@ if __name__ == '__main__':
     if cfg['domain']['domain'] in ["protein", "protein_multichi"]:
         if args.debug:
             print("debug")
-            cfg['datamodule']['batch_size'] = 300 * 300
-            cfg['datamodule']['sample_lengths'] = {
-                60: 5,
-                # 70: 5,
-                80: 5,
-                # 90: 5,
-                100: 5,
-                # 200: 5,
-                # 300: 5,
-                # 110: 5,
-                # 120: 1
-                # 230: 1
-            }
+            cfg['datamodule']['batch_size'] = 2 * 300 * 300
+            # cfg['datamodule']['sample_lengths'] = {
+            #     # 60: 5,
+            #     # 70: 5,
+            #     # 80: 5,
+            #     # 90: 5,
+            #     # 100: 5,
+            #     # 200: 5,
+            #     300: 5,
+            #     # 110: 5,
+            #     # 120: 1
+            #     # 230: 1
+            # }
+            if cfg['datamodule']['max_len'] == 128 or 'afdb_128' in cfg['datamodule']['data_dir']:
+                cfg['datamodule']['sample_lengths'] = {
+                    60: 10,
+                    70: 10,
+                    80: 10,
+                    90: 10,
+                    100: 10,
+                    110: 10,
+                    120: 10
+                }
+            else:
+                cfg['datamodule']['sample_lengths'] = {
+                    70: 10,
+                    100: 10,
+                    200: 10,
+                    300: 10,
+                }
         else:
             if cfg['datamodule']['max_len'] == 128 or 'afdb_128' in cfg['datamodule']['data_dir']:
                 cfg['datamodule']['sample_lengths'] = {

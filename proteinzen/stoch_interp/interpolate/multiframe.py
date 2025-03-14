@@ -107,7 +107,12 @@ class MultiSE3Interpolant:
                  trans_sfm_g=0.1,
                  use_rot_sfm=False,
                  rot_sfm_g=0.1,
-                 shift_time_scale=False
+                 shift_time_scale=False,
+                 trans_gamma=0.04,
+                 trans_step_size=1.5,
+                 rot_gamma=0.04,
+                 rot_step_size=1.5,
+                 sampling_churn=0.2,
     ):
         self._cfg = cfg
         self._rots_cfg = cfg.rots
@@ -129,6 +134,12 @@ class MultiSE3Interpolant:
         self.mixed_beta_t_sched = mixed_beta_t_sched
         self.beta_p1 = beta_p1
         self.beta_p2 = beta_p2
+
+        self.trans_gamma = trans_gamma
+        self.trans_step_size = trans_step_size
+        self.rot_gamma = rot_gamma
+        self.rot_step_size = rot_step_size
+        self.churn = sampling_churn
 
         print(self.igso3)
 
@@ -322,11 +333,30 @@ class MultiSE3Interpolant:
         else:
             raise ValueError(f"Invalid schedule: {self._rots_cfg.sample_schedule}")
 
+    def g_t(self, t):
+        return (1 - t) / (t + 0.1) ** 2
+
+    def _trans_churn(self, d_t, t, trans_t):
+        t_hat = torch.clamp(t - self.churn * d_t, min=0)
+        d_t_hat = d_t * (1 + self.churn)
+        noise_scale = torch.sqrt(
+            2 * self.g_t(t_hat) * self.trans_gamma - 2 * self.g_t(t) * self.trans_gamma
+        )
+        trans_t_hat = trans_t + torch.randn_like(trans_t) * noise_scale * 10
+        return t_hat, d_t_hat, trans_t_hat
+
     def _trans_score(self, t, trans_1, trans_t):
         trans_vf = (trans_1 - trans_t) / (1 - t)
         return (t * trans_vf - trans_t) / (1-t)
 
-    def _trans_euler_step(self, d_t, t, trans_1, trans_t):
+    def _trans_euler_step(
+            self,
+            d_t,
+            t,
+            trans_1,
+            trans_t,
+            add_noise=True,
+    ):
         trans_vf = (trans_1 - trans_t) / (1 - t)
         if self.use_trans_sfm:
             g = self.trans_sfm_g
@@ -336,9 +366,14 @@ class MultiSE3Interpolant:
             dW_trans = torch.randn_like(trans_t) * std * scaling * torch.sqrt(d_t)
             trans_t = trans_t + dW_trans
 
-        g_t = (1 - t) / (t + 0.01)
-        gamma = 0.3
-        dW_t = torch.randn_like(trans_t) * torch.sqrt(d_t)
+        step_size = self.trans_step_size
+        # g_t = (1 - t) / (t + 0.01)
+        # g_t = (1 - t) / (t + 0.01)
+        # g_t = (1 - t) ** 2 / (t + 0.1) ** 2
+        g_t = self.g_t(t)
+        # g_t = torch.sqrt(1 - t) / (t + 0.1) ** 2
+        gamma = self.trans_gamma
+        dW_t = torch.randn_like(trans_t) * torch.sqrt(d_t) * 10
         trans_score = self._trans_score(t, trans_1, trans_t)
         # trans_score = trans_score * min(5, (1-t) / t)
 
@@ -351,12 +386,32 @@ class MultiSE3Interpolant:
         )
 
         if t > 0.99:
-            return trans_t + trans_vf * d_t
+            return trans_t + (trans_vf * d_t) * step_size
         else:
-            return trans_t + trans_vf * d_t + trans_score * g_t * d_t + torch.sqrt(2 * g_t * gamma) * dW_t
+            if add_noise:
+                noise_t = torch.sqrt(2 * g_t * gamma) * dW_t
+                return trans_t + (trans_vf * d_t + trans_score * g_t * d_t) * step_size + noise_t
+            else:
+                return trans_t + (trans_vf * d_t + trans_score * g_t * d_t) * step_size
 
 
         # return trans_t + trans_vf * d_t
+
+    def _rot_churn(self, d_t, t, rotmats_t):
+        gamma = self.rot_gamma
+        # churn = 0.8
+        churn = self.churn
+        t_hat = torch.clamp(t - churn * d_t, min=0)
+        d_t_hat = d_t * (1 + churn)
+        noise_scale = torch.sqrt(
+            2 * self.g_t(t_hat) * gamma - 2 * self.g_t(t) * gamma
+        )
+        dB_rot = torch.randn(rotmats_t.shape[:-1], device=rotmats_t.device) * noise_scale
+        rotmats_t_hat = so3_utils.rot_mult(
+            rotmats_t,
+            so3_utils.rotvec_to_rotmat(dB_rot)
+        )
+        return t_hat, d_t_hat, rotmats_t_hat
 
     def _rots_score(self, t, rotmats_1, rotmats_t):
         ls = torch.arange(1000, device=rotmats_t.device)
@@ -364,17 +419,29 @@ class MultiSE3Interpolant:
         omega, _, _ = so3_utils.angle_from_rotmat(rel_rotmat)
         omega = omega.view(-1)
         sigma = (
-            (t * 1.5).square()
-            + ((1-t) * 0.1).square()
+            ((1-t) * 1.5).square()
+            + (t * 0.1).square()
         ).sqrt()
+        # sigma = torch.log(t * np.exp(0.1) + (1-t) * np.exp(1.5))
         sigma = sigma[None].expand(omega.shape).to(omega.device)
         prefactor = so3_utils.dlog_igso3_expansion(omega, sigma, ls)
         prefactor = prefactor.view(rotmats_t.shape[:-2])
         omega = omega.view(rotmats_t.shape[:-2])
-        rot_score = (prefactor / omega)[..., None] * so3_utils.calc_rot_vf(rotmats_t, rotmats_1)
+        # rot_score = (prefactor / omega)[..., None] * so3_utils.calc_rot_vf(rotmats_t, rotmats_1)
+        rot_score = (prefactor / omega)[..., None] * so3_utils.calc_rot_vf(rotmats_1, rotmats_t)
         return rot_score
 
-    def _rots_euler_step(self, d_t, t, rotmats_1, rotmats_t):
+        # trans_vf = (trans_1 - trans_t) * 5
+        # return trans_t + trans_vf * d_t
+
+    def _rots_euler_step(
+            self,
+            d_t,
+            t,
+            rotmats_1,
+            rotmats_t,
+            add_noise=True,
+    ):
         # scaling = 1 / (1 - t)
         # rot_vf = so3_utils.calc_rot_vf(rotmats_t, rotmats_1)
         # rot_angle = torch.linalg.vector_norm(rot_vf, dim=-1)
@@ -410,13 +477,24 @@ class MultiSE3Interpolant:
         rot_vf = so3_utils.calc_rot_vf(rotmats_t, rotmats_1) / (1 - t)
         # rot_vf = so3_utils.calc_rot_vf(rotmats_t, rotmats_1) * 10
         rot_score = self._rots_score(t, rotmats_1, rotmats_t)
-        g_t = (1 - t) / (t + 0.01)
-        gamma = 0.3
+        # g_t = (1 - t) / (t + 0.01)
+        # g_t = (1 - t) ** 2 / (t + 0.1) ** 2
+        # g_t = torch.sqrt(1 - t) / (t + 0.1) ** 2
+        g_t = self.g_t(t)
+        step_size = self.rot_step_size
+        gamma = self.rot_gamma
         dB_rot = torch.randn_like(rot_vf) * torch.sqrt(d_t)
         if t > 0.99:
-            mat_t = so3_utils.rotvec_to_rotmat(d_t * rot_vf)
+            mat_t = so3_utils.rotvec_to_rotmat(d_t * rot_vf * step_size)
         else:
-            mat_t = so3_utils.rotvec_to_rotmat(d_t * rot_vf - d_t * g_t * rot_score + torch.sqrt(2 * g_t * gamma) * dB_rot)
+            # mat_t = so3_utils.rotvec_to_rotmat(d_t * rot_vf - d_t * g_t * rot_score + torch.sqrt(2 * g_t * gamma) * dB_rot)
+            if add_noise:
+                rotvec_t = d_t * rot_vf + d_t * g_t * rot_score
+                noise_t = torch.sqrt(2 * g_t * gamma) * dB_rot
+                mat_t = so3_utils.rotvec_to_rotmat(rotvec_t * step_size + noise_t)
+            else:
+                rotvec_t = d_t * rot_vf + d_t * g_t * rot_score
+                mat_t = so3_utils.rotvec_to_rotmat(step_size * rotvec_t)
         # mat_t = so3_utils.rotvec_to_rotmat(d_t * rot_vf)
 
         print(

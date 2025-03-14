@@ -284,6 +284,7 @@ class MultiFrameInterpolation(Task):
         # model.self_conditioning = False
         # if model.rot_preconditioning:
         #     self.frame_noiser._rots_cfg.sample_schedule = 'linear'
+        #     self.frame_noiser._rots_cfg.sample_schedule = 'test'
 
         num_res = inputs['num_res']
         total_num_res = sum(num_res)
@@ -319,8 +320,13 @@ class MultiFrameInterpolation(Task):
 
         # Set-up time
         ts = torch.linspace(self.frame_noiser._cfg.min_t, 1.0, self.frame_noiser._sample_cfg.num_timesteps)
-        if self.frame_noiser.shift_time_scale:
-            ts = self.frame_noiser.time_shift(ts, num_res[0])
+
+        # ts = 1.0 - torch.logspace(-2, 0, self.frame_noiser._sample_cfg.num_timesteps + 1).flip(0)
+        # ts = ts - torch.min(ts)
+        # ts = ts / torch.max(ts)
+
+        # shift_scale = np.sqrt(num_res[0]/100)
+        # ts = ts / (ts * (1 - shift_scale) + shift_scale)
 
         t_1 = ts[0]
 
@@ -339,18 +345,22 @@ class MultiFrameInterpolation(Task):
         denoiser_out = None
 
         for t_2 in tqdm.tqdm(ts[1:]):
+            d_t = t_2 - t_1
             # Run model.
             trans_t_1, rotmats_t_1, _, _ = prot_traj[-1]
-            res_data["trans_t"] = trans_t_1
-            res_data["rotmats_t"] = rotmats_t_1
+            t_hat, d_t_hat, trans_t_hat = self.frame_noiser._trans_churn(d_t, t_1, trans_t_1)
+            _, _, rotmats_t_hat = self.frame_noiser._rot_churn(d_t, t_1, rotmats_t_1)
+
+            res_data["trans_t"] = trans_t_hat
+            res_data["rotmats_t"] = rotmats_t_hat
             res_data['rigids_t'] = ru.Rigid(
-                rots=ru.Rotation(rot_mats=rotmats_t_1),
-                trans=trans_t_1
+                rots=ru.Rotation(rot_mats=rotmats_t_hat),
+                trans=trans_t_hat
             ).to_tensor_7()
-            t = torch.ones(batch.num_graphs, device=device) * t_1
+            t = torch.ones(batch.num_graphs, device=device) * t_hat
             batch["t"] = t
             if self.trans_preconditioning:
-                trans_var_scaling_dict = self.frame_noiser.var_scaling_factors(t)
+                trans_var_scaling_dict = self.frame_noiser.var_scaling_factors(t_hat)
                 batch['trans_c_skip'] = trans_var_scaling_dict['c_skip']
                 batch['trans_c_in'] = trans_var_scaling_dict['c_in']
                 batch['trans_c_out'] = trans_var_scaling_dict['c_out']
@@ -373,9 +383,8 @@ class MultiFrameInterpolation(Task):
             )
 
             # Take reverse step
-            d_t = t_2 - t_1
-            trans_t_2 = self.frame_noiser._trans_euler_step(d_t, t_1, pred_trans_1, trans_t_1)
-            rotmats_t_2 = self.frame_noiser._rots_euler_step(d_t, t_1, pred_rotmats_1, rotmats_t_1)
+            trans_t_2 = self.frame_noiser._trans_euler_step(d_t_hat, t_hat, pred_trans_1, trans_t_hat, add_noise=False)
+            rotmats_t_2 = self.frame_noiser._rots_euler_step(d_t_hat, t_hat, pred_rotmats_1, rotmats_t_hat, add_noise=False)
 
             prot_traj.append(
                 (trans_t_2,
