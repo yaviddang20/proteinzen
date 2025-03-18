@@ -10,6 +10,7 @@
 #$ -l mem_free=32G
 #$ -l h_rt=TRAINHOURS:00:00
 #$ -l compute_cap=61,gpu_mem=40G
+#$ -l h=!(qb3-idgpu18)
 
 # if you need to exclude nodes
 # -l h=!(qb3-atgpu32)&!(qb3-atgpu33)

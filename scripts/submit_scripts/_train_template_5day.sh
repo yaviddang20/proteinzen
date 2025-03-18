@@ -3,10 +3,11 @@
 #$ -o OUTFILE.log
 #$ -j y
 #$ -r y
+#$ -R y
 #$ -cwd
 #$ -q gpu.q
 #$ -pe smp 1
-#$ -l mem_free=32G
+#$ -l mem_free=16G
 #$ -l h_rt=120:00:00
 #$ -l compute_cap=61,gpu_mem=40G
 

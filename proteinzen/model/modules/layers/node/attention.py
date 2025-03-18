@@ -541,13 +541,19 @@ class ConditionedTransformerPairBiasLayer(nn.Module):
                  no_heads,
                  dropout=0.1,
                  row_dropout=0.0,
-                 inf=1e8
+                 inf=1e8,
+                 use_qk_norm=False
 
     ):
         super().__init__()
         self.h_head = c_s // no_heads
         self.no_heads = no_heads
         self.inf = inf
+        self.use_qk_norm = use_qk_norm
+
+        if self.use_qk_norm:
+            self.q_norm = LayerNorm(self.h_head)
+            self.k_norm = LayerNorm(self.h_head)
 
         self.lin_q = Linear(c_s, self.h_head * no_heads, bias=False)
         self.lin_kv = Linear(c_s, 2 * self.h_head * no_heads, bias=False)
@@ -582,6 +588,11 @@ class ConditionedTransformerPairBiasLayer(nn.Module):
             q = q.view(*q.shape[:2], self.no_heads, self.h_head)[:, None]
             k = k.view(*k.shape[:2], self.no_heads, self.h_head)[:, None]
             v = v.view(*v.shape[:2], self.no_heads, self.h_head)[:, None]
+
+            if self.use_qk_norm:
+                q = self.q_norm(q)
+                k = self.k_norm(k)
+
             res_mask = x_mask[..., None, None, None, :]
             pair_bias = permute_final_dims(b[:, None], (2, 0, 1))
             # print(q.shape, k.shape, v.shape, res_mask.shape, pair_bias.shape)
@@ -609,6 +620,11 @@ class ConditionedTransformerPairBiasLayer(nn.Module):
             q = q.view(*q.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
             k = k.view(*k.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
             v = v.view(*v.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
+
+            if self.use_qk_norm:
+                q = self.q_norm(q)
+                k = self.k_norm(k)
+
             # print(q.shape, k.shape, v.shape, b.shape)
             update = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=permute_final_dims(b, (2, 0, 1))
@@ -634,6 +650,7 @@ class ConditionedTransformerPairBias(nn.Module):
                  n_layers,
                  dropout=0.1,
                  row_dropout=0.0,
+                 use_qk_norm=False,
     ):
         super().__init__()
         self.layers = nn.ModuleList(
@@ -645,6 +662,7 @@ class ConditionedTransformerPairBias(nn.Module):
                     no_heads=no_heads,
                     dropout=dropout,
                     row_dropout=row_dropout,
+                    use_qk_norm=use_qk_norm
                 )
                 for _ in range(n_layers)
             ]

@@ -37,3 +37,9 @@ if __name__ == '__main__':
     num_clusters = run_easy_cluster("precise_samples.fa", "precise_seq_clusters/")
     with open("num_mmseqs_precise_clusters.txt", "w") as fp:
         fp.write(f"Num clusters: {num_clusters}")
+
+    os.system("~/software/bin/pdb2fasta consistent_samples_folded/* > consistent_samples.fa")
+    os.makedirs("consistent_seq_clusters", exist_ok=True)
+    num_clusters = run_easy_cluster("consistent_samples.fa", "consistent_seq_clusters/")
+    with open("num_mmseqs_consistent_clusters.txt", "w") as fp:
+        fp.write(f"Num clusters: {num_clusters}")

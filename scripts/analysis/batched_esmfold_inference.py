@@ -141,7 +141,10 @@ if __name__ == "__main__":
 
     import glob
 
-    for fasta in glob.glob(os.path.join(args.fasta_folder, "*.fa")):
+    for fasta in sorted(
+        glob.glob(os.path.join(args.fasta_folder, "*.fa")),
+        key=lambda x: float(x.split("/")[-1].split("_")[1])
+    ):
         os.chdir(args.pdb)
         fasta = Path(fasta)
 

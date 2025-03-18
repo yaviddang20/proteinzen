@@ -10,11 +10,11 @@ import torch
 import numpy as np
 
 from lightning import LightningDataModule, LightningModule, Trainer
-from lightning.pytorch.loggers.wandb import WandbLogger
+# from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
 
-import wandb
+# import wandb
 
 
 from proteinzen.runtime.config import config_hydra_store, remove_zen_keys
@@ -43,9 +43,10 @@ class Experiment:
             log.info("Debug mode.")
             logger = None
         else:
-            logger = WandbLogger(
-                **remove_zen_keys(self._exp_cfg.wandb),
-            )
+            raise NotImplementedError()
+            # logger = WandbLogger(
+            #     **remove_zen_keys(self._exp_cfg.wandb),
+            # )
 
         # # Checkpoint directory.
         # ckpt_dir = self._exp_cfg.checkpointer.dirpath

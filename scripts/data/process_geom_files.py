@@ -10,6 +10,8 @@ import pandas as pd
 from rdkit import Chem
 
 from proteinzen.data.datasets.featurize.molecule import conformer_props
+from proteinzen.data.datasets.featurize.coarse_grain import compute_coarse_grain_groups
+from proteinzen.data.datasets.featurize.conformer_matching import optimize_rotatable_bonds, get_torsion_angles
 
 dihedral_pattern = Chem.MolFromSmarts('[*]~[*]~[*]~[*]')
 
@@ -46,17 +48,26 @@ def process(smiles_fp, out_folder, splits=None, include_h=False):
         conf_prop_dicts = []
         rd_mols = []
         for conf_data in data['conformers']:
+            # true_mol = conf_data['rd_mol']
+            # mol = Chem.Mol(true_mol)
+            # rotatable_bonds = get_torsion_angles(mol)
+            # opt_mol = optimize_rotatable_bonds(mol, true_mol, rotatable_bonds)
+            # conformer = opt_mol.GetConformer()
+            conformer = conf_data['rd_mol'].GetConformer()
             boltzmann_weights.append(conf_data['boltzmannweight'])
-            conf_prop_dicts.append(conformer_props(conf_data['rd_mol'].GetConformer(), implicit_H=(not include_h)))
+            conf_prop_dicts.append(conformer_props(conformer, implicit_H=(not include_h)))
             rd_mols.append(conf_data['rd_mol'])
     except Exception as e:
         print(smiles)
         raise e
 
+    cg_groups = compute_coarse_grain_groups(rd_mols[0])
+
     save_data = {
         "boltzmann_weights": boltzmann_weights,
         "conformer_property_dicts": conf_prop_dicts,
-        "rd_mols": rd_mols
+        "rd_mols": rd_mols,
+        "cg_groups": cg_groups
     }
     fp_name = os.path.basename(smiles_fp)
     out_path = os.path.join(out_folder, fp_name)

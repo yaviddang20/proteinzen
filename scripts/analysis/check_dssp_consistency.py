@@ -1,6 +1,11 @@
+import math
 import numpy as np
 import mdtraj as md
 import os
+
+from tmtools.io import get_structure, get_residue_data
+from tmtools.testing import get_pdb_path
+from tmtools import tm_align
 
 def compute_dssp(sample_file, folded_file):
     # MDtraj
@@ -31,6 +36,16 @@ def compute_dssp(sample_file, folded_file):
     metadata['sample_e_to_folded_h'] = ((sample_pdb_ss == 'E') & (folded_pdb_ss == 'H')).sum() / max((sample_pdb_ss == 'E').sum(), 1)
     metadata['sample_h_to_folded_e'] = ((sample_pdb_ss == 'H') & (folded_pdb_ss == 'E')).sum() / max((sample_pdb_ss == 'H').sum(), 1)
 
+    sample_struct = get_structure(sample_file)
+    folded_struct = get_structure(folded_file)
+    sample_chain = next(sample_struct.get_chains())
+    folded_chain = next(folded_struct.get_chains())
+    sample_coords, sample_seq = get_residue_data(sample_chain)
+    folded_coords, folded_seq = get_residue_data(folded_chain)
+    res = tm_align(sample_coords, folded_coords, sample_seq, folded_seq)
+    metadata['tm'] = res.tm_norm_chain1
+
+    # metadata['tm_rmsd'] = res.rmsd
 
     return metadata
 
@@ -40,7 +55,7 @@ if __name__ == '__main__':
     from tqdm import tqdm
 
     results = []
-    for pdb in tqdm(glob.glob("not_consistent_samples/*.pdb")):
+    for pdb in tqdm(sorted(glob.glob("not_consistent_samples/*.pdb"))):
         folded_pdb_file = os.path.basename(pdb)
         folded_pdb_file = "not_consistent_samples_folded/" + folded_pdb_file.replace(".", "_sc.")
         results.append(compute_dssp(pdb, folded_pdb_file))

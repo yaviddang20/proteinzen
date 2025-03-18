@@ -73,6 +73,9 @@ class MultiFrameInterpolation(Task):
                  polar_residues_v2=False,
                  polar_residues_v3=False,
                  polar_residues_v4=False,
+                 polar_residues_v5=False,
+                 polar_residues_v6=False,
+                 polar_residues_v7=False,
                  downweight_K=False
     ):
         super().__init__()
@@ -129,6 +132,21 @@ class MultiFrameInterpolation(Task):
             self.polar_residues = torch.tensor([
                 residue_constants.restype_order[i]
                 for i in ['C', 'D', 'E', 'H', 'P', 'Q', 'R', 'S', 'T']
+            ])
+        elif polar_residues_v5:
+            self.polar_residues = torch.tensor([
+                residue_constants.restype_order[i]
+                for i in ['C', 'D', 'E', 'H', 'P', 'Q', 'R', 'S', 'T', 'W']
+            ])
+        elif polar_residues_v6:
+            self.polar_residues = torch.tensor([
+                residue_constants.restype_order[i]
+                for i in ['C', 'E', 'H', 'P', 'Q', 'R', 'S', 'T', 'W']
+            ])
+        elif polar_residues_v7:
+            self.polar_residues = torch.tensor([
+                residue_constants.restype_order[i]
+                for i in ['C', 'E', 'H', 'P', 'Q', 'R', 'W']
             ])
         else:
             self.polar_residues = torch.tensor([

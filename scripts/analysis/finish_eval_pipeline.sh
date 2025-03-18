@@ -8,6 +8,7 @@
 #$ -l h_rt=0:30:00
 
 conda activate proteinzen-refactor
+echo $PWD
 python ~/projects/proteinzen/scripts/analysis/esm_analysis.py --esmlog esmfold.log --folded_folder $PWD --samples ../samples
 cd ..
 bash ~/projects/proteinzen/scripts/analysis/analysis_suite.sh

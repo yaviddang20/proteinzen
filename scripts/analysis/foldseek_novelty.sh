@@ -55,29 +55,29 @@ foldseek easy-search $DESIGNABLE_DIR \
     --max-seqs 10000000000
 
 
-# i think i also got this from jason yim, need to double check
-foldseek easy-search $DESIGNABLE_DIR \
-    /wynton/group/kortemme/foldseek_db/AF_proteome \
-    $OUTPUTDIR/aln_AFDB_proteome.tsv \
-    $OUTPUTDIR/tmpFolder \
-    --alignment-type 1 \
-    --format-output query,target,alntmscore,lddt \
-    --tmscore-threshold 0.0 \
-    --exhaustive-search \
-    --threads 32 \
-    --max-seqs 10000000000
-
-# i think i also got this from jason yim, need to double check
-foldseek easy-search $DESIGNABLE_DIR \
-    /wynton/group/kortemme/foldseek_db/AF_swiss_prot \
-    $OUTPUTDIR/aln_AFDB_swiss_prot.tsv \
-    $OUTPUTDIR/tmpFolder \
-    --alignment-type 1 \
-    --format-output query,target,alntmscore,lddt \
-    --tmscore-threshold 0.0 \
-    --exhaustive-search \
-    --threads 32 \
-    --max-seqs 10000000000
+# # i think i also got this from jason yim, need to double check
+# foldseek easy-search $DESIGNABLE_DIR \
+#     /wynton/group/kortemme/foldseek_db/AF_proteome \
+#     $OUTPUTDIR/aln_AFDB_proteome.tsv \
+#     $OUTPUTDIR/tmpFolder \
+#     --alignment-type 1 \
+#     --format-output query,target,alntmscore,lddt \
+#     --tmscore-threshold 0.0 \
+#     --exhaustive-search \
+#     --threads 32 \
+#     --max-seqs 10000000000
+#
+# # i think i also got this from jason yim, need to double check
+# foldseek easy-search $DESIGNABLE_DIR \
+#     /wynton/group/kortemme/foldseek_db/AF_swiss_prot \
+#     $OUTPUTDIR/aln_AFDB_swiss_prot.tsv \
+#     $OUTPUTDIR/tmpFolder \
+#     --alignment-type 1 \
+#     --format-output query,target,alntmscore,lddt \
+#     --tmscore-threshold 0.0 \
+#     --exhaustive-search \
+#     --threads 32 \
+#     --max-seqs 10000000000
 
 # # i think i also got this from jason yim, need to double check
 # foldseek easy-search $DESIGNABLE_DIR \

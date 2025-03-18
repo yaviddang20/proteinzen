@@ -35,7 +35,7 @@ if __name__ == '__main__':
         current_folded = None
         folded_paths = glob.glob(os.path.join(folded_path, "*"))
         for path in folded_paths:
-            if row['name'] in path:
+            if row['name'] in path.split("/")[-1]:
                 current_folded = path
                 break
 

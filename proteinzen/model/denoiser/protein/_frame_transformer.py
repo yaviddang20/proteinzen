@@ -1556,8 +1556,12 @@ class SequenceFrameTransformerUpdate(nn.Module):
                 * rigids_mask[0:1, ..., None, :].tile(1, n_rigids, 1)
             )
 
-            framepairs_idx = to_pairs(rigids_pair_idx.float()).long()
-            framepairs_mask = to_pairs(rigids_pair_mask[..., None].float()).bool()
+            # bmm only works on floating point types
+            # but we lose precision on large ints so we disable autocast
+            with torch.autocast("cuda", enabled=False):
+                framepairs_idx = to_pairs(rigids_pair_idx.float()).long()
+                framepairs_mask = to_pairs(rigids_pair_mask[..., None].float()).bool()
+
         framepairs = z[:, framepairs_idx[0, ..., 0], framepairs_idx[0, ..., 1]]
         framepairs = framepairs * framepairs_mask
         return framepairs
@@ -1941,8 +1945,9 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
                 * rigids_mask[0:1, ..., None, :].tile(1, n_rigids, 1)
             )
 
-            framepairs_idx = to_pairs(rigids_pair_idx.float()).long()
-            framepairs_mask = to_pairs(rigids_pair_mask[..., None].float()).bool()
+            with torch.autocast("cuda", enabled=False):
+                framepairs_idx = to_pairs(rigids_pair_idx.float()).long()
+                framepairs_mask = to_pairs(rigids_pair_mask[..., None].float()).bool()
         framepairs = z[:, framepairs_idx[0, ..., 0], framepairs_idx[0, ..., 1]]
         framepairs = framepairs * framepairs_mask
         return framepairs

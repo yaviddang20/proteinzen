@@ -1,3 +1,4 @@
+import json
 import logging
 import math
 import os
@@ -886,7 +887,14 @@ class ProteinModule(L.LightningModule):
 
     def on_before_optimizer_step(self, optimizer):
         with torch.no_grad():
-            norms = [torch.linalg.vector_norm(p.grad.view(-1), dim=-1) for _, p in self.model.named_parameters() if p.grad is not None]
+            norms = []
+            norm_dict = {}
+            for name, p in self.model.named_parameters():
+                if p.grad is not None:
+                    n = torch.linalg.vector_norm(p.grad.view(-1), dim=-1)
+                    norms.append(n)
+                    norm_dict[name] = n.item()
+            # print(json.dumps(norm_dict, indent=4))
             total_norm = torch.linalg.vector_norm(
                 torch.stack(norms, dim=0),
                 dim=0

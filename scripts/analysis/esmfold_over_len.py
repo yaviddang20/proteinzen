@@ -52,7 +52,7 @@ pos.x1 += 0.10
 cbar.ax.set_position(pos)
 
 ax.axhline(y=2.0, color='red', linestyle='--')
-plt.savefig("designability_over_len.png", dpi=1200)
+plt.savefig("designability_over_len.png")
 
 plt.clf()
 

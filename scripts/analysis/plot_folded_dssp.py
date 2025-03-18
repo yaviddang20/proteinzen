@@ -41,7 +41,13 @@ if __name__ == '__main__':
     df['frac_helix'] = df['helix_percent']
     df['frac_strand'] = df['strand_percent']
 
-    jointplot = sns.jointplot(df, x="frac_helix", y="frac_strand", hue="seq_len", palette="colorblind", height=6)
+    if len(set(df['seq_len'].tolist())) < 10:
+        discrete = True
+        colors = "colorblind"
+    else:
+        discrete = False
+        colors = None
+    jointplot = sns.jointplot(df, x="frac_helix", y="frac_strand", hue="seq_len", palette=colors, height=9, s=100)
     # plt.suptitle("Secondary structure content of\nsequence-structure consistent samples")
 
     ax = plt.gca()

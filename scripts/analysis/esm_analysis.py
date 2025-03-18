@@ -103,6 +103,8 @@ if __name__ == '__main__':
 
     rmsds = []
     all_atom_rmsds = []
+    core_all_atom_rmsds = []
+    surface_all_atom_rmsds = []
     superimpose = Superimposer()
     pdbio = PDBIO()
 
@@ -142,13 +144,39 @@ if __name__ == '__main__':
         rmsds.append(superimpose.rms)
 
         if args.fold_original and row['sample'] == 0:
-            TMPFILE = f"/tmp/folded_intermediate-{hash(current_folded)}.pdb"
+            if os.path.isdir("/scratch/alexjli"):
+                TMPFILE = f"/scratch/alexjli/folded_intermediate-{hash(current_folded)}.pdb"
+            else:
+                TMPFILE = f"/tmp/folded_intermediate-{hash(current_folded)}.pdb"
             shutil.copyfile(current_folded, TMPFILE)
 
             sample_pose = pyrosetta.io.pose_from_pdb(sample_path)
             folded_pose = pyrosetta.io.pose_from_pdb(TMPFILE)
             rmsd = pyrosetta.rosetta.core.scoring.all_atom_rmsd(sample_pose, folded_pose)
             all_atom_rmsds.append(rmsd)
+
+            core_res_selector = pyrosetta.rosetta.core.select.residue_selector.NumNeighborsSelector()
+            # i have no idea how ur supposed to properly do this
+            core_res = list(pyrosetta.rosetta.core.select.get_residues_from_subset(core_res_selector.apply(sample_pose)))
+            core_res_list = pyrosetta.rosetta.std.list_unsigned_long_t()
+            for i in core_res:
+                core_res_list.append(i)
+            core_rmsd = pyrosetta.rosetta.core.scoring.all_atom_rmsd(sample_pose, folded_pose, core_res_list)
+            core_all_atom_rmsds.append(core_rmsd)
+
+            not_core_res_selector = pyrosetta.rosetta.core.select.residue_selector.NotResidueSelector()
+            not_core_res_selector.set_residue_selector(core_res_selector)
+            # i have no idea how ur supposed to properly do this
+            not_core_res = list(pyrosetta.rosetta.core.select.get_residues_from_subset(not_core_res_selector.apply(sample_pose)))
+            not_core_res_list = pyrosetta.rosetta.std.list_unsigned_long_t()
+            for i in not_core_res:
+                not_core_res_list.append(i)
+            surface_rmsd = pyrosetta.rosetta.core.scoring.all_atom_rmsd(sample_pose, folded_pose, not_core_res_list)
+            surface_all_atom_rmsds.append(surface_rmsd)
+
+            print(rmsd, core_rmsd, surface_rmsd)
+
+
             if os.path.exists(TMPFILE):
                 os.remove(TMPFILE)
 
@@ -231,6 +259,10 @@ if __name__ == '__main__':
     folding_df = df[df['sample'] == 0]
     if len(all_atom_rmsds) == len(folding_df):
         folding_df['sc_rmsd_all_atom'] = all_atom_rmsds
+    if len(core_all_atom_rmsds) == len(folding_df):
+        folding_df['sc_rmsd_core_all_atom'] = core_all_atom_rmsds
+    if len(core_all_atom_rmsds) == len(folding_df):
+        folding_df['sc_rmsd_surface_all_atom'] = surface_all_atom_rmsds
     folding_df.to_csv("folding_rmsd.csv")
 
     collapsed_df = []
@@ -243,5 +275,6 @@ if __name__ == '__main__':
     with open("../num_designable.txt", 'w') as fp:
         fp.write(f"Num designable: {len(collapsed_df[collapsed_df.sc_rmsd < 2])}\n")
         fp.write(f"Num folded correctly (bb): {len(folding_df[folding_df.sc_rmsd < 2])}\n")
-        fp.write(f"Num folded correctly (aa): {len(folding_df[folding_df.sc_rmsd_all_atom < 2])}")
+        fp.write(f"Num folded correctly (aa): {len(folding_df[folding_df.sc_rmsd_all_atom < 2])}\n")
+        fp.write(f"Num folded correctly (core): {len(folding_df[(folding_df.sc_rmsd_core_all_atom < 2) & (folding_df.sc_rmsd < 2)])}")
 
