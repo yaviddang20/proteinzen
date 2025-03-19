@@ -66,6 +66,10 @@ parser.add_argument(
     type=str,
     default='./data/processed_pdb')
 parser.add_argument(
+    '--do_not_overwrite',
+    help='Whether to avoid overwriting existing files.',
+    action='store_true')
+parser.add_argument(
     '--debug',
     help='Turn on for debugging.',
     action='store_true')
@@ -272,8 +276,19 @@ def process_fn(
         verbose=None,
         max_resolution=None,
         max_len=None,
-        write_dir=None):
+        write_dir=None,
+        overwrite=True):
     try:
+        mmcif_name = os.path.basename(mmcif_path).replace('.cif', '')
+        if mmcif_name.startswith("AF-"):
+            mmcif_subdir = os.path.join(write_dir, mmcif_name[5:7].lower())
+        else:
+            mmcif_subdir = os.path.join(write_dir, mmcif_name[1:3].lower())
+        processed_mmcif_path = os.path.join(mmcif_subdir, f'{mmcif_name}.pkl')
+        processed_mmcif_path = os.path.abspath(processed_mmcif_path)
+        if not overwrite and os.path.exists(processed_mmcif_path):
+            return None
+
         start_time = time.time()
         metadata = process_mmcif(
             mmcif_path,
@@ -318,7 +333,8 @@ def main(args):
             verbose=args.verbose,
             max_resolution=args.max_resolution,
             max_len=args.max_len,
-            write_dir=write_dir)
+            write_dir=write_dir,
+            overwrite=(not args.do_not_overwrite))
         # Uses max number of available cores.
         with mp.Pool(processes=args.num_processes) as pool:
             all_metadata = list(tqdm(pool.imap(_process_fn, all_mmcif_paths), total=len(all_mmcif_paths)))

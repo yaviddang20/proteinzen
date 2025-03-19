@@ -246,6 +246,7 @@ class MultiSE3Interpolant:
         # [B]
         if self.use_diffusion_forcing:
             rigidwise_t = self.sample_t(res_data.batch.numel() * self.rigids_per_res)
+            rigidwise_t = rigidwise_t.reshape(rigids_noising_mask.shape)
             # batch["t"] = t
 
             if self.shift_time_scale:
@@ -301,7 +302,10 @@ class MultiSE3Interpolant:
         res_data["rotmats_t"] = rotmats_t
         res_data["trans_t"] = trans_t
 
-        var_scaling_dict = self.var_scaling_factors(t)
+        if self.use_diffusion_forcing:
+            var_scaling_dict = self.var_scaling_factors(rigidwise_t)
+        else:
+            var_scaling_dict = self.var_scaling_factors(t)
         # print(var_scaling_dict)
         batch['trans_c_skip'] = var_scaling_dict['c_skip']
         batch['trans_c_in'] = var_scaling_dict['c_in']

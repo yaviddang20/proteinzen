@@ -80,15 +80,15 @@ def angle_axis_rot_vf_loss(
         ref_rot_vf,
         batch,
         res_mask,
-        norm_scale,
+        rigidwise_norm_scale,
         angle_loss_weight=0.5,
         seqwise_weight=None,
         rot_cap_loss_weight=0.0,
         eps=1e-8):
     pred_rot_abs_angle = torch.norm(pred_rot_vf, dim=-1)
 
-    pred_rot_vf = pred_rot_vf / norm_scale[batch, None]
-    ref_rot_vf = ref_rot_vf / norm_scale[batch, None]
+    pred_rot_vf = pred_rot_vf / rigidwise_norm_scale[..., None]
+    ref_rot_vf = ref_rot_vf / rigidwise_norm_scale[..., None]
 
     gt_rot_angle = torch.norm(ref_rot_vf, dim=-1, keepdim=True)
     gt_rot_axis = ref_rot_vf / (gt_rot_angle + eps)

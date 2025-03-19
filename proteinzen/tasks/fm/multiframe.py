@@ -16,8 +16,8 @@ from proteinzen.data.openfold import data_transforms, residue_constants
 from proteinzen.utils.openfold import rigid_utils as ru
 from proteinzen.tasks import Task
 
-from proteinzen.runtime.loss.common import atomic_losses
-from proteinzen.runtime.loss.multiframe import multiframe_fm_loss
+from proteinzen.runtime.loss.common import atomic_losses_reduced
+from proteinzen.runtime.loss.multiframe import multiframe_fm_loss_reduced
 from proteinzen.runtime.loss.traj import multiframe_traj_loss
 from proteinzen.stoch_interp.interpolate.multiframe import _centered_gaussian, _uniform_so3, MultiSE3Interpolant
 
@@ -94,13 +94,13 @@ class MultiFrameInterpolation(Task):
         self.sidechain_upweight = sidechain_upweight
         self.trans_preconditioning = trans_preconditioning
         self.rot_preconditioning = rot_preconditioning
-        self.rot_loss_exp_weighting = rot_loss_exp_weighting
+        assert (not rot_loss_exp_weighting), "depreciated"
         self.fafe_weight = fafe_weight
         self.rot_vf_angle_loss_weight = rot_vf_angle_loss_weight
         self.rigids_traj_loss_scale = rigids_traj_loss_scale
         self.bb_traj_loss_scale = bb_traj_loss_scale
         self.ignore_rigid_2_vf_loss = ignore_rigid_2_vf_loss
-        self.disable_rot_vf_time_scaling = disable_rot_vf_time_scaling
+        assert (not disable_rot_vf_time_scaling), "depreciated"
         self.rot_cap_loss_weight = rot_cap_loss_weight
         self.dummy_rigid_to_sidechain_rigid = dummy_rigid_to_sidechain_rigid
         self.cg_version = cg_version
@@ -377,6 +377,7 @@ class MultiFrameInterpolation(Task):
             ).to_tensor_7()
             t = torch.ones(batch.num_graphs, device=device) * t_hat
             batch["t"] = t
+            batch["rigidwise_t"] = torch.ones((total_num_res, self.frame_noiser.rigids_per_res), device=device) * t_hat
             if self.trans_preconditioning:
                 trans_var_scaling_dict = self.frame_noiser.var_scaling_factors(t_hat)
                 batch['trans_c_skip'] = trans_var_scaling_dict['c_skip']
@@ -477,7 +478,7 @@ class MultiFrameInterpolation(Task):
 
 
     def compute_loss(self, inputs, outputs: Dict):
-        frame_fm_loss_dict = multiframe_fm_loss(
+        frame_fm_loss_dict = multiframe_fm_loss_reduced(
             inputs, outputs, sep_rot_loss=self.sep_rot_loss,
             t_norm_clip=self.t_norm_clip,
             square_aux_loss_time_factor=True,
@@ -488,10 +489,9 @@ class MultiFrameInterpolation(Task):
             polar_upweight=self.polar_upweight,
             sidechain_upweight=self.sidechain_upweight,
             trans_preconditioning=self.trans_preconditioning,
-            rot_exp_weighting=self.rot_loss_exp_weighting,
+            # rot_exp_weighting=self.rot_loss_exp_weighting,
             rot_vf_angle_loss_weight=self.rot_vf_angle_loss_weight,
             ignore_rigid_2_vf_loss=self.ignore_rigid_2_vf_loss,
-            disable_rot_vf_time_scaling=self.disable_rot_vf_time_scaling,
             rot_cap_loss_weight=self.rot_cap_loss_weight,
             fafe_l2_block_mask_size=self.fafe_l2_block_mask_size,
             downweight_K=self.downweight_K
@@ -505,19 +505,18 @@ class MultiFrameInterpolation(Task):
             frame_fm_loss_dict["unscaled_trans_vf_loss"] +
             frame_fm_loss_dict["unscaled_rot_vf_loss"]
         )
-        bb_denoising_finegrain_loss = (
-            frame_fm_loss_dict["scaled_pred_bb_mse"] # / (18 * 3)
-            + frame_fm_loss_dict["scaled_dist_mat_loss"] # / (18 * 3)
-        ) * (inputs['t'] > self.aux_loss_t_min)
+        if self.bb_aux_loss_weight > 0.0:
+            bb_denoising_finegrain_loss = (
+                frame_fm_loss_dict["scaled_pred_bb_mse"] # / (18 * 3)
+                + frame_fm_loss_dict["scaled_dist_mat_loss"] # / (18 * 3)
+            ) * (inputs['t'] > self.aux_loss_t_min)
+        else:
+            bb_denoising_finegrain_loss = torch.zeros_like(frame_vf_loss)
 
-        atomic_loss_dict = atomic_losses(
+
+        atomic_loss_dict = atomic_losses_reduced(
             inputs,
             outputs,
-            use_smooth_lddt=True,
-            use_fape=self.use_fape,
-            t_norm_clip=self.t_norm_clip,
-            use_sidechain_dists_mse_loss=False,
-            use_sidechain_clash_loss=False,
             polar_upweight=self.polar_upweight,
             sidechain_upweight=self.sidechain_upweight
         )
@@ -526,7 +525,7 @@ class MultiFrameInterpolation(Task):
             self.atom14_mse_weight * atomic_loss_dict[("scaled_atom14_mse" if self.scale_atom14_mse else "atom14_mse")] # * 1/(18 * 3)
             + self.seq_loss_weight * atomic_loss_dict["seq_loss"] # / np.log(20)
             + self.smooth_lddt_weight * atomic_loss_dict["smooth_lddt"]
-            + atomic_loss_dict[('scaled_fape' if self.scale_frame_aligned_errors or self.scale_fape else 'fape')]
+            # + atomic_loss_dict[('scaled_fape' if self.scale_frame_aligned_errors or self.scale_fape else 'fape')]
         )
 
 

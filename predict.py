@@ -301,7 +301,7 @@ if __name__ == '__main__':
     cfg = load_from_yaml(config_path)
     cfg['experiment']['warm_start'] = ckpt_path
     # cfg['datamodule']['batch_size'] = 2000
-    cfg['datamodule']['batch_size'] = 450 * 300
+    cfg['datamodule']['batch_size'] = 6 * 300 * 300
     # if 'compatibility_mode' not in cfg['model']:
     #     cfg['model']['compatibility_mode'] = True
     cfg['save_traj'] = args.save_traj
@@ -344,7 +344,7 @@ if __name__ == '__main__':
     if cfg['domain']['domain'] in ["protein", "protein_multichi"]:
         if args.debug:
             print("debug")
-            cfg['datamodule']['batch_size'] = 2 * 300 * 300
+            cfg['datamodule']['batch_size'] = 300 * 300
             # cfg['datamodule']['sample_lengths'] = {
             #     # 60: 5,
             #     # 70: 5,
@@ -369,10 +369,10 @@ if __name__ == '__main__':
                 }
             else:
                 cfg['datamodule']['sample_lengths'] = {
-                    70: 10,
-                    100: 10,
-                    200: 10,
-                    300: 10,
+                    70:  5,
+                    100: 5,
+                    200: 2,
+                    300: 1,
                 }
         else:
             if cfg['datamodule']['max_len'] == 128 or 'afdb_128' in cfg['datamodule']['data_dir']:

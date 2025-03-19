@@ -1296,6 +1296,91 @@ def atomic_losses(batch,
     return out_dict
 
 
+def atomic_losses_reduced(batch,
+                  model_outputs,
+                  polar_upweight=False,
+                  sidechain_upweight=False,
+):
+    res_data = batch['residue']
+
+    gt_atom14 = res_data['atom14_gt_positions']
+    alt_atom14 = res_data['atom14_alt_gt_positions']
+    # ref_atom14 = res_data['noised_atom14']
+
+    seq = res_data['seq']
+    seq_mask = res_data['seq_mask']
+
+    res_mask = res_data['res_mask']
+    noising_mask = res_data['res_noising_mask']
+    # mlm_mask = res_data['mlm_mask']
+    atom14_gt_mask = res_data['atom14_gt_exists']
+    atom14_alt_gt_mask = res_data['atom14_alt_gt_exists']
+
+    minimal_mask = res_mask & seq_mask
+    # ae_mask = res_mask & mlm_mask & seq_mask
+    denoiser_mask = res_mask & noising_mask & seq_mask
+    # decoded_all_atom14 = model_outputs['decoded_all_atom14']
+    # decoded_all_chis = model_outputs['decoded_all_chis']
+    pred_atom14 = model_outputs['denoised_atom14']
+    pred_atom14_gt_seq = model_outputs['denoised_atom14_gt_seq']
+    seq_logits = model_outputs['decoded_seq_logits']
+
+    # pred_atom14 = _collect_from_seq(decoded_all_atom14, seq, seq_mask)
+    # pred_chis = _collect_from_seq(decoded_all_chis, seq, seq_mask)
+    seqwise_weight = 1
+    if polar_upweight:
+        seqwise_weight = seqwise_weight * (res_data['polar_mask'].float()+1)[..., None]
+    if sidechain_upweight:
+        sidechain_weight = torch.ones(14, device=gt_atom14.device)
+        sidechain_weight[5:] += 1
+        seqwise_weight = seqwise_weight * sidechain_weight[None]
+
+
+    atom14_mse = atom14_mse_loss(
+        gt_atom14,
+        alt_atom14,
+        pred_atom14_gt_seq,
+        res_data.batch,
+        atom14_gt_mask,
+        atom14_alt_gt_mask,
+        minimal_mask,
+        no_bb=False,
+        seqwise_weight=seqwise_weight,
+        ignore_symmetry=True
+    )
+    seq_loss = seq_cce_loss(
+        seq,
+        seq_logits,
+        res_data.batch,
+        seq_mask,
+        seqwise_weight=(res_data['polar_mask'].float()+1 if polar_upweight else None)
+    )
+    per_seq_recov = seq_recov(
+        seq,
+        seq_logits,
+        res_data.batch,
+        denoiser_mask)
+    atom14_rmsd = atom14_mse.sqrt()
+
+    smooth_lddt = smooth_lddt_loss(
+        pred_atom14=pred_atom14_gt_seq,
+        gt_atom14=gt_atom14,
+        alt_atom14=alt_atom14,
+        batch=res_data.batch,
+        atom14_mask=atom14_gt_mask.bool()
+    )
+
+    out_dict = {
+        "seq_loss": seq_loss,
+        "per_seq_recov": per_seq_recov,
+        "atom14_mse": atom14_mse,
+        "atom14_rmsd": atom14_rmsd,
+        "smooth_lddt": smooth_lddt,
+    }
+
+    return out_dict
+
+
 def atom14_fm_losses(batch,
                   model_outputs,
                   label_smoothing=0.0,

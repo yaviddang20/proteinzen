@@ -956,8 +956,9 @@ class IpaScore(nn.Module):
         rigids_embed = input_feats['rigids_embed']
         curr_rigids = Rigid.from_tensor_7(torch.clone(init_frames))
 
-        time_embed = self.time_embed(input_feats['t'])
-        time_embed = time_embed[:, None].expand(-1, node_mask.shape[1], -1)
+        if not self.no_time_condition:
+            time_embed = self.time_embed(input_feats['t'])
+            time_embed = time_embed[:, None].expand(-1, node_mask.shape[1], -1)
 
         n_batch = curr_rigids.shape[0]
         n_rigids = curr_rigids.shape[1] * curr_rigids.shape[2]
@@ -1333,8 +1334,7 @@ class IpaMultiRigidDenoiser(nn.Module):
     def forward(self, data, self_condition=None):
         res_data = data['residue']
         res_mask = (res_data['res_mask']).bool()
-        t = data['t']
-        batch_size = t.shape[0]
+        batch_size = data.num_graphs # t.shape[0]
         # fixed_mask = torch.zeros_like(res_mask).view(batch_size, -1)
         fixed_mask = ~res_data['res_noising_mask'].view(batch_size, -1)
 
@@ -1362,7 +1362,7 @@ class IpaMultiRigidDenoiser(nn.Module):
 
         # center the training example at the mean of the x_cas
         rigids_t = Rigid.from_tensor_7(res_data['rigids_t'])
-        rigids_t = rigids_t.view([t.shape[0], -1, rigids_t.shape[-1]])
+        rigids_t = rigids_t.view([batch_size, -1, rigids_t.shape[-1]])
         center = rigids_t.get_trans().mean(dim=(-2, -3))
         rigids_t = rigids_t.translate(-center[..., None, None, :])
 
@@ -1382,6 +1382,7 @@ class IpaMultiRigidDenoiser(nn.Module):
 
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_amp):
             if self.use_embedder_v2:
+                t = data['t']
                 node_embed, edge_embed, rigids_embed, framepair_embed = self.embedder(
                     seq_idx=seq_idx,
                     chain_idx=chain_idx,
@@ -1391,6 +1392,14 @@ class IpaMultiRigidDenoiser(nn.Module):
                     fixed_mask=fixed_mask,
                     sc_rigids=sc_rigids,
                 )
+                input_feats = {
+                    'fixed_mask': fixed_mask,
+                    'res_mask': res_mask.view(batch_size, -1),
+                    'rigids_t': rigids_in.to_tensor_7(),
+                    't': t,
+                    "rigids_embed": rigids_embed,
+                    "framepair_embed": framepair_embed
+                }
             elif self.use_embedder_v3:
                 rigidwise_t = data['rigidwise_t']
                 node_embed, edge_embed, rigids_embed, framepair_embed = self.embedder(
@@ -1401,7 +1410,16 @@ class IpaMultiRigidDenoiser(nn.Module):
                     node_mask=res_mask.view(batch_size, -1),
                     sc_rigids=sc_rigids,
                 )
+                input_feats = {
+                    'fixed_mask': fixed_mask,
+                    'res_mask': res_mask.view(batch_size, -1),
+                    'rigids_t': rigids_in.to_tensor_7(),
+                    't': rigidwise_t,
+                    "rigids_embed": rigids_embed,
+                    "framepair_embed": framepair_embed
+                }
             else:
+                t = data['t']
                 node_embed, edge_embed, rigids_embed = self.embedder(
                     seq_idx=seq_idx,
                     t=t,
@@ -1410,15 +1428,14 @@ class IpaMultiRigidDenoiser(nn.Module):
                 )
                 framepair_embed = None
 
-
-            input_feats = {
-                'fixed_mask': fixed_mask,
-                'res_mask': res_mask.view(batch_size, -1),
-                'rigids_t': rigids_in.to_tensor_7(),
-                't': t,
-                "rigids_embed": rigids_embed,
-                "framepair_embed": framepair_embed
-            }
+                input_feats = {
+                    'fixed_mask': fixed_mask,
+                    'res_mask': res_mask.view(batch_size, -1),
+                    'rigids_t': rigids_in.to_tensor_7(),
+                    't': t,
+                    "rigids_embed": rigids_embed,
+                    "framepair_embed": framepair_embed
+                }
 
             score_dict = self.ipa_score(node_embed, edge_embed, input_feats)
 
@@ -1441,12 +1458,13 @@ class IpaMultiRigidDenoiser(nn.Module):
                     )
 
         if self.rot_preconditioning:
+            rigidwise_t = data['rigidwise_t'].unflatten(0, (batch_size, seq_idx.shape[1]))
             def scale_rot(rot_in, rot_out):
                 rel_rot = rot_out.compose_q(rot_in.invert())
                 rel_rotquat = rel_rot.get_quats()
                 rel_rotvec = rotquat_to_rotvec(rel_rotquat.view(-1, 4)).view(*rel_rotquat.shape[:-1], -1)
                 angle = torch.linalg.vector_norm(rel_rotvec + 1e-8, dim=-1)
-                scaled_angle = angle * (1 - t.view(*t.shape, *[1 for _ in range(angle.dim() - t.dim())]))
+                scaled_angle = angle * (1 - rigidwise_t)
                 axis = F.normalize(rel_rotvec, dim=-1)
                 scaled_rotquat = torch.cat([
                     torch.cos(scaled_angle/2)[..., None], torch.sin(scaled_angle/2)[..., None] * axis
@@ -1484,7 +1502,7 @@ class IpaMultiRigidDenoiser(nn.Module):
             rel_rotvec = rotquat_to_rotvec(rel_rotquat.view(-1, 4)).view(*rel_rotquat.shape[:-1], -1)
             angle = torch.linalg.vector_norm(rel_rotvec + 1e-8, dim=-1)
             angle = angle.clamp(min=1e-8, max=torch.pi-1e-8)
-            capped_angle = torch.min(angle, torch.ones_like(angle) * torch.pi * (1-t)[..., None, None])
+            capped_angle = torch.min(angle, torch.ones_like(angle) * torch.pi * (1-rigidwise_t))
             axis = F.normalize(rel_rotvec, dim=-1)
             capped_rotquat = torch.cat([
                 torch.cos(capped_angle/2)[..., None], torch.sin(capped_angle/2)[..., None] * axis
