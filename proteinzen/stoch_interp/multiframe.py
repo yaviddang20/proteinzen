@@ -103,10 +103,6 @@ class MultiSE3Interpolant:
                  mixed_beta_t_sched=False,
                  beta_p1=1.9,
                  beta_p2=1.0,
-                 use_trans_sfm=False,
-                 trans_sfm_g=0.1,
-                 use_rot_sfm=False,
-                 rot_sfm_g=0.1,
                  shift_time_scale=False,
                  trans_gamma=0.16,
                  trans_step_size=1.5,
@@ -127,10 +123,6 @@ class MultiSE3Interpolant:
         self.lognorm_t_sched = lognorm_t_sched
         self.lognorm_mu = lognorm_mu
         self.lognorm_sig = lognorm_sig
-        self.use_trans_sfm = use_trans_sfm
-        self.trans_sfm_g = trans_sfm_g
-        self.use_rot_sfm = use_rot_sfm
-        self.rot_sfm_g = rot_sfm_g
         self.shift_time_scale = shift_time_scale
         self.mixed_beta_t_sched = mixed_beta_t_sched
         self.beta_p1 = beta_p1
@@ -192,15 +184,6 @@ class MultiSE3Interpolant:
 
     def _corrupt_trans(self, trans_1, trans_0, t, res_mask, diffuse_mask, batch):
         trans_t = (1 - t[..., None]) * trans_0 + t[..., None] * trans_1
-
-        if self.use_trans_sfm:
-            g = self.trans_sfm_g
-            std = g * (t * (1-t)).sqrt()
-            # TODO: this is a typo but i'm keeping it so i can compare against previous training runs
-            scaling = self.trans_preconditioning_std if self.trans_preconditioning else 16 #du.NM_TO_ANG_SCALE
-            dW_trans = torch.randn_like(trans_0) * std[batch, None, None] * scaling
-            trans_t = trans_t + dW_trans
-
         trans_t = _trans_diffuse_mask(trans_t, trans_1, diffuse_mask)
         return trans_t * res_mask[..., None, None]
 
@@ -214,14 +197,6 @@ class MultiSE3Interpolant:
     def _corrupt_rotmats(self, rotmats_1, rotmats_0, t, res_mask, diffuse_mask, batch):
         rotmats_t = so3_utils.geodesic_t(t[..., None], rotmats_1, rotmats_0)
         identity = torch.eye(3, device=self._device)
-
-        if self.use_rot_sfm:
-            g = self.rot_sfm_g
-            std = g * (t * (1-t)).sqrt()
-            dB_rot = self.igso3.sample(std, self.rigids_per_res).to(rotmats_1.device)
-            dB_rot = dB_rot[batch]
-            rotmats_t = torch.einsum("...ij,...jk->...ik", rotmats_t, dB_rot)
-
         rotmats_t = rotmats_t * res_mask[..., None, None, None] + identity[None, None] * (
             ~res_mask[..., None, None, None]
         )
@@ -244,28 +219,9 @@ class MultiSE3Interpolant:
         rigids_noising_mask = res_data["rigids_noising_mask"]
 
         # [B]
-        if self.use_diffusion_forcing:
-            rigidwise_t = self.sample_t(res_data.batch.numel() * self.rigids_per_res)
-            rigidwise_t = rigidwise_t.reshape(rigids_noising_mask.shape)
-            # batch["t"] = t
-
-            if self.shift_time_scale:
-                rigidwise_t = self.time_shift(rigidwise_t, (res_data.batch == 0).float().sum().item())
-            batch['rigidwise_t'] = rigidwise_t
-
-        else:
-            t = self.sample_t(batch.num_graphs)
-            batch["t"] = t
-
-            if self.shift_time_scale:
-                t = self.time_shift(t, (res_data.batch == 0).float().sum().item())
-
-            nodewise_t = batchwise_to_nodewise(t, res_data.batch)
-            rigidwise_t = (
-                nodewise_t[..., None] * rigids_noising_mask +
-                torch.ones_like(nodewise_t[..., None]) * ~rigids_noising_mask
-            )
-            batch['rigidwise_t'] = rigidwise_t
+        rigidwise_t = batch['rigidwise_t']
+        if self.shift_time_scale:
+            rigidwise_t = self.time_shift(rigidwise_t, (res_data.batch == 0).float().sum().item())
 
         rotmats_0 = self._sample_rotmats_0(rotmats_1)
         trans_0 = self._sample_trans_0(res_data.batch, trans_1.device)
@@ -302,51 +258,7 @@ class MultiSE3Interpolant:
         res_data["rotmats_t"] = rotmats_t
         res_data["trans_t"] = trans_t
 
-        if self.use_diffusion_forcing:
-            var_scaling_dict = self.var_scaling_factors(rigidwise_t)
-        else:
-            var_scaling_dict = self.var_scaling_factors(t)
-        # print(var_scaling_dict)
-        batch['trans_c_skip'] = var_scaling_dict['c_skip']
-        batch['trans_c_in'] = var_scaling_dict['c_in']
-        batch['trans_c_out'] = var_scaling_dict['c_out']
-        batch['trans_loss_weighting'] = var_scaling_dict['loss_weighting']
-
         return batch
-
-    def var_scaling_factors(self, t):
-        if not isinstance(t, torch.Tensor):
-            t = torch.as_tensor(t)
-
-        sig_1 = self.trans_preconditioning_std
-        sig_0 = self.trans_preconditioning_std
-        sig_signal = sig_1 * t
-        sig_noise = sig_0 * (1-t)
-        var_t = sig_signal ** 2 + sig_noise ** 2
-        # TODO: i did some emperical calculations to adjust c_out
-        # to have the vector field target be Var 1 rather than
-        # the denoiser target but you should check this math
-        # old: c_out = (1-t) * sig_1 * sig_0 / torch.sqrt(var_t)
-        c_skip = t * sig_1**2 / (var_t)
-        # c_out = sig_1 * sig_0 / torch.sqrt(var_t)
-        c_out = (1-t) * sig_1 * sig_0 / torch.sqrt(var_t)
-        c_in = 1 / torch.sqrt(var_t)
-        # loss_weighting = 1 / (c_out ** 2)
-        loss_weighting = 1 / (3 * 18 * (sig_1 ** 2))
-        return {
-            "c_skip": c_skip,
-            "c_out": c_out,
-            "c_in": c_in,
-            "loss_weighting": loss_weighting
-        }
-
-    def rot_sample_kappa(self, t):
-        if self._rots_cfg.sample_schedule == "exp":
-            return 1 - torch.exp(-t * self._rots_cfg.exp_rate)
-        elif self._rots_cfg.sample_schedule == "linear":
-            return t
-        else:
-            raise ValueError(f"Invalid schedule: {self._rots_cfg.sample_schedule}")
 
     def g_t(self, t):
         return (1 - t) / (t + 0.1) ** 2
@@ -373,13 +285,6 @@ class MultiSE3Interpolant:
             add_noise=True,
     ):
         trans_vf = (trans_1 - trans_t) / (1 - t)
-        if self.use_trans_sfm:
-            g = self.trans_sfm_g
-            std = g * (t * (1-t)).sqrt()
-            # TODO: this is a typo but i'm keeping it so i can compare against previous training runs
-            scaling = self.trans_preconditioning_std if self.trans_preconditioning else 16 #du.NM_TO_ANG_SCALE
-            dW_trans = torch.randn_like(trans_t) * std * scaling * torch.sqrt(d_t)
-            trans_t = trans_t + dW_trans
 
         step_size = self.trans_step_size
         g_t = self.g_t(t)

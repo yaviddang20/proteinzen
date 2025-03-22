@@ -13,7 +13,7 @@ from .atomic.atomic import framediff_local_atomic_context_loss
 from .atomic.interresidue import backbone_dihedrals_loss, chain_constraints_loss, bb_clash_loss
 from .openfold import compute_fape
 
-from proteinzen.stoch_interp.interpolate import so3_utils as so3_fm_utils
+from proteinzen.stoch_interp import so3_utils as so3_fm_utils
 
 def all_atom_fape_loss(
     pred_atom14,

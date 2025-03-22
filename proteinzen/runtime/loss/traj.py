@@ -6,7 +6,7 @@ from torch_geometric.nn import radius_graph
 
 from proteinzen.utils.openfold import rigid_utils as ru
 from proteinzen.model.utils.graph import batchwise_to_nodewise, get_data_lens
-from proteinzen.stoch_interp.interpolate import so3_utils as so3_fm_utils
+from proteinzen.stoch_interp import so3_utils as so3_fm_utils
 
 from .utils import _nodewise_to_graphwise
 from .frames import angle_axis_rot_vf_loss

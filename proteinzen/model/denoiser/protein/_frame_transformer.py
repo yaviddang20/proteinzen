@@ -79,6 +79,57 @@ class GatherConditionedTransition(nn.Module):
         return s
 
 
+class GatherUpdate(nn.Module):
+    def __init__(self, c_s, c_frame):
+        super().__init__()
+        self.lin = nn.Sequential(
+            LayerNorm(c_s),
+            Linear(c_s, c_frame, bias=False)
+        )
+
+    def forward(self,
+                node_embed,
+                rigids_embed,
+                rigids_to_res_idx,
+                rigids_mask):
+        broadcast_embed = self.lin(node_embed)
+        broadcast_embed = torch.gather(
+            node_embed,
+            -2,
+            rigids_to_res_idx[..., None].expand([-1 for _ in range(rigids_to_res_idx.dim())] + [rigids_embed.shape[-1]])
+        )
+        rigids_embed = rigids_embed + broadcast_embed * rigids_mask[..., None]
+        return rigids_embed
+
+
+class ScatterUpdate(nn.Module):
+    def __init__(self, c_s, c_frame):
+        super().__init__()
+        self.lin = Linear(c_frame, c_s, bias=False)
+
+    def forward(self,
+                rigids_embed,
+                node_embed,
+                rigids_to_res_idx,
+                rigids_mask):
+        out = torch.zeros_like(node_embed)
+        out.scatter_reduce_(
+            -2,
+            rigids_to_res_idx[..., None].expand(-1, -1, node_embed.shape[-1]),
+            F.relu(self.lin(rigids_embed)) * rigids_mask[..., None],
+            reduce='mean'
+        )
+        out_denom = torch.zeros(node_embed.shape[:-1], device=out.device)
+        denom = rigids_mask.float()
+        out_denom.scatter_add_(
+            -1,
+            rigids_to_res_idx,
+            denom,
+        )
+        out = out / out_denom[..., None]
+        return out + node_embed
+
+
 # from boltz1
 def get_indexing_matrix(K, W, H, device):
     assert W % 2 == 0
@@ -471,294 +522,6 @@ class BlockInvariantPointAttention(nn.Module):
 
         if self.out_gate is not None:
             gate = self.out_gate(q_in)
-            o_feats = o_feats * torch.sigmoid(gate)
-
-        # [*, N_block, block_Q, C_s]
-        out = self.linear_out(o_feats)
-
-        return out.view(s.shape)
-
-def gen_block_mask_mod(block_Q, block_K):
-    def mask_mod(batch, head, q_idx, k_idx):
-        block_idx = q_idx // block_Q
-        subset_center = block_Q / 2 + block_idx * block_Q
-        return torch.abs(q_idx - subset_center) < block_Q/2 & torch.abs(k_idx - subset_center) < block_K/2
-    return mask_mod
-
-
-class FlexBlockInvariantPointAttention(nn.Module):
-    """
-    Implements Algorithm 22.
-    """
-    def __init__(
-        self,
-        c_s,
-        c_z,
-        c_hidden,
-        num_heads,
-        num_qk_points,
-        num_v_points,
-        inf: float = 1e5,
-        eps: float = 1e-8,
-        final_init='final',
-        block_Q=32,
-        block_K=128,
-        use_compile_path=False,
-        use_out_gating=False,
-        ablate_down_z=False
-    ):
-        """
-        Args:
-            c_s:
-                Single representation channel dimension
-            c_z:
-                Pair representation channel dimension
-            c_hidden:
-                Hidden channel dimension
-            no_heads:
-                Number of attention heads
-            no_qk_points:
-                Number of query/key points to generate
-            no_v_points:
-                Number of value points to generate
-        """
-        super().__init__()
-
-        self.c_s = c_s
-        self.c_z = c_z
-        self.c_hidden = c_hidden
-        self.no_heads = num_heads
-        self.no_qk_points = num_qk_points
-        self.no_v_points = num_v_points
-        self.inf = inf
-        self.eps = eps
-        self.block_Q = block_Q
-        self.block_K = block_K
-        self.use_compile_path = use_compile_path
-        self.use_out_gating = use_out_gating
-        self.ablate_down_z = ablate_down_z
-
-        # These linear layers differ from their specifications in the
-        # supplement. There, they lack bias and use Glorot initialization.
-        # Here as in the official source, they have bias and use the default
-        # Lecun initialization.
-        hc = self.c_hidden * self.no_heads
-        self.linear_q = Linear(self.c_s, hc, bias=False)
-        self.linear_k = Linear(self.c_s, hc, bias=False)
-        self.linear_v = Linear(self.c_s, hc, bias=False)
-
-        hpq = self.no_heads * self.no_qk_points * 3
-        self.linear_q_points = Linear(self.c_s, hpq, bias=False)
-
-        hpkv = self.no_heads * (self.no_qk_points + self.no_v_points) * 3
-        self.linear_kv_points = Linear(self.c_s, hpkv, bias=False)
-
-        self.linear_b = Linear(self.c_z, self.no_heads, bias=False)
-        self.down_z = Linear(self.c_z, self.c_z // 4, bias=False)
-
-        self.head_weights = nn.Parameter(torch.zeros((self.no_heads)))
-        ipa_point_weights_init_(self.head_weights)
-
-        concat_out_dim =  (
-            self.c_hidden + self.no_v_points * 4
-        )
-        self.linear_out = Linear(self.no_heads * concat_out_dim, self.c_s, init=final_init, bias=False)
-
-        self.softmax = nn.Softmax(dim=-1)
-        self.softplus = nn.Softplus()
-
-        self.ln_s = LayerNorm(c_s)
-        self.ln_z = LayerNorm(c_z)
-        if use_out_gating:
-            self.out_gate = Linear(self.c_s, self.no_heads * concat_out_dim, bias=False)
-        else:
-            self.out_gate = None
-
-    def _pts_bias(
-        self,
-        q_pts,
-        k_pts,
-        pts_cdist=False
-    ):
-        if pts_cdist:
-            # we can do a lot of these operations in-place which saves us a small chunk of memory
-            pt_att = -2 * torch.einsum("...ahpd,...bhpd->...abh", q_pts, k_pts)
-            q_pts_norm = torch.sum(q_pts ** 2, dim=(-1, -2))
-            k_pts_norm = torch.sum(k_pts ** 2, dim=(-1, -2))
-            pt_att += q_pts_norm[..., None, :]
-            pt_att += k_pts_norm[..., None, :, :]
-
-            head_weights = self.softplus(self.head_weights).view(
-                *((1,) * len(pt_att.shape[:-1]) + (-1,))
-            )
-            head_weights = head_weights * math.sqrt(
-                1.0 / (3 * (self.no_qk_points * 9.0 / 2))
-            )
-            pt_att *= head_weights
-            pt_att *= -0.5
-        else:
-            # [*, N_res, N_res, H, P_q, 3]
-            pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
-            pt_att = pt_displacement ** 2
-
-            # [*, N_res, N_res, H, P_q]
-            pt_att = sum(torch.unbind(pt_att, dim=-1))
-            head_weights = self.softplus(self.head_weights).view(
-                *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
-            )
-            head_weights = head_weights * math.sqrt(
-                1.0 / (3 * (self.no_qk_points * 9.0 / 2))
-            )
-            pt_att = pt_att * head_weights
-
-            # [*, N_res, N_res, H]
-            pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
-
-        return pt_att
-
-    def forward(
-        self,
-        s: torch.Tensor,
-        z: torch.Tensor,
-        r: ru.Rigid,
-        s_mask: torch.Tensor,
-        to_queries: Callable,
-        to_keys: Callable,
-        block_mask
-    ) -> torch.Tensor:
-        """
-        Args:
-            s:
-                [*, N_res, C_s] single representation
-            z:
-                [*, N_res, N_res, C_z] pair representation
-            r:
-                [*, N_res] transformation object
-            mask:
-                [*, N_res] mask
-        Returns:
-            [*, N_res, C_s] single representation update
-        """
-        s = self.ln_s(s)
-        z = self.ln_z(z)
-
-        #######################################
-        # Generate scalar and point activations
-        #######################################
-        # [*, N_res, H * C_hidden]
-        q = self.linear_q(s)
-        # [*, N_res, H * C_hidden]
-        k = self.linear_k(s)
-        # [*, N_res, H * C_hidden]
-        v = self.linear_v(s)
-
-        # [*, N_res, H, C_hidden]
-        q = q.view(q.shape[:-1] + (self.no_heads, -1))
-
-        # [*, N_res, H, C_hidden]
-        k = k.view(k.shape[:-1] + (self.no_heads, -1))
-        # [*, N_res, H, C_hidden]
-        v = v.view(v.shape[:-1] + (self.no_heads, -1))
-
-        # [*, N_res, H * P_q * 3]
-        q_pts = self.linear_q_points(s)
-        # [*, N_res, H * P_q, 3]
-        q_pts = q_pts.view(q_pts.shape[:-1] + (self.no_heads * self.no_qk_points, 3))
-        q_pts = r[..., None].apply(q_pts)
-        # [*, N_res, H, P_q, 3]
-        q_pts = q_pts.view(
-            q_pts.shape[:-2] + (self.no_heads, self.no_qk_points, 3)
-        )
-
-        # [*, N_res, H * (P_q + P_v) * 3]
-        kv_pts = self.linear_kv_points(s)
-        # [*, N_res, H * (P_q + P_v), 3]
-        kv_pts = kv_pts.view(kv_pts.shape[:-1] + (-1, 3))
-        kv_pts = r[..., None].apply(kv_pts)
-
-        # [*, N_res, H, (P_q + P_v), 3]
-        kv_pts = kv_pts.view(kv_pts.shape[:-2] + (self.no_heads, -1, 3))
-
-        # [*, N_res, H, P_q/P_v, 3]
-        k_pts, v_pts = torch.split(
-            kv_pts, [self.no_qk_points, self.no_v_points], dim=-2
-        )
-
-        ##########################
-        # Compute attention scores
-        ##########################
-        # [*, N_block, block_Q, block_K, H]
-        b = self.linear_b(z)
-        # [*, N_block, block_Q, block_K]
-        attn_mask = to_queries(s_mask[..., None].float()) * to_keys(s_mask[..., None].float()).transpose(-1, -2)
-        attn_mask = self.inf * (attn_mask - 1)
-
-        b += attn_mask[..., None]
-
-        head_weights = self.softplus(self.head_weights)
-        head_weights = head_weights * math.sqrt(
-            1.0 / (3 * (self.no_qk_points * 9.0 / 2))
-        )
-
-        v_in = [
-            v.transpose(-2, -3),  # [*, H, N_res, C_hidden]
-            flatten_final_dims(v_pts, 2).transpose(-2, -3),  # [*, H, N_res, P_v * 3]
-        ]
-
-        split_lens = [t.shape[-1] for t in v_in]
-        v_in = torch.cat(v_in, dim=-1)
-
-        def score_mod(
-            score,
-            batch,
-            head,
-            q_idx,
-            k_idx
-        ):
-            block_idx = q_idx // self.block_Q
-            subset_center = self.block_Q / 2 + block_idx * self.block_Q
-            min_block_k_idx = subset_center - self.block_K / 2
-            block_q_idx = q_idx % self.block_Q
-            block_k_idx = k_idx - min_block_k_idx
-            bias = b[batch, block_idx, block_q_idx, block_k_idx, head]
-            pt_bias = torch.sum(
-                (q_pts[batch, q_idx, head] - k_pts[batch, k_idx, head]) ** 2
-            )
-            return math.sqrt(1/self.c_hidden) * score + bias + head_weights[head] * pt_bias
-
-        v_out = torch.nn.attention.flex_attention(
-            q.transpose(-2, -3),
-            k.transpose(-2, -3),
-            v_in,
-            score_mod=score_mod,
-            block_mask=block_mask
-        )
-        o, o_pt = v_out.split(split_lens, dim=-1)
-
-        # [*, N_res, H * C_hidden]
-        o = flatten_final_dims(o.transpose(-2, -3), 2)
-
-        # [*, N_res, H, P_v, 3]
-        n_res = v.shape[1]
-        o_pt = o_pt.transpose(-2, -3).view(o_pt.shape[0], n_res, self.no_heads, -1, 3)
-        o_pt = r[..., None, None].invert_apply(o_pt)
-
-        # [*, N_res, H * P_v]
-        o_pt_dists = torch.sqrt(torch.sum(o_pt ** 2, dim=-1) + self.eps)
-        o_pt_norm_feats = flatten_final_dims(
-            o_pt_dists, 2)
-
-        # [*, N_res, H * P_v, 3]
-        o_pt = o_pt.reshape(*o_pt.shape[:-3], -1, 3)
-
-        o_feats = [o, *torch.unbind(o_pt, dim=-1), o_pt_norm_feats]
-
-        o_feats = torch.cat(
-            o_feats, dim=-1
-        ).to(dtype=z.dtype)
-
-        if self.out_gate is not None:
-            gate = self.out_gate(s)
             o_feats = o_feats * torch.sigmoid(gate)
 
         # [*, N_block, block_Q, C_s]
@@ -1348,6 +1111,207 @@ class ConditionedBlockTransformerPairBias(nn.Module):
         return rigids_embed
 
 
+def pad_and_flatten_rigids(rigids, rigids_embed, rigids_noising_mask, block_q):
+    rigids_to_res_idx = torch.arange(rigids_embed.shape[1], device=rigids_embed.device)
+    n_batch, _, rigids_per_res = rigids_embed.shape[:3]
+    rigids_to_res_idx = torch.tile(rigids_to_res_idx[None, :, None], (n_batch, 1, rigids_per_res))
+    bb_rigids_mask = torch.zeros_like(rigids_to_res_idx, dtype=torch.bool)
+    bb_rigids_mask[..., 0] = True
+
+    # pad to proper input shape
+    rigids_embed_flat = rigids_embed.flatten(1, 2)
+    rigids_mask = torch.ones(rigids_embed_flat.shape[:-1], device=rigids_embed_flat.device, dtype=torch.bool)
+    n_padding = (block_q - (rigids_embed_flat.shape[1] % block_q)) % block_q
+    rigids_embed_flat = F.pad(rigids_embed_flat, (0, 0, 0, n_padding), value=0)
+    rigids_noising_mask_flat = F.pad(rigids_noising_mask.flatten(-2, -1), (0, n_padding), value=False)
+    rigids_flat_mask = F.pad(rigids_mask, (0, n_padding), value=0)
+    rigids_to_res_idx = F.pad(
+        rigids_to_res_idx.view(n_batch, -1),
+        (0, n_padding),
+        value=0
+    )
+    bb_rigids_mask = F.pad(bb_rigids_mask.flatten(-2, -1), (0, n_padding), value=False)
+
+    # pad the rigids
+    rigids_flat = rigids.view(n_batch, -1)
+    rigids_padding = ru.Rigid.identity(shape=(n_batch, n_padding), device=rigids_embed.device, fmt="quat")
+    # we don't use ru.Rigid.cat cuz this automatically converts stuff to rotmats...
+    # we need to stay in quats
+    rigids_flat = ru.Rigid(
+        trans=torch.cat([rigids_flat.get_trans(), rigids_padding.get_trans()], dim=-2),
+        rots=ru.Rotation(
+            quats=torch.cat([
+                rigids_flat.get_rots().get_quats(), rigids_padding.get_rots().get_quats()
+            ], dim=-2)
+        )
+    )
+    return rigids_flat, rigids_embed_flat, rigids_to_res_idx, rigids_flat_mask, rigids_noising_mask_flat, bb_rigids_mask, n_padding
+
+
+def unflatten_rigids(rigids_flat, n_padding):
+    shape = (rigids_flat.shape[0], -1, 3)
+    if n_padding > 0:
+        return rigids_flat[..., :-n_padding].view(*shape)
+    else:
+        return rigids_flat.view(*shape)
+
+
+class FramepairEmbedder(nn.Module):
+    def __init__(self,
+                 c_framepair):
+        super().__init__()
+        self.lin_framepair_dist_vec = Linear(3, c_framepair, bias=False)
+        self.lin_framepair_rel_quat = Linear(4, c_framepair, bias=False)
+        self.lin_framepair_dist = Linear(1, c_framepair, bias=False)
+        self.lin_same_res = Linear(1, c_framepair, bias=False)
+
+    def forward(self,
+               rigids_flat,
+               rigids_to_res_idx,
+               rigids_mask,
+               to_queries,
+               to_keys):
+        trans = rigids_flat.get_trans()
+        rots = rigids_flat.get_rots().get_cur_rot()
+        assert rots.shape[-1] == 4
+
+        # [*, N_block, block_Q]
+        q_trans = to_queries(trans)
+        q_rots = to_queries(rots)
+        q_rigids = ru.Rigid(
+            trans=q_trans,
+            rots=ru.Rotation(quats=q_rots)
+        )
+        # [*, N_block, block_K]
+        k_trans = to_keys(trans)
+        k_rots = to_keys(rots)
+        # there's some more shenanigans that needs to happen because to_keys will
+        # zero out some quats which will lead to weird problems
+        mask = (k_rots == 0).all(dim=-1)
+        k_rots = (
+            k_rots * (~mask[..., None])
+            + torch.tensor([1., 0., 0., 0.], device=k_rots.device)[None, None, None] * mask[..., None]
+        )
+        k_rigids = ru.Rigid(
+            trans=k_trans,
+            rots=ru.Rotation(quats=k_rots)
+        )
+
+        rel_quat = k_rigids[..., None, :].get_rots().compose_q(q_rigids[..., None].invert().get_rots())
+        rel_quat = rel_quat.get_quats()
+        # rel_trans = k_rigids[..., None, :].get_trans() - q_rigids[..., None].get_trans()
+        rel_trans = q_rigids[..., None].invert_apply(k_rigids[..., None, :].get_trans())
+        rel_dist = torch.sum(rel_trans ** 2, dim=-1, keepdim=True)
+
+        v_lm = to_queries(rigids_to_res_idx[..., None].float())[..., None, :].long() == to_keys(rigids_to_res_idx[..., None].float())[..., None, :, :].long()
+        v_lm = v_lm.float()
+        framepair_embed = self.lin_framepair_dist_vec(rel_trans) * v_lm
+        framepair_embed = framepair_embed + self.lin_framepair_rel_quat(rel_quat) * v_lm
+        framepair_embed = framepair_embed + self.lin_framepair_dist(1 / (1 + rel_dist)) * v_lm
+        framepair_embed = framepair_embed + self.lin_same_res(v_lm) * v_lm
+        framepair_mask = to_queries(rigids_mask[..., None].float())[..., None, :].bool() & to_keys(rigids_mask[..., None].float())[..., None, :, :].bool()
+        framepair_embed = framepair_embed * framepair_mask
+
+        return framepair_embed
+
+
+class FramepairUpdate(nn.Module):
+    def __init__(
+        self,
+        c_z,
+        c_frame,
+        c_framepair,
+        broadcast_singles=True,
+        broadcast_pairs=True,
+        framepair_ffn=True,
+    ):
+        super().__init__()
+        if broadcast_pairs:
+            self.nodepair_to_framepair_broadcast = nn.Sequential(
+                LayerNorm(c_z),
+                Linear(c_z, c_framepair, bias=False)
+            )
+        else:
+            self.nodepair_to_framepair_broadcast = None
+
+        self.broadcast_singles = broadcast_singles
+        if broadcast_singles:
+            self.frame_ln = LayerNorm(c_frame, c_frame)
+            self.frame_l_to_framepair_broadcast = Linear(c_frame, c_framepair, bias=False)
+            self.frame_m_to_framepair_broadcast = Linear(c_frame, c_framepair, bias=False)
+
+        if framepair_ffn:
+            self.framepair_ffn = nn.Sequential(
+                LayerNorm(c_framepair),
+                Linear(c_framepair, c_framepair),
+                nn.ReLU(),
+                Linear(c_framepair, c_framepair),
+                nn.ReLU(),
+                Linear(c_framepair, c_framepair),
+            )
+        else:
+            self.framepair_ffn = None
+
+    def _broadcast_pairs(
+        self,
+        z,
+        rigids_to_res_idx,
+        rigids_mask,
+        to_pairs
+    ):
+        n_rigids = rigids_mask.shape[-1]
+        # TODO: this is a little jenk
+        # with the batch dim
+        with torch.no_grad():
+            rigids_pair_idx = torch.stack([
+                rigids_to_res_idx[0:1, ..., None].tile(1, 1, n_rigids),
+                rigids_to_res_idx[0:1, ..., None, :].tile(1, n_rigids, 1)
+            ], dim=-1)
+            rigids_pair_mask = (
+                rigids_mask[0:1, ..., None].tile(1, 1, n_rigids)
+                * rigids_mask[0:1, ..., None, :].tile(1, n_rigids, 1)
+            )
+
+            # bmm only works on floating point types
+            # but we lose precision on large ints so we disable autocast
+            with torch.autocast("cuda", enabled=False):
+                framepairs_idx = to_pairs(rigids_pair_idx.float()).long()
+                framepairs_mask = to_pairs(rigids_pair_mask[..., None].float()).bool()
+
+        framepairs = z[:, framepairs_idx[0, ..., 0], framepairs_idx[0, ..., 1]]
+        framepairs = framepairs * framepairs_mask
+        return framepairs
+
+    def forward(
+        self,
+        z,
+        framepair_embed,
+        rigids_embed_flat,
+        rigids_to_res_idx,
+        rigids_mask,
+        to_queries,
+        to_keys,
+        to_pairs
+
+    ):
+        if self.broadcast_singles:
+            framepair_src = self.frame_ln(rigids_embed_flat)
+            framepair_l = self.frame_l_to_framepair_broadcast(framepair_src)
+            framepair_m = self.frame_m_to_framepair_broadcast(framepair_src)
+            framepair_l = to_queries(framepair_l).unsqueeze(-2) # .view(n_batch, -1, self.block_q, 1, self.c_framepair)
+            framepair_m = to_keys(framepair_m).unsqueeze(-3) #.view(n_batch, -1, 1, self.block_k, self.c_framepair)
+            framepair_embed = framepair_embed + framepair_l + framepair_m
+
+        if self.nodepair_to_framepair_broadcast is not None:
+            z_broadcast = self._broadcast_pairs(z, rigids_to_res_idx, rigids_mask, to_pairs)
+            framepair_embed = framepair_embed + self.nodepair_to_framepair_broadcast(z_broadcast)
+
+        if self.framepair_ffn is not None:
+            framepair_embed = framepair_embed + self.framepair_ffn(framepair_embed)
+
+        return framepair_embed
+
+
 class SequenceFrameTransformerBlock(nn.Module):
     def __init__(self,
                  c_s=256,
@@ -1459,39 +1423,16 @@ class SequenceFrameTransformerUpdate(nn.Module):
         self.add_vanilla_transformer = add_vanilla_transformer
         self.add_full_transformer = add_full_transformer
 
-        if framepair_init:
-            self.lin_framepair_dist_vec = Linear(3, c_framepair, bias=False)
-            self.lin_framepair_rel_quat = Linear(4, c_framepair, bias=False)
-            self.lin_framepair_dist = Linear(1, c_framepair, bias=False)
-            self.lin_same_res = Linear(1, c_framepair, bias=False)
+        self.node_to_frame_broadcast = GatherUpdate(c_s, c_frame)
 
-        self.node_to_frame_broadcast = Linear(c_s, c_frame, bias=False)
-
-        if broadcast_pairs:
-            self.nodepair_to_framepair_broadcast = nn.Sequential(
-                LayerNorm(c_z),
-                Linear(c_z, c_framepair, bias=False)
-            )
-        else:
-            self.nodepair_to_framepair_broadcast = None
-
-        self.broadcast_singles = broadcast_singles
-        if broadcast_singles:
-            self.frame_ln = LayerNorm(c_frame, c_frame)
-            self.frame_l_to_framepair_broadcast = Linear(c_frame, c_framepair, bias=False)
-            self.frame_m_to_framepair_broadcast = Linear(c_frame, c_framepair, bias=False)
-
-        if framepair_ffn:
-            self.framepair_ffn = nn.Sequential(
-                LayerNorm(c_framepair),
-                Linear(c_framepair, c_framepair),
-                nn.ReLU(),
-                Linear(c_framepair, c_framepair),
-                nn.ReLU(),
-                Linear(c_framepair, c_framepair),
-            )
-        else:
-            self.framepair_ffn = None
+        self.framepair_update = FramepairUpdate(
+            c_z=c_z,
+            c_frame=c_frame,
+            c_framepair=c_framepair,
+            broadcast_singles=broadcast_singles,
+            broadcast_pairs=broadcast_pairs,
+            framepair_ffn=framepair_ffn
+        )
 
         self.trunk = nn.ModuleDict()
         for b in range(n_blocks):
@@ -1531,168 +1472,44 @@ class SequenceFrameTransformerUpdate(nn.Module):
                 self.trunk[f'frame_update_{b}'] = BackboneUpdate(c_frame)
 
         if self.agg_rigid_embed:
-            self.frame_to_node_broadcast = nn.Sequential(
-                LayerNorm(c_frame),
-                Linear(c_frame, c_s, bias=False, init='final')
+            self.frame_to_node_broadcast = ScatterUpdate(
+                c_s,
+                c_frame
             )
 
-    def _broadcast_pairs(
-        self,
-        z,
-        rigids_to_res_idx,
-        rigids_mask,
-        to_pairs
-    ):
-        n_rigids = rigids_mask.shape[-1]
-        # TODO: this is a little jenk
-        # with the batch dim
-        with torch.no_grad():
-            rigids_pair_idx = torch.stack([
-                rigids_to_res_idx[0:1, ..., None].tile(1, 1, n_rigids),
-                rigids_to_res_idx[0:1, ..., None, :].tile(1, n_rigids, 1)
-            ], dim=-1)
-            rigids_pair_mask = (
-                rigids_mask[0:1, ..., None].tile(1, 1, n_rigids)
-                * rigids_mask[0:1, ..., None, :].tile(1, n_rigids, 1)
-            )
-
-            # bmm only works on floating point types
-            # but we lose precision on large ints so we disable autocast
-            with torch.autocast("cuda", enabled=False):
-                framepairs_idx = to_pairs(rigids_pair_idx.float()).long()
-                framepairs_mask = to_pairs(rigids_pair_mask[..., None].float()).bool()
-
-        framepairs = z[:, framepairs_idx[0, ..., 0], framepairs_idx[0, ..., 1]]
-        framepairs = framepairs * framepairs_mask
-        return framepairs
-
-
-    def _framepair_init(self,
-                        rigids_flat,
-                        rigids_to_res_idx,
-                        rigids_mask,
-                        to_queries,
-                        to_keys):
-        trans = rigids_flat.get_trans()
-        rots = rigids_flat.get_rots().get_cur_rot()
-        assert rots.shape[-1] == 4
-
-        # [*, N_block, block_Q]
-        q_trans = to_queries(trans)
-        q_rots = to_queries(rots)
-        q_rigids = ru.Rigid(
-            trans=q_trans,
-            rots=ru.Rotation(quats=q_rots)
-        )
-        # [*, N_block, block_K]
-        k_trans = to_keys(trans)
-        k_rots = to_keys(rots)
-        # there's some more shenanigans that needs to happen because to_keys will
-        # zero out some quats which will lead to weird problems
-        mask = (k_rots == 0).all(dim=-1)
-        k_rots = (
-            k_rots * (~mask[..., None])
-            + torch.tensor([1., 0., 0., 0.], device=k_rots.device)[None, None, None] * mask[..., None]
-        )
-        k_rigids = ru.Rigid(
-            trans=k_trans,
-            rots=ru.Rotation(quats=k_rots)
-        )
-
-        rel_quat = k_rigids[..., None, :].get_rots().compose_q(q_rigids[..., None].invert().get_rots())
-        rel_quat = rel_quat.get_quats()
-        # rel_trans = k_rigids[..., None, :].get_trans() - q_rigids[..., None].get_trans()
-        rel_trans = q_rigids[..., None].invert_apply(k_rigids[..., None, :].get_trans())
-        rel_dist = torch.sum(rel_trans ** 2, dim=-1, keepdim=True)
-
-        v_lm = to_queries(rigids_to_res_idx[..., None].float())[..., None, :].long() == to_keys(rigids_to_res_idx[..., None].float())[..., None, :, :].long()
-        v_lm = v_lm.float()
-        framepair_embed = self.lin_framepair_dist_vec(rel_trans) * v_lm
-        framepair_embed = framepair_embed + self.lin_framepair_rel_quat(rel_quat) * v_lm
-        framepair_embed = framepair_embed + self.lin_framepair_dist(1 / (1 + rel_dist)) * v_lm
-        framepair_embed = framepair_embed + self.lin_same_res(v_lm) * v_lm
-        framepair_mask = to_queries(rigids_mask[..., None].float())[..., None, :].bool() & to_keys(rigids_mask[..., None].float())[..., None, :, :].bool()
-        framepair_embed = framepair_embed * framepair_mask
-
-        return framepair_embed
 
     def forward(
         self,
         s,
         z,
-        rigids,
-        rigids_embed,
+        framepair_embed,
+        rigids_flat,
+        rigids_embed_flat,
+        rigids_to_res_idx,
+        rigids_mask,
+        rigids_noising_mask,
         to_queries,
         to_keys,
         to_pairs,
-        framepair_embed=None
     ):
-        s_broadcast = self.node_to_frame_broadcast(s)
-        rigids_embed = rigids_embed + s_broadcast[..., None, :]
-
-        rigids_to_res_idx = torch.arange(rigids_embed.shape[1], device=rigids_embed.device)
-        n_batch, _, rigids_per_res = rigids_embed.shape[:3]
-        rigids_to_res_idx = torch.tile(rigids_to_res_idx[None, :, None], (n_batch, 1, rigids_per_res))
-
-        # pad to proper input shape
-        n_batch = rigids.shape[0]
-        rigids_embed_flat = rigids_embed.view(n_batch, -1, self.c_frame)
-        n_rigids = rigids_embed_flat.shape[1]
-        rigids_mask = torch.ones(rigids_embed_flat.shape[:-1], device=rigids_embed_flat.device, dtype=torch.bool)
-        n_padding = (self.block_q - rigids_embed_flat.shape[1] % self.block_q) % self.block_q
-        rigids_embed_flat = F.pad(rigids_embed_flat, (0, 0, 0, n_padding), value=0)
-        rigids_mask = F.pad(rigids_mask, (0, n_padding), value=0)
-        rigids_to_res_idx = F.pad(
-            rigids_to_res_idx.view(n_batch, -1),
-            (0, n_padding),
-            value=0
+        rigids_embed_flat = self.node_to_frame_broadcast(
+            s,
+            rigids_embed_flat,
+            rigids_to_res_idx,
+            rigids_mask
         )
 
-        # pad the rigids
-        rigids_flat = rigids.view(n_batch, -1)
-        rigids_padding = ru.Rigid.identity(shape=(n_batch, n_padding), device=rigids_embed.device, fmt="quat")
-        # we don't use ru.Rigid.cat cuz this automatically converts stuff to rotmats...
-        rigids_flat = ru.Rigid(
-            trans=torch.cat([rigids_flat.get_trans(), rigids_padding.get_trans()], dim=-2),
-            rots=ru.Rotation(
-                quats=torch.cat([
-                    rigids_flat.get_rots().get_quats(), rigids_padding.get_rots().get_quats()
-                ], dim=-2)
-            )
+        framepair_embed = self.framepair_update(
+            z,
+            framepair_embed,
+            rigids_embed_flat,
+            rigids_to_res_idx,
+            rigids_mask,
+            to_queries,
+            to_keys,
+            to_pairs
         )
 
-        if framepair_embed is None:
-            if self.framepair_init:
-                framepair_embed = self._framepair_init(
-                    rigids_flat,
-                    rigids_to_res_idx,
-                    rigids_mask,
-                    to_queries,
-                    to_keys
-                )
-            else:
-                framepair_embed = 0
-
-        if self.broadcast_singles:
-            framepair_src = self.frame_ln(rigids_embed_flat)
-            framepair_l = self.frame_l_to_framepair_broadcast(framepair_src)
-            framepair_m = self.frame_m_to_framepair_broadcast(framepair_src)
-            framepair_l = to_queries(framepair_l).view(n_batch, -1, self.block_q, 1, self.c_framepair)
-            framepair_m = to_keys(framepair_m).view(n_batch, -1, 1, self.block_k, self.c_framepair)
-            framepair_embed = framepair_embed + framepair_l + framepair_m
-
-        if self.nodepair_to_framepair_broadcast is not None:
-            z_broadcast = self._broadcast_pairs(z, rigids_to_res_idx, rigids_mask, to_pairs)
-            framepair_embed = framepair_embed + self.nodepair_to_framepair_broadcast(z_broadcast)
-
-        if self.framepair_ffn is not None:
-            framepair_embed = framepair_embed + self.framepair_ffn(framepair_embed)
-
-        # rigids_padding = torch.zeros([n_batch, n_padding, 7], device=rigids_embed.device)
-        # rigids_padding[:, 0] = 1
-        # rigids_flat = ru.Rigid.cat([
-        #     rigids_flat, ru.Rigid.from_tensor_7(rigids_padding)
-        # ], dim=-1)
         for b in range(self.n_blocks):
             rigids_embed_flat = self.trunk[f'tfmr_{b}'](
                 s,
@@ -1720,31 +1537,18 @@ class SequenceFrameTransformerUpdate(nn.Module):
                     rigids_mask,
                 )
             if self.do_rigid_updates:
-                # print(rigids_embed_flat)
                 rigids_update = self.trunk[f'frame_update_{b}'](rigids_embed_flat) * rigids_mask[..., None]
-                # print(b, rigids_update)
-                # print(rigids_update)
-                # print(rigids_flat.get_rots().get_cur_rot().shape)
-                rigids_flat = rigids_flat.compose_q_update_vec(rigids_update)
-                # print(rigids_flat.get_rots().get_cur_rot().shape)
-                # print(rigids_flat.get_trans(), rigids_flat.get_rots().get_cur_rot())
-
-        rigids_embed = rigids_embed_flat[..., :n_rigids, :].view(rigids_embed.shape)
+                rigids_flat = rigids_flat.compose_q_update_vec(rigids_update * rigids_noising_mask[..., None])
 
         if self.agg_rigid_embed:
-            s = s + self.frame_to_node_broadcast(rigids_embed).mean(dim=-2)
+            s = self.frame_to_node_broadcast(
+                rigids_embed_flat,
+                s,
+                rigids_to_res_idx,
+                rigids_mask
+            )
 
-        rigids_out = rigids_flat[..., :n_rigids].view(rigids.shape)
-        # print(rigids_out.get_trans(), rigids_out.get_rots().get_cur_rot())
-        # TODO: we only have to do this because we reshape the rigid at the output of the denoiser
-        # to match with graph-based losses. if we convert to full dense we
-        # should get rid of this part
-        rigids_out = ru.Rigid(
-            rots=rigids_out.get_rots().map_tensor_fn(lambda x: x.contiguous()),
-            trans=rigids_out.get_trans()
-        )
-
-        return rigids_embed, s, framepair_embed, rigids_out
+        return rigids_embed_flat, s, framepair_embed, rigids_flat
 
 
 class ConditionedSequenceFrameTransformerBlock(nn.Module):
@@ -1833,7 +1637,9 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
         inf=1e8,
         n_blocks=2,
         do_rigid_updates=False,
+        broadcast_singles=True,
         broadcast_pairs=False,
+        framepair_ffn=True,
         agg_rigid_embed=True,
         compile_ipa=False,
         framepair_init=False,
@@ -1855,32 +1661,15 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
         self.add_vanilla_transformer = add_vanilla_transformer
         self.add_full_transformer = add_full_transformer
 
-        if framepair_init:
-            self.lin_framepair_dist_vec = Linear(3, c_framepair, bias=False)
-            self.lin_framepair_rel_quat = Linear(4, c_framepair, bias=False)
-            self.lin_framepair_dist = Linear(1, c_framepair, bias=False)
-            self.lin_same_res = Linear(1, c_framepair, bias=False)
+        self.node_to_frame_broadcast = GatherUpdate(c_s, c_frame)
 
-        self.node_to_frame_broadcast = Linear(c_s, c_frame, bias=False)
-
-        if broadcast_pairs:
-            self.nodepair_to_framepair_broadcast = nn.Sequential(
-                LayerNorm(c_z),
-                Linear(c_z, c_framepair, bias=False)
-            )
-        else:
-            self.nodepair_to_framepair_broadcast = None
-
-        self.frame_ln = LayerNorm(c_frame, c_frame)
-        self.frame_l_to_framepair_broadcast = Linear(c_frame, c_framepair, bias=False)
-        self.frame_m_to_framepair_broadcast = Linear(c_frame, c_framepair, bias=False)
-        self.framepair_ffn = nn.Sequential(
-            LayerNorm(c_framepair),
-            Linear(c_framepair, c_framepair),
-            nn.ReLU(),
-            Linear(c_framepair, c_framepair),
-            nn.ReLU(),
-            Linear(c_framepair, c_framepair),
+        self.framepair_update = FramepairUpdate(
+            c_z=c_z,
+            c_frame=c_frame,
+            c_framepair=c_framepair,
+            broadcast_singles=broadcast_singles,
+            broadcast_pairs=broadcast_pairs,
+            framepair_ffn=framepair_ffn
         )
 
         self.trunk = nn.ModuleDict()
@@ -1920,165 +1709,44 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
                 self.trunk[f'frame_update_{b}'] = BackboneUpdate(c_frame)
 
         if self.agg_rigid_embed:
-            self.frame_to_node_broadcast = nn.Sequential(
-                LayerNorm(c_frame),
-                Linear(c_frame, c_s, bias=False, init='final')
+            self.frame_to_node_broadcast = ScatterUpdate(
+                c_s,
+                c_frame
             )
-
-    def _broadcast_pairs(
-        self,
-        z,
-        rigids_to_res_idx,
-        rigids_mask,
-        to_pairs
-    ):
-        n_rigids = rigids_mask.shape[-1]
-        # TODO: this is a little jenk
-        # with the batch dim
-        with torch.no_grad():
-            rigids_pair_idx = torch.stack([
-                rigids_to_res_idx[0:1, ..., None].tile(1, 1, n_rigids),
-                rigids_to_res_idx[0:1, ..., None, :].tile(1, n_rigids, 1)
-            ], dim=-1)
-            rigids_pair_mask = (
-                rigids_mask[0:1, ..., None].tile(1, 1, n_rigids)
-                * rigids_mask[0:1, ..., None, :].tile(1, n_rigids, 1)
-            )
-
-            with torch.autocast("cuda", enabled=False):
-                framepairs_idx = to_pairs(rigids_pair_idx.float()).long()
-                framepairs_mask = to_pairs(rigids_pair_mask[..., None].float()).bool()
-        framepairs = z[:, framepairs_idx[0, ..., 0], framepairs_idx[0, ..., 1]]
-        framepairs = framepairs * framepairs_mask
-        return framepairs
-
-
-    def _framepair_init(self,
-                        rigids_flat,
-                        rigids_to_res_idx,
-                        rigids_mask,
-                        to_queries,
-                        to_keys):
-        trans = rigids_flat.get_trans()
-        rots = rigids_flat.get_rots().get_cur_rot()
-        assert rots.shape[-1] == 4
-
-        # [*, N_block, block_Q]
-        q_trans = to_queries(trans)
-        q_rots = to_queries(rots)
-        q_rigids = ru.Rigid(
-            trans=q_trans,
-            rots=ru.Rotation(quats=q_rots)
-        )
-        # [*, N_block, block_K]
-        k_trans = to_keys(trans)
-        k_rots = to_keys(rots)
-        # there's some more shenanigans that needs to happen because to_keys will
-        # zero out some quats which will lead to weird problems
-        mask = (k_rots == 0).all(dim=-1)
-        k_rots = (
-            k_rots * (~mask[..., None])
-            + torch.tensor([1., 0., 0., 0.], device=k_rots.device)[None, None, None] * mask[..., None]
-        )
-        k_rigids = ru.Rigid(
-            trans=k_trans,
-            rots=ru.Rotation(quats=k_rots)
-        )
-
-        rel_quat = k_rigids[..., None, :].get_rots().compose_q(q_rigids[..., None].invert().get_rots())
-        rel_quat = rel_quat.get_quats()
-        # rel_trans = k_rigids.get_trans()[..., None, :] - q_rigids[..., None].get_trans()
-        rel_trans = q_rigids[..., None].invert_apply(k_rigids[..., None, :].get_trans())
-        rel_dist = torch.sum(rel_trans ** 2, dim=-1, keepdim=True)
-
-        v_lm = to_queries(rigids_to_res_idx[..., None].float())[..., None, :].long() == to_keys(rigids_to_res_idx[..., None].float())[..., None, :, :].long()
-        v_lm = v_lm.float()
-        framepair_embed = self.lin_framepair_dist_vec(rel_trans) * v_lm
-        framepair_embed = framepair_embed + self.lin_framepair_rel_quat(rel_quat) * v_lm
-        framepair_embed = framepair_embed + self.lin_framepair_dist(1 / (1 + rel_dist)) * v_lm
-        framepair_embed = framepair_embed + self.lin_same_res(v_lm) * v_lm
-        framepair_mask = to_queries(rigids_mask[..., None].float())[..., None, :].bool() & to_keys(rigids_mask[..., None].float())[..., None, :, :].bool()
-        framepair_embed = framepair_embed * framepair_mask
-
-        return framepair_embed
 
     def forward(
         self,
         s,
         z,
-        rigids,
-        rigids_embed,
-        cond_rigids_embed,
+        framepair_embed,
+        rigids_flat,
+        rigids_embed_flat,
+        rigids_to_res_idx,
+        rigids_mask,
+        rigids_noising_mask,
+        cond_rigids_embed_flat,
         to_queries,
         to_keys,
         to_pairs,
-        framepair_embed=None
     ):
-        s_broadcast = self.node_to_frame_broadcast(s)
-        rigids_embed = rigids_embed + s_broadcast[..., None, :]
-
-        rigids_to_res_idx = torch.arange(rigids_embed.shape[1], device=rigids_embed.device)
-        n_batch, _, rigids_per_res = rigids_embed.shape[:3]
-        rigids_to_res_idx = torch.tile(rigids_to_res_idx[None, :, None], (n_batch, 1, rigids_per_res))
-
-        # pad to proper input shape
-        n_batch = rigids.shape[0]
-        rigids_embed_flat = rigids_embed.view(n_batch, -1, self.c_frame)
-        cond_rigids_embed_flat = cond_rigids_embed.view(n_batch, -1, self.c_frame)
-        n_rigids = rigids_embed_flat.shape[1]
-        rigids_mask = torch.ones(rigids_embed_flat.shape[:-1], device=rigids_embed_flat.device, dtype=torch.bool)
-        n_padding = (self.block_q - rigids_embed_flat.shape[1] % self.block_q) % self.block_q
-        rigids_embed_flat = F.pad(rigids_embed_flat, (0, 0, 0, n_padding), value=0)
-        cond_rigids_embed_flat = F.pad(cond_rigids_embed_flat, (0, 0, 0, n_padding), value=0)
-        rigids_mask = F.pad(rigids_mask, (0, n_padding), value=0)
-        rigids_to_res_idx = F.pad(
-            rigids_to_res_idx.view(n_batch, -1),
-            (0, n_padding),
-            value=0
+        rigids_embed_flat = self.node_to_frame_broadcast(
+            s,
+            rigids_embed_flat,
+            rigids_to_res_idx,
+            rigids_mask
         )
 
-        # pad the rigids
-        rigids_flat = rigids.view(n_batch, -1)
-        rigids_padding = ru.Rigid.identity(shape=(n_batch, n_padding), device=rigids_embed.device, fmt="quat")
-        # we don't use ru.Rigid.cat cuz this automatically converts stuff to rotmats...
-        rigids_flat = ru.Rigid(
-            trans=torch.cat([rigids_flat.get_trans(), rigids_padding.get_trans()], dim=-2),
-            rots=ru.Rotation(
-                quats=torch.cat([
-                    rigids_flat.get_rots().get_quats(), rigids_padding.get_rots().get_quats()
-                ], dim=-2)
-            )
+        framepair_embed = self.framepair_update(
+            z,
+            framepair_embed,
+            rigids_embed_flat,
+            rigids_to_res_idx,
+            rigids_mask,
+            to_queries,
+            to_keys,
+            to_pairs
         )
 
-        framepair_src = self.frame_ln(rigids_embed_flat)
-        framepair_l = self.frame_l_to_framepair_broadcast(framepair_src)
-        framepair_m = self.frame_m_to_framepair_broadcast(framepair_src)
-        framepair_l = to_queries(framepair_l).view(n_batch, -1, self.block_q, 1, self.c_framepair)
-        framepair_m = to_keys(framepair_m).view(n_batch, -1, 1, self.block_k, self.c_framepair)
-        if framepair_embed is None:
-            if self.framepair_init:
-                framepair_embed = self._framepair_init(
-                    rigids_flat,
-                    rigids_to_res_idx,
-                    rigids_mask,
-                    to_queries,
-                    to_keys
-                )
-            else:
-                framepair_embed = 0
-        framepair_embed = framepair_embed + framepair_l + framepair_m
-
-        if self.nodepair_to_framepair_broadcast is not None:
-            z_broadcast = self._broadcast_pairs(z, rigids_to_res_idx, rigids_mask, to_pairs)
-            framepair_embed = framepair_embed + self.nodepair_to_framepair_broadcast(z_broadcast)
-
-        framepair_embed = framepair_embed + self.framepair_ffn(framepair_embed)
-
-        # rigids_padding = torch.zeros([n_batch, n_padding, 7], device=rigids_embed.device)
-        # rigids_padding[:, 0] = 1
-        # rigids_flat = ru.Rigid.cat([
-        #     rigids_flat, ru.Rigid.from_tensor_7(rigids_padding)
-        # ], dim=-1)
         for b in range(self.n_blocks):
             rigids_embed_flat = self.trunk[f'tfmr_{b}'](
                 s,
@@ -2106,425 +1774,15 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
                 )
 
             if self.do_rigid_updates:
-                # print(rigids_embed_flat)
                 rigids_update = self.trunk[f'frame_update_{b}'](rigids_embed_flat) * rigids_mask[..., None]
-                # print(b, rigids_update)
-                # print(rigids_update)
-                # print(rigids_flat.get_rots().get_cur_rot().shape)
-                rigids_flat = rigids_flat.compose_q_update_vec(rigids_update)
-                # print(rigids_flat.get_rots().get_cur_rot().shape)
-                # print(rigids_flat.get_trans(), rigids_flat.get_rots().get_cur_rot())
-
-        rigids_embed = rigids_embed_flat[..., :n_rigids, :].view(rigids_embed.shape)
+                rigids_flat = rigids_flat.compose_q_update_vec(rigids_update * rigids_noising_mask[..., None])
 
         if self.agg_rigid_embed:
-            s = s + self.frame_to_node_broadcast(rigids_embed).mean(dim=-2)
-
-        rigids_out = rigids_flat[..., :n_rigids].view(rigids.shape)
-        # print(rigids_out.get_trans(), rigids_out.get_rots().get_cur_rot())
-        # TODO: we only have to do this because we reshape the rigid at the output of the denoiser
-        # to match with graph-based losses. if we convert to full dense we
-        # should get rid of this part
-        rigids_out = ru.Rigid(
-            rots=rigids_out.get_rots().map_tensor_fn(lambda x: x.contiguous()),
-            trans=rigids_out.get_trans()
-        )
-
-        return rigids_embed, s, framepair_embed, rigids_out
-
-class KnnInvariantPointAttention(nn.Module):
-    """
-    Implements Algorithm 22.
-    """
-    def __init__(
-        self,
-        c_s,
-        c_z,
-        c_hidden,
-        num_heads,
-        num_qk_points,
-        num_v_points,
-        inf: float = 1e5,
-        eps: float = 1e-8,
-        final_init='final',
-    ):
-        """
-        Args:
-            c_s:
-                Single representation channel dimension
-            c_z:
-                Pair representation channel dimension
-            c_hidden:
-                Hidden channel dimension
-            no_heads:
-                Number of attention heads
-            no_qk_points:
-                Number of query/key points to generate
-            no_v_points:
-                Number of value points to generate
-        """
-        super().__init__()
-
-        self.c_s = c_s
-        self.c_z = c_z
-        self.c_hidden = c_hidden
-        self.no_heads = num_heads
-        self.no_qk_points = num_qk_points
-        self.no_v_points = num_v_points
-        self.inf = inf
-        self.eps = eps
-
-        # These linear layers differ from their specifications in the
-        # supplement. There, they lack bias and use Glorot initialization.
-        # Here as in the official source, they have bias and use the default
-        # Lecun initialization.
-        hc = self.c_hidden * self.no_heads
-        self.linear_q = Linear(self.c_s, hc, bias=False)
-        self.linear_k = Linear(self.c_s, hc, bias=False)
-        self.linear_v = Linear(self.c_s, hc, bias=False)
-
-        hpq = self.no_heads * self.no_qk_points * 3
-        self.linear_q_points = Linear(self.c_s, hpq, bias=False)
-
-        hpkv = self.no_heads * (self.no_qk_points + self.no_v_points) * 3
-        self.linear_kv_points = Linear(self.c_s, hpkv, bias=False)
-
-        self.linear_b = Linear(self.c_z, self.no_heads, bias=False)
-        self.down_z = Linear(self.c_z, self.c_z // 4, bias=False)
-
-        self.head_weights = nn.Parameter(torch.zeros((self.no_heads)))
-        ipa_point_weights_init_(self.head_weights)
-
-        concat_out_dim =  (
-            self.c_z // 4 + self.c_hidden + self.no_v_points * 4
-        )
-        self.linear_out = Linear(self.no_heads * concat_out_dim, self.c_s, init=final_init, bias=False)
-
-        self.softmax = nn.Softmax(dim=-1)
-        self.softplus = nn.Softplus()
-
-        self.ln_s = LayerNorm(c_s)
-        self.ln_z = LayerNorm(c_z)
-
-    def forward(
-        self,
-        s: torch.Tensor,
-        edge_index: torch.Tensor,
-        z: torch.Tensor,
-        r: ru.Rigid,
-        s_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Args:
-            s:
-                [*, N_res, C_s] single representation
-            z:
-                [*, N_res, N_res, C_z] pair representation
-            r:
-                [*, N_res] transformation object
-            mask:
-                [*, N_res] mask
-        Returns:
-            [*, N_res, C_s] single representation update
-        """
-        s = self.ln_s(s)
-        z = self.ln_z(z)
-
-        #######################################
-        # Generate scalar and point activations
-        #######################################
-        # [*, N_res, H * C_hidden]
-        q = self.linear_q(s)
-        # [*, N_res, H * C_hidden]
-        k = self.linear_k(s)
-        # [*, N_res, H * C_hidden]
-        v = self.linear_v(s)
-
-        # [*, N_res, K, H * C_hidden]
-        k = torch.gather(
-            k[..., None, :].expand(-1, -1, edge_index.shape[-1], -1),
-            1,
-            edge_index[..., None].tile(1, 1, 1, k.shape[-1])
-        )
-        # [*, N_res, K, H * C_hidden]
-        v = torch.gather(
-            v[..., None, :].expand(-1, -1, edge_index.shape[-1], -1),
-            1,
-            edge_index[..., None].tile(1, 1, 1, v.shape[-1])
-        )
-
-        # [*, N_res, H, C_hidden]
-        q = q.view(q.shape[:-1] + (self.no_heads, -1))
-        # [*, N_res, K, H, C_hidden]
-        k = k.view(k.shape[:-1] + (self.no_heads, -1))
-        # [*, N_res, K, H, C_hidden]
-        v = v.view(v.shape[:-1] + (self.no_heads, -1))
-
-        # [*, N_res, H * P_q * 3]
-        q_pts = self.linear_q_points(s)
-        # [*, N_res, H * P_q, 3]
-        q_pts = q_pts.view(q_pts.shape[:-1] + (self.no_heads * self.no_qk_points, 3))
-        q_pts = r[..., None].apply(q_pts)
-        # [*, N_res, H, P_q, 3]
-        q_pts = q_pts.view(
-            q_pts.shape[:-2] + (self.no_heads, self.no_qk_points, 3)
-        )
-
-        # [*, N_res, H * (P_q + P_v) * 3]
-        kv_pts = self.linear_kv_points(s)
-        # [*, N_res, K, H * (P_q + P_v) * 3]
-        kv_pts = torch.gather(
-            kv_pts[..., None, :].expand(-1, -1, edge_index.shape[-1], -1),
-            1,
-            edge_index[..., None].tile(1, 1, 1, kv_pts.shape[-1])
-        )
-        # [*, N_res, K, H * (P_q + P_v), 3]
-        kv_pts = kv_pts.view(kv_pts.shape[:-1] + (-1, 3))
-        kv_pts = r[..., None, None].apply(kv_pts)
-
-        # [*, N_res, K, H, (P_q + P_v), 3]
-        kv_pts = kv_pts.view(kv_pts.shape[:-2] + (self.no_heads, -1, 3))
-
-        # [*, N_res, K, H, P_q/P_v, 3]
-        k_pts, v_pts = torch.split(
-            kv_pts, [self.no_qk_points, self.no_v_points], dim=-2
-        )
-
-        ##########################
-        # Compute attention scores
-        ##########################
-        # [*, N_res, K, H]
-        b = self.linear_b(z)
-
-        # [*, N_res, K, H]
-        a = torch.einsum("bnhc,bnkhc->bnkh", q, k)
-        a *= math.sqrt(1.0 / (3 * self.c_hidden))
-        a += math.sqrt(1.0 / 3) * b
-
-        # [*, N_res, K, H, P_q, 3]
-        pt_displacement = q_pts.unsqueeze(-4) - k_pts
-        pt_att = pt_displacement ** 2
-
-        # [*, N_res, K, H, P_q]
-        pt_att = sum(torch.unbind(pt_att, dim=-1))
-        head_weights = self.softplus(self.head_weights).view(
-            *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
-        )
-        head_weights = head_weights * math.sqrt(
-            1.0 / (3 * (self.no_qk_points * 9.0 / 2))
-        )
-        pt_att = pt_att * head_weights
-
-        # [*, N_res, K, H]
-        pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
-        # [*, N_res, K]
-        attn_mask = s_mask[..., None].float() * torch.gather(
-            s_mask[..., None].expand(-1, -1, edge_index.shape[-1]),
-            1,
-            edge_index
-        )
-        attn_mask = self.inf * (attn_mask - 1)
-
-        # [*, N_res, K, H]
-        a = a + pt_att
-        a = a + attn_mask[..., None]
-        # [*, N_res, H, K]
-        a = a.transpose(-1, -2)
-        a = self.softmax(a)
-
-        ################
-        # Compute output
-        ################
-        # [*, N_res, H, C_hidden]
-        o = torch.einsum("bnhk,bnkhc->bnhc", a, v)
-
-        # [*, N_res, H * C_hidden]
-        o = flatten_final_dims(o, 2)
-
-        # [*, N_res, H, P_v, 3]
-        o_pt = torch.einsum("bnhk,bnkhvc->bnhvc", a, v_pts)
-        o_pt = r[..., None, None].invert_apply(o_pt)
-
-        # [*, N_res, H * P_v]
-        o_pt_dists = torch.sqrt(torch.sum(o_pt ** 2, dim=-1) + self.eps)
-        o_pt_norm_feats = flatten_final_dims(
-            o_pt_dists, 2)
-
-        # [*, N_res, H * P_v * 3]
-        o_pt = flatten_final_dims(o_pt, 3)
-
-        # [*, N_res, K, H, C_z // 4]
-        pair_z = self.down_z(z).to(dtype=a.dtype)
-        # [*, N_res, H, C_z // 4]
-        o_pair = torch.einsum("bnhk,bnkc->bnhc", a, pair_z)
-
-        # [*, N_res, H * C_z // 4]
-        o_pair = flatten_final_dims(o_pair, 2)
-
-        o_feats = [o, o_pt, o_pt_norm_feats, o_pair]
-
-        # [*, N_res, C_s]
-        out = self.linear_out(
-            torch.cat(
-                o_feats, dim=-1
-            ).to(dtype=z.dtype)
-        )
-
-        return out.view(s.shape)
-
-
-
-class KnnFrameTransformerBlock(nn.Module):
-    def __init__(self,
-                 c_s=256,
-                 c_frame=128,
-                 c_framepair=16,
-                 num_heads=4,
-                 num_qk_points=8,
-                 num_v_points=12,
-                 inf=1e8
-                 ):
-        super().__init__()
-
-        self.c_frame = c_frame
-        self.c_framepair = c_framepair
-        self.c_s = c_s
-        self.num_heads = num_heads
-        self.c_hidden = c_frame // num_heads
-        self.inf = inf
-
-        self.block_ipa = KnnInvariantPointAttention(
-            c_s=c_frame,
-            c_z=c_framepair,
-            c_hidden=self.c_hidden,
-            num_heads=num_heads,
-            num_qk_points=num_qk_points,
-            num_v_points=num_v_points,
-        )
-
-        self.transition = GatherConditionedTransition(c_frame, c_s)
-
-    def forward(
-        self,
-        s,
-        rigids,
-        rigids_embed,
-        framepair_embed,
-        edge_index,
-        rigids_mask,
-        rigids_to_res_idx
-    ):
-        rigids_embed_update = self.block_ipa(
-            s=rigids_embed,
-            edge_index=edge_index,
-            z=framepair_embed,
-            r=rigids,
-            s_mask=rigids_mask,
-        )
-        rigids_embed = rigids_embed + rigids_embed_update * rigids_mask[..., None]
-
-        rigids_embed = rigids_embed + self.transition(rigids_embed, s, rigids_to_res_idx) * rigids_mask[..., None]
-
-        return rigids_embed
-
-
-class KnnFrameTransformerUpdate(nn.Module):
-    def __init__(
-        self,
-        c_s=256,
-        c_z=128,
-        c_frame=128,
-        c_framepair=16,
-        num_heads=4,
-        num_qk_points=8,
-        num_v_points=12,
-        inf=1e8,
-        n_blocks=2,
-        k=20
-    ):
-        super().__init__()
-        self.c_s = c_s
-        self.c_frame = c_frame
-        self.c_framepair = c_framepair
-        self.n_blocks = n_blocks
-        self.k = k
-
-        self.node_to_frame_broadcast = Linear(c_s, c_frame, bias=False)
-        self.nodepair_ln = LayerNorm(c_z)
-        self.nodepair_to_framepair_broadcast = Linear(c_z, c_framepair, bias=False)
-
-        self.trunk = nn.ModuleDict()
-        for b in range(n_blocks):
-            self.trunk[f'tfmr_{b}'] = KnnFrameTransformerBlock(
-                c_s=c_s,
-                c_frame=c_frame,
-                c_framepair=c_framepair,
-                num_heads=num_heads,
-                num_qk_points=num_qk_points,
-                num_v_points=num_v_points,
-                inf=inf,
-            )
-
-        self.frame_to_node_broadcast = nn.Sequential(
-            LayerNorm(c_frame),
-            Linear(c_frame, c_s, bias=False, init='final')
-        )
-
-    @torch.no_grad()
-    def _construct_knn_graph(self, rigids):
-        n_batch, n_res, n_rigids_per_res = rigids.shape
-        trans = rigids.get_trans()
-        bb_trans = trans[..., 0, :]
-        dist_mat = torch.cdist(bb_trans, bb_trans)
-        _, res_edge_index = torch.topk(dist_mat, k=self.k, dim=-1, largest=False)
-        rigid_idx = torch.arange(np.prod(rigids.shape[-2:]), device=trans.device).view(rigids.shape[-2:])
-        rigid_edge_index = rigid_idx[res_edge_index]
-        print(rigid_edge_index.shape)
-        rigid_edge_index = rigid_edge_index.view(n_batch, n_res * self.k * n_rigids_per_res)
-        return res_edge_index, rigid_edge_index
-
-
-    def forward(
-        self,
-        s,
-        z,
-        rigids,
-        rigids_embed,
-        s_mask,
-    ):
-        s_broadcast = self.node_to_frame_broadcast(s)
-        rigids_embed = rigids_embed + s_broadcast[..., None, :]
-
-        res_edge_index, rigid_edge_index = self._construct_knn_graph(rigids)
-        framepair_embed = self.nodepair_to_framepair_broadcast(self.nodepair_ln(z))
-        print(framepair_embed.shape, res_edge_index.shape)
-        framepair_embed = torch.gather(
-            framepair_embed,
-            2,
-            res_edge_index[..., None].tile(1, 1, 1, framepair_embed.shape[-1])
-        )
-        n_rigids_per_res = rigids.shape[-1]
-        framepair_embed = torch.repeat_interleave(framepair_embed, n_rigids_per_res, dim=-2)
-
-        rigids_to_res_idx = torch.arange(rigids_embed.shape[1], device=rigids_embed.device)
-        n_batch, _, rigids_per_res = rigids_embed.shape[:3]
-        rigids_to_res_idx = torch.tile(rigids_to_res_idx[None, :, None], (n_batch, 1, rigids_per_res))
-
-        rigids_flat = rigids.view(n_batch, -1)
-        rigids_embed_flat = rigids_embed.view(n_batch, -1, self.c_frame)
-        rigids_mask = torch.repeat_interleave(s_mask, n_rigids_per_res, dim=-1)
-        for b in range(self.n_blocks):
-            rigids_embed_flat = self.trunk[f'tfmr_{b}'](
-                s,
-                rigids_flat,
+            s = self.frame_to_node_broadcast(
                 rigids_embed_flat,
-                framepair_embed,
-                rigid_edge_index,
-                rigids_mask,
-                rigids_to_res_idx
+                s,
+                rigids_to_res_idx,
+                rigids_mask
             )
 
-        rigids_embed = rigids_embed + rigids_embed_flat.view(rigids_embed.shape)
-        s = s + self.frame_to_node_broadcast(rigids_embed).mean(dim=-2)
-
-        return rigids_embed, s
+        return rigids_embed_flat, s, framepair_embed, rigids_flat

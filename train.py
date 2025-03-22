@@ -16,9 +16,9 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 
 # import wandb
 
-
 from proteinzen.runtime.config import config_hydra_store, remove_zen_keys
-from proteinzen.tasks.task import single_task_sampler
+from proteinzen.harness.fm.multiframe import MultiFrameInterpolation
+from proteinzen.runtime.training.task import TaskSampler
 
 
 # A logger for this file
@@ -94,47 +94,31 @@ def main(model,
          lmodule,
          datamodule,
          experiment,
+         harness,
          tasks,
          zen_cfg):
     # change into the output directory
     os.chdir(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)
     log.info(f"Experiment started in folder: {os.getcwd()}")
 
-    # if hasattr(corrupter, "sidechain_noiser") and isinstance(corrupter.sidechain_noiser, torch.nn.Module):
-    #     model.add_module("sidechain_noiser", corrupter.sidechain_noiser.learned_sched)
-    kwargs = {}
-    if 'freeze_encoder' in zen_cfg:
-        kwargs['freeze_encoder'] = zen_cfg['freeze_encoder']
-    if 'freeze_decoder' in zen_cfg:
-        kwargs['freeze_decoder'] = zen_cfg['freeze_decoder']
-
-    # for name, module in model.named_modules():
-    #     print(name, sum([p.numel() for p in module.parameters()]))
-
+    # assemble task sampler
+    print(tasks)
+    task_freq_keys = [key for key in tasks if key.endswith("_freq")]
+    task_list = []
+    task_probs = []
+    for task_freq_key in task_freq_keys:
+        task_freq = tasks[task_freq_key]
+        task = tasks[task_freq_key[:-len("_freq")]]
+        task_list.append(task)
+        task_probs.append(task_freq)
+    task_sampler = TaskSampler(task_list, task_probs)
 
     # datamodule and optim are all partial'd __init__s
     # so we instantiate instances of each
-    model = lmodule(model, experiment['optim'], **kwargs)
+    harness = harness(corrupter, task_sampler)
+    model = lmodule(model, experiment['optim'], harness)
     checkpointer = experiment['checkpointer']
     os.makedirs(model.val_dir, exist_ok=True)
-    task_sampler = single_task_sampler(tasks(corrupter))
-
-    if 'only_load_state_dict' in zen_cfg:
-        assert zen_cfg['experiment']['warm_start'] is not None
-        ckpt = torch.load(zen_cfg['experiment']['warm_start'], map_location='cpu')
-        encoder_dict = {
-            k.removeprefix("model.encoder."): v
-            for k, v in ckpt['state_dict'].items()
-            if k.startswith("model.encoder")
-        }
-        decoder_dict = {
-            k.removeprefix("model.decoder."): v
-            for k, v in ckpt['state_dict'].items()
-            if k.startswith("model.decoder")
-        }
-        model.model.encoder.load_state_dict(encoder_dict)
-        model.model.decoder.load_state_dict(decoder_dict)
-        zen_cfg['experiment']['warm_start'] = None
 
 
     # TODO: this is so jenk
@@ -152,9 +136,9 @@ def main(model,
             knn = _model.knn_k
             edges_per_node = min(lrange+knn, n)
             return edges_per_node * n
-        datamodule_inst = datamodule(task_sampler=task_sampler, batch_by_edge_fn=batch_by_edge_fn)
+        datamodule_inst = datamodule(training_harness=harness, batch_by_edge_fn=batch_by_edge_fn)
     else:
-        datamodule_inst = datamodule(task_sampler=task_sampler)
+        datamodule_inst = datamodule(training_harness=harness)
 
     exp = Experiment(
         model=model,
@@ -165,9 +149,6 @@ def main(model,
 
 
 if __name__ == '__main__':
-    import warp as wp
-    wp.init()
-
     config_hydra_store()
     torch.set_float32_matmul_precision("medium")
 

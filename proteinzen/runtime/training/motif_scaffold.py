@@ -1,0 +1,110 @@
+from functools import partialmethod
+
+import math
+import numpy as np
+import torch
+
+from .task import TrainingTask
+
+# inspired by Genie2
+class MotifScaffolding(TrainingTask):
+    def __init__(self,
+                 t_sched='lognorm',
+                 mode='full_residue',
+                 lognorm_mu=0.0,
+                 lognorm_sig=1.0,
+                 beta_p1=1.9,
+                 beta_p2=1.0,
+                 shift_time_scale=False,
+                 t_min=0.01,
+                 t_max=0.99,
+    ):
+        assert t_sched in ['lognorm', 'mixed_beta']
+        assert mode in ['backbone', 'full_residue', 'inv_rotamer']
+        self.t_sched = t_sched
+        self.mode = mode
+        self.lognorm_mu = lognorm_mu
+        self.lognorm_sig = lognorm_sig
+        self.beta_p1 = beta_p1
+        self.beta_p2 = beta_p2
+        self.t_min = t_min
+        self.t_max = t_max
+        self.shift_time_scale = shift_time_scale
+
+    def generate_motif_mask(self, batch):
+        masks = []
+        N = batch['residue'].num_nodes // batch.num_graphs
+        for i in range(batch.num_graphs):
+            num_segments = np.random.randint(1, 5)
+            # we switch this from Genie2
+            # to increase the probability of sampling minimal motifs
+            num_res = np.random.randint(num_segments, math.ceil(0.5 * N)) + 1
+            # num_res = np.random.randint(math.floor(0.05 * N), math.ceil(0.5 * N) + 1)
+            # # when N < 80 it's possible for num_segments > num_res
+            # num_res = max(num_segments + 1, num_res)
+            B = np.random.choice(num_res - 1, size=num_segments, replace=False) + 1
+            B = np.sort(
+                np.concatenate([[0], B, [num_res]], axis=0)
+            )
+            L = B[1:] - B[:-1]
+            permute_list = [[0] for _ in range(N - num_res)] + [np.ones((l,)) for l in L]
+            permutation = np.random.permutation(len(permute_list))
+            permuted_list = [permute_list[i] for i in permutation]
+            M = np.concatenate(permuted_list, axis=0)
+            masks.append(torch.as_tensor(M, dtype=bool))
+        return torch.stack(masks, dim=0)
+
+    def sample_t_and_mask(self, batch):
+        rigids_1 = batch['residue']['rigids_1']
+        device = rigids_1.device
+        num_batch = batch.num_graphs
+        rigids_1 = rigids_1.unflatten(0, (num_batch, -1))
+        # num_batch = rigids_1.shape[0]
+        if self.t_sched == 'lognorm':
+            ln_sig = self.lognorm_mu + torch.randn(num_batch, device=device).float() * self.lognorm_sig
+            t = torch.sigmoid(ln_sig)
+        elif self.t_sched == 'mixed_beta':
+            u = torch.rand(1)
+            if u < 0.02:
+                t = torch.rand(num_batch, device=device).float()
+            else:
+                dist = torch.distributions.beta.Beta(self.beta_p1, self.beta_p2)
+                t = dist.sample((num_batch,)).to(device)
+        else:
+            raise ValueError(f"self.t_sched={self.t_sched} not recognized")
+        t = t.view(-1, *[1 for _ in rigids_1.shape[1:-1]]) * torch.ones(rigids_1.shape[:-1], device=device)
+        rigids_noising_mask = torch.ones_like(t, dtype=bool)
+
+        motif_mask = self.generate_motif_mask(batch)
+        t = t.flatten(0, 1)
+        rigids_noising_mask = rigids_noising_mask.flatten(0, 1)
+        motif_mask = motif_mask.flatten(0, 1)
+        seq_noising_mask = ~motif_mask
+        if self.mode == 'backbone':
+            t[motif_mask, 0] = 1
+            rigids_noising_mask[motif_mask, 0] = False
+            seq_noising_mask = torch.zeros_like(motif_mask)
+        elif self.mode == 'full_residue':
+            t[motif_mask] = 1
+            rigids_noising_mask[motif_mask] = False
+        elif self.mode == 'inv_rotamer':
+            t[motif_mask, 1:] = 1
+            rigids_noising_mask[motif_mask, 1:] = False
+
+
+        return t, rigids_noising_mask, seq_noising_mask
+
+
+class BackboneMotifScaffolding(MotifScaffolding):
+
+    __init__ = partialmethod(MotifScaffolding.__init__, mode='backbone')
+
+
+class ResidueMotifScaffolding(MotifScaffolding):
+
+    __init__ = partialmethod(MotifScaffolding.__init__, mode='full_residue')
+
+
+class InverseRotamerMotifScaffolding(MotifScaffolding):
+
+    __init__ = partialmethod(MotifScaffolding.__init__, mode='inv_rotamer')

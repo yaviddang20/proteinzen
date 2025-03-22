@@ -14,20 +14,22 @@ from torch_geometric.data import HeteroData, Batch
 
 from proteinzen.data.openfold import data_transforms, residue_constants
 from proteinzen.utils.openfold import rigid_utils as ru
-from proteinzen.tasks import Task
+from proteinzen.harness import TrainingHarness
 
 from proteinzen.runtime.loss.common import atomic_losses_reduced
 from proteinzen.runtime.loss.multiframe import multiframe_fm_loss_reduced
 from proteinzen.runtime.loss.traj import multiframe_traj_loss
-from proteinzen.stoch_interp.interpolate.multiframe import _centered_gaussian, _uniform_so3, MultiSE3Interpolant
+from proteinzen.runtime.training.task import TaskSampler
+from proteinzen.stoch_interp.multiframe import _centered_gaussian, _uniform_so3, MultiSE3Interpolant
 
-import proteinzen.stoch_interp.interpolate.utils as du
+
+import proteinzen.stoch_interp.utils as du
 from proteinzen.utils.framediff import all_atom
 from proteinzen.utils.coarse_grain import compute_atom14_from_cg_frames
 
 
 
-class MultiFrameInterpolation(Task):
+class MultiFrameInterpolation(TrainingHarness):
 
     bb_x_1_key='rigids_1'
     bb_x_1_pred_key='final_rigids'
@@ -35,6 +37,7 @@ class MultiFrameInterpolation(Task):
 
     def __init__(self,
                  protein_noiser: MultiSE3Interpolant,
+                 task_sampler: TaskSampler,
                  aux_loss_t_min=0.25,
                  use_fape=False,
                  use_fafe=False,
@@ -46,7 +49,6 @@ class MultiFrameInterpolation(Task):
                  square_fafe_l2=False,
                  square_fafe_scale=True,
                  fafe_l2_block_mask_size=1,
-                 # fafe_weight=1/18.,#0.25,
                  fafe_weight=0.25,
                  polar_upweight=False,
                  sidechain_upweight=False,
@@ -154,10 +156,8 @@ class MultiFrameInterpolation(Task):
                 for i in ['C', 'D', 'E', 'H', 'K', 'N', 'Q', 'R', 'S', 'T', 'Y']
             ])
 
-    def _gen_diffuse_mask(self, data: HeteroData):
-        rigids_noising_mask = torch.ones_like(data['rigids_mask']).bool()
-        res_noising_mask = torch.ones_like(data['res_mask']).bool()
-        return res_noising_mask, rigids_noising_mask
+        self.task_sampler = task_sampler
+
 
     def _resolve_symmetry(self, data, chain_feats):
         res_data = data['residue']
@@ -219,14 +219,11 @@ class MultiFrameInterpolation(Task):
         else:
             rigids_1 = ru.Rigid.from_tensor_4x4(chain_feats['cg_groups_gt_frames'])[:, (0, 2, 3)]
 
-
         # compute bb frame features
         rigids_mask = chain_feats["cg_groups_gt_exists"][:, (0, 2, 3)]
         rigids_mask *= res_data['res_mask'][..., None]
         res_data['rigids_mask'] = rigids_mask
-        res_noising_mask, rigids_noising_mask = self._gen_diffuse_mask(res_data)
-        res_data['res_noising_mask'] = res_noising_mask
-        res_data['rigids_noising_mask'] = rigids_noising_mask
+        # res_data['rigids_noising_mask'] = rigids_noising_mask
         res_data['x'] = rigids_1.get_trans()  # for HeteroData's sake
         rigids_1_tensor_7 = rigids_1.to_tensor_7()
 
@@ -275,6 +272,13 @@ class MultiFrameInterpolation(Task):
             polar_mask = (seq[..., None] == self.polar_residues.to(seq.device)[None]).any(dim=-1)
             res_data['polar_mask'] = polar_mask
 
+        task = self.task_sampler.sample_task()
+        rigidwise_t, rigidwise_noising_mask, seq_noising_mask = task.sample_t_and_mask(data)
+        res_data['seq_noising_mask'] = seq_noising_mask
+        data['rigidwise_t'] = rigidwise_t
+        data['t'] = rigidwise_t.unflatten(0, (data.num_graphs, -1))[..., 0, 0]
+        res_data['rigids_noising_mask'] = rigidwise_noising_mask
+
         data = self.frame_noiser.corrupt_batch(data)
 
         return data
@@ -311,7 +315,6 @@ class MultiFrameInterpolation(Task):
             data = HeteroData(
                 residue={
                     "res_mask": torch.ones(n, device=device).bool(),
-                    "res_noising_mask": torch.ones(n, device=device).bool(),
                     "rigids_mask": torch.ones((n, 3), device=device).bool(),
                     "rigids_noising_mask": torch.ones((n, 3), device=device).bool(),
                     "seq": torch.full((n,), residue_constants.restype_order['R'], device=device).long(),
@@ -378,11 +381,6 @@ class MultiFrameInterpolation(Task):
             t = torch.ones(batch.num_graphs, device=device) * t_hat
             batch["t"] = t
             batch["rigidwise_t"] = torch.ones((total_num_res, self.frame_noiser.rigids_per_res), device=device) * t_hat
-            if self.trans_preconditioning:
-                trans_var_scaling_dict = self.frame_noiser.var_scaling_factors(t_hat)
-                batch['trans_c_skip'] = trans_var_scaling_dict['c_skip']
-                batch['trans_c_in'] = trans_var_scaling_dict['c_in']
-                batch['trans_c_out'] = trans_var_scaling_dict['c_out']
 
             denoiser_out = model(batch, self_condition=denoiser_out)
 
@@ -433,11 +431,7 @@ class MultiFrameInterpolation(Task):
         ).to_tensor_7()
         t = torch.ones(batch.num_graphs, device=device) * t_1
         batch["t"] = t
-        if self.trans_preconditioning:
-            trans_var_scaling_dict = self.frame_noiser.var_scaling_factors(t)
-            batch['trans_c_skip'] = trans_var_scaling_dict['c_skip']
-            batch['trans_c_in'] = trans_var_scaling_dict['c_in']
-            batch['trans_c_out'] = trans_var_scaling_dict['c_out']
+        batch["rigidwise_t"] = torch.ones((total_num_res, self.frame_noiser.rigids_per_res), device=device) * t
 
         denoiser_out = model(batch, self_condition=denoiser_out)
 
@@ -481,17 +475,9 @@ class MultiFrameInterpolation(Task):
         frame_fm_loss_dict = multiframe_fm_loss_reduced(
             inputs, outputs, sep_rot_loss=self.sep_rot_loss,
             t_norm_clip=self.t_norm_clip,
-            square_aux_loss_time_factor=True,
-            use_fafe=self.use_fafe,
-            use_fafe_l2=self.use_fafe_l2,
-            square_fafe_l2=self.square_fafe_l2,
-            square_fafe_scale=self.square_fafe_scale,
             polar_upweight=self.polar_upweight,
             sidechain_upweight=self.sidechain_upweight,
-            trans_preconditioning=self.trans_preconditioning,
-            # rot_exp_weighting=self.rot_loss_exp_weighting,
             rot_vf_angle_loss_weight=self.rot_vf_angle_loss_weight,
-            ignore_rigid_2_vf_loss=self.ignore_rigid_2_vf_loss,
             rot_cap_loss_weight=self.rot_cap_loss_weight,
             fafe_l2_block_mask_size=self.fafe_l2_block_mask_size,
             downweight_K=self.downweight_K
@@ -499,20 +485,12 @@ class MultiFrameInterpolation(Task):
 
         frame_vf_loss = (
             frame_fm_loss_dict["trans_vf_loss"] +
-            frame_fm_loss_dict["rot_vf_loss"] # / 3
+            frame_fm_loss_dict["rot_vf_loss"]
         )
         unscaled_frame_vf_loss = (
             frame_fm_loss_dict["unscaled_trans_vf_loss"] +
             frame_fm_loss_dict["unscaled_rot_vf_loss"]
         )
-        if self.bb_aux_loss_weight > 0.0:
-            bb_denoising_finegrain_loss = (
-                frame_fm_loss_dict["scaled_pred_bb_mse"] # / (18 * 3)
-                + frame_fm_loss_dict["scaled_dist_mat_loss"] # / (18 * 3)
-            ) * (inputs['t'] > self.aux_loss_t_min)
-        else:
-            bb_denoising_finegrain_loss = torch.zeros_like(frame_vf_loss)
-
 
         atomic_loss_dict = atomic_losses_reduced(
             inputs,
@@ -522,37 +500,22 @@ class MultiFrameInterpolation(Task):
         )
 
         atomic_loss = (
-            self.atom14_mse_weight * atomic_loss_dict[("scaled_atom14_mse" if self.scale_atom14_mse else "atom14_mse")] # * 1/(18 * 3)
-            + self.seq_loss_weight * atomic_loss_dict["seq_loss"] # / np.log(20)
+            self.seq_loss_weight * atomic_loss_dict["seq_loss"]
             + self.smooth_lddt_weight * atomic_loss_dict["smooth_lddt"]
-            # + atomic_loss_dict[('scaled_fape' if self.scale_frame_aligned_errors or self.scale_fape else 'fape')]
         )
-
 
         loss = (
             frame_vf_loss
-            + self.fafe_weight * frame_fm_loss_dict[('scaled_fafe' if self.scale_frame_aligned_errors or self.scale_fafe else 'fafe')] # / 2
-            + self.bb_aux_loss_weight * bb_denoising_finegrain_loss
+            + self.fafe_weight * frame_fm_loss_dict[
+                ('scaled_fafe' if self.scale_frame_aligned_errors or self.scale_fafe else 'fafe')
+            ]
             + atomic_loss
         )
-        if self.use_traj_losses:
-            traj_loss_dict = multiframe_traj_loss(inputs, outputs, traj_decay_factor=0.99)
-            loss = loss + (
-                traj_loss_dict['traj_bb_loss'] * self.bb_traj_loss_scale
-                + traj_loss_dict['traj_rigids_loss'] * self.rigids_traj_loss_scale
-                + traj_loss_dict['traj_pred_dist_loss'] * 0.5 # / np.log(64)
-                + traj_loss_dict['traj_pred_framepair_dist_loss'] * 0.5 # / np.log(64)
-                + traj_loss_dict['traj_seq_loss'] * 0.25  # / np.log(20)
-                + traj_loss_dict['traj_seqpair_loss'] * 0.25
-            )
-        else:
-            traj_loss_dict = {}
-        loss = loss.mean() # / 12
+        loss = loss.mean()
 
         loss_dict = {"loss": loss, "frame_vf_loss": frame_vf_loss, "frame_vf_loss_unscaled": unscaled_frame_vf_loss}
         loss_dict.update(frame_fm_loss_dict)
         loss_dict.update(atomic_loss_dict)
-        loss_dict.update(traj_loss_dict)
         # loss_dict.update(discrim_loss_dict)
         return loss_dict
 

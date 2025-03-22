@@ -14,18 +14,18 @@ from torch_geometric.data import HeteroData, Batch
 
 from proteinzen.data.openfold import data_transforms, residue_constants
 from proteinzen.utils.openfold import rigid_utils as ru
-from proteinzen.tasks import Task
+from proteinzen.harness import TrainingHarness
 
 from proteinzen.runtime.loss.frames import bb_frame_fm_loss, all_atom_fape_loss
 from proteinzen.runtime.loss.common import (
     atom14_fm_losses
 )
 from proteinzen.runtime.loss.traj import atomic_traj_loss
-from proteinzen.stoch_interp.interpolate.se3 import _centered_gaussian, _uniform_so3
-from proteinzen.stoch_interp.interpolate.atom14 import Atom14Interpolant
+from proteinzen.stoch_interp.multiframe import _centered_gaussian
+from proteinzen.stoch_interp.atom14_nonequiv import Atom14Interpolant
 
 
-import proteinzen.stoch_interp.interpolate.utils as du
+import proteinzen.stoch_interp.utils as du
 from proteinzen.utils.framediff import all_atom
 
 
@@ -60,7 +60,7 @@ def no_grad_for_input(model, data):
 
 
 
-class Atom14Interpolation(Task):
+class Atom14Interpolation(TrainingHarness):
 
     bb_x_1_key='rigids_1'
     bb_x_1_pred_key='final_rigids'
@@ -197,7 +197,7 @@ class Atom14Interpolation(Task):
 
         # TODO: this is jenk but i will fix it later
         atom14_0 = (
-            _centered_gaussian(res_data.batch.repeat(14), device) * self.atom_noiser.prior_std
+            _centered_gaussian(res_data.batch, 14, device) * self.atom_noiser.prior_std
         ).reshape(-1, 14, 3)
 
         seq_logits_0 = torch.randn(total_num_res, 20, device=device)
@@ -303,7 +303,26 @@ class Atom14Interpolation(Task):
 
 
     def compute_loss(self, inputs, outputs: Dict):
-        traj_loss_dict = atomic_traj_loss(inputs, outputs, traj_decay_factor=self.traj_decay_factor)
+        # # rigid align against gt
+        # noised_atom14 = outputs['denoised_atom14']
+        # flat_noised_atom14 = noised_atom14.flatten(0, 1)
+        # with torch.no_grad():
+        #     gt_atom14 = inputs['residue']['atom14']
+        #     flat_gt_atom14 = gt_atom14.flatten(0, 1)
+        #     atom_batch = inputs['residue'].batch[..., None].expand(-1, 14).reshape(-1)
+        #     _, _, align_rot_mats = du.align_structures(
+        #         flat_noised_atom14,
+        #         atom_batch,
+        #         flat_gt_atom14,
+        #     )
+        #     align_rot_mats = align_rot_mats[atom_batch]
+        # flat_noised_atom14 = torch.einsum("...ij,...j->...i", align_rot_mats, flat_noised_atom14)
+        # outputs['denoised_atom14'] = flat_noised_atom14.view(noised_atom14.shape)
+        outputs['denoised_atom14'] = torch.einsum(
+            "...ij,...kj->...ki",
+            inputs['residue']['aug_rot'].transpose(-1, -2),
+            outputs['denoised_atom14']
+        )
 
         atomic_loss_dict = atom14_fm_losses(
             inputs, outputs,
@@ -317,22 +336,22 @@ class Atom14Interpolation(Task):
         )
 
         atomic_loss = (
-            atomic_loss_dict["scaled_atom14_mse"]
+            atomic_loss_dict["scaled_atom14_mse"] / (3 * 256)
             + atomic_loss_dict["seq_loss"] * 0.25
             + atomic_loss_dict["smooth_lddt"]
         )
 
         loss = (
             + atomic_loss
-            + traj_loss_dict['traj_ca_loss']
-            + traj_loss_dict['traj_pred_dist_loss'] * 0.5
-            + traj_loss_dict['traj_seq_loss'] * 0.25
+            # + traj_loss_dict['traj_ca_loss']
+            # + traj_loss_dict['traj_pred_dist_loss'] * 0.5
+            # + traj_loss_dict['traj_seq_loss'] * 0.25
         )
 
         loss = loss.mean()
 
         loss_dict = {"loss": loss}
         loss_dict.update(atomic_loss_dict)
-        loss_dict.update(traj_loss_dict)
+        # loss_dict.update(traj_loss_dict)
         return loss_dict
 

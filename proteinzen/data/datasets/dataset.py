@@ -16,7 +16,7 @@ from proteinzen.data.io import utils as du
 from proteinzen.data.openfold.residue_constants import restype_order_with_x
 
 from proteinzen.data.datasets.featurize.molecule import featurize_props
-from proteinzen.utils.torsion import get_transformation_mask
+# from proteinzen.utils.torsion import get_transformation_mask
 
 
 class PdbDataset(data.Dataset):
@@ -237,68 +237,3 @@ class LengthDataset(data.Dataset):
             ret['latent_norm_std'] = self.cache_stats['std'].clone()
 
         return ret
-
-
-class GEOMDataset(data.Dataset):
-    def __init__(
-            self,
-            csv_path,
-            subset=None,
-            split=None
-        ):
-        self._log = logging.getLogger(__name__)
-        self.csv_path = csv_path
-        self.subset = subset
-        self.split = split
-        self._init_metadata()
-
-    def _init_metadata(self):
-        """Initialize metadata."""
-
-        # Process CSV with different filtering criterions.
-        pdb_csv = pd.read_csv(self.csv_path)
-        self.raw_csv = pdb_csv
-
-        pdb_csv = pdb_csv[~pdb_csv.smiles.str.contains('.', regex=False)]
-        if self.subset is not None:
-            if self.subset > 0:
-                pdb_csv = pdb_csv.iloc[:self.subset]
-            elif self.subset < 0:
-                pdb_csv = pdb_csv.iloc[self.subset:]
-
-        if self.split is not None:
-            pdb_csv = pdb_csv[pdb_csv.splits == self.split]
-
-        self.csv = pdb_csv
-
-
-    def _process_csv_row(self, processed_file_path):
-        data_dict = du.read_pkl(processed_file_path)
-        weights = data_dict['boltzmann_weights']
-        rng = np.random.default_rng()
-        conformer_id = rng.choice(
-            a=np.arange(len(weights)),
-            p=np.array(weights) / np.sum(weights)
-        )
-        conformer_id = 0
-        unprocessed_feats = data_dict['conformer_property_dicts'][int(conformer_id)]
-        graph = featurize_props(unprocessed_feats)
-        graph['rd_mol'] = data_dict['rd_mols']
-        graph['path'] = processed_file_path
-        mask_edges, mask_rotate = get_transformation_mask(graph)
-        graph['ligand', 'ligand']['rotatable_bonds'] = torch.as_tensor(mask_edges)
-        graph['ligand', 'ligand']['mask_rotate'] = torch.as_tensor(mask_rotate)
-
-        return graph
-
-    def __len__(self):
-        return len(self.csv)
-
-    def __getitem__(self, idx):
-        # Sample data example.
-        example_idx = idx
-        csv_row = self.csv.iloc[example_idx]
-        processed_file_path = csv_row['processed_path']
-        mol_feats = self._process_csv_row(processed_file_path)
-        mol_feats['csv_idx'] = torch.ones(1, dtype=torch.long) * idx
-        return mol_feats

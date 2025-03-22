@@ -20,11 +20,10 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 import wandb
 
 from proteinzen.runtime.config import config_hydra_store, remove_zen_keys
-from proteinzen.tasks.task import single_task_sampler
 from proteinzen.data.io.atom91 import atom91_to_pdb, atom91_to_chain, chains_to_model, models_to_struct, save_struct
 from proteinzen.utils.atom_reps import atom14_to_atom91
 from proteinzen.data.openfold.residue_constants import restypes
-from proteinzen.runtime.lmod import BackboneModule
+from proteinzen.runtime.lmod import ProteinModule
 
 
 # A logger for this file
@@ -191,7 +190,7 @@ def main(model,
          datamodule,
          lmodule,
          experiment,
-         tasks,
+         harness,
          zen_cfg):
     # change into the output directory
     # os.chdir(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)
@@ -201,8 +200,8 @@ def main(model,
     # so we instantiate instances of each
     # model = lmodule(model, experiment['optim'])
     # model = BackboneModule(model, experiment['optim'])
-    model = lmodule(model, experiment['optim'])
-    task_sampler = single_task_sampler(tasks(corrupter))
+    harness = harness(corrupter, None)
+    model = lmodule(model, experiment['optim'], harness)
 
     # corrupter._sample_cfg.num_timesteps = 200
     # corrupter._sample_cfg.num_timesteps = 500
