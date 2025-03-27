@@ -1,7 +1,7 @@
 import os
 
 import torch
-from hydra_zen import store, just, builds, make_custom_builds_fn, make_config, kwargs_of
+from hydra_zen import store, just, make_custom_builds_fn, make_config, kwargs_of
 from hydra.conf import HydraConf, RunDir
 import omegaconf
 from datetime import timedelta
@@ -23,6 +23,9 @@ from proteinzen.harness.fm.multiframe import MultiFrameInterpolation
 from proteinzen.runtime.lmod import ProteinModule
 from proteinzen.runtime.training.unconditional import UnconditionalGeneration
 from proteinzen.runtime.training.motif_scaffold import BackboneMotifScaffolding, ResidueMotifScaffolding, InverseRotamerMotifScaffolding
+from proteinzen.runtime.training.folding import Folding
+from proteinzen.runtime.training.diffusion_forcing import DiffusionForcing
+from proteinzen.runtime.training.sidechain_design import SidechainDesign
 from proteinzen.runtime.optim import get_std_opt
 
 if os.environ.get("REPO_ROOT") is None:
@@ -48,6 +51,7 @@ print("REPO_ROOT:", os.environ.get("REPO_ROOT"))
 # pylint: disable=not-callable
 
 pbuilds = make_custom_builds_fn(zen_partial=True, populate_full_signature=True)
+builds = make_custom_builds_fn(populate_full_signature=True)
 
 
 def config_hydra_store():
@@ -137,11 +141,17 @@ def config_hydra_store():
         'backbone_motif_scaffolding_freq': 0.0,
         'residue_motif_scaffolding_freq': 0.0,
         'inverse_rotamer_motif_scaffolding_freq': 0.0,
+        'folding_freq': 0.0,
+        'diffusion_forcing_freq': 0.0,
+        'sidechain_design_freq': 0.0,
     }, name='default')
     tasks_store(group='tasks/unconditional')(builds(UnconditionalGeneration), name='default')
     tasks_store(group='tasks/backbone_motif_scaffolding')(builds(BackboneMotifScaffolding), name='default')
     tasks_store(group='tasks/residue_motif_scaffolding')(builds(ResidueMotifScaffolding), name='default')
     tasks_store(group='tasks/inverse_rotamer_motif_scaffolding')(builds(InverseRotamerMotifScaffolding), name='default')
+    tasks_store(group='tasks/folding')(builds(Folding), name='default')
+    tasks_store(group='tasks/diffusion_forcing')(builds(DiffusionForcing), name='default')
+    tasks_store(group='tasks/sidechain_design')(builds(SidechainDesign), name='default')
 
     exp_store = store(group="experiment")
     exp_store({
@@ -195,6 +205,9 @@ def config_hydra_store():
             {"tasks/backbone_motif_scaffolding": "default"},
             {"tasks/residue_motif_scaffolding": "default"},
             {"tasks/inverse_rotamer_motif_scaffolding": "default"},
+            {"tasks/folding": "default"},
+            {"tasks/diffusion_forcing": "default"},
+            {"tasks/sidechain_design": "default"},
             {"experiment": "default"},
             {"experiment/optim": "adam"},
             {"experiment/lightning": "default"},

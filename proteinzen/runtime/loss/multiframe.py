@@ -81,8 +81,6 @@ def multiframe_fm_loss_reduced(
         sidechain_weight = torch.tensor([1] + [2 for _ in range(noised_frames.shape[-1]-1)], device=t.device)
         seqwise_weight = seqwise_weight * sidechain_weight[None]
 
-    seqwise_loss = {}
-
     if sep_rot_loss:
         rot_vf_loss = angle_axis_rot_vf_loss(
             pred_rot_vf,
@@ -176,7 +174,6 @@ def multiframe_fm_loss_reduced(
         "fafe": fafe,
         "scaled_fafe": scaled_fafe
     }
-    ret.update(seqwise_loss)
     return ret
 
 

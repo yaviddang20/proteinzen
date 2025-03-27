@@ -1,9 +1,10 @@
+import numpy as np
 import torch
 
 from .task import TrainingTask
 
-class Folding(TrainingTask):
-    name: str = "folding"
+class DiffusionForcing(TrainingTask):
+    name: str = "diffusion_forcing"
     def __init__(
         self,
         t_sched='lognorm',
@@ -29,24 +30,21 @@ class Folding(TrainingTask):
         rigids_1 = batch['residue']['rigids_1']
         device = rigids_1.device
         # num_batch = rigids_t.shape[0]
-        num_batch = batch.num_graphs # rigids_t.shape[0]
-        rigids_1 = rigids_1.unflatten(0, (num_batch, -1))
+        num_rigids = np.prod(rigids_1.shape[:-1])
         if self.t_sched == 'lognorm':
-            ln_sig = self.lognorm_mu + torch.randn(num_batch, device=device).float() * self.lognorm_sig
+            ln_sig = self.lognorm_mu + torch.randn(num_rigids, device=device).float() * self.lognorm_sig
             t = torch.sigmoid(ln_sig)
         elif self.t_sched == 'mixed_beta':
             u = torch.rand(1)
             if u < 0.02:
-                t = torch.rand(num_batch, device=device).float()
+                t = torch.rand(num_rigids, device=device).float()
             else:
                 dist = torch.distributions.beta.Beta(self.beta_p1, self.beta_p2)
-                t = dist.sample((num_batch,)).to(device)
+                t = dist.sample((num_rigids,)).to(device)
         else:
             raise ValueError(f"self.t_sched={self.t_sched} not recognized")
 
-        t = t.view(-1, *[1 for _ in rigids_1.shape[1:-1]]) * torch.ones(rigids_1.shape[:-1], device=device)
+        t = t.view(rigids_1.shape[:-1])
         rigids_noising_mask = torch.ones_like(t, dtype=torch.bool)
-        t = t.flatten(0, 1)
-        rigids_noising_mask = rigids_noising_mask.flatten(0, 1)
-        seq_noising_mask = torch.zeros_like(rigids_noising_mask[:, 0])
+        seq_noising_mask = torch.ones_like(rigids_noising_mask[:, 0])
         return t, rigids_noising_mask, seq_noising_mask

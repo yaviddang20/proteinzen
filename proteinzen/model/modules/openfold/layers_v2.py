@@ -278,6 +278,17 @@ class AdaLN(nn.Module):
         return s
 
 
+class AdaScale(nn.Module):
+    def __init__(self, c_s, c_cond):
+        super().__init__()
+        self.lin_cond = Linear(c_cond, c_s, init='final')
+        with torch.no_grad():
+            self.lin_cond.bias.fill_(-2.0)
+
+    def forward(self, s, cond):
+        return s * torch.sigmoid(self.lin_cond(cond))
+
+
 class ConditionedTransition(nn.Module):
     def __init__(self, c_s, c_cond, n=2):
         super().__init__()
@@ -406,6 +417,11 @@ class ConditionedInvariantPointAttention(nn.Module):
 
         self.ln_s = AdaLN(c_s=c_s, c_cond=c_cond)
         self.ln_z = LayerNorm(c_z)
+
+        self.lin_out_cond = nn.Sequential(
+            LayerNorm(c_cond),
+            Linear(c_cond, c_s)
+        )
 
     def forward(
         self,
@@ -677,5 +693,7 @@ class ConditionedInvariantPointAttention(nn.Module):
                 o_feats, dim=-1
             ).to(dtype=z[0].dtype)
         )
+        s = torch.sigmoid(self.lin_out_cond(cond)) * s
+
 
         return s

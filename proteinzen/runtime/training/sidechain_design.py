@@ -2,8 +2,8 @@ import torch
 
 from .task import TrainingTask
 
-class Folding(TrainingTask):
-    name: str = "folding"
+class SidechainDesign(TrainingTask):
+    name: str = "sidechain_design"
     def __init__(
         self,
         t_sched='lognorm',
@@ -45,8 +45,10 @@ class Folding(TrainingTask):
             raise ValueError(f"self.t_sched={self.t_sched} not recognized")
 
         t = t.view(-1, *[1 for _ in rigids_1.shape[1:-1]]) * torch.ones(rigids_1.shape[:-1], device=device)
+        t[..., 0] = 1
         rigids_noising_mask = torch.ones_like(t, dtype=torch.bool)
+        rigids_noising_mask[..., 0] = False
         t = t.flatten(0, 1)
         rigids_noising_mask = rigids_noising_mask.flatten(0, 1)
-        seq_noising_mask = torch.zeros_like(rigids_noising_mask[:, 0])
+        seq_noising_mask = torch.ones_like(rigids_noising_mask[:, 0])
         return t, rigids_noising_mask, seq_noising_mask

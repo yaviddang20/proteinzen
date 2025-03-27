@@ -236,9 +236,9 @@ def main(model,
             knn = _model.knn_k
             edges_per_node = min(lrange+knn, n)
             return edges_per_node * n
-        datamodule_inst = datamodule(task_sampler=task_sampler, batch_by_edge_fn=batch_by_edge_fn)
+        datamodule_inst = datamodule(training_harness=harness, batch_by_edge_fn=batch_by_edge_fn)
     else:
-        datamodule_inst = datamodule(task_sampler=task_sampler)
+        datamodule_inst = datamodule(training_harness=harness)
 
     # datamodule_inst = datamodule(task_sampler=task_sampler)
 

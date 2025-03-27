@@ -8,6 +8,7 @@ from .task import TrainingTask
 
 # inspired by Genie2
 class MotifScaffolding(TrainingTask):
+    name: str = "motif_scaffolding"
     def __init__(self,
                  t_sched='lognorm',
                  mode='full_residue',
@@ -83,7 +84,7 @@ class MotifScaffolding(TrainingTask):
         if self.mode == 'backbone':
             t[motif_mask, 0] = 1
             rigids_noising_mask[motif_mask, 0] = False
-            seq_noising_mask = torch.zeros_like(motif_mask)
+            seq_noising_mask = torch.ones_like(motif_mask)
         elif self.mode == 'full_residue':
             t[motif_mask] = 1
             rigids_noising_mask[motif_mask] = False
@@ -96,15 +97,17 @@ class MotifScaffolding(TrainingTask):
 
 
 class BackboneMotifScaffolding(MotifScaffolding):
+    name: str = "bb_motif_scaffolding"
 
     __init__ = partialmethod(MotifScaffolding.__init__, mode='backbone')
 
 
 class ResidueMotifScaffolding(MotifScaffolding):
-
+    name: str = "res_motif_scaffolding"
     __init__ = partialmethod(MotifScaffolding.__init__, mode='full_residue')
 
 
 class InverseRotamerMotifScaffolding(MotifScaffolding):
+    name: str = "inv_rot_motif_scaffolding"
 
     __init__ = partialmethod(MotifScaffolding.__init__, mode='inv_rotamer')

@@ -5,6 +5,7 @@ from torch import Tensor
 
 
 class TrainingTask(abc.ABC):
+    name: str = "abc"  # override this
     def sample_t_and_mask(self, batch) -> Tuple[Tensor, Tensor, Tensor]:
         raise NotImplementedError
 
@@ -15,7 +16,7 @@ class TaskSampler:
         task_list: List[TrainingTask],
         task_probs: List[float]
     ):
-        assert sum(task_probs) == 1.0
+        assert np.isclose(sum(task_probs), 1.0), sum(task_probs)
         keep = [(p > 0.0) for p in task_probs]
 
         self.task_list = [task for i, task in enumerate(task_list) if keep[i]]

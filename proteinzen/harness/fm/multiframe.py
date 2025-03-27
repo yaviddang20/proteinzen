@@ -273,6 +273,7 @@ class MultiFrameInterpolation(TrainingHarness):
             res_data['polar_mask'] = polar_mask
 
         task = self.task_sampler.sample_task()
+        data['task'] = task
         rigidwise_t, rigidwise_noising_mask, seq_noising_mask = task.sample_t_and_mask(data)
         res_data['seq_noising_mask'] = seq_noising_mask
         data['rigidwise_t'] = rigidwise_t
@@ -317,7 +318,9 @@ class MultiFrameInterpolation(TrainingHarness):
                     "res_mask": torch.ones(n, device=device).bool(),
                     "rigids_mask": torch.ones((n, 3), device=device).bool(),
                     "rigids_noising_mask": torch.ones((n, 3), device=device).bool(),
-                    "seq": torch.full((n,), residue_constants.restype_order['R'], device=device).long(),
+                    "seq": torch.full((n,), residue_constants.restype_order_with_x['X'], device=device).long(),
+                    "seq_mask": torch.ones(n, device=device).bool(),
+                    "seq_noising_mask": torch.ones(n, device=device).bool(),
                     "chain_idx": torch.zeros(n, device=device),
                     # "chain_idx": torch.cat([torch.zeros(n//2, device=device), torch.ones(n//2, device=device)], dim=0),
                     "num_nodes": n
@@ -431,7 +434,7 @@ class MultiFrameInterpolation(TrainingHarness):
         ).to_tensor_7()
         t = torch.ones(batch.num_graphs, device=device) * t_1
         batch["t"] = t
-        batch["rigidwise_t"] = torch.ones((total_num_res, self.frame_noiser.rigids_per_res), device=device) * t
+        batch["rigidwise_t"] = torch.ones((total_num_res, self.frame_noiser.rigids_per_res), device=device) * t_1
 
         denoiser_out = model(batch, self_condition=denoiser_out)
 
@@ -514,6 +517,7 @@ class MultiFrameInterpolation(TrainingHarness):
         loss = loss.mean()
 
         loss_dict = {"loss": loss, "frame_vf_loss": frame_vf_loss, "frame_vf_loss_unscaled": unscaled_frame_vf_loss}
+        loss_dict["loss_" + inputs['task'].name] = loss
         loss_dict.update(frame_fm_loss_dict)
         loss_dict.update(atomic_loss_dict)
         # loss_dict.update(discrim_loss_dict)

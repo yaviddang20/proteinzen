@@ -3,6 +3,7 @@ import torch
 from .task import TrainingTask
 
 class UnconditionalGeneration(TrainingTask):
+    name: str = "unconditional"
     def __init__(
         self,
         t_sched='lognorm',
