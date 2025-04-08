@@ -197,7 +197,7 @@ class MultiFrameInterpolation(TrainingHarness):
         return ru.Rigid.from_tensor_4x4(tensor_4x4)[:, (0, 2, 3)]
 
 
-    def process_input(self, data: HeteroData):
+    def process_input(self, data: HeteroData, force_t0=False):
         data = copy.deepcopy(data)
         self.frame_noiser.set_device(data['residue']['atom37'].device)
         res_data = data['residue']
@@ -275,6 +275,8 @@ class MultiFrameInterpolation(TrainingHarness):
         task = self.task_sampler.sample_task()
         data['task'] = task
         rigidwise_t, rigidwise_noising_mask, seq_noising_mask = task.sample_t_and_mask(data)
+        if force_t0:
+            rigidwise_t = torch.zeros_like(rigidwise_t)
         res_data['seq_noising_mask'] = seq_noising_mask
         data['rigidwise_t'] = rigidwise_t
         data['t'] = rigidwise_t.unflatten(0, (data.num_graphs, -1))[..., 0, 0]
@@ -372,8 +374,18 @@ class MultiFrameInterpolation(TrainingHarness):
             d_t = t_2 - t_1
             # Run model.
             trans_t_1, rotmats_t_1, _, _ = prot_traj[-1]
-            t_hat, d_t_hat, trans_t_hat = self.frame_noiser._trans_churn(d_t, t_1, trans_t_1)
-            _, _, rotmats_t_hat = self.frame_noiser._rot_churn(d_t, t_1, rotmats_t_1)
+            t_hat, d_t_hat, trans_t_hat = self.frame_noiser._trans_churn(
+                d_t,
+                t_1,
+                trans_t_1,
+                noising_mask=res_data['rigids_noising_mask']
+            )
+            _, _, rotmats_t_hat = self.frame_noiser._rot_churn(
+                d_t,
+                t_1,
+                rotmats_t_1,
+                noising_mask=res_data['rigids_noising_mask']
+            )
 
             res_data["trans_t"] = trans_t_hat
             res_data["rotmats_t"] = rotmats_t_hat
@@ -403,8 +415,22 @@ class MultiFrameInterpolation(TrainingHarness):
             )
 
             # Take reverse step
-            trans_t_2 = self.frame_noiser._trans_euler_step(d_t_hat, t_hat, pred_trans_1, trans_t_hat, add_noise=False)
-            rotmats_t_2 = self.frame_noiser._rots_euler_step(d_t_hat, t_hat, pred_rotmats_1, rotmats_t_hat, add_noise=False)
+            trans_t_2 = self.frame_noiser._trans_euler_step(
+                d_t_hat,
+                t_hat,
+                pred_trans_1,
+                trans_t_hat,
+                noising_mask=res_data['rigids_noising_mask'],
+                add_noise=False
+            )
+            rotmats_t_2 = self.frame_noiser._rots_euler_step(
+                d_t_hat,
+                t_hat,
+                pred_rotmats_1,
+                rotmats_t_hat,
+                noising_mask=res_data['rigids_noising_mask'],
+                add_noise=False
+            )
 
             prot_traj.append(
                 (trans_t_2,
@@ -517,7 +543,10 @@ class MultiFrameInterpolation(TrainingHarness):
         loss = loss.mean()
 
         loss_dict = {"loss": loss, "frame_vf_loss": frame_vf_loss, "frame_vf_loss_unscaled": unscaled_frame_vf_loss}
-        loss_dict["loss_" + inputs['task'].name] = loss
+        loss_dict[inputs['task'].name + "_loss"] = loss
+        loss_dict[inputs['task'].name + "_seq_loss"] = atomic_loss_dict["seq_loss"]
+        loss_dict[inputs['task'].name + "_frame_vf_loss"] = frame_vf_loss
+        loss_dict[inputs['task'].name + "_frame_vf_loss_unscaled"] = unscaled_frame_vf_loss
         loss_dict.update(frame_fm_loss_dict)
         loss_dict.update(atomic_loss_dict)
         # loss_dict.update(discrim_loss_dict)

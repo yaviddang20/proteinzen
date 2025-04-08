@@ -425,8 +425,8 @@ def atom37_to_cg_frames(protein, eps=1e-8, cg_version=2):
     restype_cg_group_mask = all_atom_mask.new_zeros(
         (*aatype.shape[:-1], 21, 4),
     )
-    restype_cg_group_mask[..., 0] = 1
-    restype_cg_group_mask[..., 1] = 1
+    restype_cg_group_mask[..., :20, 0] = 1
+    restype_cg_group_mask[..., :20, 1] = 1
     restype_cg_group_mask[..., :20, 2:] = all_atom_mask.new_tensor(
         [cg.cg_group_mask[rc.restype_1to3[resname]][2:] for resname in rc.restypes]
     )

@@ -9,7 +9,7 @@ from datetime import timedelta
 from lightning import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
 
-from proteinzen.data.datasets.datamodule import FramediffDataModule
+from proteinzen.data.datasets.datamodule import FramediffDataModule, SamplingDataModule
 
 from proteinzen.stoch_interp.atom14_nonequiv import Atom14Interpolant as NonEquivAtom14Interpolant
 from proteinzen.stoch_interp.multiframe import MultiSE3Interpolant, SE3InterpolantConfig
@@ -82,6 +82,16 @@ def config_hydra_store():
     datamodule_store(
         pbuilds(
             FramediffDataModule,
+            data_dir=f"{os.environ.get('REPO_ROOT')}/data/cath",
+            batch_size=3000,
+            num_workers=4,
+            use_val_split=True,
+            min_ordered_percent=0.0
+        ),
+        name="cath")
+    datamodule_store(
+        pbuilds(
+            FramediffDataModule,
             data_dir=f"{os.environ.get('REPO_ROOT')}/data/framediff_clustered",
             batch_size=3000,
             num_workers=4
@@ -119,6 +129,14 @@ def config_hydra_store():
             num_workers=4
         ),
         name="afdb_512")
+    datamodule_store(
+        pbuilds(
+            FramediffDataModule,
+            data_dir=f"{os.environ.get('REPO_ROOT')}/data/afdb_512_clusters",
+            batch_size=3000,
+            num_workers=8
+        ),
+        name="afdb_512_clusters")
 
     lmodule_store = store(group="lmodule")
     lmodule_store(
@@ -238,3 +256,44 @@ def remove_zen_keys(cfg, keys=['_target_', '_partial_']):
         return cfg
 
     return remove_key(cfg.copy())
+
+
+def config_sampling_hydra_store():
+    # change hydra conf defaults to avoid run collisions
+    store(
+        HydraConf(
+            run=RunDir(dir="./sampling_outputs/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}")
+    ))
+
+    # store(
+    #     {
+    #         "model_dir": "",
+    #         "out_prefix": "samples",
+    #         "save_traj": False,
+    #         "debug": False,
+    #         "checkpoint_idx": -1
+    #     },
+    #     name='default'
+    # )
+
+    sampler_store = store(group="sampler")
+    sampler_store(
+        builds(
+            SamplingDataModule
+        ),
+        name="default"
+    )
+
+    SamplingConfig = make_config(
+        model_dir="",
+        out_prefix="samples",
+        save_traj=False,
+        checkpoint_idx=-1,
+        hydra_defaults=[
+            {"sampler": "default"},
+            '_self_'
+        ],
+    )
+
+    store(SamplingConfig, name="main")
+    store.add_to_hydra_store()

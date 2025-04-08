@@ -1,6 +1,7 @@
 """ Batch samplers for datasets """
 import logging
 
+import pandas as pd
 import numpy as np
 import random
 import torch
@@ -353,7 +354,8 @@ class ClusteredLengthBatchSampler:
                  num_replicas=1,
                  rank=0,
                  seed=0,
-                 afdb_frac=0.75
+                 afdb_frac=0.75,
+                 sample_by_length_bucket=False
                  ):
         self.dataset = dataset
         self.batch_size = batch_size
@@ -366,6 +368,7 @@ class ClusteredLengthBatchSampler:
             max_num_per_batch = batch_size
         self.max_num_per_batch = max_num_per_batch
         self.afdb_frac = afdb_frac
+        self.sample_by_length_bucket = sample_by_length_bucket
 
         self.num_replicas = num_replicas
         self.rank = rank
@@ -399,12 +402,22 @@ class ClusteredLengthBatchSampler:
         print(len(clusters))
 
         # sample one example per cluster
-        for cluster in clusters:
-            cluster_sample = df[df['cluster'] == cluster].sample(1, random_state=g)
-            iloc = cluster_sample['iloc'].iloc[0]
-            assert df.iloc[iloc].pdb_name == cluster_sample.pdb_name.iloc[0]
-            idx.append(iloc)
-            node_counts.append(cluster_sample.modeled_seq_len.iloc[0])
+        # for cluster in clusters:
+        #     cluster_sample = df[df['cluster'] == cluster].sample(1, random_state=g)
+        #     iloc = cluster_sample['iloc'].iloc[0]
+        #     assert df.iloc[iloc].pdb_name == cluster_sample.pdb_name.iloc[0]
+        #     idx.append(iloc)
+        #     node_counts.append(cluster_sample.modeled_seq_len.iloc[0])
+        cluster_samples = df.groupby('cluster').sample(1, random_state=g)
+        cluster_samples = cluster_samples[cluster_samples['cluster'].isin(clusters)]
+        if self.sample_by_length_bucket:
+            cluster_samples = cluster_samples.groupby("modeled_seq_len").sample(
+                max(self.max_num_per_batch, 10),
+                replace=True,
+                random_state=g
+            )
+        idx = cluster_samples['iloc'].tolist()
+        node_counts = cluster_samples['modeled_seq_len'].tolist()
 
         node_counts = np.array(node_counts)
         idx = np.array(idx)

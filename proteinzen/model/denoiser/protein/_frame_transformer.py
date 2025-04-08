@@ -1452,6 +1452,7 @@ class SequenceFrameTransformerUpdate(nn.Module):
         framepair_init=False,
         framepair_ffn=False,
         add_vanilla_transformer=False,
+        add_second_transformer=False,
         add_full_transformer=False,
         use_ipa_gating=False,
         ablate_ipa_down_z=False,
@@ -1469,6 +1470,7 @@ class SequenceFrameTransformerUpdate(nn.Module):
         self.agg_rigid_embed = agg_rigid_embed
         self.framepair_init = framepair_init
         self.add_vanilla_transformer = add_vanilla_transformer
+        self.add_second_transformer = add_second_transformer
         self.add_full_transformer = add_full_transformer
 
         self.node_to_frame_broadcast = GatherUpdate(c_s, c_frame)
@@ -1501,6 +1503,14 @@ class SequenceFrameTransformerUpdate(nn.Module):
             )
             if self.add_vanilla_transformer:
                 self.trunk[f'vanilla_tfmr_{b}'] = BlockTransformerPairBias(
+                    c_s=c_frame,
+                    c_cond=c_s,
+                    c_z=c_framepair,
+                    num_heads=num_heads,
+                    use_qk_norm=use_qk_norm
+                )
+            if self.add_second_transformer:
+                self.trunk[f'second_tfmr_{b}'] = BlockTransformerPairBias(
                     c_s=c_frame,
                     c_cond=c_s,
                     c_z=c_framepair,
@@ -1580,6 +1590,16 @@ class SequenceFrameTransformerUpdate(nn.Module):
                     rigids_mask=rigids_mask,
                     rigids_to_res_idx=rigids_to_res_idx
                 )
+            if self.add_second_transformer:
+                rigids_embed_flat = self.trunk[f'second_tfmr_{b}'](
+                    s=s,
+                    rigids_embed=rigids_embed_flat,
+                    framepair_embed=framepair_embed,
+                    to_queries=to_queries,
+                    to_keys=to_keys,
+                    rigids_mask=rigids_mask,
+                    rigids_to_res_idx=rigids_to_res_idx
+                )
             if self.add_full_transformer:
                 rigids_embed_flat = self.trunk[f'full_tfmr_{b}'](
                     rigids_embed_flat,
@@ -1615,6 +1635,7 @@ class ConditionedSequenceFrameTransformerBlock(nn.Module):
                  use_ipa_gating=False,
                  ablate_ipa_down_z=False,
                  use_qk_norm=False,
+                 use_conditioned_ipa=True,
                  ):
         super().__init__()
 
@@ -1627,22 +1648,41 @@ class ConditionedSequenceFrameTransformerBlock(nn.Module):
         self.block_k = block_k
         self.inf = inf
 
-        self.block_ipa = ConditionedBlockInvariantPointAttention(
-            c_s=c_frame,
-            c_cond=c_s,
-            c_z=c_framepair,
-            c_hidden=self.c_hidden,
-            num_heads=num_heads,
-            num_qk_points=num_qk_points,
-            num_v_points=num_v_points,
-            block_Q=block_q,
-            block_K=block_k,
-            use_compile_path=compile_ipa,
-            use_out_gating=use_ipa_gating,
-            use_cond_gating=use_ipa_gating,
-            ablate_down_z=ablate_ipa_down_z,
-            use_qk_norm=use_qk_norm,
-        )
+        self.use_conditioned_ipa = use_conditioned_ipa
+
+        if use_conditioned_ipa:
+            self.block_ipa = ConditionedBlockInvariantPointAttention(
+                c_s=c_frame,
+                c_cond=c_s,
+                c_z=c_framepair,
+                c_hidden=self.c_hidden,
+                num_heads=num_heads,
+                num_qk_points=num_qk_points,
+                num_v_points=num_v_points,
+                block_Q=block_q,
+                block_K=block_k,
+                use_compile_path=compile_ipa,
+                use_out_gating=use_ipa_gating,
+                use_cond_gating=use_ipa_gating,
+                ablate_down_z=ablate_ipa_down_z,
+                use_qk_norm=use_qk_norm,
+            )
+        else:
+            self.block_ipa = BlockInvariantPointAttention(
+                c_s=c_frame,
+                c_z=c_framepair,
+                c_hidden=self.c_hidden,
+                num_heads=num_heads,
+                num_qk_points=num_qk_points,
+                num_v_points=num_v_points,
+                block_Q=block_q,
+                block_K=block_k,
+                use_compile_path=compile_ipa,
+                use_out_gating=use_ipa_gating,
+                ablate_down_z=ablate_ipa_down_z,
+                use_qk_norm=use_qk_norm,
+            )
+
         self.transition = GatherConditionedTransition(c_frame, c_s)
 
 
@@ -1657,16 +1697,26 @@ class ConditionedSequenceFrameTransformerBlock(nn.Module):
         rigids_mask,
         rigids_to_res_idx,
     ):
-        rigids_embed_update = self.block_ipa(
-            s=rigids_embed,
-            cond=s,
-            cond_to_s_idx=rigids_to_res_idx,
-            z=framepair_embed,
-            r=rigids,
-            s_mask=rigids_mask,
-            to_queries=to_queries,
-            to_keys=to_keys,
-        )
+        if self.use_conditioned_ipa:
+            rigids_embed_update = self.block_ipa(
+                s=rigids_embed,
+                cond=s,
+                cond_to_s_idx=rigids_to_res_idx,
+                z=framepair_embed,
+                r=rigids,
+                s_mask=rigids_mask,
+                to_queries=to_queries,
+                to_keys=to_keys,
+            )
+        else:
+            rigids_embed_update = self.block_ipa(
+                s=rigids_embed,
+                z=framepair_embed,
+                r=rigids,
+                s_mask=rigids_mask,
+                to_queries=to_queries,
+                to_keys=to_keys,
+            )
         rigids_embed = rigids_embed + rigids_embed_update * rigids_mask[..., None]
 
         rigids_embed = rigids_embed + self.transition(
@@ -1701,9 +1751,11 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
         compile_ipa=False,
         framepair_init=False,
         add_vanilla_transformer=False,
+        add_second_transformer=False,
         use_ipa_gating=False,
         ablate_ipa_down_z=False,
         use_qk_norm=False,
+        use_conditioned_ipa=True,
     ):
         super().__init__()
         self.c_s = c_s
@@ -1716,6 +1768,7 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
         self.agg_rigid_embed = agg_rigid_embed
         self.framepair_init = framepair_init
         self.add_vanilla_transformer = add_vanilla_transformer
+        self.add_second_transformer = add_second_transformer
 
         self.node_to_frame_broadcast = GatherUpdate(c_s, c_frame)
 
@@ -1744,9 +1797,18 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
                 use_ipa_gating=use_ipa_gating,
                 ablate_ipa_down_z=ablate_ipa_down_z,
                 use_qk_norm=use_qk_norm,
+                use_conditioned_ipa=use_conditioned_ipa,
             )
             if self.add_vanilla_transformer:
                 self.trunk[f'vanilla_tfmr_{b}'] = ConditionedBlockTransformerPairBias(
+                    c_s=c_frame,
+                    c_cond=c_s,
+                    c_z=c_framepair,
+                    num_heads=num_heads,
+                    use_qk_norm=use_qk_norm
+                )
+            if self.add_second_transformer:
+                self.trunk[f'second_tfmr_{b}'] = ConditionedBlockTransformerPairBias(
                     c_s=c_frame,
                     c_cond=c_s,
                     c_z=c_framepair,
@@ -1808,6 +1870,16 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
             )
             if self.add_vanilla_transformer:
                 rigids_embed_flat = self.trunk[f'vanilla_tfmr_{b}'](
+                    s=s,
+                    rigids_embed=rigids_embed_flat,
+                    framepair_embed=framepair_embed,
+                    to_queries=to_queries,
+                    to_keys=to_keys,
+                    rigids_mask=rigids_mask,
+                    rigids_to_res_idx=rigids_to_res_idx,
+                )
+            if self.add_second_transformer:
+                rigids_embed_flat = self.trunk[f'second_tfmr_{b}'](
                     s=s,
                     rigids_embed=rigids_embed_flat,
                     framepair_embed=framepair_embed,

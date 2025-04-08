@@ -359,7 +359,8 @@ class ConditionedInvariantPointAttention(nn.Module):
         num_v_points,
         inf: float = 1e5,
         eps: float = 1e-8,
-        final_init='final'
+        final_init='final',
+        use_qk_norm=False,
     ):
         """
         Args:
@@ -386,6 +387,11 @@ class ConditionedInvariantPointAttention(nn.Module):
         self.no_v_points = num_v_points
         self.inf = inf
         self.eps = eps
+        self.use_qk_norm = use_qk_norm
+
+        if self.use_qk_norm:
+            self.q_norm = LayerNorm(self.c_hidden)
+            self.k_norm = LayerNorm(self.c_hidden)
 
         # These linear layers differ from their specifications in the
         # supplement. There, they lack bias and use Glorot initialization.
@@ -470,6 +476,10 @@ class ConditionedInvariantPointAttention(nn.Module):
 
         # [*, N_res, H, C_hidden]
         k, v = torch.split(kv, self.c_hidden, dim=-1)
+
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         # [*, N_res, H * P_q * 3]
         q_pts = self.linear_q_points(s)
