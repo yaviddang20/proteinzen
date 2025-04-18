@@ -47,7 +47,8 @@ def compute_coarse_grain_groups(mol):
     c = np.ones(num_cg_groups)
 
     res = milp(c, bounds=(0, 1), integrality=np.ones(num_cg_groups), constraints=atom_cover_constraint)
-    return [g for i, g in enumerate(cg_groups) if res.x[i] == 1]
+    cg_group_list =  [sorted(g) for i, g in enumerate(cg_groups) if res.x[i] == 1]
+    return sorted(cg_group_list, key=lambda x: len(x))
 
 
 def compute_coarse_grain_frames(
@@ -62,8 +63,12 @@ def compute_coarse_grain_frames(
     atom_pos = torch.as_tensor(atom_pos)
     rigids = []
     ref_pos = []
-    group_idx = []
+    gt_atom_pos = []
+    group_idx = torch.full((atom_pos.shape[0],), torch.nan) # []
+    same_group_idx = torch.zeros((atom_pos.shape[0], atom_pos.shape[0]), dtype=torch.bool) # []
     dummy_rot_mask = []
+
+    covered_atoms = []
 
     for idx, cg_group in enumerate(cg_groups):
         cg_group = sorted(cg_group)
@@ -116,21 +121,74 @@ def compute_coarse_grain_frames(
                     closest_atom_pos[[2]],
                 )
             else:
-                raise ValueError("no available frame construction method for this case")
+                # check if 1 2 4 are colinear
+                cross_prod_1_2_4 = torch.cross(
+                    closest_atom_pos[1] - closest_atom_pos[0],
+                    closest_atom_pos[3] - closest_atom_pos[0],
+                    dim=-1
+                )
+                if torch.linalg.vector_norm(cross_prod_1_2_4) > colinear_eps:
+                    rigid = ru.Rigid.from_3_points(
+                        closest_atom_pos[[1]],
+                        closest_atom_pos[[0]],
+                        closest_atom_pos[[3]],
+                    )
+                else:
+                    raise ValueError("it appears your molecule has >3 co-linear atoms, which we do not support frame construction for")
 
             dummy_rot_mask.append(False)
 
-        group_idx += [idx for _ in cg_group]
+        for atom_idx in cg_group:
+            if atom_idx not in covered_atoms:
+                group_idx[atom_idx] = idx
+                covered_atoms.append(idx)
+
         rigids.append(rigid)
-        ref_pos.append(
-            rigid.invert_apply(group_atom_pos)
-        )
+
+    for cg_group in enumerate(cg_groups):
+        for atom_idx1 in cg_group:
+            for atom_idx2 in cg_group:
+                same_group_idx[covered_atoms.index(atom_idx1)][covered_atoms.index(atom_idx2)] = True
+
+    assert torch.isfinite(group_idx).all()
 
     ret = {
         "rigids": ru.Rigid.cat(rigids, dim=0),
-        "group_idx": torch.as_tensor(group_idx),
-        "ref_pos": torch.cat(ref_pos, dim=0),
-        "dummy_rot_mask": torch.as_tensor(dummy_rot_mask)
+        "group_idx": group_idx.long(),
+        "same_group_idx": same_group_idx,
+        "ref_pos": torch.stack(ref_pos, dim=0),
+        "gt_atom_pos": torch.stack(gt_atom_pos, dim=0),
+        "dummy_rot_mask": torch.as_tensor(dummy_rot_mask),
+        "atompos_idx_from_rdkit_idx": torch.as_tensor(covered_atoms, dtype=torch.long)
     }
     return ret
 
+
+def compute_atomic_frames(
+    mol,
+    cg_groups,
+    conf_id=-1,
+    colinear_eps=1e-6,
+    frame_select_aug=True
+):
+    cg_data = compute_coarse_grain_frames(
+        mol,
+        cg_groups,
+        conf_id,
+        colinear_eps,
+        frame_select_aug
+    )
+    cg_rigids = cg_data['rigids']
+    group_idx = cg_data['group_idx']
+    gt_atom_pos = cg_data['gt_atom_pos']
+    atom_rigids = ru.Rigid(
+        rots=cg_rigids.get_rots()[group_idx],
+        trans=gt_atom_pos
+    )
+    atom_dummy_rot = cg_data['dummy_rot_mask'][group_idx]
+
+    return {
+        "atom_rigids": atom_rigids,
+        "atom_dummy_rot_mask": atom_dummy_rot,
+        "atompos_idx_from_rdkit_idx": cg_data['atompos_idx_from_rdkit_idx']
+    }

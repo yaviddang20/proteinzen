@@ -1196,6 +1196,7 @@ def pad_and_flatten_rigids(rigids, rigids_embed, rigids_noising_mask, block_q):
     return rigids_flat, rigids_embed_flat, rigids_to_res_idx, rigids_flat_mask, rigids_noising_mask_flat, bb_rigids_mask, n_padding
 
 
+
 def unflatten_rigids(rigids_flat, n_padding):
     shape = (rigids_flat.shape[0], -1, 3)
     if n_padding > 0:

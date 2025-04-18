@@ -19,6 +19,9 @@ class MotifScaffolding(TrainingTask):
                  shift_time_scale=False,
                  t_min=0.01,
                  t_max=0.99,
+                 max_frac_res=0.5,
+                 max_num_res=40,
+                 p_is_unindexed=0.8
     ):
         assert t_sched in ['lognorm', 'mixed_beta']
         assert mode in ['backbone', 'full_residue', 'inv_rotamer']
@@ -32,6 +35,10 @@ class MotifScaffolding(TrainingTask):
         self.t_max = t_max
         self.shift_time_scale = shift_time_scale
 
+        self.max_frac_res = max_frac_res
+        self.max_num_res = max_num_res
+        self.p_is_unindexed = p_is_unindexed
+
     def generate_motif_mask(self, batch):
         masks = []
         N = batch['residue'].num_nodes // batch.num_graphs
@@ -39,7 +46,10 @@ class MotifScaffolding(TrainingTask):
             num_segments = np.random.randint(1, 5)
             # we switch this from Genie2
             # to increase the probability of sampling minimal motifs
-            num_res = np.random.randint(num_segments, math.ceil(0.5 * N)) + 1
+            # we also give the option to lower the maximum number of residues sampled
+            res_cap = min(math.ceil(self.max_frac_res * N), self.max_num_res)
+            res_cap = max(res_cap, num_segments) + 1
+            num_res = np.random.randint(num_segments, res_cap) + 1
             # num_res = np.random.randint(math.floor(0.05 * N), math.ceil(0.5 * N) + 1)
             # # when N < 80 it's possible for num_segments > num_res
             # num_res = max(num_segments + 1, num_res)
@@ -86,14 +96,20 @@ class MotifScaffolding(TrainingTask):
             rigids_noising_mask[motif_mask, 0] = False
             seq_noising_mask = torch.ones_like(motif_mask)
         elif self.mode == 'full_residue':
-            t[motif_mask] = 1
+            # t[motif_mask] = 1
             rigids_noising_mask[motif_mask] = False
         elif self.mode == 'inv_rotamer':
             t[motif_mask, 1:] = 1
             rigids_noising_mask[motif_mask, 1:] = False
 
+        res_is_unindexed_mask = torch.rand_like(seq_noising_mask, dtype=torch.float32) < self.p_is_unindexed
 
-        return t, rigids_noising_mask, seq_noising_mask
+        return {
+            "t": t,
+            "rigids_noising_mask": rigids_noising_mask,
+            "seq_noising_mask": seq_noising_mask,
+            "res_is_unindexed_mask": res_is_unindexed_mask
+        }
 
 
 class BackboneMotifScaffolding(MotifScaffolding):

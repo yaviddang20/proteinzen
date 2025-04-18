@@ -47,4 +47,9 @@ class DiffusionForcing(TrainingTask):
         t = t.view(rigids_1.shape[:-1])
         rigids_noising_mask = torch.ones_like(t, dtype=torch.bool)
         seq_noising_mask = torch.ones_like(rigids_noising_mask[:, 0])
-        return t, rigids_noising_mask, seq_noising_mask
+        return {
+            "t": t,
+            "rigids_noising_mask": rigids_noising_mask,
+            "seq_noising_mask": seq_noising_mask
+        }
+

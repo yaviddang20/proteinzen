@@ -220,8 +220,9 @@ class SamplingDataModule(L.LightningDataModule):
     def __init__(self,
                  tasks_yaml,
                  batch_size,
-                 batching_mode="lazy"):
+                 batching_mode="optimal"):
         super().__init__()
+        self.batching_mode = batching_mode
 
         self.task_dispatcher = TaskDispatcher(
             tasks_yaml,
@@ -230,9 +231,28 @@ class SamplingDataModule(L.LightningDataModule):
         )
 
     def predict_dataloader(self):
-        return DataLoader(
-            self.task_dispatcher,
-            shuffle=False,
-            collate_fn=lambda x: x[0],
-            batch_size=1
-        )
+        if self.batching_mode == "optimal":
+            rank = self.trainer.local_rank
+            num_replicas = self.trainer.num_devices
+            return DataLoader(
+                self.task_dispatcher,
+                sampler=torch.utils.data.distributed.DistributedSampler(
+                    self.task_dispatcher,
+                    num_replicas=num_replicas,
+                    rank=rank,
+                    shuffle=False,
+                    seed=0,
+                    drop_last=False
+                ),
+                shuffle=False,
+                collate_fn=lambda x: x[0],
+                batch_size=1
+            )
+
+        elif self.batching_mode == "lazy":
+            return DataLoader(
+                self.task_dispatcher,
+                shuffle=False,
+                collate_fn=lambda x: x[0],
+                batch_size=1
+            )

@@ -62,7 +62,7 @@ class MultiFrameInterpolation(TrainingHarness):
                  ignore_rigid_2_vf_loss=False,
                  dummy_rigid_to_sidechain_rigid=False,
                  rot_cap_loss_weight=0.0,
-                 cg_version=2,
+                 cg_version=1,
                  resolve_sidechain_ambiguity=False,
                  self_condition_rate=0.5,
                  bb_aux_loss_weight=0.25,
@@ -241,6 +241,7 @@ class MultiFrameInterpolation(TrainingHarness):
                 rigids_1_tensor_7[..., 0:1, :] * (1 - rigids_mask[..., None].float())
             )
         res_data['rigids_1'] = rigids_1_tensor_7
+        res_data['rigids_1_flat'] = rigids_1_tensor_7.flatten(0, 1)
 
         # compute sidechain features
         ## generate data dict
@@ -274,13 +275,18 @@ class MultiFrameInterpolation(TrainingHarness):
 
         task = self.task_sampler.sample_task()
         data['task'] = task
-        rigidwise_t, rigidwise_noising_mask, seq_noising_mask = task.sample_t_and_mask(data)
+        task_data = task.sample_t_and_mask(data)
+        rigidwise_t = task_data['t']
+        rigidwise_noising_mask = task_data['rigids_noising_mask']
+        seq_noising_mask = task_data['seq_noising_mask']
         if force_t0:
             rigidwise_t = torch.zeros_like(rigidwise_t)
         res_data['seq_noising_mask'] = seq_noising_mask
         data['rigidwise_t'] = rigidwise_t
         data['t'] = rigidwise_t.unflatten(0, (data.num_graphs, -1))[..., 0, 0]
         res_data['rigids_noising_mask'] = rigidwise_noising_mask
+        if 'rigid_unindexed_mask' in task_data:
+            res_data['rigid_unindexed_mask'] = task_data['rigid_unindexed_mask']
 
         data = self.frame_noiser.corrupt_batch(data)
 

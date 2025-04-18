@@ -283,6 +283,12 @@ def config_sampling_hydra_store():
         ),
         name="default"
     )
+    corrupter_store = store(group="corrupter")
+    corrupter_store(
+        MultiSE3Interpolant,
+        cfg=builds(SE3InterpolantConfig),
+        name="default"
+    )
 
     SamplingConfig = make_config(
         model_dir="",
@@ -291,6 +297,7 @@ def config_sampling_hydra_store():
         checkpoint_idx=-1,
         hydra_defaults=[
             {"sampler": "default"},
+            {"corrupter": "default"},
             '_self_'
         ],
     )

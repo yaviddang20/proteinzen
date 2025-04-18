@@ -79,22 +79,6 @@ class PdbDataset(data.Dataset):
 
         pdb_csv = pdb_csv[pdb_csv["coil_percent"] < (1 - self.min_percent_ordered)]
 
-        if self.use_tmpdir:
-            assert 'TMPDIR' in os.environ
-            pdb_csv['tmpfile_path'] = [
-                os.path.join(os.environ['TMPDIR'], pdb_name + ".pt")
-                for pdb_name in pdb_csv['pdb_name']
-            ]
-
-        if self.cache_dir is not None:
-            cache_df = pd.read_csv(os.path.join(self.cache_dir, "metadata.csv"))
-            # assert len(cache_df) == len(pdb_csv), "diff lengths not supported atm"
-            print(len(pdb_csv), len(cache_df))
-            merged_csv = pdb_csv.merge(cache_df, on="pdb_name")
-            print(len(pdb_csv), len(merged_csv))
-            assert len(pdb_csv) == len(merged_csv), (len(pdb_csv), len(merged_csv))
-            pdb_csv = merged_csv
-
         self.csv = pdb_csv
 
 
@@ -150,28 +134,6 @@ class PdbDataset(data.Dataset):
         chain_feats = self._process_csv_row(processed_file_path)
         chain_feats['name'] = csv_row['pdb_name']
         chain_feats['csv_idx'] = torch.ones(1, dtype=torch.long) * idx
-
-        if self.use_tmpdir:
-            tmpfile_path = csv_row['tmpfile_path']
-            chain_feats['tmpfile_path'] = tmpfile_path
-            if os.path.exists(tmpfile_path):
-                tmp_dict = torch.load(tmpfile_path, map_location='cpu')
-                chain_feats['residue']['latent_mu'] = tmp_dict['latent_mu']
-                chain_feats['residue']['latent_logvar'] = tmp_dict['latent_logvar']
-            else:
-                chain_feats['residue']['latent_mu'] = torch.zeros([0, 128])
-                chain_feats['residue']['latent_logvar'] = torch.zeros([0, 128])
-
-        if self.cache_dir is not None:
-            cache_data = torch.load(csv_row['latent_cache_file'], map_location='cpu')
-            chain_feats['residue']['latent_mu'] = cache_data['latent_mu']
-            chain_feats['residue']['latent_logvar'] = cache_data['latent_logvar']
-            if self.normalize_cache:
-                cache_stats = torch.load(os.path.join(self.cache_dir, "latent_stats.pt"), map_location='cpu')
-                chain_feats['residue']['latent_norm_mu'] = cache_stats['mu'][None]
-                chain_feats['residue']['latent_norm_std'] = cache_stats['std'][None]
-
-
 
         return chain_feats
 

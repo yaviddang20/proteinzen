@@ -1,16 +1,9 @@
 """Utilities for calculating all atom representations."""
 import torch
 from proteinzen.utils.openfold import feats, rigid_utils as ru
+from proteinzen.utils.openfold.tensor_utils import batched_gather
 from proteinzen.data.openfold import residue_constants
-from proteinzen.data.constants import (
-    coarse_grain,
-    _coarse_grain_v3 as cg_v3,
-    _coarse_grain_v4 as cg_v4,
-    _coarse_grain_v5 as cg_v5,
-    _coarse_grain_v6 as cg_v6,
-    _coarse_grain_v7 as cg_v7,
-    _coarse_grain_v8 as cg_v8,
-)
+from proteinzen.data.constants import coarse_grain
 
 from .framediff.all_atom import adjust_oxygen_pos
 
@@ -31,20 +24,14 @@ def _gen_version_dict(module):
     }
 
 cg_version_constants = {
-    2: _gen_version_dict(coarse_grain),
-    3: _gen_version_dict(cg_v3),
-    4: _gen_version_dict(cg_v4),
-    5: _gen_version_dict(cg_v5),
-    6: _gen_version_dict(cg_v6),
-    7: _gen_version_dict(cg_v7),
-    8: _gen_version_dict(cg_v8),
+    1: _gen_version_dict(coarse_grain),
 }
 
 
 def frames_to_atom14_pos(
         r: Rigid,
         aatype: torch.Tensor,
-        cg_version: int=2
+        cg_version: int=1
     ):
     """Convert frames to their idealized all atom representation.
 
@@ -87,7 +74,7 @@ def frames_to_atom14_pos(
     return pred_positions
 
 
-def compute_atom14_from_cg_frames(rigids, res_mask, seq, cg_version):
+def compute_atom14_from_cg_frames(rigids, res_mask, seq, cg_version=1):
     rigids = ru.Rigid.cat([
         rigids[..., 0:1],
         rigids[..., 0:1],
@@ -107,3 +94,43 @@ def compute_atom14_from_cg_frames(rigids, res_mask, seq, cg_version):
     atom37 = adjust_oxygen_pos(atom37_bb_pos.view(-1, 37, 3), res_mask.view(-1)).view(atom37_bb_pos.shape)
     atom14_pos[..., 3, :] = atom37[..., 4, :]
     return atom14_pos
+
+
+def compute_atom14_frames_from_cg_frames(rigids, res_mask, seq, cg_version=1):
+    rigids_4 = ru.Rigid.cat([
+        rigids[..., 0:1],
+        rigids[..., 0:1],
+        rigids[..., 1:],
+    ], dim=-1)
+    atom14_pos = frames_to_atom14_pos(
+        rigids_4,
+        seq,
+        cg_version
+    )
+    atom37_bb_pos = torch.zeros(rigids[..., 0].shape + (37, 3), device=atom14_pos.device)
+    # atom14 bb order = ['N', 'CA', 'C', 'O', 'CB']
+    # atom37 bb order = ['N', 'CA', 'C', 'CB', 'O']
+    atom37_bb_pos[..., :3, :] = atom14_pos[..., :3, :]
+    atom37_bb_pos[..., 3, :] = atom14_pos[..., 4, :]
+    atom37_bb_pos[..., 4, :] = atom14_pos[..., 3, :]
+    atom37 = adjust_oxygen_pos(atom37_bb_pos.view(-1, 37, 3), res_mask.view(-1)).view(atom37_bb_pos.shape)
+    atom14_pos[..., 3, :] = atom37[..., 4, :]
+
+    GROUP_IDX = cg_version_constants[cg_version]["GROUP_IDX"].to(seq.device)
+    atom14_mask = ATOM_MASK.to(seq.device)[seq].bool()
+    rigid_quats = rigids_4.get_rots().get_quats()
+    atom_quats = batched_gather(
+        rigid_quats,
+        GROUP_IDX[seq],
+        1,
+        1
+    )
+    atom_quats = atom_quats * atom14_mask[..., None]
+    atom_quats[atom14_mask, 0] = 1
+
+    atom_rigids = ru.Rigid(
+        rots=ru.Rotation(quats=atom_quats),
+        trans=atom14_pos,
+    )
+
+    return atom_rigids, atom14_mask

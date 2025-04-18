@@ -1,6 +1,6 @@
 
 from hydra_zen import load_from_yaml
-from torch.utils.data import IterableDataset
+from torch.utils.data import Dataset # IterableDataset
 from torch_geometric.data import Batch
 
 from .task import SamplingTask
@@ -8,7 +8,7 @@ from .unconditional import UnconditionalSampling
 from .motif_scaffolding import MotifScaffoldingTask
 
 
-class TaskDispatcher(IterableDataset):
+class TaskDispatcher(Dataset):
     name_to_task_class = {
         "motif_scaffolding": MotifScaffoldingTask,
         "unconditional": UnconditionalSampling
@@ -18,7 +18,7 @@ class TaskDispatcher(IterableDataset):
         self,
         tasks_yaml,
         batch_size,
-        batching_mode="lazy"
+        batching_mode="optimal"
     ):
         super().__init__()
         assert batching_mode in ["lazy", "optimal"]
@@ -34,16 +34,31 @@ class TaskDispatcher(IterableDataset):
             task = task_class(**task_dict)
             self.task_objs.append((task_dict, task))
 
+        if batching_mode == 'optimal':
+            self.batches = self._optimal_batching()
+        else:
+            self.batches = None
+
     def __iter__(self):
         if self.batching_mode == "lazy":
             for batch in self._lazy_batching():
                 yield Batch.from_data_list(self._pad_batch(batch))
 
         elif self.batching_mode == "optimal":
-            raise NotImplementedError()
+            assert self.batches is not None
+            for batch in self.batches:
+                yield Batch.from_data_list(self._pad_batch(batch))
+
+    def __getitem__(self, idx):
+        assert self.batching_mode == "optimal"
+        assert self.batches is not None
+        return Batch.from_data_list(self._pad_batch(self.batches[idx]))
 
     def __len__(self):
-        return sum([t['num_samples'] for t, _ in self.task_objs])
+        if self.batching_mode == 'optimal':
+            return len(self.batches)
+        else:
+            return sum([t['num_samples'] for t, _ in self.task_objs])
 
     def _pad_batch(self, batch):
         max_len = max([sample['residue']['num_nodes'] for sample in batch])
@@ -81,17 +96,27 @@ class TaskDispatcher(IterableDataset):
 
 
     def _optimal_batching(self):
-        current_batch = []
-        max_sample_size = 0
+        all_samples = []
         for _, task in self.task_objs:
             for sample in task.sample_data():
-                sample_size = (sample['residue']['num_nodes']) ** 2
-                _max_sample_size = max(sample_size, max_sample_size)
+                all_samples.append(sample)
+        all_samples = sorted(all_samples, key=lambda x: x['residue']['num_nodes'])
 
-                if _max_sample_size * len(current_batch) <= self.batch_size:
-                    current_batch.append(sample)
-                    max_sample_size = _max_sample_size
-                else:
-                    yield current_batch
-                    current_batch = [sample]
-                    max_sample_size = sample_size
+        batches = []
+        current_batch = []
+        max_sample_size = 0
+        for sample in all_samples:
+            sample_size = (sample['residue']['num_nodes']) ** 2
+            _max_sample_size = max(sample_size, max_sample_size)
+
+            if _max_sample_size * len(current_batch) <= self.batch_size:
+                current_batch.append(sample)
+                max_sample_size = _max_sample_size
+            else:
+                batches.append(current_batch)
+                current_batch = [sample]
+                max_sample_size = sample_size
+        if len(current_batch) > 0:
+            batches.append(current_batch)
+
+        return batches

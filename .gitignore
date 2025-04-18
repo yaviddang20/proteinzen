@@ -118,6 +118,7 @@ data/framediff/*.json
 data/framediff/*.jsonl
 scripts/submit_scripts/autogen_scripts
 outputs/
+sampling_outputs/
 _debug/
 prelim_experiments/
 analysis/esmfold/pdbs

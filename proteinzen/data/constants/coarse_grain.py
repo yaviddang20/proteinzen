@@ -40,6 +40,10 @@ from proteinzen.utils.openfold import rigid_utils
 # I'm generating these semi-manually here from openfold residue_constants, but
 # at some point I should export them
 
+
+# changes since v2
+# C frame now matches S
+
 # group 2 and 3 atoms
 coarse_grain_sidechain_groups = {
     "ALA": {2: [], 3: []},
@@ -147,11 +151,7 @@ coarse_grain_sidechain_axes = {
         3: []
     },
     "CYS": {
-        # admittedly this is a little strange
-        # but in order not to clash with D/N/L/T/S
-        # i think it's better to differentiate using the translation of the frame
-        # rather than the rotation (which argubly has a larger degree of freedom)
-        2: ["SG", "CA", "CB"],
+        2: ["CA", "CB", "SG"],
         3: []
     },
     "GLN": {
@@ -236,8 +236,7 @@ coarse_grain_atom_positions = {
         ["N", 0, (-0.524, 1.362, -0.000)],
         ["CA", 0, (0.000, 0.000, 0.000)],
         ["C", 0, (1.525, -0.000, -0.000)],
-        # commenting this out only for visualization purposes
-        # ["CB", 0, (-0.524, -0.778, -1.209)],
+        ["CB", 0, (-0.524, -0.778, -1.209)],
         ["O", 1, (0.626, 1.062, 0.000)],
     ],
     "ASN": [

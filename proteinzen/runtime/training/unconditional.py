@@ -49,4 +49,8 @@ class UnconditionalGeneration(TrainingTask):
         t = t.flatten(0, 1)
         rigids_noising_mask = rigids_noising_mask.flatten(0, 1)
         seq_noising_mask = torch.ones_like(rigids_noising_mask[:, 0])
-        return t, rigids_noising_mask, seq_noising_mask
+        return {
+            "t": t,
+            "rigids_noising_mask": rigids_noising_mask,
+            "seq_noising_mask": seq_noising_mask
+        }

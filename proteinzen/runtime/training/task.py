@@ -1,12 +1,12 @@
 import abc
-from typing import Tuple, List
+from typing import Tuple, List, Dict
 import numpy as np
 from torch import Tensor
 
 
 class TrainingTask(abc.ABC):
     name: str = "abc"  # override this
-    def sample_t_and_mask(self, batch) -> Tuple[Tensor, Tensor, Tensor]:
+    def sample_t_and_mask(self, batch) -> Dict[str, Tensor]:
         raise NotImplementedError
 
 

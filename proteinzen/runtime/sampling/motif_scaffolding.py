@@ -17,6 +17,7 @@ If you wish to redesign the sequence identity as well, modify the input PDB resi
 """
 import copy
 import string
+import functools as fn
 
 from Bio.PDB.PDBParser import PDBParser
 from scipy.spatial.transform import Rotation
@@ -90,17 +91,23 @@ class MotifScaffoldingTask(SamplingTask):
                 chain = contig[0]
                 if "-" in contig:
                     motif_start, motif_end = [int(i) for i in contig[1:].split("-")]
+                    # print("scaffold", contig, motif_start, motif_end)
                     data_chunks.append(self._get_motif_data(chain, motif_start, motif_end))
                 else:
                     motif_resid = int(contig[1:])
+                    # print("scaffold", contig, motif_resid)
                     data_chunks.append(self._get_motif_data(chain, motif_resid))
             else:
                 if "-" in contig:
                     lower, upper = [int(i) for i in contig.split("-")]
-                    data_chunks.append(lambda: self._get_blank_data(lower, upper))
+                    # print("design", contig, lower, upper)
+                    chunk_fn = fn.partial(self._get_blank_data, lower=lower, upper=upper)
+                    data_chunks.append(chunk_fn)
                 else:
                     length = int(contig)
-                    data_chunks.append(lambda: self._get_blank_data(length, length))
+                    # print("design", contig, length)
+                    chunk_fn = fn.partial(self._get_blank_data, lower=length, upper=length)
+                    data_chunks.append(chunk_fn)
 
         return data_chunks
 
@@ -142,19 +149,25 @@ class MotifScaffoldingTask(SamplingTask):
 
     def _sample_init_data(self):
         data_chunks = []
-        for c in self.contigs:
+        for i, c in enumerate(self.contigs):
             if isinstance(c, dict):
                 data_chunks.append(c)
             elif callable(c):
                 data_chunks.append(c())
             else:
                 raise ValueError(f"we dont recognize condition {c}")
+            # print(i, data_chunks[-1]['aatype'].numel())
             # print({k: v.shape for k,v in data_chunks[-1].items()})
 
         chain_feats = dict_cat(data_chunks)
 
         chain_feats = data_transforms.atom37_to_cg_frames(chain_feats, cg_version=self.cg_version)
         chain_feats = data_transforms.atom37_to_torsion_angles(prefix="")(chain_feats)  # TODO: uncurry this
+
+        for key, value in chain_feats.items():
+            if value.dtype == torch.float64:
+                chain_feats[key] = value.float()
+
         chain_feats = data_transforms.make_atom14_masks(chain_feats)
         chain_feats = data_transforms.make_atom14_positions(chain_feats)
         seq = chain_feats['aatype']

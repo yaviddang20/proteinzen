@@ -243,6 +243,9 @@ class ProteinModule(L.LightningModule):
         # Set-up time
         ts = torch.linspace(frame_noiser._cfg.min_t, 1.0, frame_noiser._sample_cfg.num_timesteps)
 
+        frame_noiser.churn = 0
+        print(batch.num_graphs)
+
         res_data = batch['residue']
         rigids_0 = ru.Rigid.from_tensor_7(res_data['rigids_t'])
         trans_0 = rigids_0.get_trans()
@@ -321,7 +324,8 @@ class ProteinModule(L.LightningModule):
                 pred_trans_1,
                 trans_t_hat,
                 noising_mask=rigids_noising_mask,
-                add_noise=False
+                add_noise=False,
+                use_score=False
             )
             rotmats_t_2 = frame_noiser._rots_euler_step(
                 d_t_hat,
@@ -329,7 +333,8 @@ class ProteinModule(L.LightningModule):
                 pred_rotmats_1,
                 rotmats_t_hat,
                 noising_mask=rigids_noising_mask,
-                add_noise=False
+                add_noise=False,
+                use_score=False
             )
             # if torch.isnan(trans_t_2).any():
             #     print("trans step", t_1)

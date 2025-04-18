@@ -971,6 +971,125 @@ class MultiRigidPairEmbedder(nn.Module):
         return self.final_layer(z) * edge_mask[..., None]
 
 
+class MultiRigidPairEmbedderV2(nn.Module):
+    def __init__(self,
+                 c_z=128,
+                 c_hidden=64,
+                 num_rbf=39,
+                 rbf_min=3.25,
+                 rbf_max=50.75,
+                 no_heads=4,
+                 no_blocks=2,
+                 relpos_clip=32,
+                 dropout=0.25,
+                 inf=1e9,
+                 use_qk_norm=False
+    ):
+        super().__init__()
+
+        self.c_z = c_z
+        self.c_hidden = c_hidden
+        self.D_min = rbf_min
+        self.D_max = rbf_max
+        self.num_rbf = num_rbf
+        self.relpos_clip = relpos_clip
+        self.no_blocks = no_blocks
+        self.inf = inf
+
+        self.c_a = (
+            num_rbf
+            + 3  # unit vecs
+            + 4  # rel quat
+        )
+
+        # self.ln_relpos = LayerNorm(2*relpos_clip+1)
+        self.lin_z_ij = Linear(2*relpos_clip+1, c_hidden)
+
+        self.lin_a_ij = Linear(2 * self.c_a, c_hidden, bias=False)
+
+        c_head = c_hidden // no_heads
+
+        self.trunk = nn.ModuleDict()
+        self.dropout_row_layer = DropoutRowwise(dropout)
+        self.dropout_col_layer = DropoutColumnwise(dropout)
+        for i in range(no_blocks):
+            self.trunk[f'mult_out_{i}'] = TriangleMultiplicationOutgoing(c_hidden, c_hidden)
+            self.trunk[f'mult_in_{i}'] = TriangleMultiplicationIncoming(c_hidden, c_hidden)
+            self.trunk[f'edge_bias_{i}'] = nn.Sequential(
+                LayerNorm(c_hidden),
+                Linear(c_hidden, no_heads, bias=False)
+            )
+            self.trunk[f'attn_start_{i}'] = TriangleAttentionCore(c_hidden, c_head, no_heads, starting=True, use_qk_norm=use_qk_norm)
+            self.trunk[f'attn_end_{i}'] = TriangleAttentionCore(c_hidden, c_head, no_heads, starting=False, use_qk_norm=use_qk_norm)
+            self.trunk[f'transition_{i}'] = SwishTransition(c_hidden)
+
+        self.final_layer = nn.Sequential(
+            LayerNorm(c_hidden),
+            nn.ReLU(),
+            Linear(c_hidden, c_z, bias=False)
+        )
+
+    def _featurize_rigids(self, rigids, distogram=False):
+        X_ca = rigids.get_trans()
+        quats = rigids.get_rots().get_quats()
+        quat_i = quats[..., None, :]
+        quat_j = quats[..., None, :, :]
+        quat_rel = ru.quat_multiply(
+            ru.invert_quat(quat_i),
+            quat_j
+        )
+        edge_dist_vec = X_ca[..., None, :] - X_ca[..., None, : ,:]
+        unit_edge_dist_vecs = F.normalize(edge_dist_vec, dim=-1)
+
+        edge_dist = torch.linalg.vector_norm(edge_dist_vec, dim=-1)
+        if distogram:
+            dist_features = calc_distogram(edge_dist, min_bin=self.D_min, max_bin=self.D_max, num_bins=self.num_rbf)
+        else:
+            dist_features = _rbf(edge_dist, D_min=self.D_min, D_max=self.D_max, D_count=self.num_rbf, device=edge_dist.device)
+
+        return torch.cat([quat_rel, unit_edge_dist_vecs, dist_features], dim=-1)
+
+
+    def forward(self, rigids, node_mask, seq_idx, chain_idx, sc_rigids=None):
+        edge_mask = node_mask[..., None] & node_mask[..., None, :]
+        same_chain_mask = (chain_idx[..., None] == chain_idx[..., None, :])
+
+        relpos_feats = relpos(seq_idx, clip=self.relpos_clip)
+        relpos_feats = relpos_feats * same_chain_mask[..., None]
+        # relpos_feats[~same_chain_mask][..., -1] += 1
+
+        z = self.lin_z_ij(relpos_feats)
+        a_current = self._featurize_rigids(rigids, distogram=False)
+        if sc_rigids is not None:
+            a_sc = self._featurize_rigids(sc_rigids, distogram=True)
+        else:
+            a_sc = torch.zeros_like(a_current)
+
+        z = z + self.lin_a_ij(torch.cat([a_current, a_sc], dim=-1))
+        z = z * edge_mask[..., None]
+
+        mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
+
+        for i in range(self.no_blocks):
+            z = z + self.dropout_row_layer(
+                self.trunk[f'mult_out_{i}'](z, edge_mask)
+            )
+            z = z + self.dropout_row_layer(
+                self.trunk[f'mult_in_{i}'](z, edge_mask)
+            )
+            edge_bias = self.trunk[f'edge_bias_{i}'](z)
+            edge_bias = permute_final_dims(edge_bias.unsqueeze(-4), (2, 0, 1))
+            z = z + self.dropout_row_layer(
+                self.trunk[f'attn_start_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
+            )
+            z = z + self.dropout_col_layer(
+                self.trunk[f'attn_end_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
+            )
+            z = z + self.trunk[f'transition_{i}'](z)
+
+        return self.final_layer(z) * edge_mask[..., None]
+
+
 class PairEmbedderV2(nn.Module):
     def __init__(self,
                  c_z=128,
