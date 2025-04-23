@@ -24,18 +24,6 @@ def compute_splice_lens(mask):
 
 
 class RigidAssembler:
-    pad_value = {
-        # "rigids": float("nan"),
-        "rigids_mask": False,
-        "rigids_noising_mask": False,
-        "seq_idx": 0,
-        "rigid_idx": 0,
-        "is_unindexed_mask": False,
-        "is_atomized_mask": False,
-        "is_center_rigid_mask": False,
-        "is_ligand_mask": False,
-        # "splice_lens": 0
-    }
     num_cg_rigids = 3
     num_atom_rigids = 14
 
@@ -45,7 +33,9 @@ class RigidAssembler:
             res_mask = None,
             seq = None,
             ligand_rigids = None,
-            cg_version=8
+            cg_version=1,
+            atomize = False,
+            promote_full_motif_to_token = True
     ):
         assert (
             (cg_rigids is not None and res_mask is not None and seq is not None)
@@ -58,39 +48,46 @@ class RigidAssembler:
         self.seq = seq
         self.cg_version = cg_version
         self.ligand_rigids = ligand_rigids
+        self.promote_full_motif_to_token = promote_full_motif_to_token
 
         if cg_rigids is not None:
-            atom_rigids, atom_rigids_mask = compute_atom14_frames_from_cg_frames(
-                cg_rigids,
-                res_mask,
-                seq,
-                cg_version
-            )
-            self.atom_rigids = atom_rigids
-            self.atom_rigids_mask = atom_rigids_mask
             self.seq_idx = torch.arange(cg_rigids.shape[0])
 
             self.cg_rigid_idx = torch.tile(
                 torch.arange(self.num_cg_rigids)[None],
                 (len(self.seq_idx), 1)
             )
-            self.cg_center_rigid_mask = torch.zeros_like(self.cg_rigid_idx, dtype=torch.bool)
-            self.cg_center_rigid_mask[..., 0] = True
+            self.cg_token_rigid_mask = torch.zeros_like(self.cg_rigid_idx, dtype=torch.bool)
+            self.cg_token_rigid_mask[..., 0] = True
 
-            self.atom_rigid_idx = torch.tile(
-                torch.arange(self.num_cg_rigids, self.num_cg_rigids + self.num_atom_rigids)[None],
-                (len(self.seq_idx), 1)
-            )
-            self.atom_center_rigid_mask = torch.zeros_like(self.atom_rigid_idx, dtype=torch.bool)
-            self.atom_center_rigid_mask[..., 1] = True
+            if atomize:
+                atom_rigids, atom_rigids_mask = compute_atom14_frames_from_cg_frames(
+                    cg_rigids,
+                    res_mask,
+                    seq,
+                    cg_version
+                )
+                self.atom_rigids = atom_rigids
+                self.atom_rigids_mask = atom_rigids_mask
+                self.atom_rigid_idx = torch.tile(
+                    torch.arange(self.num_cg_rigids, self.num_cg_rigids + self.num_atom_rigids)[None],
+                    (len(self.seq_idx), 1)
+                )
+                self.atom_token_rigid_mask = torch.zeros_like(self.atom_rigid_idx, dtype=torch.bool)
+                self.atom_token_rigid_mask[..., 1] = True
+            else:
+                self.atom_rigids = None
+                self.atom_rigids_mask = None
+                self.atom_rigid_idx = None
+                self.atom_token_rigid_mask = None
 
         else:
             self.atom_rigids = None
             self.atom_rigids_mask = None
             self.atom_rigid_idx = None
-            self.atom_center_rigid_mask = None
+            self.atom_token_rigid_mask = None
             self.cg_rigid_idx = None
-            self.cg_center_rigid_mask = None
+            self.cg_token_rigid_mask = None
 
 
     def _assemble_protein_no_atomization(
@@ -101,42 +98,117 @@ class RigidAssembler:
         assert self.cg_rigids is not None
         assert rigids_noising_mask is not None
 
-        # now, splice together the proper chunks
+        unindexed_motif_mask = (~rigids_noising_mask & res_is_unindexed_mask[..., None]).view(-1)
+        indexed_motif_mask = (~rigids_noising_mask & ~res_is_unindexed_mask[..., None]).view(-1)
+        # print(self.cg_rigids.shape[0], unindexed_motif_mask.sum(), indexed_motif_mask.sum())
+
         flat_rigids = self.cg_rigids.flatten(0, 1)
-        flat_noising_mask = rigids_noising_mask.flatten(0, 1)
-        flat_seq_idx = torch.tile(
+        flat_rigids_mask = (torch.ones_like(rigids_noising_mask) * self.res_mask[..., None]).view(-1)
+        flat_noising_mask = torch.ones_like(indexed_motif_mask)
+        _seq_idx = torch.tile(
             self.seq_idx[..., None],
             (1, self.cg_rigids.shape[1])
         ).flatten(0, 1)
+        flat_seq_idx = _seq_idx.clone()
+        flat_rigid_token_uid = flat_seq_idx.clone()
         flat_rigid_idx = self.cg_rigid_idx.flatten(0, 1)
         flat_is_atomized = torch.zeros_like(flat_seq_idx, dtype=torch.bool)
         flat_is_unindexed = torch.zeros_like(flat_seq_idx, dtype=torch.bool)
-        flat_is_center_rigid = self.cg_center_rigid_mask.flatten(0, 1)
+        flat_is_token_rigid = self.cg_token_rigid_mask.flatten(0, 1)
+        flat_is_ligand = torch.zeros_like(flat_noising_mask, dtype=torch.bool)
+        flat_is_protein_output = torch.ones_like(flat_noising_mask, dtype=torch.bool)
 
-        if res_is_unindexed_mask is not None:
-            unindexed_cg_rigids = self.cg_rigids[res_is_unindexed_mask].flatten(0, 1)
-            unindexed_cg_rigids_noising_mask = rigids_noising_mask[res_is_unindexed_mask].flatten(0, 1)
+        if indexed_motif_mask.any():
+            indexed_cg_rigids = self.cg_rigids.flatten(0, 1)[indexed_motif_mask]
+            indexed_cg_rigids_noising_mask = torch.zeros(indexed_motif_mask.sum().item(), device=indexed_cg_rigids.device)
+            indexed_cg_rigids_seq_idx = _seq_idx[indexed_motif_mask]
+            indexed_cg_rigids_idx = self.cg_rigid_idx.flatten(0, 1)[indexed_motif_mask]
 
-            flat_rigids = torch.cat([flat_rigids, unindexed_cg_rigids], dim=0)
-            flat_noising_mask = torch.cat([flat_noising_mask, unindexed_cg_rigids_noising_mask], dim=0)
 
-            num_unindexed_res = int(res_is_unindexed_mask.long().sum())
-            num_indexed_res = res_is_unindexed_mask.numel()
-            unindexed_seq_idx = torch.tile(
-                torch.arange(num_unindexed_res)[..., None],
-                (1, self.num_cg_rigids)
-            ) + num_indexed_res
+            flat_rigids = torch.cat([flat_rigids, indexed_cg_rigids], dim=0)
+            flat_rigids_mask = torch.cat([flat_rigids_mask, torch.ones_like(indexed_cg_rigids_noising_mask)], dim=0)
+            flat_noising_mask = torch.cat([flat_noising_mask, indexed_cg_rigids_noising_mask], dim=0)
             flat_seq_idx = torch.cat([
                 flat_seq_idx,
-                unindexed_seq_idx.flatten(0, 1)
+                indexed_cg_rigids_seq_idx
             ], dim=0)
-            unindexed_cg_rigid_idx = torch.tile(
-                torch.arange(self.cg_rigids.shape[1])[None],
-                (int(res_is_unindexed_mask.sum()), 1)
-            )
             flat_rigid_idx = torch.cat([
                 flat_rigid_idx,
-                unindexed_cg_rigid_idx.flatten(0, 1)
+                indexed_cg_rigids_idx
+            ], dim=0)
+            flat_is_atomized = torch.cat([
+                flat_is_atomized,
+                torch.zeros_like(indexed_cg_rigids_noising_mask, dtype=torch.bool)
+            ], dim=0)
+            flat_is_unindexed = torch.cat([
+                flat_is_unindexed,
+                torch.zeros_like(indexed_cg_rigids_noising_mask, dtype=torch.bool)
+            ], dim=0)
+            flat_is_ligand = torch.cat([
+                flat_is_ligand,
+                torch.zeros_like(indexed_cg_rigids_noising_mask, dtype=torch.bool)
+            ], dim=0)
+            flat_is_protein_output = torch.cat([
+                flat_is_protein_output,
+                torch.zeros_like(indexed_cg_rigids_noising_mask, dtype=torch.bool)
+            ], dim=0)
+
+            if self.promote_full_motif_to_token:
+                max_token_uid = flat_rigid_token_uid.max()
+                num_indexed_rigids = indexed_motif_mask.long().sum().item()
+                new_token_uids = torch.arange(num_indexed_rigids) + max_token_uid + 1
+
+                flat_is_token_rigid = torch.cat([
+                    flat_is_token_rigid,
+                    torch.ones_like(indexed_cg_rigids_noising_mask, dtype=torch.bool)
+                ], dim=0)
+                flat_rigid_token_uid = torch.cat([
+                    flat_rigid_token_uid,
+                    new_token_uids
+                ], dim=0)
+
+            else:
+                indexed_motif_res_mask = (~rigids_noising_mask & ~res_is_unindexed_mask[..., None]).any(dim=-1)
+
+                max_token_uid = flat_rigid_token_uid.max()
+                num_indexed_rigids = indexed_motif_res_mask.long().sum().item()
+                new_token_uids = torch.arange(num_indexed_rigids) + max_token_uid + 1
+
+                indexed_motif_token_uids = torch.tile(
+                    new_token_uids[..., None],
+                    (1, self.num_cg_rigids)
+                ).flatten(0, 1)
+
+                flat_is_token_rigid = torch.cat([
+                    flat_is_token_rigid,
+                    self.cg_token_rigid_mask.flatten(0, 1)[indexed_motif_mask]
+                ], dim=0)
+                flat_rigid_token_uid = torch.cat([
+                    flat_rigid_token_uid,
+                    indexed_motif_token_uids
+                ], dim=0)
+
+
+        if unindexed_motif_mask.any():
+            unindexed_cg_rigids = self.cg_rigids.flatten(0, 1)[unindexed_motif_mask]
+            unindexed_cg_rigids_noising_mask = torch.zeros(unindexed_motif_mask.sum().item(), device=unindexed_cg_rigids.device)
+            unindexed_cg_rigids_seq_idx = _seq_idx[unindexed_motif_mask]
+            unindexed_cg_rigids_idx = self.cg_rigid_idx.flatten(0, 1)[unindexed_motif_mask]
+
+            max_token_uid = flat_rigid_token_uid.max()
+            num_unindexed_rigids = unindexed_motif_mask.long().sum().item()
+            new_token_uids = torch.arange(num_unindexed_rigids) + max_token_uid + 1
+
+            flat_rigids = torch.cat([flat_rigids, unindexed_cg_rigids], dim=0)
+            flat_rigids_mask = torch.cat([flat_rigids_mask, torch.ones_like(unindexed_cg_rigids_noising_mask)], dim=0)
+            flat_noising_mask = torch.cat([flat_noising_mask, unindexed_cg_rigids_noising_mask], dim=0)
+            flat_seq_idx = torch.cat([
+                flat_seq_idx,
+                unindexed_cg_rigids_seq_idx
+            ], dim=0)
+            flat_rigid_idx = torch.cat([
+                flat_rigid_idx,
+                unindexed_cg_rigids_idx
             ], dim=0)
             flat_is_atomized = torch.cat([
                 flat_is_atomized,
@@ -146,25 +218,63 @@ class RigidAssembler:
                 flat_is_unindexed,
                 torch.ones_like(unindexed_cg_rigids_noising_mask, dtype=torch.bool)
             ], dim=0)
-            flat_is_center_rigid = torch.cat([
-                flat_is_center_rigid,
-                torch.ones_like(unindexed_cg_rigids_noising_mask, dtype=torch.bool)
+
+            flat_is_ligand = torch.cat([
+                flat_is_ligand,
+                torch.zeros_like(unindexed_cg_rigids_noising_mask, dtype=torch.bool)
+            ], dim=0)
+            flat_is_protein_output = torch.cat([
+                flat_is_protein_output,
+                torch.zeros_like(unindexed_cg_rigids_noising_mask, dtype=torch.bool)
             ], dim=0)
 
-        flat_is_ligand = torch.zeros(
-            sum([t.shape[0] for t in flat_noising_mask]),
-            dtype=torch.bool
-        )
+
+            if self.promote_full_motif_to_token:
+                max_token_uid = flat_rigid_token_uid.max()
+                num_unindexed_rigids = unindexed_motif_mask.long().sum().item()
+                new_token_uids = torch.arange(num_unindexed_rigids) + max_token_uid + 1
+
+                flat_is_token_rigid = torch.cat([
+                    flat_is_token_rigid,
+                    torch.ones_like(unindexed_cg_rigids_noising_mask, dtype=torch.bool)
+                ], dim=0)
+                flat_rigid_token_uid = torch.cat([
+                    flat_rigid_token_uid,
+                    new_token_uids
+                ], dim=0)
+            else:
+                unindexed_motif_res_mask = (~rigids_noising_mask & res_is_unindexed_mask[..., None]).any(dim=-1)
+
+                max_token_uid = flat_rigid_token_uid.max()
+                num_unindexed_rigids = unindexed_motif_res_mask.long().sum().item()
+                new_token_uids = torch.arange(num_unindexed_rigids) + max_token_uid + 1
+
+                unindexed_motif_token_uids = torch.tile(
+                    new_token_uids[..., None],
+                    (1, self.num_cg_rigids)
+                ).flatten(0, 1)
+
+                flat_is_token_rigid = torch.cat([
+                    flat_is_token_rigid,
+                    self.cg_token_rigid_mask.flatten(0, 1)[unindexed_motif_mask]
+                ], dim=0)
+                flat_rigid_token_uid = torch.cat([
+                    flat_rigid_token_uid,
+                    unindexed_motif_token_uids
+                ], dim=0)
 
         return {
             "rigids": flat_rigids,
-            "rigids_noising_mask": flat_noising_mask,
+            "rigids_mask": flat_rigids_mask.bool(),
+            "rigids_noising_mask": flat_noising_mask.bool(),
             "seq_idx": flat_seq_idx,
+            "token_uid": flat_rigid_token_uid,
             "rigid_idx": flat_rigid_idx,
-            "is_atomized_mask": flat_is_atomized,
-            "is_unindexed_mask": flat_is_unindexed,
-            "is_center_rigid_mask": flat_is_center_rigid,
-            "is_ligand_mask": flat_is_ligand,
+            "is_atomized_mask": flat_is_atomized.bool(),
+            "is_unindexed_mask": flat_is_unindexed.bool(),
+            "is_token_rigid_mask": flat_is_token_rigid.bool(),
+            "is_ligand_mask": flat_is_ligand.bool(),
+            "is_protein_output_mask": flat_is_protein_output.bool(),
             "splice_lens": torch.tensor([flat_is_atomized.numel()], dtype=torch.long)
         }
 
@@ -404,6 +514,7 @@ class RigidAssembler:
                     res_is_unindexed_mask
                 )
             elif res_atomized_mask.all():
+                raise NotImplementedError("i'll do this later")
                 protein_rigids_dict = self._assemble_protein_full_atomization(
                     res_atom_noising_mask,
                     res_is_unindexed_mask
@@ -420,6 +531,7 @@ class RigidAssembler:
             protein_rigids_dict = {}
 
         if ligand_noising_mask is not None:
+            raise NotImplementedError("i'll do this later")
             ligand_rigids_dict = self._assemble_ligand(ligand_noising_mask)
         else:
             ligand_rigids_dict = {}
@@ -435,85 +547,74 @@ class RigidAssembler:
         else:
             raise ValueError("we were not provided enough information to construct input rigids")
 
+        is_token_rigid_mask = rigids_dict['is_token_rigid_mask']
+        rigids_dict['token_gather_idx'] = torch.arange(is_token_rigid_mask.numel())[is_token_rigid_mask]
+
         return rigids_dict
-
-    @classmethod
-    def pad_data_list(cls, rigids_data_list):
-        max_len = max([data['rigids_noising_mask'].numel() for data in rigids_data_list])
-
-        ret = []
-        for rigid_data in rigids_data_list:
-            padded_data = {}
-            pad_len = max_len - rigid_data['rigids_noising_mask'].numel()
-
-            rigid_data['rigids_mask'] = torch.ones_like(rigid_data['rigids_noising_mask'], dtype=torch.bool)
-            for key, value in rigid_data.items():
-                if key == "rigids":
-                    padding = torch.zeros((pad_len, 7), dtype=torch.float32, device=value.device)
-                    padding[..., 0] = 1
-                    padded_data[key] = torch.cat([value, padding], dim=0)
-                elif key == "splice_lens":
-                    continue
-                else:
-                    padded_data[key] = F.pad(value, (0, pad_len), cls.pad_value[key])
-
-            ret.append(padded_data)
-        return ret
-
-    @classmethod
-    def pad_batch(cls, rigid_data, pad_len):
-        padded_data = {}
-
-        rigid_data['rigids_mask'] = torch.ones_like(rigid_data['rigids_noising_mask'], dtype=torch.bool)
-        for key, value in rigid_data.items():
-            if key == "rigids":
-                padding = torch.zeros((pad_len, 7), dtype=torch.float32, device=value.device)
-                padding[..., 0] = 1
-                padded_data[key] = torch.cat([value, padding], dim=0)
-            elif key == "splice_lens":
-                continue
-            else:
-                padded_data[key] = F.pad(value, (0, pad_len), cls.pad_value[key])
-
-        return padded_data
 
 
 def rigids_to_atom14(
     rigids,
     rigids_mask,
-    is_atomized_mask,
-    res_is_atomized,
+    rigids_is_protein_output_mask,
+    rigids_is_atomized_mask,
+    token_is_atomized_mask,
+    token_is_protein_output_mask,
     seq,
     cg_version
 ):
-    atom14 = torch.zeros(
-        (res_is_atomized.shape[0], 14, 3),
-        dtype=torch.float32,
-        device=res_is_atomized.device
+
+    cg_res_pos_flat = ~token_is_atomized_mask[token_is_protein_output_mask]
+    cg_res_lens = token_is_protein_output_mask.sum(dim=-1)
+    cg_res_pos_list = cg_res_pos_flat.split(cg_res_lens.tolist())
+    cg_res_pos_mask = torch.zeros(
+        (
+            token_is_protein_output_mask.shape[0],
+            cg_res_lens.max().item(),
+        ),
+        dtype=torch.bool,
+        device=cg_res_lens.device
     )
-    cg_rigids = rigids[~is_atomized_mask].view(-1, 3)
-    res_mask = rigids_mask[~is_atomized_mask].view(-1, 3)[..., 0]
+    for i, t in enumerate(cg_res_pos_list):
+        cg_res_pos_mask[i, :cg_res_lens[i].item()] = t
+
+
+    atom14 = torch.zeros(
+        (
+            *cg_res_pos_mask.shape,
+            14, 3
+        ),
+        dtype=torch.float32,
+        device=token_is_atomized_mask.device
+    )
+    cg_rigids = rigids[rigids_is_protein_output_mask].view(-1, 3)
+    res_mask = rigids_mask[rigids_is_protein_output_mask].view(-1, 3)[..., 0]
+
+    cg_seq = seq[token_is_protein_output_mask * (~token_is_atomized_mask)]
+    # print(cg_rigids.shape, res_mask.shape, cg_seq.shape)
     cg_atom14 = compute_atom14_from_cg_frames(
         cg_rigids,
         res_mask,
-        seq[~is_atomized_mask],
+        cg_seq,
         cg_version
     )
-    atom14[~is_atomized_mask] += cg_atom14
+    # print(cg_atom14.shape, token_is_atomized_mask.sum(), atom14.shape, cg_res_pos_mask.shape)
+    atom14[cg_res_pos_mask] += cg_atom14
 
-    atomized_seq = seq[res_is_atomized]
-    atom_mask = torch.as_tensor(rc.restype_atom14_mask, device=seq.device)
-    atom_mask = atom_mask[atomized_seq]
-    atom14[is_atomized_mask][atom_mask] += rigids[is_atomized_mask].get_trans()
+    if token_is_atomized_mask.any():
+        atomized_seq = seq[token_is_atomized_mask]
+        atom_mask = torch.as_tensor(rc.restype_atom14_mask, device=seq.device)
+        atom_mask = atom_mask[atomized_seq]
+        atom14[rigids_is_atomized_mask][atom_mask] += rigids[rigids_is_atomized_mask].get_trans()
 
-    # adjust the bb oxygen to be based off of the other backbone atoms
-    atom37_bb = torch.zeros((atom14.shape[0], 37, 3), device=atom14.device)
-    # atom14 bb order = ['N', 'CA', 'C', 'O', 'CB']
-    # atom37 bb order = ['N', 'CA', 'C', 'CB', 'O']
-    atom37_bb[..., :3, :] = atom14[..., :3, :]
-    atom37_bb[..., 3, :] = atom14[..., 4, :]
-    atom37_bb[..., 4, :] = atom14[..., 3, :]
-    atom37 = adjust_oxygen_pos(atom37_bb.view(-1, 37, 3), res_mask.view(-1)).view(atom37_bb.shape)
-    atom14[..., 3, :] = atom37[..., 4, :]
+        # adjust the bb oxygen to be based off of the other backbone atoms
+        atom37_bb = torch.zeros((atom14.shape[0], 37, 3), device=atom14.device)
+        # atom14 bb order = ['N', 'CA', 'C', 'O', 'CB']
+        # atom37 bb order = ['N', 'CA', 'C', 'CB', 'O']
+        atom37_bb[..., :3, :] = atom14[..., :3, :]
+        atom37_bb[..., 3, :] = atom14[..., 4, :]
+        atom37_bb[..., 4, :] = atom14[..., 3, :]
+        atom37 = adjust_oxygen_pos(atom37_bb.view(-1, 37, 3), res_mask.view(-1)).view(atom37_bb.shape)
+        atom14[..., 3, :] = atom37[..., 4, :]
 
     return atom14

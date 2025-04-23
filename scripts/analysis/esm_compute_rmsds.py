@@ -117,7 +117,7 @@ def compute_rmsds(design_path, folded_path, pmpnn_paths, fixed_res, fixed_res_ch
 
     rmsd_metric.set_rmsd_type(RMSD_ALL_HEAVY_TYPE)
     rmsd_metric.set_residue_selector_super(fixed_res_selector)
-    rmsd_metric.set_corresponding_atoms_robust(False)
+    # rmsd_metric.set_corresponding_atoms_robust(False)
 
     rmsd_metric.set_residue_selector(fixed_res_selector)
     design_data['motif_all_atom_rmsd'] = rmsd_metric.calculate(folded_pose)
@@ -131,15 +131,14 @@ def compute_rmsds(design_path, folded_path, pmpnn_paths, fixed_res, fixed_res_ch
     design_data['global_ca_rmsd'] = rmsd_metric.calculate(folded_pose)
 
     pmpnn_data = []
-    rmsd_metric.set_corresponding_atoms_robust(True)
+    # rmsd_metric.set_corresponding_atoms_robust(True)
     for path in pmpnn_paths:
+        print(path)
         _data = {}
         with open(path) as fp:
             pmpnn_pose = pyrosetta.Pose()
             pyrosetta.rosetta.core.import_pose.pose_from_pdbstring(pmpnn_pose, fp.read())
         rmsd_metric.set_rmsd_type(RMSD_ALL_HEAVY_TYPE)
-        rmsd_metric.set_residue_selector_super(fixed_res_selector)
-
         rmsd_metric.set_residue_selector(fixed_res_selector)
         _data['motif_all_atom_rmsd'] = rmsd_metric.calculate(pmpnn_pose)
         rmsd_metric.set_rmsd_type(RMSD_PROTEIN_BB_CA_TYPE)
@@ -192,12 +191,19 @@ if __name__ == '__main__':
 
         fixed_res_idx = samples_metadata[name]['fixed_res_idx']
         fixed_res_chain = samples_metadata[name]['fixed_res_chain']
-        design_rmsds, pmpnn_rmsds = compute_rmsds(sample_path, design_folded_path, pmpnn_paths, fixed_res_idx, fixed_res_chain)
+        try:
+            design_rmsds, pmpnn_rmsds = compute_rmsds(sample_path, design_folded_path, pmpnn_paths, fixed_res_idx, fixed_res_chain)
+            print(design_rmsds)
+            print(pmpnn_rmsds)
+        except Exception as e:
+            print(f"Error in {name}")
+            raise e
         for i, _data in sample_data.items():
             if i == 0:
                 folding_dict = {
                     "name": name,
-                    "path": os.path.abspath(sample_path)
+                    "path": os.path.abspath(sample_path),
+                    "task": samples_metadata[name]['name']
                 }
                 folding_dict.update(_data)
                 folding_dict.update(design_rmsds)
@@ -207,7 +213,8 @@ if __name__ == '__main__':
                 sc_dict = {
                     "name": name,
                     "path": os.path.abspath(pmpnn_paths[_idx]),
-                    "sample": i
+                    "sample": i,
+                    "task": samples_metadata[name]['name']
                 }
                 sc_dict.update(_data)
                 sc_dict.update(pmpnn_rmsds[_idx])
@@ -233,9 +240,13 @@ if __name__ == '__main__':
 
     pmpnn_pass = sc_df[(sc_df['motif_all_atom_rmsd'] < 1) & (sc_df['global_ca_rmsd'] < 2)]
     pmpnn_pass = pmpnn_pass.groupby("name").sample(1)
+    pmpnn_task_pass = pmpnn_pass.groupby("task")
     pz_pass = folding_df[(folding_df['motif_all_atom_rmsd'] < 1) & (folding_df['global_all_atom_rmsd'] < 2)]
+    pz_task_pass = pz_pass.groupby("task")
 
     with open("../num_designable.txt", 'w') as fp:
         fp.write(f"Num designable: {len(pmpnn_pass)}\n")
+        fp.write(f"Num tasks passed: {len(pmpnn_task_pass)}\n")
         fp.write(f"Num consistent: {len(pz_pass)}\n")
+        fp.write(f"Num tasks consistent: {len(pz_task_pass)}\n")
 

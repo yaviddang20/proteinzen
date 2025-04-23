@@ -25,6 +25,7 @@ get_ax_idx = lambda x: (x // 3, x % 3)
 loss_terms = [
     'train/loss_epoch',
     'train/frame_vf_loss_epoch',
+    'train/atom14_rmsd_epoch',
     'train/scaled_fafe_epoch'
     'train/scaled_pred_bb_mse_epoch',
     'train/scaled_dist_mat_loss_epoch',

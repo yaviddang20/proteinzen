@@ -70,7 +70,8 @@ class MotifScaffoldingTask(SamplingTask):
         contigs,
         pdb,
         num_samples,
-        cg_version,
+        total_len=None,
+        cg_version=1,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -78,9 +79,18 @@ class MotifScaffoldingTask(SamplingTask):
         self.generator = np.random.default_rng()
         parser = PDBParser()
         self.structure = parser.get_structure("", pdb)
-        self.contigs = self._parse_condition_str(contigs)
+        try:
+            self.contigs = self._parse_condition_str(contigs)
+        except Exception as e:
+            print(f"error with parsing contigs {contigs} from {pdb}")
+            raise e
         self.num_samples = num_samples
         self.cg_version = cg_version
+
+        if total_len is not None:
+            self.total_len = [int(i) for i in total_len.split("-")]
+        else:
+            self.total_len = None
 
     def _parse_condition_str(self, contigs_str):
         contigs = [c.strip() for c in contigs_str.split(",")]
@@ -135,8 +145,11 @@ class MotifScaffoldingTask(SamplingTask):
             'all_atom_mask': atom37_mask,
         }
 
-    def _get_blank_data(self, lower, upper):
-        num_res = self.generator.integers(lower, upper, endpoint=True)
+    def _get_blank_data(self, lower, upper, override=None):
+        if override is not None:
+            num_res = override
+        else:
+            num_res = self.generator.integers(lower, upper, endpoint=True)
         dummy_atom37 = torch.full((num_res, 37, 3), torch.nan)
         atom37_mask = torch.ones((num_res, 37))
         seq = torch.full((num_res,), residue_constants.restype_order_with_x['X'])
@@ -153,7 +166,12 @@ class MotifScaffoldingTask(SamplingTask):
             if isinstance(c, dict):
                 data_chunks.append(c)
             elif callable(c):
-                data_chunks.append(c())
+                if i == len(self.contigs)-1 and self.total_len is not None and len(self.total_len) == 1:
+                    curr_len = sum([d['aatype'].numel() for d in data_chunks])
+                    override_len = self.total_len[-1] - curr_len
+                    data_chunks.append(c(override=override_len))
+                else:
+                    data_chunks.append(c())
             else:
                 raise ValueError(f"we dont recognize condition {c}")
             # print(i, data_chunks[-1]['aatype'].numel())

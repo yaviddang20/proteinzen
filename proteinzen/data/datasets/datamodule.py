@@ -15,6 +15,7 @@ from proteinzen.runtime.sampling.dispatcher import TaskDispatcher
 
 from .dataset import PdbDataset, LengthDataset
 from .sampler import BatchSampler, LengthBatchSampler, ClusteredBatchSampler, ClusteredLengthBatchSampler
+from .collate import featurize_input, collate
 
 
 def gen_collate_fn(training_harness: TrainingHarness):
@@ -56,7 +57,8 @@ class FramediffDataModule(L.LightningDataModule):
                  use_tmpdir=False,
                  predict_on_train=False,
                  use_val_split=False,
-                 afdb_frac=0.75
+                 afdb_frac=0.75,
+                 use_collate_v2=False
                  ):
         super().__init__()
         self.data_dir = data_dir
@@ -70,6 +72,7 @@ class FramediffDataModule(L.LightningDataModule):
         self.predict_on_train = predict_on_train
         self.afdb_frac = afdb_frac
         self.sample_by_length_bucket = sample_by_length_bucket
+        self.use_collate_v2 = use_collate_v2
 
         self.sample_lengths = sample_lengths
         csv = "filtered_metadata.csv"
@@ -186,7 +189,17 @@ class FramediffDataModule(L.LightningDataModule):
         return dataloader
 
     def train_dataloader(self):
-        collate_fn = gen_collate_fn(self.training_harness)
+        if self.use_collate_v2:
+            def collate_fn(data_list):
+                task = self.training_harness.task_sampler.sample_task()
+                corrupter = self.training_harness.frame_noiser
+                data_list = [featurize_input(task, d) for d in data_list]
+                batch = collate(data_list)
+                batch = corrupter.corrupt_dense_batch(batch)
+                batch['task'] = task
+                return batch
+        else:
+            collate_fn = gen_collate_fn(self.training_harness)
         return self.build_dataloader(self.train_dataset, collate_fn)
 
     def predict_dataloader(self):

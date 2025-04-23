@@ -135,6 +135,105 @@ def atomic_losses_reduced(batch,
 
     return out_dict
 
+def dense_smooth_lddt_loss(
+    pred_atom14,
+    gt_atom14,
+    alt_atom14,
+    atom14_mask,
+    eps=1e-6,
+):
+    """ smooth_lddt_loss from AlphaFold3
+
+    Args:
+        pred_atom14 (_type_): _description_
+        gt_atom14 (_type_): _description_
+        alt_atom14 (_type_): _description_
+        batch (_type_): _description_
+        atom14_mask (_type_): _description_
+        r (int, optional): _description_. Defaults to 6.
+        eps (_type_, optional): _description_. Defaults to 1e-6.
+        max_num_neighbors (int, optional): _description_. Defaults to 100.
+
+    Returns:
+        _type_: _description_
+    """
+    # with torch.no_grad():
+    #     pred_gt_diff = torch.square(pred_atom14 - gt_atom14).sum(dim=-1)
+    #     pred_alt_diff = torch.square(pred_atom14 - alt_atom14).sum(dim=-1)
+    #     pred_gt_mse = torch.sum(pred_gt_diff * atom14_mask, dim=-1)
+    #     pred_alt_mse = torch.sum(pred_alt_diff * atom14_mask, dim=-1)
+
+    #     gt_over_alt = pred_gt_mse < pred_alt_mse
+    #     ref_atom14 = gt_atom14 * gt_over_alt[..., None, None] + alt_atom14 * ~gt_over_alt[..., None, None]
+    ref_atom14 = gt_atom14
+    # print(pred_atom14.shape, ref_atom14.shape)
+
+    flat_ref_atom14 = ref_atom14.flatten(-3, -2)
+    flat_pred_atom14 = pred_atom14.flatten(-3, -2)
+    pred_atom14_dists = torch.cdist(flat_pred_atom14, flat_pred_atom14, p=2)
+    ref_atom14_dists = torch.cdist(flat_ref_atom14, flat_ref_atom14, p=2).squeeze(0)
+    abs_dev = torch.abs(pred_atom14_dists - ref_atom14_dists + eps)
+    lddt = 0.25 * (
+        torch.sigmoid(0.5 - abs_dev)
+        + torch.sigmoid(1 - abs_dev)
+        + torch.sigmoid(2 - abs_dev)
+        + torch.sigmoid(4 - abs_dev)
+    )
+    mask = 1 - torch.eye(lddt.shape[1], device=lddt.device)[None]
+    # print(atom14_mask.shape, mask.shape)
+    mask = mask * atom14_mask.flatten(-2, -1)[..., None] * atom14_mask.flatten(-2, -1)[..., None, :]
+    radius_mask = (ref_atom14_dists < 15)
+    smooth_lddt = torch.sum(lddt * mask * radius_mask) / torch.sum(mask)
+    return 1 - smooth_lddt
+
+def atomic_losses_dense_batch(
+    batch,
+    model_outputs,
+    seqwise_weight=1,
+):
+    atom_data = batch['atom']
+    token_data = batch['token']
+
+    gt_atom14 = atom_data['atom14_gt_positions']
+    alt_atom14 = atom_data['atom14_alt_gt_positions']
+    atom14_gt_mask = atom_data['atom14_gt_exists']
+
+    seq = token_data['seq']
+    seq_mask = token_data['seq_mask']
+    token_mask = token_data['token_mask']
+    seq_noising_mask = token_data['seq_noising_mask']
+
+    seq_loss_mask = token_mask & seq_mask & seq_noising_mask
+    pred_atom14_gt_seq = model_outputs['denoised_atom14_gt_seq']
+    seq_logits = model_outputs['decoded_seq_logits']
+
+    seq_loss = F.cross_entropy(
+        seq_logits.flatten(0, 1),
+        (seq * seq_loss_mask).flatten(0, 1),
+        reduction='none'
+    ).view(seq.shape) * seq_loss_mask
+    seq_loss = seq_loss * seqwise_weight
+    seq_loss = seq_loss.sum(dim=-1) / seq_loss_mask.sum(dim=-1)
+
+    per_seq_recov = (seq == seq_logits[..., :-1].argmax(dim=-1))
+    per_seq_recov = (per_seq_recov * seq_loss_mask).sum(dim=-1) / seq_loss_mask.sum(dim=-1)
+
+    smooth_lddt = dense_smooth_lddt_loss(
+        pred_atom14=pred_atom14_gt_seq,
+        gt_atom14=gt_atom14,
+        alt_atom14=alt_atom14,
+        atom14_mask=atom14_gt_mask.bool()
+    )
+
+    out_dict = {
+        "seq_loss": seq_loss,
+        "per_seq_recov": per_seq_recov,
+        "smooth_lddt": smooth_lddt,
+    }
+
+    return out_dict
+
+
 
 def atom14_fm_losses(batch,
                   model_outputs,

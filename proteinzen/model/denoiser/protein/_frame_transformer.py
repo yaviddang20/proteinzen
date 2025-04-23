@@ -127,7 +127,8 @@ class ScatterUpdate(nn.Module):
             rigids_to_res_idx,
             denom,
         )
-        out = out / out_denom[..., None]
+        # print(out_denom)
+        out = out / out_denom[..., None].clip(min=1)
         return out + node_embed
 
 
@@ -1611,6 +1612,7 @@ class SequenceFrameTransformerUpdate(nn.Module):
                 rigids_flat = rigids_flat.compose_q_update_vec(rigids_update * rigids_noising_mask[..., None])
 
         if self.agg_rigid_embed:
+            # print(rigids_embed_flat.isnan().any(), s.isnan().any())
             s = self.frame_to_node_broadcast(
                 rigids_embed_flat,
                 s,

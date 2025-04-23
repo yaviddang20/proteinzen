@@ -53,13 +53,13 @@ def build_residue(aa, coords, res_idx, atom_start_idx, segid="A"):
 def atom91_to_chain(seq, atom91, chain_id, x_bb=None):
     if x_bb:
         atom91[..., :4, :] = x_bb
-    atom_idx = 0
+    atom_idx = 1 # 0
     chain = Chain.Chain(chain_id)
     for seq_idx, aa in enumerate(seq):
         coords = atom91[seq_idx]
         if np.isnan(coords).all():
             continue
-        res, atom_idx = build_residue(aa, coords, seq_idx, atom_idx)
+        res, atom_idx = build_residue(aa, coords, seq_idx+1, atom_idx) # 1-indexed chain for pyrosetta
         chain.add(res)
     return chain
 

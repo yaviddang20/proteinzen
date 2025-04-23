@@ -18,6 +18,7 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source $SCRIPT_DIR/../../env_vars.sh
 
 module load Sali cuda
+REPO_ROOT="/wynton/home/kortemme/alexjli/projects/proteinzen-clone"
 
 fasta=$PWD/../seqs/
 outdir=$PWD

@@ -294,8 +294,8 @@ class MultiFrameInterpolation(TrainingHarness):
 
 
     def run_eval(self, model, inputs):
-        device = inputs['residue']['x'].device
-        self.frame_noiser.set_device(device)
+        # device = inputs['residue']['x'].device
+        # self.frame_noiser.set_device(device)
         # TODO: should this be a separate flag?
         if model.self_conditioning and np.random.uniform() < self.self_condition_rate:
             with torch.no_grad():

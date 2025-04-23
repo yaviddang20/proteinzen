@@ -1,7 +1,7 @@
 import os
 
 import torch
-from hydra_zen import store, just, make_custom_builds_fn, make_config, kwargs_of
+from hydra_zen import store, make_custom_builds_fn, make_config, kwargs_of
 from hydra.conf import HydraConf, RunDir
 import omegaconf
 from datetime import timedelta
@@ -12,10 +12,10 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from proteinzen.data.datasets.datamodule import FramediffDataModule, SamplingDataModule
 
 from proteinzen.stoch_interp.atom14_nonequiv import Atom14Interpolant as NonEquivAtom14Interpolant
-from proteinzen.stoch_interp.multiframe import MultiSE3Interpolant, SE3InterpolantConfig
+from proteinzen.stoch_interp.multiframe import MultiSE3Interpolant
 
 from proteinzen.model.denoiser.protein.atom14_nonequiv import AtomDenoiser
-from proteinzen.model.denoiser.protein.dense_multiframe import IpaMultiRigidDenoiser
+from proteinzen.model.denoiser.protein.dense_multiframe import IpaMultiRigidDenoiser, IpaMultiRigidDenoiserV2
 
 from proteinzen.harness.fm.atom14_nonequiv import Atom14Interpolation as NonEquivAtom14Interpolation
 from proteinzen.harness.fm.multiframe import MultiFrameInterpolation
@@ -75,7 +75,6 @@ def config_hydra_store():
         name="nonequiv_atom14fm_protein")
     corruption_store(
         MultiSE3Interpolant,
-        cfg=builds(SE3InterpolantConfig),
         name="multiframefm_protein")
 
     datamodule_store = store(group="datamodule")
@@ -147,7 +146,8 @@ def config_hydra_store():
     # latent_fm_wrapper = ChimeraLatentWrapper
     model_store = store(group="model")
     model_store(AtomDenoiser, name="nonequiv_atom14fm_protein")
-    model_store(IpaMultiRigidDenoiser, name="multiframefm_protein")
+    model_store(IpaMultiRigidDenoiserV2, name="multiframefm_protein")
+    # model_store(IpaMultiRigidDenoiser, name="multiframefm_protein")
 
     harness_store = store(group="harness")
     harness_store(pbuilds(NonEquivAtom14Interpolation), name="nonequiv_atom14fm_protein")
@@ -286,7 +286,6 @@ def config_sampling_hydra_store():
     corrupter_store = store(group="corrupter")
     corrupter_store(
         MultiSE3Interpolant,
-        cfg=builds(SE3InterpolantConfig),
         name="default"
     )
 

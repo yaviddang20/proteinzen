@@ -154,6 +154,9 @@ if __name__ == "__main__":
         sample_dir = os.path.splitext(os.path.basename(fasta))[0]
         if not os.path.exists(sample_dir):
             os.mkdir(sample_dir)
+        else:
+            logger.info(f"Skipping {sample_dir} because folder already exists")
+            continue
 
         logger.info("Starting Predictions")
 

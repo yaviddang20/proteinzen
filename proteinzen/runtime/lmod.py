@@ -16,6 +16,9 @@ from proteinzen.utils.coarse_grain import compute_atom14_from_cg_frames
 from .utils import gen_pbar_str
 from .ema import EMAModel
 
+from .loss.multiframe import multiframe_fm_loss_dense_batch
+from .loss.common import atomic_losses_dense_batch
+
 
 def t_stratified_loss(batch_t, batch_loss, num_bins=4, loss_name=None):
     """Stratify loss by binning t."""
@@ -52,6 +55,7 @@ class ProteinModule(L.LightningModule):
                  use_ema=False,
                  ema_decay=0.999,
                  use_posthoc_ema=False,
+                 use_dense_batch_loss=False
     ):
         super().__init__()
         self._log = logging.getLogger(__name__)
@@ -65,6 +69,8 @@ class ProteinModule(L.LightningModule):
         self.cosine_total_steps = cosine_total_steps
         self.use_ema = use_ema
         self.use_posthoc_ema = use_posthoc_ema
+        self.use_dense_batch_loss = use_dense_batch_loss
+
         if self.use_amp:
             torch.set_float32_matmul_precision("medium")
 
@@ -86,7 +92,6 @@ class ProteinModule(L.LightningModule):
         if hasattr(self.trainer.train_dataloader.batch_sampler, "epoch"):
             self.trainer.train_dataloader.batch_sampler.set_epoch(self.trainer.current_epoch)
 
-
     def training_step(self, batch):
         training_harness = self.training_harness
 
@@ -100,10 +105,17 @@ class ProteinModule(L.LightningModule):
         if self.use_amp:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 outputs = training_harness.run_eval(self.model, batch)
-            loss_dict = training_harness.compute_loss(batch, outputs)
+
+            if self.use_dense_batch_loss:
+                loss_dict = self._loss_step(batch, outputs)
+            else:
+                loss_dict = training_harness.compute_loss(batch, outputs)
         else:
             outputs = training_harness.run_eval(self.model, batch)
-            loss_dict = training_harness.compute_loss(batch, outputs)
+            if self.use_dense_batch_loss:
+                loss_dict = self._loss_step(batch, outputs)
+            else:
+                loss_dict = training_harness.compute_loss(batch, outputs)
 
         log_dict = tree.map_structure(
             lambda x: torch.round(torch.mean(x), decimals=3) if torch.is_tensor(x) else x,
@@ -126,26 +138,91 @@ class ProteinModule(L.LightningModule):
                 f"train/{k}": torch.round(torch.as_tensor(v, device=log_dict['train/loss'].device), decimals=3)
                 for k,v in stratified_losses.items()
             }
+            if self.use_dense_batch_loss:
+                self.log_dict(
+                    stratified_losses,
+                    prog_bar=False,
+                    logger=True,
+                    on_step=None,
+                    on_epoch=True,
+                    batch_size=t.shape[0],
+                    sync_dist=False)
+            else:
+                self.log_dict(
+                    stratified_losses,
+                    prog_bar=False,
+                    logger=True,
+                    on_step=None,
+                    on_epoch=True,
+                    batch_size=batch.num_graphs,
+                    sync_dist=False)
+
+        if self.use_dense_batch_loss:
             self.log_dict(
-                stratified_losses,
-                prog_bar=False,
-                logger=True,
+                log_dict,
                 on_step=None,
                 on_epoch=True,
+                prog_bar=True,
+                logger=True,
+                batch_size=t.shape[0],
+                sync_dist=True)
+        else:
+            self.log_dict(
+                log_dict,
+                on_step=None,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
                 batch_size=batch.num_graphs,
-                sync_dist=False)
-
-        self.log_dict(
-            log_dict,
-            on_step=None,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-            batch_size=batch.num_graphs,
-            sync_dist=True)
+                sync_dist=True)
 
         # self._log.info(gen_pbar_str(loss_dict))
         return loss_dict
+
+
+    def _loss_step(self, inputs, outputs):
+        frame_fm_loss_dict = multiframe_fm_loss_dense_batch(
+            inputs, outputs, sep_rot_loss=True,
+            t_norm_clip=0.9,
+            rot_vf_angle_loss_weight=0.5,
+            fafe_l2_block_mask_size=1,
+        )
+
+        frame_vf_loss = (
+            frame_fm_loss_dict["trans_vf_loss"] +
+            frame_fm_loss_dict["rot_vf_loss"]
+        )
+        unscaled_frame_vf_loss = (
+            frame_fm_loss_dict["unscaled_trans_vf_loss"] +
+            frame_fm_loss_dict["unscaled_rot_vf_loss"]
+        )
+
+        atomic_loss_dict = atomic_losses_dense_batch(
+            inputs,
+            outputs,
+        )
+
+        atomic_loss = (
+            0.25 * atomic_loss_dict["seq_loss"]
+            + 1 * atomic_loss_dict["smooth_lddt"]
+        )
+
+        loss = (
+            frame_vf_loss
+            + 0.5 * frame_fm_loss_dict['scaled_fafe']
+            + atomic_loss
+        )
+        loss = loss.mean()
+
+        loss_dict = {"loss": loss, "frame_vf_loss": frame_vf_loss, "frame_vf_loss_unscaled": unscaled_frame_vf_loss}
+        loss_dict[inputs['task'].name + "_loss"] = loss
+        loss_dict[inputs['task'].name + "_seq_loss"] = atomic_loss_dict["seq_loss"]
+        loss_dict[inputs['task'].name + "_frame_vf_loss"] = frame_vf_loss
+        loss_dict[inputs['task'].name + "_frame_vf_loss_unscaled"] = unscaled_frame_vf_loss
+        loss_dict.update(frame_fm_loss_dict)
+        loss_dict.update(atomic_loss_dict)
+        return loss_dict
+
 
     def on_before_optimizer_step(self, optimizer):
         with torch.no_grad():
@@ -241,9 +318,9 @@ class ProteinModule(L.LightningModule):
     ):
         frame_noiser = self.training_harness.frame_noiser
         # Set-up time
-        ts = torch.linspace(frame_noiser._cfg.min_t, 1.0, frame_noiser._sample_cfg.num_timesteps)
+        ts = torch.linspace(0.0, 1.0, frame_noiser.num_timesteps)
 
-        frame_noiser.churn = 0
+        # frame_noiser.churn = 0
         print(batch.num_graphs)
 
         res_data = batch['residue']
@@ -270,10 +347,14 @@ class ProteinModule(L.LightningModule):
         clean_traj = []
         denoiser_out = None
 
+        global_shift = 0
         for t_2 in tqdm.tqdm(ts[1:]):
             d_t = t_2 - t_1
             # Run model.
             trans_t_1, rotmats_t_1, _, _ = prot_traj[-1]
+            trans_t_1, center = frame_noiser._center_trans(trans_t_1, res_data.batch)
+            global_shift += center
+
             t_hat, d_t_hat, trans_t_hat = frame_noiser._trans_churn(
                 d_t,
                 t_1,
@@ -324,8 +405,8 @@ class ProteinModule(L.LightningModule):
                 pred_trans_1,
                 trans_t_hat,
                 noising_mask=rigids_noising_mask,
-                add_noise=False,
-                use_score=False
+                # add_noise=False,
+                # use_score=False
             )
             rotmats_t_2 = frame_noiser._rots_euler_step(
                 d_t_hat,
@@ -333,8 +414,8 @@ class ProteinModule(L.LightningModule):
                 pred_rotmats_1,
                 rotmats_t_hat,
                 noising_mask=rigids_noising_mask,
-                add_noise=False,
-                use_score=False
+                # add_noise=False,
+                # use_score=False
             )
             # if torch.isnan(trans_t_2).any():
             #     print("trans step", t_1)

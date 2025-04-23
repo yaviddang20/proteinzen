@@ -120,7 +120,7 @@ class Experiment:
                     "task": sample_task,
                     "name": task_kwargs['name'] if 'name' in task_kwargs else None,
                     "length": sample_len,
-                    "fixed_res_idx": sample_data['fixed_res_idx'].tolist(),
+                    "fixed_res_idx": [i+1 for i in sample_data['fixed_res_idx'].tolist()],  # 1-indexed chain for pyrosetta
                     "fixed_res_chain": [PDB_CHAIN_IDS[int(i)] for i in sample_data['fixed_res_chain_idx']],
                 }
                 curr_sample_id += 1
@@ -195,16 +195,6 @@ def main(sampler,
 
     with open(os.path.join(run_dir, zen_cfg['out_prefix'], "run.log"), 'w') as fp:
         fp.write(f"Sampling config path: {zen_cfg['sampler']['tasks_yaml']}")
-
-    # corrupter._sample_cfg.num_timesteps = 200
-    # corrupter._sample_cfg.num_timesteps = 500
-    if hasattr(corrupter, "se3_noiser"):
-        corrupter.se3_noiser._sample_cfg.num_timesteps = 400
-        # corrupter.se3_noiser._rots_cfg.exp_rate = 5
-    else:
-        if hasattr(corrupter, "_sample_cfg"):
-            # corrupter._sample_cfg.num_timesteps = 400
-            corrupter._sample_cfg.num_timesteps = 100
 
     exp = Experiment(
         model=model,

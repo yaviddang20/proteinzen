@@ -19,6 +19,6 @@ module load Sali cuda
 fasta=$PWD/../seqs/
 outdir=$PWD
 cd /wynton
-apptainer exec --nv /wynton/group/kortemme/esmfold/esmfold_1128.sif python /wynton/home/kortemme/alexjli/projects/ligbinddiff/scripts/analysis/batched_esmfold_inference.py -i $fasta -o $outdir
+apptainer exec --nv /wynton/group/kortemme/esmfold/esmfold_1128.sif python /wynton/home/kortemme/alexjli/projects/proteinzen-clone/scripts/analysis/batched_esmfold_inference.py -i $fasta -o $outdir
 cd $PWD
-qsub ~/projects/proteinzen/scripts/analysis/finish_eval_pipeline.sh &> /dev/null
+qsub ~/projects/proteinzen-clone/scripts/analysis/finish_eval_pipeline.sh &> /dev/null
