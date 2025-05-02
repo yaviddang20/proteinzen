@@ -70,7 +70,8 @@ class MotifScaffoldingTask(SamplingTask):
         contigs,
         pdb,
         num_samples,
-        total_len=None,
+        redesign_contigs,
+        total_length=None,
         cg_version=1,
         **kwargs
     ):
@@ -79,18 +80,35 @@ class MotifScaffoldingTask(SamplingTask):
         self.generator = np.random.default_rng()
         parser = PDBParser()
         self.structure = parser.get_structure("", pdb)
+        self.num_samples = num_samples
+        self.cg_version = cg_version
+
+        if total_length is not None:
+            self.total_len = [int(i) for i in total_length.split("-")]
+            assert len(self.total_len) in (1, 2)
+        else:
+            self.total_len = None
+
+        self.redesign_contigs = {}
+
+        if len(redesign_contigs) > 1:
+            redesign_contigs = [c.strip() for c in redesign_contigs.split(",")]
+            for contig in redesign_contigs:
+                chain = contig[0]
+                if chain not in self.redesign_contigs:
+                    self.redesign_contigs[chain] = set()
+                if "-" in contig:
+                    start, end = [int(i) for i in contig[1:].split("-")]
+                    self.redesign_contigs[chain].update(set(range(start, end+1)))
+                else:
+                    resid = int(contig[1:])
+                    self.redesign_contigs[chain].add(resid)
+
         try:
             self.contigs = self._parse_condition_str(contigs)
         except Exception as e:
             print(f"error with parsing contigs {contigs} from {pdb}")
             raise e
-        self.num_samples = num_samples
-        self.cg_version = cg_version
-
-        if total_len is not None:
-            self.total_len = [int(i) for i in total_len.split("-")]
-        else:
-            self.total_len = None
 
     def _parse_condition_str(self, contigs_str):
         contigs = [c.strip() for c in contigs_str.split(",")]
@@ -125,24 +143,41 @@ class MotifScaffoldingTask(SamplingTask):
         chain = self.structure[0][chain_id]
         atom37 = []
         seq = []
+        redesign_mask = []
         if motif_end is not None:
             for resid in range(motif_start, motif_end+1):
                 res_atom37, res_seq = residue_to_atom37(chain[resid])
-                atom37.append(res_atom37)
-                seq.append(res_seq)
+                if chain.id in self.redesign_contigs and resid in self.redesign_contigs[chain.id]:
+                    res_atom37[3:] = torch.nan
+                    atom37.append(res_atom37)
+                    seq.append(residue_constants.restype_order_with_x['X'])
+                    redesign_mask.append(True)
+                else:
+                    atom37.append(res_atom37)
+                    seq.append(res_seq)
+                    redesign_mask.append(False)
         else:
             res_atom37, res_seq = residue_to_atom37(chain[motif_start])
-            atom37.append(res_atom37)
-            seq.append(res_seq)
+            if chain.id in self.redesign_contigs and motif_start in self.redesign_contigs[chain.id]:
+                res_atom37[3:] = torch.nan
+                atom37.append(res_atom37)
+                seq.append(residue_constants.restype_order_with_x['X'])
+                redesign_mask.append(True)
+            else:
+                atom37.append(res_atom37)
+                seq.append(res_seq)
+                redesign_mask.append(False)
 
         atom37 = torch.stack(atom37).double()
         seq = torch.as_tensor(seq).long()
         atom37_mask = torch.isfinite(atom37).all(dim=-1)
+        redesign_mask = torch.as_tensor(redesign_mask, dtype=torch.bool)
 
         return {
             'aatype': seq,
             'all_atom_positions': atom37,
             'all_atom_mask': atom37_mask,
+            'redesign_mask': redesign_mask
         }
 
     def _get_blank_data(self, lower, upper, override=None):
@@ -158,27 +193,37 @@ class MotifScaffoldingTask(SamplingTask):
             'aatype': seq.long(),
             'all_atom_positions': dummy_atom37.double(),
             'all_atom_mask': atom37_mask.double(),
+            'redesign_mask': torch.zeros_like(seq, dtype=torch.bool)
         }
 
     def _sample_init_data(self):
         data_chunks = []
+        # print(len(self.contigs))
         for i, c in enumerate(self.contigs):
             if isinstance(c, dict):
                 data_chunks.append(c)
             elif callable(c):
                 if i == len(self.contigs)-1 and self.total_len is not None and len(self.total_len) == 1:
                     curr_len = sum([d['aatype'].numel() for d in data_chunks])
-                    override_len = self.total_len[-1] - curr_len
-                    data_chunks.append(c(override=override_len))
+                    min_len = self.total_len[0] - curr_len
+                    max_len = self.total_len[-1] - curr_len
+                    if min_len == max_len:
+                        override_len = max_len
+                    else:
+                        override_len = self.generator.integers(min_len, max_len, endpoint=True)
+                    if override_len > 0:
+                        data_chunks.append(c(override=override_len))
                 else:
                     data_chunks.append(c())
             else:
                 raise ValueError(f"we dont recognize condition {c}")
             # print(i, data_chunks[-1]['aatype'].numel())
             # print({k: v.shape for k,v in data_chunks[-1].items()})
+        # print(sum([d['aatype'].numel() for d in data_chunks]))
 
         chain_feats = dict_cat(data_chunks)
 
+        # TODO: the nans stuff doesn't work unless every atom in the residue is nan
         chain_feats = data_transforms.atom37_to_cg_frames(chain_feats, cg_version=self.cg_version)
         chain_feats = data_transforms.atom37_to_torsion_angles(prefix="")(chain_feats)  # TODO: uncurry this
 
@@ -189,6 +234,7 @@ class MotifScaffoldingTask(SamplingTask):
         chain_feats = data_transforms.make_atom14_masks(chain_feats)
         chain_feats = data_transforms.make_atom14_positions(chain_feats)
         seq = chain_feats['aatype']
+        redesign_mask = chain_feats['redesign_mask']
 
         # compute rigids from data
         # a lot of these will be nan
@@ -212,6 +258,9 @@ class MotifScaffoldingTask(SamplingTask):
         rigids_1_tensor_7[dummy_rigid_location] = 0
         rigids_1_tensor_7 += dummy_rigid[..., None, :] * dummy_rigid_location[..., None]
         rigids_noising_mask = torch.isnan(rigids_1_tensor_7).any(dim=-1)
+        rigids_noising_mask[redesign_mask, 1:] = True
+
+        # print(rigids_noising_mask)
 
         # center the motif rigids
         motif_rigids_1_tensor_7 = rigids_1_tensor_7[~rigids_noising_mask]

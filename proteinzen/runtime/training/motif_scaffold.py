@@ -21,10 +21,10 @@ class MotifScaffolding(TrainingTask):
                  t_max=0.99,
                  max_frac_res=0.5,
                  max_num_res=40,
-                 p_is_unindexed=0.8
+                 p_is_unindexed=0.8,
     ):
         assert t_sched in ['lognorm', 'mixed_beta']
-        assert mode in ['backbone', 'full_residue', 'inv_rotamer']
+        assert mode in ['backbone', 'full_residue', 'inv_rotamer', 'mixed']
         self.t_sched = t_sched
         self.mode = mode
         self.lognorm_mu = lognorm_mu
@@ -39,7 +39,7 @@ class MotifScaffolding(TrainingTask):
         self.max_num_res = max_num_res
         self.p_is_unindexed = p_is_unindexed
 
-    def _generate_motif_mask(self, batch):
+    def generate_motif_mask(self, batch):
         masks = []
         N = batch['residue'].num_nodes // batch.num_graphs
         for i in range(batch.num_graphs):
@@ -65,7 +65,7 @@ class MotifScaffolding(TrainingTask):
             masks.append(torch.as_tensor(M, dtype=bool))
         return torch.stack(masks, dim=0)
 
-    def generate_motif_mask(self, N):
+    def _generate_motif_mask(self, N):
         num_segments = np.random.randint(1, 5)
         # we switch this from Genie2
         # to increase the probability of sampling minimal motifs
@@ -87,7 +87,7 @@ class MotifScaffolding(TrainingTask):
         M = np.concatenate(permuted_list, axis=0)
         return torch.as_tensor(M, dtype=torch.bool)
 
-    def _sample_t_and_mask(self, batch):
+    def sample_t_and_mask(self, batch):
         rigids_1 = batch['residue']['rigids_1']
         device = rigids_1.device
         num_batch = batch.num_graphs
@@ -123,6 +123,11 @@ class MotifScaffolding(TrainingTask):
         elif self.mode == 'inv_rotamer':
             # t[motif_mask, 1:] = 1
             rigids_noising_mask[motif_mask, 1:] = False
+        elif self.mode == 'mixed':
+            mask_bb_only = torch.rand_like(rigids_noising_mask[..., 0], dtype=torch.float32) < 0.5
+            rigids_noising_mask[motif_mask & mask_bb_only, 0] = False
+            rigids_noising_mask[motif_mask & (~mask_bb_only)] = False
+            seq_noising_mask[motif_mask & mask_bb_only] = True
 
         res_is_unindexed_mask = torch.rand_like(seq_noising_mask, dtype=torch.float32) < self.p_is_unindexed
 
@@ -133,7 +138,7 @@ class MotifScaffolding(TrainingTask):
             "res_is_unindexed_mask": res_is_unindexed_mask
         }
 
-    def sample_t_and_mask(self, data):
+    def _sample_t_and_mask(self, data):
         rigids_1 = data['residue']['rigids_1']
         device = rigids_1.device
         if self.t_sched == 'lognorm':
@@ -192,3 +197,8 @@ class InverseRotamerMotifScaffolding(MotifScaffolding):
     name: str = "inv_rot_motif_scaffolding"
 
     __init__ = partialmethod(MotifScaffolding.__init__, mode='inv_rotamer')
+
+
+class MixedMotifScaffolding(MotifScaffolding):
+    name: str = "mixed_motif_scaffolding"
+    __init__ = partialmethod(MotifScaffolding.__init__, mode='mixed')

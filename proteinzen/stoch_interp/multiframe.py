@@ -415,13 +415,25 @@ class MultiSE3Interpolant:
     def g_t_inv(self, s):
         return (- (0.2 * s + 1) + ((0.2 * s + 1) ** 2 - 4 * s * (0.01 * s - 1)) ** 0.5) / (2 * s)
 
-    def _center_trans(self, trans_t, batch):
-        center = scatter(
-            trans_t,
-            index=batch,
-            dim=0,
-            reduce='mean'
-        ).mean(dim=-2)
+    def _center_trans(self, trans_t, batch, trans_noising_mask=None):
+        if trans_noising_mask is not None:
+            fixed_trans = trans_t[~trans_noising_mask]
+            fixed_batch = batch[..., None].expand(-1, trans_t.shape[-2])
+            fixed_batch = fixed_batch[~trans_noising_mask]
+            center = scatter(
+                fixed_trans,
+                index=fixed_batch,
+                dim=0,
+                reduce='mean',
+                dim_size=int(batch.max().item() + 1)
+            )
+        else:
+            center = scatter(
+                trans_t,
+                index=batch,
+                dim=0,
+                reduce='mean'
+            ).mean(dim=-2)
         return trans_t - center[batch][..., None, :], center
 
     def _trans_churn(self, d_t, t, trans_t, noising_mask):

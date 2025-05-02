@@ -81,6 +81,12 @@ class PdbDataset(data.Dataset):
 
         self.csv = pdb_csv
 
+    def precompute_motif_params(self):
+        seq_lens = self.csv['modeled_seq_len'].to_numpy()
+        num_segments = np.random.randint(1, 5, size=seq_lens.shape)
+        num_motif_res = np.random.randint(num_segments, seq_lens * 0.5)
+        self.csv['motif_num_res'] = num_motif_res
+        self.csv['motif_num_segments'] = num_segments
 
     def _process_csv_row(self, processed_file_path):
         processed_feats = du.read_pkl(processed_file_path)

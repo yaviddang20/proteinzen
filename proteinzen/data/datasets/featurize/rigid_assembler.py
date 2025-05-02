@@ -279,211 +279,6 @@ class RigidAssembler:
         }
 
 
-    def _assemble_protein_full_atomization(
-        self,
-        res_atom_noising_mask,
-        res_is_unindexed_mask,
-    ):
-        assert self.atom_rigids is not None
-        assert self.atom_rigids_mask is not None
-        assert res_atom_noising_mask is not None
-
-        # now, splice together the proper chunks
-        flat_rigids = self.atom_rigids[self.atom_rigids_mask]
-        flat_noising_mask = res_atom_noising_mask[self.atom_rigids_mask]
-        flat_seq_idx = torch.tile(
-            self.seq_idx[..., None],
-            (1, self.cg_rigids.shape[1])
-        )[self.atom_rigids_mask]
-        flat_rigid_idx = self.atom_rigid_idx[self.atom_rigids_mask]
-        flat_is_atomized = torch.ones_like(flat_seq_idx, dtype=torch.bool)
-        flat_is_unindexed = torch.zeros_like(flat_seq_idx, dtype=torch.bool)
-        flat_is_center_rigid = self.atom_center_rigid_mask[self.atom_rigids_mask]
-
-        if res_is_unindexed_mask is not None:
-            unindexed_atom_rigids = self.atom_rigids[res_is_unindexed_mask][self.atom_rigids_mask[res_is_unindexed_mask]]
-            unindexed_atom_rigids_noising_mask = res_atom_noising_mask[res_is_unindexed_mask][self.atom_rigids_mask[res_is_unindexed_mask]]
-
-            flat_rigids = torch.cat([flat_rigids, unindexed_atom_rigids], dim=0)
-            flat_noising_mask = torch.cat([flat_noising_mask, unindexed_atom_rigids_noising_mask], dim=0)
-
-            num_unindexed_res = int(res_is_unindexed_mask.long().sum())
-            num_indexed_res = res_is_unindexed_mask.numel()
-            unindexed_seq_idx = torch.tile(
-                torch.arange(num_unindexed_res)[..., None],
-                (1, self.num_atom_rigids)
-            ) + num_indexed_res
-            flat_seq_idx = torch.cat([
-                flat_seq_idx,
-                unindexed_seq_idx[self.atom_rigids_mask[res_is_unindexed_mask]]
-            ], dim=0)
-            unindexed_atom_rigid_idx = torch.tile(
-                torch.arange(self.atom_rigids.shape[1])[None],
-                (int(res_is_unindexed_mask.sum()), 1)
-            )
-            flat_rigid_idx = torch.cat([
-                flat_rigid_idx,
-                unindexed_atom_rigid_idx.flatten(0, 1)
-            ], dim=0)
-            flat_is_atomized = torch.cat([
-                flat_is_atomized,
-                torch.zeros_like(unindexed_atom_rigids_noising_mask, dtype=torch.bool)
-            ], dim=0)
-            flat_is_unindexed = torch.cat([
-                flat_is_unindexed,
-                torch.ones_like(unindexed_atom_rigids_noising_mask, dtype=torch.bool)
-            ], dim=0)
-            flat_is_center_rigid = torch.cat([
-                flat_is_center_rigid,
-                torch.ones_like(unindexed_atom_rigids_noising_mask, dtype=torch.bool)
-            ], dim=0)
-
-        flat_is_ligand = torch.zeros(
-            sum([t.shape[0] for t in flat_noising_mask]),
-            dtype=torch.bool
-        )
-
-        return {
-            "rigids": flat_rigids,
-            "rigids_noising_mask": flat_noising_mask,
-            "seq_idx": flat_seq_idx,
-            "rigid_idx": flat_rigid_idx,
-            "is_atomized_mask": flat_is_atomized,
-            "is_center_rigid_mask": flat_is_center_rigid,
-            "is_ligand_mask": flat_is_ligand,
-            "splice_lens": torch.tensor([flat_is_atomized.numel()], dtype=torch.long)
-        }
-
-
-    def _assemble_protein_partial_atomization(
-        self,
-        rigids_noising_mask,
-        res_atom_noising_mask,
-        res_atomized_mask,
-        res_is_unindexed_mask,
-    ):
-        assert self.cg_rigids is not None
-        assert self.atom_rigids is not None
-        assert self.atom_rigids_mask is not None
-        assert rigids_noising_mask is not None
-        assert res_atom_noising_mask is not None
-        assert res_atomized_mask is not None
-
-        # if we atomize residues
-        # we need to place them in the proper sequence order
-        # since we use sequence-local blocks to save compute
-        # first, split everything into chunks
-        splice_lens, take_atom_rigids = compute_splice_lens(res_atomized_mask)
-        cg_rigid_chunks = self.cg_rigids.split(splice_lens)
-        atom_rigids_chunks = self.atom_rigids.split(splice_lens)
-        atom_rigids_mask_chunks = self.atom_rigids_mask.split(splice_lens)
-        rigids_noising_mask_chunks = rigids_noising_mask.split(splice_lens)
-        res_atom_noising_mask_chunks = res_atom_noising_mask.split(splice_lens)
-        seq_idx_chunks = self.seq_idx.split(splice_lens)
-        cg_rigid_idx_chunks = self.cg_rigid_idx.split(splice_lens)
-        atom_rigid_idx_chunks = self.atom_rigid_idx.split(splice_lens)
-        cg_center_rigid_mask_chunks = self.cg_center_rigid_mask.split(splice_lens)
-        atom_center_rigid_mask_chunks = self.atom_center_rigid_mask.split(splice_lens)
-
-        # now, splice together the proper chunks
-        flat_rigids = []
-        flat_noising_mask = []
-        flat_seq_idx = []
-        flat_rigid_idx = []
-        flat_is_atomized = []
-        flat_is_center_rigid = []
-        for i, take_atom_rigids_i in enumerate(take_atom_rigids):
-            if take_atom_rigids_i:
-                atom_rigids_mask_i = atom_rigids_mask_chunks[i]
-                atom_rigids_i = atom_rigids_chunks[i]
-                atom_noising_mask_i = res_atom_noising_mask_chunks[i]
-
-                rigid_idx_i = atom_rigid_idx_chunks[i]
-                seq_idx_i = torch.tile(
-                    seq_idx_chunks[i][..., None],
-                    (1, rigid_idx_i.shape[-1])
-                )
-                is_center_rigid_mask_i = atom_center_rigid_mask_chunks[i]
-
-                flat_rigids.append(atom_rigids_i[atom_rigids_mask_i])
-                flat_noising_mask.append(atom_noising_mask_i[atom_rigids_mask_i])
-                flat_seq_idx.append(seq_idx_i[atom_rigids_mask_i])
-                flat_rigid_idx.append(rigid_idx_i[atom_rigids_mask_i])
-                flat_is_atomized.append(torch.ones_like(seq_idx_i[atom_rigids_mask_i], dtype=torch.bool))
-                flat_is_center_rigid.append(is_center_rigid_mask_i[atom_rigids_mask_i])
-            else:
-                rigid_idx_i = cg_rigid_idx_chunks[i]
-                seq_idx_i = torch.tile(
-                    seq_idx_chunks[i][..., None],
-                    (1, rigid_idx_i.shape[-1])
-                )
-                is_center_rigid_mask_i = cg_center_rigid_mask_chunks[i]
-
-                flat_rigids.append(cg_rigid_chunks[i].flatten(0, 1))
-                flat_noising_mask.append(rigids_noising_mask_chunks[i].flatten(0, 1))
-                flat_seq_idx.append(seq_idx_i.flatten(0, 1))
-                flat_rigid_idx.append(rigid_idx_i.flatten(0, 1))
-                flat_is_atomized.append(torch.zeros_like(seq_idx_i.flatten(0, 1), dtype=torch.bool))
-                flat_is_center_rigid.append(is_center_rigid_mask_i.flatten(0, 1))
-
-        if res_is_unindexed_mask is not None:
-            # process unindexed rigids
-            unindexed_atomized_res_mask = res_atomized_mask & res_is_unindexed_mask
-            unindexed_cg_res_mask = (~res_atomized_mask) & res_is_unindexed_mask
-            unindexed_atomized_rigids = self.atom_rigids[
-                unindexed_atomized_res_mask
-            ][self.atom_rigids_mask[unindexed_atomized_res_mask]]
-            unindexed_atomized_rigids_noising_mask = res_atom_noising_mask[
-                unindexed_atomized_res_mask
-            ][self.atom_rigids_mask[unindexed_atomized_res_mask]]
-            unindexed_cg_rigids = self.cg_rigids[unindexed_cg_res_mask].flatten(0, 1)
-            unindexed_cg_rigids_noising_mask = rigids_noising_mask[unindexed_cg_res_mask].flatten(0, 1)
-
-            flat_rigids.append(unindexed_atomized_rigids)
-            flat_noising_mask.append(unindexed_atomized_rigids_noising_mask)
-            flat_seq_idx.append(torch.full_like(unindexed_atomized_rigids_noising_mask, -1))
-            unindexed_atomized_rigid_idx = torch.tile(
-                torch.arange(self.atom_rigids.shape[1])[None],
-                (int(unindexed_atomized_res_mask.sum()), 1)
-            )
-            flat_rigid_idx.append(unindexed_atomized_rigid_idx[self.atom_rigids_mask[unindexed_atomized_res_mask]])
-            flat_is_atomized.append(torch.ones_like(unindexed_atomized_rigids_noising_mask, dtype=torch.bool))
-            flat_is_center_rigid.append(torch.ones_like(unindexed_atomized_rigids_noising_mask, dtype=torch.bool))
-
-            flat_rigids.append(unindexed_cg_rigids)
-            flat_noising_mask.append(unindexed_cg_rigids_noising_mask)
-            flat_seq_idx.append(torch.full_like(unindexed_cg_rigids_noising_mask, -1))
-            unindexed_cg_rigid_idx = torch.tile(
-                torch.arange(self.cg_rigids.shape[1])[None],
-                (int(unindexed_cg_res_mask.sum()), 1)
-            )
-            flat_rigid_idx.append(unindexed_cg_rigid_idx.flatten(0, 1))
-            flat_is_atomized.append(torch.zeros_like(unindexed_cg_rigids_noising_mask, dtype=torch.bool))
-            flat_is_center_rigid.append(torch.ones_like(unindexed_cg_rigids_noising_mask, dtype=torch.bool))
-
-        flat_is_ligand = torch.zeros(
-            sum([t.shape[0] for t in flat_noising_mask]),
-            dtype=torch.bool
-        )
-        flat_rigids = torch.cat(flat_rigids, dim=0)
-        flat_noising_mask = torch.cat(flat_noising_mask, dim=0)
-        flat_seq_idx = torch.cat(flat_seq_idx, dim=0)
-        flat_rigid_idx = torch.cat(flat_rigid_idx, dim=0)
-        flat_is_atomized = torch.cat(flat_is_atomized, dim=0)
-        flat_is_center_rigid = torch.cat(flat_is_center_rigid, dim=0)
-
-        return {
-            "rigids": flat_rigids,
-            "rigids_noising_mask": flat_noising_mask,
-            "seq_idx": flat_seq_idx,
-            "rigid_idx": flat_rigid_idx,
-            "is_atomized_mask": flat_is_atomized,
-            "is_center_rigid_mask": flat_is_center_rigid,
-            "is_ligand_mask": flat_is_ligand,
-            "splice_lens": torch.as_tensor(splice_lens, dtype=torch.long)
-        }
-
-
     def _assemble_ligand(self, ligand_noising_mask):
         assert self.ligand_rigids is not None
         return {
@@ -514,25 +309,17 @@ class RigidAssembler:
                     res_is_unindexed_mask
                 )
             elif res_atomized_mask.all():
+                # full atomization
                 raise NotImplementedError("i'll do this later")
-                protein_rigids_dict = self._assemble_protein_full_atomization(
-                    res_atom_noising_mask,
-                    res_is_unindexed_mask
-                )
             else:
+                # partial atomization
                 raise NotImplementedError("i'll do this later")
-                protein_rigids_dict = self._assemble_protein_partial_atomization(
-                    rigids_noising_mask,
-                    res_atom_noising_mask,
-                    res_atomized_mask,
-                    res_is_unindexed_mask
-                )
         else:
             protein_rigids_dict = {}
 
         if ligand_noising_mask is not None:
-            raise NotImplementedError("i'll do this later")
             ligand_rigids_dict = self._assemble_ligand(ligand_noising_mask)
+            raise NotImplementedError("i'll do this later")
         else:
             ligand_rigids_dict = {}
 
@@ -546,6 +333,237 @@ class RigidAssembler:
             rigids_dict = ligand_rigids_dict
         else:
             raise ValueError("we were not provided enough information to construct input rigids")
+
+        is_token_rigid_mask = rigids_dict['is_token_rigid_mask']
+        rigids_dict['token_gather_idx'] = torch.arange(is_token_rigid_mask.numel())[is_token_rigid_mask]
+
+        return rigids_dict
+
+
+class SampleRigidAssembler:
+    num_cg_rigids = 3
+    num_atom_rigids = 14
+
+    def __init__(
+            self,
+            motif_rigids = None,
+            motif_seq = None,
+            ligand_rigids = None,
+            cg_version=1,
+            atomize = False,
+            promote_full_motif_to_token = True
+    ):
+        assert (
+            (motif_rigids is not None and motif_seq is not None)
+            or
+            ligand_rigids is not None
+        )
+
+        self.motif_cg_rigids = motif_rigids
+        self.motif_seq = motif_seq
+        self.cg_version = cg_version
+        self.ligand_rigids = ligand_rigids
+        self.promote_full_motif_to_token = promote_full_motif_to_token
+
+        if motif_rigids is not None:
+            self.motif_cg_rigid_idx = torch.tile(
+                torch.arange(self.num_cg_rigids)[None],
+                (motif_rigids.shape[0], 1)
+            )
+            self.motif_cg_token_rigid_mask = torch.zeros_like(self.motif_cg_rigid_idx, dtype=torch.bool)
+            self.motif_cg_token_rigid_mask[..., 0] = True
+
+            if atomize:
+                raise NotImplementedError("i'll do this later")
+            else:
+                self.atom_rigids = None
+                self.atom_rigids_mask = None
+                self.atom_rigid_idx = None
+                self.atom_token_rigid_mask = None
+
+        else:
+            self.atom_rigids = None
+            self.atom_rigids_mask = None
+            self.atom_rigid_idx = None
+            self.atom_token_rigid_mask = None
+            self.motif_cg_rigid_idx = None
+            self.motif_cg_token_rigid_mask = None
+
+
+    def _assemble_protein_no_atomization(
+        self,
+        noisy_rigids,
+        motif_noising_mask,
+        motif_seq_idx,
+        motif_res_is_unindexed,
+    ):
+        assert self.motif_cg_rigids is not None
+        assert motif_noising_mask is not None
+
+        flat_rigids = noisy_rigids.flatten(0, 1)
+        num_res = noisy_rigids.shape[0]
+        num_rigids = flat_rigids.shape[0]
+
+        flat_rigids_mask = torch.ones(num_rigids)
+        flat_noising_mask = torch.ones(num_rigids)
+        seq_idx = torch.arange(num_res)
+        cg_rigid_idx = torch.tile(
+            torch.arange(self.num_cg_rigids)[None],
+            (len(seq_idx), 1)
+        )
+        cg_token_rigid_mask = torch.zeros_like(cg_rigid_idx, dtype=torch.bool)
+        cg_token_rigid_mask[..., 0] = True
+
+        _seq_idx = torch.tile(
+            seq_idx[..., None],
+            (1, noisy_rigids.shape[1])
+        ).flatten(0, 1)
+        flat_seq_idx = _seq_idx.clone()
+        flat_rigid_token_uid = flat_seq_idx.clone()
+        flat_rigid_idx = cg_rigid_idx.flatten(0, 1)
+        flat_is_atomized = torch.zeros_like(flat_seq_idx, dtype=torch.bool)
+        flat_is_unindexed = torch.zeros_like(flat_seq_idx, dtype=torch.bool)
+        flat_is_token_rigid = cg_token_rigid_mask.flatten(0, 1)
+        flat_is_ligand = torch.zeros_like(flat_noising_mask, dtype=torch.bool)
+        flat_is_protein_output = torch.ones_like(flat_noising_mask, dtype=torch.bool)
+
+        motif_fixed_mask = ~motif_noising_mask
+        flat_motif_rigids = self.motif_cg_rigids.flatten(0, 1)
+        flat_motif_rigids_mask = torch.ones_like(motif_fixed_mask.flatten(0, 1), dtype=torch.bool)
+        flat_motif_noising_mask = torch.zeros_like(flat_motif_rigids_mask)
+        flat_motif_seq_idx = torch.tile(
+            motif_seq_idx[..., None],
+            (1, self.num_cg_rigids)
+        ).flatten(0, 1)
+        flat_motif_rigids_idx = torch.tile(
+            torch.arange(self.num_cg_rigids)[None],
+            ((self.motif_cg_rigids.shape[0]), 1)
+        ).flatten(0, 1)
+        flat_motif_is_atomized = torch.zeros_like(flat_motif_rigids_mask)
+        flat_motif_is_unindexed = torch.tile(
+            motif_res_is_unindexed[..., None],
+            (1, self.num_cg_rigids)
+        ).flatten()
+        flat_motif_is_ligand = torch.zeros_like(flat_motif_rigids_mask)
+        flat_motif_is_protein_output = torch.zeros_like(flat_motif_rigids_mask)
+
+        flat_rigids = torch.cat([flat_rigids, flat_motif_rigids], dim=0)
+        flat_rigids_mask = torch.cat([flat_rigids_mask, flat_motif_rigids_mask], dim=0)
+        flat_noising_mask = torch.cat([flat_noising_mask, flat_motif_noising_mask], dim=0)
+        flat_seq_idx = torch.cat([
+            flat_seq_idx,
+            flat_motif_seq_idx
+        ], dim=0)
+        flat_rigid_idx = torch.cat([
+            flat_rigid_idx,
+            flat_motif_rigids_idx
+        ], dim=0)
+        flat_is_atomized = torch.cat([
+            flat_is_atomized,
+            flat_motif_is_atomized
+        ], dim=0)
+        flat_is_unindexed = torch.cat([
+            flat_is_unindexed,
+            flat_motif_is_unindexed
+        ], dim=0)
+
+        flat_is_ligand = torch.cat([
+            flat_is_ligand,
+            flat_motif_is_ligand
+        ], dim=0)
+        flat_is_protein_output = torch.cat([
+            flat_is_protein_output,
+            flat_motif_is_protein_output
+        ], dim=0)
+
+
+        max_token_uid = flat_rigid_token_uid.max()
+        if self.promote_full_motif_to_token:
+            raise NotImplementedError("will do this later")
+            rigid_is_unindexed = motif_res_is_unindexed[..., None] * motif_fixed_mask
+            num_unindexed_rigids = rigid_is_unindexed.long().sum().item()
+            new_token_uids = torch.arange(num_unindexed_rigids) + max_token_uid + 1
+
+            motif_token_uid = torch.tile(
+                motif_seq_idx[..., None],
+                (1, self.num_cg_rigids)
+            )
+            motif_token_uid[rigid_is_unindexed] = new_token_uids
+            flat_motif_token_uid = motif_token_uid[motif_fixed_mask]
+
+            flat_is_token_rigid = torch.cat([
+                flat_is_token_rigid,
+                torch.ones_like(flat_motif_token_uid, dtype=torch.bool)
+            ], dim=0)
+            flat_rigid_token_uid = torch.cat([
+                flat_rigid_token_uid,
+                flat_motif_token_uid
+            ], dim=0)
+        else:
+            num_unindexed_res = motif_res_is_unindexed.long().sum().item()
+            new_token_uids = torch.arange(num_unindexed_res) + max_token_uid + 1
+            motif_token_uid = motif_seq_idx.clone()
+            motif_token_uid[motif_res_is_unindexed] = new_token_uids
+
+            motif_token_uid = torch.tile(
+                motif_token_uid[..., None],
+                (1, self.num_cg_rigids)
+            )
+            motif_cg_token_rigid_mask = torch.zeros_like(motif_token_uid)
+            motif_cg_token_rigid_mask[..., 0] = True
+
+            flat_is_token_rigid = torch.cat([
+                flat_is_token_rigid,
+                motif_cg_token_rigid_mask.flatten(0, 1)
+            ], dim=0)
+            flat_rigid_token_uid = torch.cat([
+                flat_rigid_token_uid,
+                motif_token_uid.flatten(0, 1)
+            ], dim=0)
+
+        return {
+            "rigids": flat_rigids,
+            "rigids_mask": flat_rigids_mask.bool(),
+            "rigids_noising_mask": flat_noising_mask.bool(),
+            "seq_idx": flat_seq_idx,
+            "token_uid": flat_rigid_token_uid,
+            "rigid_idx": flat_rigid_idx,
+            "is_atomized_mask": flat_is_atomized.bool(),
+            "is_unindexed_mask": flat_is_unindexed.bool(),
+            "is_token_rigid_mask": flat_is_token_rigid.bool(),
+            "is_ligand_mask": flat_is_ligand.bool(),
+            "is_protein_output_mask": flat_is_protein_output.bool(),
+            "splice_lens": torch.tensor([flat_is_atomized.numel()], dtype=torch.long)
+        }
+
+
+    def _assemble_ligand(self, ligand_noising_mask):
+        assert self.ligand_rigids is not None
+        return {
+            "rigids": self.ligand_rigids,
+            "rigids_noising_mask": ligand_noising_mask,
+            "seq_idx": torch.full_like(ligand_noising_mask, -1, dtype=torch.float32),
+            "rigid_idx": torch.full_like(ligand_noising_mask, -1, dtype=torch.float32),
+            "is_atomized_mask": torch.ones_like(ligand_noising_mask, dtype=torch.bool),
+            "is_center_mask": torch.ones_like(ligand_noising_mask, dtype=torch.bool),
+            "is_ligand": torch.ones_like(ligand_noising_mask, dtype=torch.bool),
+            "splice_lens": torch.tensor([ligand_noising_mask.numel()], dtype=torch.long)  # TODO: should we split by ligand?
+        }
+
+
+    def assemble(
+        self,
+        noisy_res_rigids,
+        motif_noising_mask,
+        motif_seq_idx,
+        motif_res_is_unindexed_mask,
+    ):
+        rigids_dict = self._assemble_protein_no_atomization(
+            noisy_res_rigids,
+            motif_noising_mask,
+            motif_seq_idx,
+            motif_res_is_unindexed_mask
+        )
 
         is_token_rigid_mask = rigids_dict['is_token_rigid_mask']
         rigids_dict['token_gather_idx'] = torch.arange(is_token_rigid_mask.numel())[is_token_rigid_mask]

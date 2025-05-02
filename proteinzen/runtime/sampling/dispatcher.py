@@ -3,14 +3,18 @@ from hydra_zen import load_from_yaml
 from torch.utils.data import Dataset # IterableDataset
 from torch_geometric.data import Batch
 
+from proteinzen.data.datasets.collate import collate
+
 from .task import SamplingTask
 from .unconditional import UnconditionalSampling
 from .motif_scaffolding import MotifScaffoldingTask
+from .motif_scaffolding_v2 import MotifScaffoldingTaskV2
 
 
 class TaskDispatcher(Dataset):
     name_to_task_class = {
         "motif_scaffolding": MotifScaffoldingTask,
+        "motif_scaffolding_v2": MotifScaffoldingTaskV2,
         "unconditional": UnconditionalSampling
     }
 
@@ -18,12 +22,14 @@ class TaskDispatcher(Dataset):
         self,
         tasks_yaml,
         batch_size,
-        batching_mode="optimal"
+        batching_mode="optimal",
+        use_collate_for_pad=False
     ):
         super().__init__()
         assert batching_mode in ["lazy", "optimal"]
         self.batch_size = batch_size
         self.batching_mode = batching_mode
+        self.use_collate_for_pad = use_collate_for_pad
         self.task_objs = []
         self.task_configs = []
 
@@ -61,18 +67,21 @@ class TaskDispatcher(Dataset):
             return sum([t['num_samples'] for t, _ in self.task_objs])
 
     def _pad_batch(self, batch):
-        max_len = max([sample['residue']['num_nodes'] for sample in batch])
-        padded_batch = []
-        for sample in batch:
-            n_padding = max_len - sample['residue']['num_nodes']
-            if n_padding > 0:
-                # TODO: this is a little clunky...
-                padded_batch.append(
-                    sample.task.pad_data(sample, n_padding)
-                )
-            else:
-                padded_batch.append(sample)
-        return padded_batch
+        if self.use_collate_for_pad:
+            return collate(batch)
+        else:
+            max_len = max([sample['residue']['num_nodes'] for sample in batch])
+            padded_batch = []
+            for sample in batch:
+                n_padding = max_len - sample['residue']['num_nodes']
+                if n_padding > 0:
+                    # TODO: this is a little clunky...
+                    padded_batch.append(
+                        sample.task.pad_data(sample, n_padding)
+                    )
+                else:
+                    padded_batch.append(sample)
+            return padded_batch
 
 
     def _lazy_batching(self):
