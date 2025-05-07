@@ -233,14 +233,17 @@ class SamplingDataModule(L.LightningDataModule):
     def __init__(self,
                  tasks_yaml,
                  batch_size,
-                 batching_mode="optimal"):
+                 batching_mode="optimal",
+                 use_collate_for_pad=False
+    ):
         super().__init__()
         self.batching_mode = batching_mode
 
         self.task_dispatcher = TaskDispatcher(
             tasks_yaml,
             batch_size,
-            batching_mode
+            batching_mode,
+            use_collate_for_pad
         )
 
     def predict_dataloader(self):

@@ -71,7 +71,8 @@ class Experiment:
                 sample_coords = sample_data['sample_coord']
                 sample_len = sample_coords.shape[0]
                 seq = sample_data['seq']
-                sample_task = sample_data['input'].task.task_name
+                sample_task = sample_data['input']['task'].task_name
+                # sample_task = sample_data['input']['task']['task_name']
 
                 seq_lt = "".join([restypes[i] for i in seq.tolist()])
                 atom91, _ = atom14_to_atom91(seq_lt, sample_coords.numpy(force=True))
@@ -113,7 +114,8 @@ class Experiment:
                     save_struct(models_to_struct(reversed(clean_models)), clean_traj_name)
                     save_struct(models_to_struct(reversed(prot_models)), prot_traj_name)
 
-                task_kwargs = sample_data['input'].task.kwargs
+                task_kwargs = sample_data['input']['task'].kwargs
+                # task_kwargs = sample_data['input']['task']
                 sample_path = os.path.join(self._cfg['samples_dir'], sample_name + ".pdb")
                 samples_metadata[sample_name] = {
                     "path": sample_path,
@@ -122,6 +124,10 @@ class Experiment:
                     "length": sample_len,
                     "fixed_res_idx": [i+1 for i in sample_data['fixed_res_idx'].tolist()],  # 1-indexed chain for pyrosetta
                     "fixed_res_chain": [PDB_CHAIN_IDS[int(i)] for i in sample_data['fixed_res_chain_idx']],
+                    "fixed_bb_res_idx": [i+1 for i in sample_data['fixed_bb_res_idx'].tolist()],  # 1-indexed chain for pyrosetta
+                    "fixed_bb_chain": [PDB_CHAIN_IDS[int(i)] for i in sample_data['fixed_bb_chain_idx']],
+                    "fixed_seq_res_idx": [i+1 for i in sample_data['fixed_seq_res_idx'].tolist()],  # 1-indexed chain for pyrosetta
+                    "fixed_seq_chain": [PDB_CHAIN_IDS[int(i)] for i in sample_data['fixed_seq_chain_idx']],
                 }
                 curr_sample_id += 1
 
@@ -134,7 +140,7 @@ class Experiment:
                 chain: []
                 for chain in set(metadata['fixed_res_chain'])
             }
-            for pos, pos_chain in zip(metadata['fixed_res_idx'], metadata['fixed_res_chain']):
+            for pos, pos_chain in zip(metadata['fixed_seq_res_idx'], metadata['fixed_seq_chain']):
                 entry[pos_chain].append(pos)
             pmpnn_fixed_pos_dict[name] = entry
 

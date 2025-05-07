@@ -44,7 +44,8 @@ def residue_to_atom37(residue):
     for atom in atoms:
         atom_name = atom.get_name()
         # we ignore hydrogens
-        if atom_name.startswith('H'):
+        if str(atom.element).upper() == 'H':
+            # print("skipping H")
             continue
         atom_idx = residue_constants.atom_types.index(atom_name)
         residue_37[atom_idx] = torch.as_tensor(atom.get_coord())
@@ -176,7 +177,7 @@ class MotifScaffoldingTaskV2(SamplingTask):
         atom37 = torch.stack(atom37).double()
         seq = torch.as_tensor(seq).long()
         atom37_mask = torch.isfinite(atom37).all(dim=-1)
-        atom37 = atom37_mask * atom37_mask[..., None]
+        atom37[~atom37_mask] = 0
 
         return {
             'aatype': seq,
@@ -206,7 +207,6 @@ class MotifScaffoldingTaskV2(SamplingTask):
         motif_feats = data_transforms.atom37_to_torsion_angles(prefix="")(motif_feats)  # TODO: uncurry this
 
         for key, value in motif_feats.items():
-            print(key, value.dtype)
             if value.dtype == torch.float64:
                 motif_feats[key] = value.float()
 
@@ -219,10 +219,14 @@ class MotifScaffoldingTaskV2(SamplingTask):
         rigids_mask = motif_feats["cg_groups_gt_exists"][:, (0, 2, 3)].bool()
         mask_AG = (motif_seq == residue_constants.restype_order['G']) | (motif_seq == residue_constants.restype_order['A'])
         mask_not_X = (motif_seq != residue_constants.restype_order_with_x['X'])
-        dummy_rigid = motif_rigids[..., 0, :] * mask_AG[..., None] + motif_rigids[..., 1, :] * (~mask_AG & mask_not_X)[..., None]
+        dummy_rigid = motif_rigids[..., 0, :] * (mask_AG & mask_not_X)[..., None] + motif_rigids[..., 1, :] * (~mask_AG & mask_not_X)[..., None]
         dummy_rigid_location = (~rigids_mask) * mask_not_X[..., None]
         motif_rigids[dummy_rigid_location] = 0
         motif_rigids += dummy_rigid[..., None, :] * dummy_rigid_location[..., None]
+
+        # center the motif
+        motif_center = motif_rigids[..., 4:].sum(dim=(0, 1)) / torch.ones_like(rigids_mask).sum()
+        motif_rigids[..., 4:] -= motif_center
 
         assembler = SampleRigidAssembler(
             motif_rigids=motif_rigids,
@@ -235,10 +239,10 @@ class MotifScaffoldingTaskV2(SamplingTask):
         else:
             num_res = self.generator.integers(self.total_len[0], self.total_len[1], endpoint=True)
 
-        noisy_trans = _centered_gaussian(num_res * 3).unflatten(0, (-1, 3))
+        noisy_trans = _centered_gaussian(num_res * 3).unflatten(0, (-1, 3)) * 16
         noisy_quats = _uniform_so3(num_res * 3).unflatten(0, (-1, 3))
         noisy_rigids = torch.cat([noisy_quats, noisy_trans], dim=-1)
-        motif_noising_mask = torch.zeros(num_res, 3)
+        motif_noising_mask = torch.zeros(motif_seq.numel(), 3).bool()
 
         rigids_data = assembler.assemble(
             noisy_rigids,
@@ -250,7 +254,8 @@ class MotifScaffoldingTaskV2(SamplingTask):
         features = {
             'token': {},
             'rigids': {},
-            'residue': {}  # only for batching
+            'residue': {},  # only for batching
+            'atom': {'atom14_mask': torch.zeros(num_res, 14)}
         }
 
         rigids_key_renaming = {
@@ -280,6 +285,7 @@ class MotifScaffoldingTaskV2(SamplingTask):
             "is_protein_output_mask": "token_is_protein_output_mask",
         }
         for rigids_key, token_key in rigids_to_token_names.items():
+            # print(rigids_key)
             features['token'][token_key] = rigids_data[rigids_key][rigids_is_token_rigid_mask]
         features['token']['token_gather_idx'] = rigids_data["token_gather_idx"]
 
@@ -290,20 +296,27 @@ class MotifScaffoldingTaskV2(SamplingTask):
             'seq_mask': torch.ones(num_res, dtype=torch.bool),
             'chain_idx': torch.zeros(num_res),
         }
-        token_feats = [
-            "seq",
-            "seq_noising_mask",
-            "seq_mask",
-            "chain_idx"
-        ]
-        # duplicate the motif residues and update res_data
-        for key in token_feats:
-            tensor = res_data[key]
-            tensor_expand = tensor[..., None].expand(-1, 3)
-            features['token'][key] = torch.cat([tensor, tensor_expand.flatten(0, 1)], dim=0)
+        token_data = features['token']
+        token_data['seq'] = torch.cat([res_data['seq'], motif_seq], dim=-1)
+        token_data['seq_noising_mask'] = torch.cat([res_data['seq_noising_mask'], torch.zeros_like(motif_seq).bool()], dim=-1)
+        token_data['seq_mask'] = torch.cat([res_data['seq_mask'], torch.ones_like(motif_seq).bool()], dim=-1)
+        token_data['chain_idx'] = torch.cat([res_data['chain_idx'], torch.full_like(motif_seq, fill_value=res_data['chain_idx'][-1])], dim=-1)
+        # token_feats = [
+        #     "seq",
+        #     "seq_noising_mask",
+        #     "seq_mask",
+        #     "chain_idx"
+        # ]
+        # # duplicate the motif residues and update res_data
+        # for key in token_feats:
+        #     tensor = res_data[key]
+        #     tensor_expand = tensor[..., None].expand(-1, 3)
+        #     features['token'][key] = torch.cat([tensor, tensor_expand.flatten(0, 1)], dim=0)
 
-        features['residue']['num_nodes'] = features['token']['seq'].numel()
-        features['residue']['num_res'] = features['token']['seq'].numel()
+        features['residue']['num_nodes'] = torch.as_tensor(features['token']['seq'].numel())
+        features['residue']['num_res'] = torch.as_tensor(features['token']['seq'].numel())
+        features['t'] = torch.zeros((1,))[None]
+        features['task'] = self
 
         return features
 

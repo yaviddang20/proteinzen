@@ -23,6 +23,7 @@ from proteinzen.harness.fm.multiframe import MultiFrameInterpolation
 from proteinzen.runtime.lmod import ProteinModule
 from proteinzen.runtime.training.unconditional import UnconditionalGeneration
 from proteinzen.runtime.training.motif_scaffold import BackboneMotifScaffolding, ResidueMotifScaffolding, InverseRotamerMotifScaffolding, MixedMotifScaffolding
+from proteinzen.runtime.training.motif_scaffold_v2 import ResidueMotifScaffoldingV2
 from proteinzen.runtime.training.folding import Folding
 from proteinzen.runtime.training.diffusion_forcing import DiffusionForcing
 from proteinzen.runtime.training.sidechain_design import SidechainDesign
@@ -65,6 +66,7 @@ def config_hydra_store():
     paradigm_store = store(group="paradigm")
     paradigm_store({"paradigm": "nonequiv_atom14fm"}, name="nonequiv_atom14fm")
     paradigm_store({"paradigm": "multiframefm"}, name="multiframefm")
+    paradigm_store({"paradigm": "multiframefm_v2"}, name="multiframefm_v2")
 
     domain_store = store(group="domain")
     domain_store({"domain": "protein"}, name="protein")
@@ -76,6 +78,9 @@ def config_hydra_store():
     corruption_store(
         MultiSE3Interpolant,
         name="multiframefm_protein")
+    corruption_store(
+        MultiSE3Interpolant,
+        name="multiframefm_v2_protein")
 
     datamodule_store = store(group="datamodule")
     datamodule_store(
@@ -146,18 +151,20 @@ def config_hydra_store():
     # latent_fm_wrapper = ChimeraLatentWrapper
     model_store = store(group="model")
     model_store(AtomDenoiser, name="nonequiv_atom14fm_protein")
-    # model_store(IpaMultiRigidDenoiserV2, name="multiframefm_protein")
     model_store(IpaMultiRigidDenoiser, name="multiframefm_protein")
+    model_store(IpaMultiRigidDenoiserV2, name="multiframefm_v2_protein")
 
     harness_store = store(group="harness")
     harness_store(pbuilds(NonEquivAtom14Interpolation), name="nonequiv_atom14fm_protein")
     harness_store(pbuilds(MultiFrameInterpolation), name="multiframefm_protein")
+    harness_store(pbuilds(MultiFrameInterpolation), name="multiframefm_v2_protein")
 
     tasks_store = store(group="tasks")
     tasks_store({
         'unconditional_freq': 1.0,
         'backbone_motif_scaffolding_freq': 0.0,
         'residue_motif_scaffolding_freq': 0.0,
+        'residue_motif_scaffolding_v2_freq': 0.0,
         'mixed_motif_scaffolding_freq': 0.0,
         'inverse_rotamer_motif_scaffolding_freq': 0.0,
         'folding_freq': 0.0,
@@ -167,6 +174,7 @@ def config_hydra_store():
     tasks_store(group='tasks/unconditional')(builds(UnconditionalGeneration), name='default')
     tasks_store(group='tasks/backbone_motif_scaffolding')(builds(BackboneMotifScaffolding), name='default')
     tasks_store(group='tasks/residue_motif_scaffolding')(builds(ResidueMotifScaffolding), name='default')
+    tasks_store(group='tasks/residue_motif_scaffolding_v2')(builds(ResidueMotifScaffoldingV2), name='default')
     tasks_store(group='tasks/mixed_motif_scaffolding')(builds(MixedMotifScaffolding), name='default')
     tasks_store(group='tasks/inverse_rotamer_motif_scaffolding')(builds(InverseRotamerMotifScaffolding), name='default')
     tasks_store(group='tasks/folding')(builds(Folding), name='default')
@@ -224,6 +232,7 @@ def config_hydra_store():
             {"tasks/unconditional": "default"},
             {"tasks/backbone_motif_scaffolding": "default"},
             {"tasks/residue_motif_scaffolding": "default"},
+            {"tasks/residue_motif_scaffolding_v2": "default"},
             {"tasks/mixed_motif_scaffolding": "default"},
             {"tasks/inverse_rotamer_motif_scaffolding": "default"},
             {"tasks/folding": "default"},

@@ -10,6 +10,7 @@ import lightning as L
 
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from proteinzen.harness import TrainingHarness
+from proteinzen.data.datasets.featurize.rigid_assembler import rigids_to_atom14
 from proteinzen.utils.openfold import rigid_utils as ru
 from proteinzen.utils.coarse_grain import compute_atom14_from_cg_frames
 
@@ -568,16 +569,20 @@ class ProteinModule(L.LightningModule):
         t_1 = ts[0]
 
         num_batch, num_res = seq_noising_mask.shape
-        res_mask = torch.ones_like(seq_noising_mask)
+        token_mask = token_data['token_mask']
         device = self.device
         prot_traj = [(
             trans_0,  # trans
             rotmats_0,  # rot
             torch.ones((num_batch, num_res, 21), device=device).float(),  # seq logits
-            compute_atom14_from_cg_frames(
-                ru.Rigid(ru.Rotation(rot_mats=rotmats_0), trans_0),
-                res_mask,
-                torch.zeros_like(res_mask),
+            rigids_to_atom14(
+                rigids_0,
+                rigids_data['rigids_mask'],
+                rigids_data['rigids_is_protein_output_mask'],
+                rigids_data['rigids_is_atomized_mask'],
+                token_data['token_is_atomized_mask'],
+                token_data['token_is_protein_output_mask'],
+                token_data['seq'],
                 cg_version=model.cg_version
             )
         )]
@@ -589,8 +594,8 @@ class ProteinModule(L.LightningModule):
             d_t = t_2 - t_1
             # Run model.
             trans_t_1, rotmats_t_1, _, _ = prot_traj[-1]
-            trans_t_1, center = frame_noiser._center_trans(trans_t_1, res_data.batch, rigids_noising_mask)
-            global_shift += center
+            # trans_t_1, center = frame_noiser._center_trans(trans_t_1, res_data.batch, rigids_noising_mask)
+            # global_shift += center
 
             t_hat, d_t_hat, trans_t_hat = frame_noiser._trans_churn(
                 d_t,
@@ -611,13 +616,13 @@ class ProteinModule(L.LightningModule):
                 rots=ru.Rotation(rot_mats=rotmats_t_hat),
                 trans=trans_t_hat
             ).to_tensor_7()
-            t = torch.ones(num_batch, device=device) * t_hat
+            t = torch.ones(num_batch, device=device)[..., None] * t_hat
             batch["t"] = t
 
             denoiser_out = model(batch, self_condition=denoiser_out)
 
             # Process model output.
-            pred_rigids = denoiser_out['final_rigids']
+            pred_rigids = denoiser_out['denoised_rigids']
             pred_trans_1 = pred_rigids.get_trans()
             pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
             # if torch.isnan(pred_trans_1).any() or torch.isnan(pred_rotmats_1).any():
@@ -665,9 +670,13 @@ class ProteinModule(L.LightningModule):
                 (trans_t_2,
                  rotmats_t_2,
                  denoiser_out["pred_seq"].detach().cpu(),
-                 compute_atom14_from_cg_frames(
+                 rigids_to_atom14(
                      ru.Rigid(ru.Rotation(rot_mats=rotmats_t_2), trans_t_2),
-                     res_data.res_mask,
+                     rigids_data['rigids_mask'],
+                     rigids_data['rigids_is_protein_output_mask'],
+                     rigids_data['rigids_is_atomized_mask'],
+                     token_data['token_is_atomized_mask'],
+                     token_data['token_is_protein_output_mask'],
                      denoiser_out["pred_seq"],
                      cg_version=model.cg_version
                  )
@@ -687,13 +696,13 @@ class ProteinModule(L.LightningModule):
             rots=ru.Rotation(rot_mats=rotmats_t_1),
             trans=trans_t_1
         ).to_tensor_7()
-        t = torch.ones(num_batch, device=device) * t_1
+        t = torch.ones(num_batch, device=device)[..., None] * t_1
         batch["t"] = t
 
         denoiser_out = model(batch, self_condition=denoiser_out)
 
         # Process model output.
-        pred_rigids = denoiser_out['final_rigids']
+        pred_rigids = denoiser_out['denoised_rigids']
         pred_trans_1 = pred_rigids.get_trans()
         pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
         decoded_struct = denoiser_out['denoised_atom14']
@@ -712,62 +721,70 @@ class ProteinModule(L.LightningModule):
         # # Convert trajectories to atom37.
         # atom37_traj = all_atom.transrotpsi_to_atom37(prot_traj, res_data.res_mask)
         # clean_atom37_traj = all_atom.transrotpsi_to_atom37(clean_traj, res_data.res_mask)
-        num_res = token_data['num_res'].cpu()
         output_mask = token_data['token_is_protein_output_mask'].cpu()
         def _package_traj(traj, idx):
-            # we take the particular index of data at that timestep
-            # and select only real residues
-            traj_component = [t[idx][res_mask.to(t[idx].device)] for t in traj]
-            # we then need to split the data into their corresponding batches
-            unbatched_traj = [t.split(num_res.tolist(), dim=0) for t in traj_component]
-            # and we zip everything together
-            return list(zip(*unbatched_traj))
+            traj_component = []
+            for t in traj:
+                unbatched_traj_frame = []
+                for batch_idx in range(output_mask.shape[0]):
+                    unbatched_traj_frame.append(
+                        t[idx][batch_idx][output_mask.to(t[idx].device)[batch_idx]]
+                        # t[idx][batch_idx]
+                    )
+                traj_component.append(unbatched_traj_frame)
+            return list(zip(*traj_component))
 
-        clean_trajs = _package_traj(clean_traj, -2)
-        clean_traj_seqs = _package_traj(clean_traj, -3)
-        prot_trajs = _package_traj(prot_traj, -1)
+        # clean_trajs = _package_traj(clean_traj, -2)
+        # clean_traj_seqs = _package_traj(clean_traj, -3)
+        # prot_trajs = _package_traj(prot_traj, -1)
+        clean_trajs = [[] for _ in range(output_mask.shape[0])]
+        clean_traj_seqs = [[] for _ in range(output_mask.shape[0])]
+        prot_trajs = [[] for _ in range(output_mask.shape[0])]
 
-        fixed_residues = (~rigids_noising_mask).all(dim=-1)[res_mask].split(num_res.tolist(), dim=0)
-        fixed_bb_residues = (~rigids_noising_mask[..., 0])[res_mask].split(num_res.tolist(), dim=0)
-        fixed_seq_residues = (~seq_noising_mask)[res_mask].split(num_res.tolist(), dim=0)
+        # fixed_residues = (~rigids_noising_mask).all(dim=-1).split(num_res.tolist(), dim=0)
+        # fixed_bb_residues = (~rigids_noising_mask[..., 0]).split(num_res.tolist(), dim=0)
+        # fixed_seq_residues = (~seq_noising_mask).split(num_res.tolist(), dim=0)
         # print([t.shape for t in fixed_residues])
-        fixed_res_idx = [torch.arange(t.numel())[t.cpu()].long() for t in fixed_residues]
-        fixed_bb_res_idx = [torch.arange(t.numel())[t.cpu()].long() for t in fixed_bb_residues]
-        fixed_seq_res_idx = [torch.arange(t.numel())[t.cpu()].long() for t in fixed_seq_residues]
 
-        res_chain_idx = res_data['chain_idx'][res_mask].split(num_res.tolist(), dim=0)
+        fixed_res_idx = [torch.as_tensor([]) for _ in range(output_mask.shape[0])]
+        fixed_bb_res_idx = [torch.as_tensor([]) for _ in range(output_mask.shape[0])]
+        fixed_seq_res_idx = [torch.as_tensor([]) for _ in range(output_mask.shape[0])]
+
+        res_chain_idx = []
         fixed_res_chain_idx = [
-            chain[mask]
-            for chain, mask in zip(res_chain_idx, fixed_residues)
+            torch.as_tensor([]) for _ in range(output_mask.shape[0])
         ]
         fixed_bb_chain_idx = [
-            chain[mask]
-            for chain, mask in zip(res_chain_idx, fixed_bb_residues)
+            torch.as_tensor([]) for _ in range(output_mask.shape[0])
         ]
         fixed_seq_chain_idx = [
-            chain[mask]
-            for chain, mask in zip(res_chain_idx, fixed_seq_residues)
+            torch.as_tensor([]) for _ in range(output_mask.shape[0])
         ]
 
-        samples = decoded_struct[
-            res_mask.to(device=decoded_struct.device)
-        ].split(num_res.tolist())
-        seqs = argmax_seq[
-            res_mask.to(device=argmax_seq.device)
-        ].split(num_res.tolist())
+        samples = []
+        seqs = []
+        max_mask_len = output_mask.sum(dim=-1).max().item()
+        for i in range(output_mask.shape[0]):
+            seqs.append(
+                argmax_seq[i][output_mask.to(device=argmax_seq.device)[i]]
+            )
+            samples.append(
+                decoded_struct[i][output_mask.to(device=decoded_struct.device)[i, :max_mask_len]]
+            )
+
 
         ret = []
 
-        data_list = batch.to_data_list()
+        # data_list = batch.to_data_list()
 
-        for i, sample_input in enumerate(data_list):
+        for i, _ in enumerate(samples):
             ret.append({
                 "sample_coord": samples[i],
                 "seq": seqs[i],
                 "clean_traj": clean_trajs[i],
                 "clean_traj_seq": clean_traj_seqs[i],
                 "prot_traj": prot_trajs[i],
-                "input": sample_input,
+                "input": {'task': batch['task'][i]},
                 "fixed_res_idx": fixed_res_idx[i],
                 "fixed_bb_res_idx": fixed_bb_res_idx[i],
                 "fixed_seq_res_idx": fixed_seq_res_idx[i],

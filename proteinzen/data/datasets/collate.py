@@ -22,22 +22,6 @@ def featurize_input(
     cg_version=1,
     dummy_rigid_to_sidechain_rigid=True
 ):
-    # sample task and associated time/masks
-    task_data = task.sample_t_and_mask(data)
-    return featurize_input_from_task_data(
-        task_data,
-        data,
-        cg_version,
-        dummy_rigid_to_sidechain_rigid
-    )
-
-
-def featurize_input_from_task_data(
-    task_data,
-    data,
-    cg_version=1,
-    dummy_rigid_to_sidechain_rigid=True
-):
     data = copy.deepcopy(data)
     res_data = data['residue']
 
@@ -45,7 +29,8 @@ def featurize_input_from_task_data(
         'token': {},
         'rigids': {},
         'ligands': {},
-        'atom': {}
+        'atom': {},
+        'task': task,
     }
 
     # compute base features from raw data
@@ -79,6 +64,7 @@ def featurize_input_from_task_data(
     data['residue']['rigids_1'] = rigids_1_tensor_7
 
     # sample task and associated time/masks
+    task_data = task.sample_t_and_mask(data)
     t = task_data['t']
     rigids_noising_mask = task_data['rigids_noising_mask']
     seq_noising_mask = task_data['seq_noising_mask']
@@ -371,4 +357,6 @@ def collate(data_list):
         pad(data, max(token_lens), max(rigids_lens), max(atom_lens))
         for data in data_list
     ]
-    return default_collate(padded_data_list)
+    batched_data_list = default_collate(padded_data_list)
+    batched_data_list['task'] = [data['task'] for data in data_list]
+    return batched_data_list

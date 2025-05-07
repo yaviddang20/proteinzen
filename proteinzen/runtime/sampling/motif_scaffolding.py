@@ -45,6 +45,8 @@ def residue_to_atom37(residue):
         # we ignore hydrogens
         if atom_name.startswith('H'):
             continue
+        if len(atom_name) > 1 and atom_name[0] in ['1', '2', '3'] and atom_name[1] == 'H':
+            continue
         atom_idx = residue_constants.atom_types.index(atom_name)
         residue_37[atom_idx] = torch.as_tensor(atom.get_coord())
     return residue_37, residue_constants.resname_to_idx[aa_3lt]

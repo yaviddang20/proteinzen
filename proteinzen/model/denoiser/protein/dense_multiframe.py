@@ -1863,6 +1863,16 @@ class IpaMultiRigidDenoiserV2(nn.Module):
             cg_version=self.cg_version
         )
 
+        with torch.no_grad():
+            bb_rigids = gather_helper(rigids_out.to_tensor_7(), token_data['token_gather_idx'])
+            bb_rigids = ru.Rigid.from_tensor_7(bb_rigids)
+
+            motif_bb_mask = (~token_data['token_is_protein_output_mask'] & ~token_data['token_is_ligand_mask'])
+            protein_bb_mask = (token_data['token_is_protein_output_mask'] & ~token_data['token_is_ligand_mask'])
+            dist_mask = motif_bb_mask[..., None] & protein_bb_mask[..., None, :]
+            res_CA_pos = bb_rigids.get_trans()
+            trans_dist = torch.cdist(res_CA_pos, res_CA_pos)
+
         ret = {}
         ret['denoised_rigids'] = rigids_out
         ret['denoised_atom14'] = denoised_atom14_pred_seq

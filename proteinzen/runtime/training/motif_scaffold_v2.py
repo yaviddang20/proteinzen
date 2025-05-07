@@ -103,3 +103,7 @@ class MotifScaffoldingV2(TrainingTask):
             "res_is_unindexed_mask": res_is_unindexed_mask,
             "res_is_atomized_mask": res_is_atomized_mask
         }
+
+class ResidueMotifScaffoldingV2(MotifScaffoldingV2):
+    name: str = "res_motif_scaffolding_v2"
+    __init__ = partialmethod(MotifScaffoldingV2.__init__, mode='full_residue')

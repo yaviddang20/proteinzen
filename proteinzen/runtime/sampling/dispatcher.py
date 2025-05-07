@@ -58,7 +58,10 @@ class TaskDispatcher(Dataset):
     def __getitem__(self, idx):
         assert self.batching_mode == "optimal"
         assert self.batches is not None
-        return Batch.from_data_list(self._pad_batch(self.batches[idx]))
+        if self.use_collate_for_pad:
+            return self._pad_batch(self.batches[idx])
+        else:
+            return Batch.from_data_list(self._pad_batch(self.batches[idx]))
 
     def __len__(self):
         if self.batching_mode == 'optimal':
