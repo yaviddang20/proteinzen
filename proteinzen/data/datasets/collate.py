@@ -20,7 +20,8 @@ def featurize_input(
     task,
     data,
     cg_version=1,
-    dummy_rigid_to_sidechain_rigid=True
+    dummy_rigid_to_sidechain_rigid=True,
+    promote_full_motif_to_token=False,
 ):
     data = copy.deepcopy(data)
     res_data = data['residue']
@@ -80,7 +81,7 @@ def featurize_input(
         res_mask=res_data['res_mask'],
         seq=res_data['seq'],
         cg_version=cg_version,
-        promote_full_motif_to_token=False
+        promote_full_motif_to_token=promote_full_motif_to_token
     )
     rigids_data = assembler.assemble(
         rigids_noising_mask=rigids_noising_mask,
@@ -125,10 +126,21 @@ def featurize_input(
         "chain_idx"
     ]
     # duplicate the motif residues and update res_data
+    token_seq_idx = features['token']['token_seq_idx']
     for key in token_feats:
         tensor = res_data[key]
-        tensor_expand = tensor[..., None].expand(-1, rigids_noising_mask.shape[-1])
-        features['token'][key] = torch.cat([tensor, tensor_expand[rigids_noising_mask]], dim=0)
+        if promote_full_motif_to_token:
+            raise NotImplementedError()
+            tensor_expand = tensor[..., None].expand(-1, rigids_noising_mask.shape[-1])
+            if key == "seq_noising_mask":
+                features['token'][key] = torch.cat([torch.ones_like(tensor), tensor_expand[rigids_noising_mask]], dim=0)
+            else:
+                features['token'][key] = torch.cat([tensor, tensor_expand[rigids_noising_mask]], dim=0)
+        else:
+            features['token'][key] = tensor[token_seq_idx]
+    token_is_protein_output_mask = features['token']['token_is_protein_output_mask']
+    features['token']['seq_noising_mask'][token_is_protein_output_mask] = True
+
 
     # compute sidechain features
     ## generate data dict

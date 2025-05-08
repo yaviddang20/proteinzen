@@ -221,13 +221,22 @@ class ProteinModule(L.LightningModule):
         )
         loss = loss.mean()
 
+
         loss_dict = {"loss": loss, "frame_vf_loss": frame_vf_loss, "frame_vf_loss_unscaled": unscaled_frame_vf_loss}
+        if 'motif_idx' in outputs:
+            pred_motif_idx = outputs['motif_idx']
+            gt_motif_idx = inputs['token']['token_seq_idx']
+            is_motif_mask = ~inputs['token']['token_is_protein_output_mask'] & ~inputs['token']['token_is_ligand_mask']
+            motif_idx_correct = (pred_motif_idx == gt_motif_idx) * is_motif_mask
+            loss_dict['motif_idx_correct'] = motif_idx_correct.sum() / is_motif_mask.sum()
         loss_dict[inputs['task'].name + "_loss"] = loss
         loss_dict[inputs['task'].name + "_seq_loss"] = atomic_loss_dict["seq_loss"]
         loss_dict[inputs['task'].name + "_frame_vf_loss"] = frame_vf_loss
         loss_dict[inputs['task'].name + "_frame_vf_loss_unscaled"] = unscaled_frame_vf_loss
         loss_dict.update(frame_fm_loss_dict)
         loss_dict.update(atomic_loss_dict)
+
+
         return loss_dict
 
 

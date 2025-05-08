@@ -1050,12 +1050,21 @@ class MultiRigidPairEmbedderV2(nn.Module):
         return torch.cat([quat_rel, unit_edge_dist_vecs, dist_features], dim=-1)
 
 
-    def forward(self, rigids, node_mask, seq_idx, chain_idx, sc_rigids=None):
+    def forward(self,
+                rigids,
+                node_mask,
+                seq_idx,
+                chain_idx,
+                token_is_unindexed_mask,
+                sc_rigids=None
+    ):
         edge_mask = node_mask[..., None] & node_mask[..., None, :]
         same_chain_mask = (chain_idx[..., None] == chain_idx[..., None, :])
+        pair_is_unindexed_mask = token_is_unindexed_mask[..., None] | token_is_unindexed_mask[..., None]
 
         relpos_feats = relpos(seq_idx, clip=self.relpos_clip)
         relpos_feats = relpos_feats * same_chain_mask[..., None]
+        relpos_featus = relpos_feats * ~pair_is_unindexed_mask[..., None]
         # relpos_feats[~same_chain_mask][..., -1] += 1
 
         z = self.lin_z_ij(relpos_feats)

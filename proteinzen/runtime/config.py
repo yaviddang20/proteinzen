@@ -22,6 +22,7 @@ from proteinzen.harness.fm.multiframe import MultiFrameInterpolation
 
 from proteinzen.runtime.lmod import ProteinModule
 from proteinzen.runtime.training.unconditional import UnconditionalGeneration
+from proteinzen.runtime.training.unconditional_v2 import UnconditionalGenerationV2
 from proteinzen.runtime.training.motif_scaffold import BackboneMotifScaffolding, ResidueMotifScaffolding, InverseRotamerMotifScaffolding, MixedMotifScaffolding
 from proteinzen.runtime.training.motif_scaffold_v2 import ResidueMotifScaffoldingV2
 from proteinzen.runtime.training.folding import Folding
@@ -162,6 +163,7 @@ def config_hydra_store():
     tasks_store = store(group="tasks")
     tasks_store({
         'unconditional_freq': 1.0,
+        'unconditional_v2_freq': 0.0,
         'backbone_motif_scaffolding_freq': 0.0,
         'residue_motif_scaffolding_freq': 0.0,
         'residue_motif_scaffolding_v2_freq': 0.0,
@@ -172,6 +174,7 @@ def config_hydra_store():
         'sidechain_design_freq': 0.0,
     }, name='default')
     tasks_store(group='tasks/unconditional')(builds(UnconditionalGeneration), name='default')
+    tasks_store(group='tasks/unconditional_v2')(builds(UnconditionalGenerationV2), name='default')
     tasks_store(group='tasks/backbone_motif_scaffolding')(builds(BackboneMotifScaffolding), name='default')
     tasks_store(group='tasks/residue_motif_scaffolding')(builds(ResidueMotifScaffolding), name='default')
     tasks_store(group='tasks/residue_motif_scaffolding_v2')(builds(ResidueMotifScaffoldingV2), name='default')
@@ -230,6 +233,7 @@ def config_hydra_store():
             {"harness": "${paradigm}_${domain}"},
             {"tasks": "default"},
             {"tasks/unconditional": "default"},
+            {"tasks/unconditional_v2": "default"},
             {"tasks/backbone_motif_scaffolding": "default"},
             {"tasks/residue_motif_scaffolding": "default"},
             {"tasks/residue_motif_scaffolding_v2": "default"},
