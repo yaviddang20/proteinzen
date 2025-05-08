@@ -28,6 +28,7 @@ from torch_geometric.data import HeteroData
 import numpy as np
 
 from proteinzen.data.openfold import residue_constants, data_transforms
+from proteinzen.data.constants import coarse_grain as cg
 from proteinzen.data.datasets.featurize.rigid_assembler import SampleRigidAssembler
 from proteinzen.utils.openfold import rigid_utils as ru
 from .task import SamplingTask
@@ -113,6 +114,13 @@ class MotifScaffoldingTaskV2(SamplingTask):
 
         self.total_len = [int(i) for i in total_length.split("-")]
         assert len(self.total_len) in (1, 2)
+
+        cg_group_mask = [
+            cg.cg_group_mask[residue_constants.restype_1to3[resname]]
+            for resname in residue_constants.restypes
+        ]
+        cg_group_mask.append([0.0] * 4)
+        self.cg_group_mask = torch.as_tensor(cg_group_mask, dtype=torch.bool)[:, (0, 2, 3)]
 
     def _parse_condition_str(self, contigs_str):
         contigs = [c.strip() for c in contigs_str.split(",")]
@@ -216,13 +224,16 @@ class MotifScaffoldingTaskV2(SamplingTask):
         motif_rigids = ru.Rigid.from_tensor_4x4(motif_feats['cg_groups_gt_frames'])[:, (0, 2, 3)].to_tensor_7()
 
         # compute the dummy rigids
-        rigids_mask = motif_feats["cg_groups_gt_exists"][:, (0, 2, 3)].bool()
+        rigids_mask_from_seq = self.cg_group_mask.to(motif_rigids.device)[motif_seq]
         mask_AG = (motif_seq == residue_constants.restype_order['G']) | (motif_seq == residue_constants.restype_order['A'])
         mask_not_X = (motif_seq != residue_constants.restype_order_with_x['X'])
         dummy_rigid = motif_rigids[..., 0, :] * (mask_AG & mask_not_X)[..., None] + motif_rigids[..., 1, :] * (~mask_AG & mask_not_X)[..., None]
-        dummy_rigid_location = (~rigids_mask) * mask_not_X[..., None]
+        dummy_rigid_location = (~rigids_mask_from_seq) * mask_not_X[..., None]
         motif_rigids[dummy_rigid_location] = 0
         motif_rigids += dummy_rigid[..., None, :] * dummy_rigid_location[..., None]
+
+        rigids_mask = motif_feats["cg_groups_gt_exists"][:, (0, 2, 3)].bool()
+        unresolved_rigid_mask = (rigids_mask_from_seq & ~rigids_mask)
 
         # center the motif
         motif_center = motif_rigids[..., 4:].sum(dim=(0, 1)) / torch.ones_like(rigids_mask).sum()
@@ -242,7 +253,7 @@ class MotifScaffoldingTaskV2(SamplingTask):
         noisy_trans = _centered_gaussian(num_res * 3).unflatten(0, (-1, 3)) * 16
         noisy_quats = _uniform_so3(num_res * 3).unflatten(0, (-1, 3))
         noisy_rigids = torch.cat([noisy_quats, noisy_trans], dim=-1)
-        motif_noising_mask = torch.zeros(motif_seq.numel(), 3).bool()
+        motif_noising_mask = unresolved_rigid_mask
 
         rigids_data = assembler.assemble(
             noisy_rigids,

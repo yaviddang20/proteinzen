@@ -323,7 +323,8 @@ def collate(data_list):
 
             # we're padding tensor_7s so we need to ensure the quat isn't 0
             if key in ('rigids_t', 'rigids_1'):
-                padded_data['rigids'][key][..., -pad_len:, 0] = 1
+                if pad_len > 0:
+                    padded_data['rigids'][key][..., -pad_len:, 0] = 1
 
         ## pad atom data
         for key, value in data['atom'].items():

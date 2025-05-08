@@ -28,6 +28,7 @@ from torch_geometric.data import HeteroData
 import numpy as np
 
 from proteinzen.data.openfold import residue_constants, data_transforms
+from proteinzen.data.constants import coarse_grain as cg
 from proteinzen.utils.openfold import rigid_utils as ru
 from .task import SamplingTask
 
@@ -43,9 +44,8 @@ def residue_to_atom37(residue):
     for atom in atoms:
         atom_name = atom.get_name()
         # we ignore hydrogens
-        if atom_name.startswith('H'):
-            continue
-        if len(atom_name) > 1 and atom_name[0] in ['1', '2', '3'] and atom_name[1] == 'H':
+        if str(atom.element).upper() == 'H':
+            # print("skipping H")
             continue
         atom_idx = residue_constants.atom_types.index(atom_name)
         residue_37[atom_idx] = torch.as_tensor(atom.get_coord())
@@ -111,6 +111,14 @@ class MotifScaffoldingTask(SamplingTask):
         except Exception as e:
             print(f"error with parsing contigs {contigs} from {pdb}")
             raise e
+
+        cg_group_mask = [
+            cg.cg_group_mask[residue_constants.restype_1to3[resname]]
+            for resname in residue_constants.restypes
+        ]
+        cg_group_mask.append([0.0] * 4)
+        self.cg_group_mask = torch.as_tensor(cg_group_mask, dtype=torch.bool)[:, (0, 2, 3)]
+
 
     def _parse_condition_str(self, contigs_str):
         contigs = [c.strip() for c in contigs_str.split(",")]
@@ -240,27 +248,28 @@ class MotifScaffoldingTask(SamplingTask):
 
         # compute rigids from data
         # a lot of these will be nan
-        rigids_1 = ru.Rigid.from_tensor_4x4(chain_feats['cg_groups_gt_frames'])[:, (0, 2, 3)]
+        rigids_1 = ru.Rigid.from_tensor_4x4(
+            torch.nan_to_num(chain_feats['cg_groups_gt_frames'], nan=0.0)
+        )[:, (0, 2, 3)]
 
-        # we're gonna do some jenk stuff via the rigid trans
-        # bc doing rotations conversions with nans is messy
-        rigids_1_isnan = torch.isnan(rigids_1.get_trans()).any(dim=-1)
-        rigids_1_finite = rigids_1[~rigids_1_isnan]
-        rigids_1_tensor_7 = torch.full((*rigids_1.shape, 7), torch.nan) # rigids_1.to_tensor_7()
-        rigids_1_tensor_7[~rigids_1_isnan] = rigids_1_finite.to_tensor_7()
+        rigids_1_tensor_7 = rigids_1.to_tensor_7()
 
         # TODO: man this is really clunky
         # we copy over dummy rigids where available
         rigids_mask = chain_feats["cg_groups_gt_exists"][:, (0, 2, 3)].bool()
-        rigids_mask = rigids_mask * (~rigids_1_isnan)
+        rigids_mask_from_seq = self.cg_group_mask.to(rigids_mask.device)[seq]
         mask_AG = (seq == residue_constants.restype_order['G']) | (seq == residue_constants.restype_order['A'])
         mask_not_X = (seq != residue_constants.restype_order_with_x['X'])
         dummy_rigid = rigids_1_tensor_7[..., 0, :] * mask_AG[..., None] + rigids_1_tensor_7[..., 1, :] * (~mask_AG & mask_not_X)[..., None]
-        dummy_rigid_location = (~rigids_mask) * mask_not_X[..., None]
+        dummy_rigid_location = (~rigids_mask_from_seq) * mask_not_X[..., None]
         rigids_1_tensor_7[dummy_rigid_location] = 0
         rigids_1_tensor_7 += dummy_rigid[..., None, :] * dummy_rigid_location[..., None]
-        rigids_noising_mask = torch.isnan(rigids_1_tensor_7).any(dim=-1)
+
+        rigids_noising_mask = ~rigids_mask
+        rigids_mask[dummy_rigid_location] = False
         rigids_noising_mask[redesign_mask, 1:] = True
+        unresolved_rigids_mask = rigids_mask_from_seq & ~rigids_mask
+        rigids_noising_mask[unresolved_rigids_mask] = True
 
         # print(rigids_noising_mask)
 
@@ -276,11 +285,6 @@ class MotifScaffoldingTask(SamplingTask):
         rotquats_0 = _uniform_so3(num_noise_rigids)
         noise_tensor_7 = torch.cat([rotquats_0, trans_0], dim=-1)
         rigids_1_tensor_7[rigids_noising_mask] = noise_tensor_7
-
-        # in theory there should be no more nans
-        assert torch.isfinite(rigids_1_tensor_7).all()
-        # print(rigids_1_tensor_7[..., 4:].mean(dim=(0, 1)))
-        # rigids_1 = ru.Rigid.from_tensor_7(rigids_1_tensor_7)
 
         # construct the input heterodata object
         num_res = seq.numel()
