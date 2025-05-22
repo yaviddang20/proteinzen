@@ -11,6 +11,7 @@ from torch.utils.data import default_collate
 
 from proteinzen.data.openfold import data_transforms, residue_constants
 from proteinzen.utils.openfold import rigid_utils as ru
+from proteinzen.data.constants import coarse_grain as cg
 
 from .featurize.rigid_assembler import RigidAssembler
 
@@ -46,17 +47,39 @@ def featurize_input(
     rigids_1 = ru.Rigid.from_tensor_4x4(chain_feats['cg_groups_gt_frames'])[:, (0, 2, 3)]
 
     # compute frame features
-    rigids_mask = chain_feats["cg_groups_gt_exists"][:, (0, 2, 3)]
+    cg_group_mask = [
+        cg.cg_group_mask[residue_constants.restype_1to3[resname]]
+        for resname in residue_constants.restypes
+    ]
+    cg_group_mask.append([0.0] * 4)
+    cg_group_mask = torch.as_tensor(cg_group_mask, dtype=torch.bool)[:, (0, 2, 3)]
+    rigids_mask = chain_feats["cg_groups_gt_exists"][:, (0, 2, 3)].bool()
     rigids_mask *= res_data['res_mask'][..., None]
     rigids_1_tensor_7 = rigids_1.to_tensor_7()
     if dummy_rigid_to_sidechain_rigid:
         seq = res_data['seq']
+        rigids_mask_from_seq = cg_group_mask[seq]
         mask_AG = (seq == residue_constants.restype_order['G']) | (seq == residue_constants.restype_order['A'])
-        dummy_rigid = rigids_1_tensor_7[..., 0, :] * mask_AG[..., None] + rigids_1_tensor_7[..., 1, :] * (~mask_AG[..., None])
-        rigids_1_tensor_7 = (
-            rigids_1_tensor_7 * rigids_mask[..., None] +
-            dummy_rigid[..., None, :] * (1 - rigids_mask[..., None].float())
+        mask_not_X = (seq != residue_constants.restype_order_with_x['X'])
+        dummy_rigid = rigids_1_tensor_7[..., 0, :] * (mask_AG & mask_not_X)[..., None] + rigids_1_tensor_7[..., 1, :] * (~mask_AG & mask_not_X)[..., None]
+        dummy_rigid_location = (~rigids_mask_from_seq) * mask_not_X[..., None]
+
+        unresolved_rigids = rigids_mask_from_seq & ~rigids_mask
+        unresolved_dummy_rigid_mask = (
+            (unresolved_rigids[..., 0] * (mask_AG & mask_not_X))
+            |
+            (unresolved_rigids[..., 1] * (~mask_AG & mask_not_X))
         )
+        dummy_rigid_location[unresolved_dummy_rigid_mask] = False
+
+        rigids_1_tensor_7[dummy_rigid_location] = 0
+        rigids_1_tensor_7 += dummy_rigid[..., None, :] * dummy_rigid_location[..., None]
+
+        rigids_mask[dummy_rigid_location] = True
+        # rigids_1_tensor_7 = (
+        #     rigids_1_tensor_7 * rigids_mask[..., None] +
+        #     dummy_rigid[..., None, :] * (1 - rigids_mask[..., None].float())
+        # )
     else:
         rigids_1_tensor_7 = (
             rigids_1_tensor_7 * rigids_mask[..., None] +
@@ -79,6 +102,7 @@ def featurize_input(
     assembler = RigidAssembler(
         cg_rigids=rigids_1_tensor_7,
         res_mask=res_data['res_mask'],
+        rigids_mask=rigids_mask,
         seq=res_data['seq'],
         cg_version=cg_version,
         promote_full_motif_to_token=promote_full_motif_to_token
@@ -113,6 +137,7 @@ def featurize_input(
         "is_unindexed_mask": "token_is_unindexed_mask",
         "is_ligand_mask": "token_is_ligand_mask",
         "is_protein_output_mask": "token_is_protein_output_mask",
+        "token_uid": "token_uid"
     }
     for rigids_key, token_key in rigids_to_token_names.items():
         features['token'][token_key] = rigids_data[rigids_key][rigids_is_token_rigid_mask]
@@ -195,6 +220,7 @@ def featurize_sample_input_from_task_data(
     rigids_1 = ru.Rigid.from_tensor_4x4(chain_feats['cg_groups_gt_frames'])[:, (0, 2, 3)]
 
     # compute frame features
+
     rigids_mask = chain_feats["cg_groups_gt_exists"][:, (0, 2, 3)]
     rigids_mask *= res_data['res_mask'][..., None]
     rigids_1_tensor_7 = rigids_1.to_tensor_7()

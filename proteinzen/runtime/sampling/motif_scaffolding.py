@@ -262,13 +262,22 @@ class MotifScaffoldingTask(SamplingTask):
         mask_not_X = (seq != residue_constants.restype_order_with_x['X'])
         dummy_rigid = rigids_1_tensor_7[..., 0, :] * mask_AG[..., None] + rigids_1_tensor_7[..., 1, :] * (~mask_AG & mask_not_X)[..., None]
         dummy_rigid_location = (~rigids_mask_from_seq) * mask_not_X[..., None]
+
+        unresolved_rigids_mask = rigids_mask_from_seq & ~rigids_mask
+        unresolved_dummy_rigid_mask = (
+            (unresolved_rigids_mask[..., 0] * (mask_AG & mask_not_X))
+            |
+            (unresolved_rigids_mask[..., 1] * (~mask_AG & mask_not_X))
+        )
+        dummy_rigid_location[unresolved_dummy_rigid_mask] = False
+
         rigids_1_tensor_7[dummy_rigid_location] = 0
         rigids_1_tensor_7 += dummy_rigid[..., None, :] * dummy_rigid_location[..., None]
 
+        rigids_mask[dummy_rigid_location] = True
         rigids_noising_mask = ~rigids_mask
-        rigids_mask[dummy_rigid_location] = False
+        rigids_noising_mask[redesign_mask, 0] = False
         rigids_noising_mask[redesign_mask, 1:] = True
-        unresolved_rigids_mask = rigids_mask_from_seq & ~rigids_mask
         rigids_noising_mask[unresolved_rigids_mask] = True
 
         # print(rigids_noising_mask)

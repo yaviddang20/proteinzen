@@ -31,6 +31,7 @@ class RigidAssembler:
             self,
             cg_rigids = None,
             res_mask = None,
+            rigids_mask = None,
             seq = None,
             ligand_rigids = None,
             cg_version=1,
@@ -38,13 +39,14 @@ class RigidAssembler:
             promote_full_motif_to_token = True
     ):
         assert (
-            (cg_rigids is not None and res_mask is not None and seq is not None)
+            (cg_rigids is not None and res_mask is not None and seq is not None and rigids_mask is not None)
             or
             ligand_rigids is not None
         )
 
         self.cg_rigids = cg_rigids
         self.res_mask = res_mask
+        self.rigids_mask = rigids_mask
         self.seq = seq
         self.cg_version = cg_version
         self.ligand_rigids = ligand_rigids
@@ -103,7 +105,7 @@ class RigidAssembler:
         # print(self.cg_rigids.shape[0], unindexed_motif_mask.sum(), indexed_motif_mask.sum())
 
         flat_rigids = self.cg_rigids.flatten(0, 1)
-        flat_rigids_mask = (torch.ones_like(rigids_noising_mask) * self.res_mask[..., None]).view(-1)
+        flat_rigids_mask = self.rigids_mask.view(-1) # (torch.ones_like(rigids_noising_mask) * self.res_mask[..., None]).view(-1)
         flat_noising_mask = torch.ones_like(indexed_motif_mask)
         _seq_idx = torch.tile(
             self.seq_idx[..., None],

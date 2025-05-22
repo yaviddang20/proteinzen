@@ -63,7 +63,7 @@ class UnconditionalSampling(SamplingTask):
 
         # replace all the remaining nans with centered noise
         num_noise_rigids = self.sample_length * self.rigids_per_res
-        trans_0 = _centered_gaussian(num_noise_rigids)
+        trans_0 = _centered_gaussian(num_noise_rigids) * 16 # * 20 #
         rotquats_0 = _uniform_so3(num_noise_rigids)
         rigids_0_tensor_7 = torch.cat([rotquats_0, trans_0], dim=-1)
         rigids_0_tensor_7 = rigids_0_tensor_7.unflatten(0, (-1, self.rigids_per_res)).contiguous()

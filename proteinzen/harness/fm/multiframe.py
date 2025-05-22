@@ -26,6 +26,7 @@ from proteinzen.stoch_interp.multiframe import _centered_gaussian, _uniform_so3,
 import proteinzen.stoch_interp.utils as du
 from proteinzen.utils.framediff import all_atom
 from proteinzen.utils.coarse_grain import compute_atom14_from_cg_frames
+from proteinzen.data.constants import coarse_grain as cg
 
 
 
@@ -222,19 +223,45 @@ class MultiFrameInterpolation(TrainingHarness):
         # compute bb frame features
         rigids_mask = chain_feats["cg_groups_gt_exists"][:, (0, 2, 3)]
         rigids_mask *= res_data['res_mask'][..., None]
-        res_data['rigids_mask'] = rigids_mask
+        rigids_mask = rigids_mask.bool()
         # res_data['rigids_noising_mask'] = rigids_noising_mask
         res_data['x'] = rigids_1.get_trans()  # for HeteroData's sake
         rigids_1_tensor_7 = rigids_1.to_tensor_7()
 
         if self.dummy_rigid_to_sidechain_rigid:
+            # seq = res_data['seq']
+            # mask_AG = (seq == residue_constants.restype_order['G']) | (seq == residue_constants.restype_order['A'])
+            # dummy_rigid = rigids_1_tensor_7[..., 0, :] * mask_AG[..., None] + rigids_1_tensor_7[..., 1, :] * (~mask_AG[..., None])
+            # rigids_1_tensor_7 = (
+            #     rigids_1_tensor_7 * rigids_mask[..., None] +
+            #     dummy_rigid[..., None, :] * (1 - rigids_mask[..., None].float())
+            # )
+            cg_group_mask = [
+                cg.cg_group_mask[residue_constants.restype_1to3[resname]]
+                for resname in residue_constants.restypes
+            ]
+            cg_group_mask.append([0.0] * 4)
+            cg_group_mask = torch.as_tensor(cg_group_mask, dtype=torch.bool)[:, (0, 2, 3)]
+
             seq = res_data['seq']
+            rigids_mask_from_seq = cg_group_mask[seq]
             mask_AG = (seq == residue_constants.restype_order['G']) | (seq == residue_constants.restype_order['A'])
-            dummy_rigid = rigids_1_tensor_7[..., 0, :] * mask_AG[..., None] + rigids_1_tensor_7[..., 1, :] * (~mask_AG[..., None])
-            rigids_1_tensor_7 = (
-                rigids_1_tensor_7 * rigids_mask[..., None] +
-                dummy_rigid[..., None, :] * (1 - rigids_mask[..., None].float())
+            mask_not_X = (seq != residue_constants.restype_order_with_x['X'])
+            dummy_rigid = rigids_1_tensor_7[..., 0, :] * (mask_AG & mask_not_X)[..., None] + rigids_1_tensor_7[..., 1, :] * (~mask_AG & mask_not_X)[..., None]
+            dummy_rigid_location = (~rigids_mask_from_seq) * mask_not_X[..., None]
+
+            unresolved_rigids = rigids_mask_from_seq & ~rigids_mask
+            unresolved_dummy_rigid_mask = (
+                (unresolved_rigids[..., 0] * (mask_AG & mask_not_X))
+                |
+                (unresolved_rigids[..., 1] * (~mask_AG & mask_not_X))
             )
+            dummy_rigid_location[unresolved_dummy_rigid_mask] = False
+
+            rigids_1_tensor_7[dummy_rigid_location] = 0
+            rigids_1_tensor_7 += dummy_rigid[..., None, :] * dummy_rigid_location[..., None]
+
+            rigids_mask[dummy_rigid_location] = True
         else:
             rigids_1_tensor_7 = (
                 rigids_1_tensor_7 * rigids_mask[..., None] +
@@ -242,6 +269,7 @@ class MultiFrameInterpolation(TrainingHarness):
             )
         res_data['rigids_1'] = rigids_1_tensor_7
         res_data['rigids_1_flat'] = rigids_1_tensor_7.flatten(0, 1)
+        res_data['rigids_mask'] = rigids_mask
 
         # compute sidechain features
         ## generate data dict

@@ -282,6 +282,7 @@ class Embedder(nn.Module):
             t,
             node_mask,
             rigids,
+            rigids_mask,
             rigids_noising_mask,
             sc_rigids=None,
         ):
@@ -361,6 +362,7 @@ class Embedder(nn.Module):
         ) = pad_and_flatten_rigids(
             rigids,
             rigids_init,
+            rigids_mask,
             rigids_noising_mask,
             self.block_q
         )
@@ -392,6 +394,7 @@ class Embedder(nn.Module):
                 sc_rigids_flat = pad_and_flatten_rigids(
                     sc_rigids,
                     rigids_init,
+                    rigids_mask,
                     rigids_noising_mask,
                     self.block_q
                 )[0]
@@ -504,6 +507,7 @@ class EmbedderV2(nn.Module):
             get_timestep_embedding_flexshape,
             embedding_dim=index_embed_size
         )
+        self.time_condition_embed = Linear(index_embed_size, c_s, bias=False)
         self.index_embedder = fn.partial(
             get_index_embedding,
             embed_size=index_embed_size
@@ -610,6 +614,9 @@ class EmbedderV2(nn.Module):
         node_init = self.node_init(node_seq_idx_embed) * (~is_unindexed_mask[..., None])
         visible_seq = seq * seq_mask + self.mask_token * (~seq_mask)
         visible_seq = visible_seq * (~seq_noising_mask) + self.mask_token * seq_noising_mask
+        # print(seq_idx)
+        # print(visible_seq)
+        # print(is_unindexed_mask)
         seq_embed = F.one_hot(visible_seq, num_classes=self.num_aa).float()
         node_init = (
             node_init
@@ -841,7 +848,7 @@ class EmbedderV2(nn.Module):
             "node_init": node_init,
             "node_embed": node_embed,
             "edge_embed": edge_embed,
-            "time_condition_embed": self.timestep_embedder(t),
+            "time_condition_embed": self.time_condition_embed(self.timestep_embedder(t)),
             "rigids_embed": rigids_embed,
             "framepair_embed": framepair_embed,
             "framepair_init": framepair_init,
@@ -1150,6 +1157,7 @@ class IpaScoreV2(nn.Module):
                  ipa_row_dropout_r=0.,
                  tfmr_row_dropout_r=0.,
                  use_qk_norm=False,
+                 predict_final_rot=False,
                  ):
         super().__init__()
         # self.diffuser = diffuser
@@ -1272,6 +1280,16 @@ class IpaScoreV2(nn.Module):
         self.torsion_pred = TorsionAngles(c_s, 1)
         self.seq_pred = SeqPredictor(c_s, c_frame)
 
+        if predict_final_rot:
+            self.final_rot_head = nn.Sequential(
+                LayerNorm(c_frame),
+                Linear(c_frame, c_frame, bias=False),
+                nn.ReLU(),
+                Linear(c_frame, 3, bias=False)
+            )
+        else:
+            self.final_rot_head = None
+
 
     def forward(self, input_feats):
         node_embed = input_feats['node_embed']
@@ -1283,7 +1301,7 @@ class IpaScoreV2(nn.Module):
 
         framepair_embed = input_feats['framepair_embed']
 
-        curr_rigids = input_feats['rigids_t']
+        init_rigids = input_feats['rigids_t']
         rigids_embed_flat = input_feats['rigids_embed']
         rigids_token_uid = input_feats['rigids_token_uid']
         rigids_mask_flat = input_feats['rigids_mask']
@@ -1293,7 +1311,7 @@ class IpaScoreV2(nn.Module):
         to_keys = input_feats['to_keys']
         to_pairs = input_feats['to_pairs']
 
-        curr_rigids = self.scale_rigids(curr_rigids)
+        curr_rigids = self.scale_rigids(init_rigids)
         node_embed = node_embed * node_mask[..., None]
         rigids_to_nodes = fn.partial(gather_helper, token_gather_idx=input_feats['token_gather_idx'])
 
@@ -1360,9 +1378,26 @@ class IpaScoreV2(nn.Module):
             out=torch.zeros_like(node_embed)
         )
         # print(curr_rigids.shape, input_feats['n_padding'])
+        if self.final_rot_head is not None:
+            rotvec = self.final_rot_head(rigids_embed_flat)
+            axis = F.normalize(rotvec, dim=-1)
+            angle = F.sigmoid(torch.linalg.vector_norm(rotvec + 1e-8, dim=-1)) * 2 * torch.pi
+            angle = angle * rigids_noising_mask_flat * rigids_mask_flat
+            rotquat = torch.cat([
+                torch.cos(angle/2)[..., None], torch.sin(angle/2)[..., None] * axis
+            ], dim=-1)
+            rel_rot = ru.Rotation(quats=rotquat)
+            new_rot = rel_rot.compose_q(init_rigids.get_rots())
+            curr_rigids = ru.Rigid(
+                rots=new_rot,
+                trans=curr_rigids.get_trans()
+            )
+
         if input_feats['n_padding'] > 0:
             curr_rigids = curr_rigids[..., :-input_feats['n_padding']]
         curr_rigids = self.unscale_rigids(curr_rigids)
+
+
         _, psi_pred = self.torsion_pred(node_embed)
         model_out = {
             'psi': psi_pred,
@@ -1586,6 +1621,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                 chain_idx=chain_idx,
                 t=rigidwise_t.unflatten(0, (batch_size, seq_idx.shape[1])),
                 rigids=rigids_in,
+                rigids_mask=res_data['rigids_mask'].unflatten(0, (batch_size, -1)),
                 rigids_noising_mask=res_data['rigids_noising_mask'].unflatten(0, (batch_size, -1)),
                 node_mask=res_mask.view(batch_size, -1),
                 sc_rigids=sc_rigids,
@@ -1655,6 +1691,40 @@ class IpaMultiRigidDenoiser(nn.Module):
         return ret
 
 
+class MonotonicIncreasingFn(nn.Module):
+    def __init__(self, c_hidden=1024):
+        super().__init__()
+        self.c_hidden = c_hidden
+        self.l1 = nn.Linear(1, 1)
+        self.l2 = nn.Linear(1, c_hidden)
+        self.l3 = nn.Linear(c_hidden, c_hidden)
+        self.l4 = nn.Linear(c_hidden, 1)
+
+    # def _forward(self, x):
+    #     x = F.linear(x, torch.exp(self.l1.weight), torch.exp(self.l1.bias))
+    #     out = F.linear(x, torch.exp(self.l2.weight), torch.exp(self.l2.bias))
+    #     out = torch.sigmoid(out)
+    #     out = F.linear(out, torch.exp(self.l4.weight), torch.exp(self.l4.bias))
+    #     return out
+
+    def _forward(self, x):
+        x = F.linear(x, torch.square(self.l1.weight), self.l1.bias)
+        out = F.linear(x, torch.square(self.l2.weight), self.l2.bias)
+        out = torch.sigmoid(out)
+        # out = F.linear(out, torch.abs(self.l3.weight), torch.abs(self.l3.bias))
+        # out = torch.sigmoid(out)
+        out = F.linear(out, torch.square(self.l4.weight))
+        return x + out
+
+    def forward(self, x):
+        x_0 = self._forward(torch.zeros_like(x))
+        x_1 = self._forward(torch.ones_like(x))
+        out = self._forward(x)
+        ret = (out - x_0) / (x_1 - x_0).clamp(min=1e-8)
+        # print(x_0, x_1, out, ret)
+        return ret
+
+
 class IpaMultiRigidDenoiserV2(nn.Module):
     def __init__(self,
                  c_s=256,
@@ -1693,6 +1763,8 @@ class IpaMultiRigidDenoiserV2(nn.Module):
                  cg_version=1,
                  use_qk_norm=False,
                  use_amp=False,
+                 predict_final_rot=False,
+                 learnable_noise_schedule=False
                  ):
         super().__init__()
 
@@ -1737,6 +1809,7 @@ class IpaMultiRigidDenoiserV2(nn.Module):
             ipa_row_dropout_r=ipa_row_dropout_r,
             tfmr_row_dropout_r=tfmr_row_dropout_r,
             use_qk_norm=use_qk_norm,
+            predict_final_rot=predict_final_rot
         )
 
         self.embedder = EmbedderV2(
@@ -1760,6 +1833,12 @@ class IpaMultiRigidDenoiserV2(nn.Module):
         self.trans_preconditioning = trans_preconditioning
         self.rot_preconditioning = rot_preconditioning
         self.cg_version = cg_version
+
+        if learnable_noise_schedule:
+            # self.trans_gamma_t = lambda x: x # MonotonicIncreasingFn()
+            self.rot_gamma_t = MonotonicIncreasingFn()
+            self.trans_gamma_t = MonotonicIncreasingFn()
+            # self.rot_gamma_t = lambda x: x # MonotonicIncreasingFn()
 
     def forward(self, data, self_condition=None):
         token_data = data['token']

@@ -1060,11 +1060,11 @@ class MultiRigidPairEmbedderV2(nn.Module):
     ):
         edge_mask = node_mask[..., None] & node_mask[..., None, :]
         same_chain_mask = (chain_idx[..., None] == chain_idx[..., None, :])
-        pair_is_unindexed_mask = token_is_unindexed_mask[..., None] | token_is_unindexed_mask[..., None]
+        pair_is_unindexed_mask = token_is_unindexed_mask[..., None] | token_is_unindexed_mask[..., None, :]
 
         relpos_feats = relpos(seq_idx, clip=self.relpos_clip)
         relpos_feats = relpos_feats * same_chain_mask[..., None]
-        relpos_featus = relpos_feats * ~pair_is_unindexed_mask[..., None]
+        relpos_feats = relpos_feats * ~pair_is_unindexed_mask[..., None]
         # relpos_feats[~same_chain_mask][..., -1] += 1
 
         z = self.lin_z_ij(relpos_feats)

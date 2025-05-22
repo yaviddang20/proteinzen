@@ -1160,7 +1160,7 @@ class ConditionedBlockTransformerPairBias(nn.Module):
         return rigids_embed
 
 
-def pad_and_flatten_rigids(rigids, rigids_embed, rigids_noising_mask, block_q):
+def pad_and_flatten_rigids(rigids, rigids_embed, rigids_mask, rigids_noising_mask, block_q):
     rigids_to_res_idx = torch.arange(rigids_embed.shape[1], device=rigids_embed.device)
     n_batch, _, rigids_per_res = rigids_embed.shape[:3]
     rigids_to_res_idx = torch.tile(rigids_to_res_idx[None, :, None], (n_batch, 1, rigids_per_res))
@@ -1169,11 +1169,11 @@ def pad_and_flatten_rigids(rigids, rigids_embed, rigids_noising_mask, block_q):
 
     # pad to proper input shape
     rigids_embed_flat = rigids_embed.flatten(1, 2)
-    rigids_mask = torch.ones(rigids_embed_flat.shape[:-1], device=rigids_embed_flat.device, dtype=torch.bool)
+    # rigids_mask = torch.ones(rigids_embed_flat.shape[:-1], device=rigids_embed_flat.device, dtype=torch.bool)
     n_padding = (block_q - (rigids_embed_flat.shape[1] % block_q)) % block_q
     rigids_embed_flat = F.pad(rigids_embed_flat, (0, 0, 0, n_padding), value=0)
     rigids_noising_mask_flat = F.pad(rigids_noising_mask.flatten(-2, -1), (0, n_padding), value=False)
-    rigids_flat_mask = F.pad(rigids_mask, (0, n_padding), value=0)
+    rigids_flat_mask = F.pad(rigids_mask.flatten(-2, -1), (0, n_padding), value=0)
     rigids_to_res_idx = F.pad(
         rigids_to_res_idx.view(n_batch, -1),
         (0, n_padding),

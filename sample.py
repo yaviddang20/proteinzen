@@ -138,7 +138,7 @@ class Experiment:
         for name, metadata in samples_metadata.items():
             entry = {
                 chain: []
-                for chain in set(metadata['fixed_res_chain'])
+                for chain in set(metadata['fixed_seq_chain'])
             }
             for pos, pos_chain in zip(metadata['fixed_seq_res_idx'], metadata['fixed_seq_chain']):
                 entry[pos_chain].append(pos)

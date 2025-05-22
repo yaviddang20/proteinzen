@@ -1,5 +1,6 @@
 import tqdm
 import torch
+import torch.nn.functional as F
 from scipy.spatial.transform import Rotation
 import copy
 from functools import partial
@@ -96,6 +97,7 @@ class MultiSE3Interpolant:
                  sampling_churn=0.4,
                  churn_by_sigma=False,
                  num_timesteps=400,
+                 use_euclidean_for_rots=False
     ):
         self._igso3 = None
 
@@ -132,6 +134,7 @@ class MultiSE3Interpolant:
         self.center_on_motif = center_on_motif
         self.sig_perturb = sig_perturb
         self.use_uniform_rot_noise = use_uniform_rot_noise
+        self.use_euclidean_for_rots = use_euclidean_for_rots
 
     @property
     def igso3(self):
@@ -175,16 +178,6 @@ class MultiSE3Interpolant:
         trans_t = _trans_diffuse_mask(trans_t, trans_1, diffuse_mask)
         return trans_t * rigids_mask[..., None]
 
-    def __sample_rotmats_0(self, rotmats_1):
-        if self.use_uniform_rot_noise:
-            rotmats_0 = _uniform_so3(rotmats_1.shape[0], rotmats_1.shape[1], rotmats_1.device)
-        else:
-            num_res = rotmats_1.shape[0]
-            noisy_rotmats = self.igso3.sample(torch.tensor([1.5]), num_res * self.rigids_per_res).to(rotmats_1.device)
-            noisy_rotmats = noisy_rotmats.squeeze(0).view(num_res, self.rigids_per_res, 3, 3).float()
-            rotmats_0 = torch.einsum("...ij,...jk->...ik", rotmats_1, noisy_rotmats)
-        return rotmats_0
-
     def _sample_rotmats_0(self, rotmats_1):
         if self.use_uniform_rot_noise:
             rotmats_0 = _uniform_so3(rotmats_1.shape[0], rotmats_1.shape[1], rotmats_1.device)
@@ -196,7 +189,20 @@ class MultiSE3Interpolant:
         return rotmats_0
 
     def _corrupt_rotmats(self, rotmats_1, rotmats_0, t, rigids_mask, diffuse_mask):
-        rotmats_t = so3_utils.geodesic_t(t[..., None], rotmats_1, rotmats_0)
+        if self.use_euclidean_for_rots:
+            rotvecs_1 = so3_utils.rotmat_to_rotvec(rotmats_1)
+            # rotvecs_0 = torch.randn_like(rotvecs_1) * torch.pi
+            rotvecs_0 = so3_utils.rotmat_to_rotvec(rotmats_0)
+            rotvecs_t = (1 - t[..., None]) * rotvecs_0 + t[..., None] * rotvecs_1
+            angle_t = torch.linalg.vector_norm(rotvecs_t + 1e-10, dim=-1)
+            angle_t = torch.remainder(angle_t, 2 * torch.pi)
+            flip_rotvec = angle_t >= torch.pi
+            angle_t = (2 * torch.pi - angle_t) * flip_rotvec + angle_t * ~flip_rotvec
+            axis_t = F.normalize(rotvecs_t, dim=-1) * (1 - 2 * flip_rotvec)[..., None]
+            rotvecs_t = axis_t * angle_t[..., None]
+            rotmats_t = so3_utils.rotvec_to_rotmat(rotvecs_t)
+        else:
+            rotmats_t = so3_utils.geodesic_t(t[..., None], rotmats_1, rotmats_0)
         identity = torch.eye(3, device=t.device)
         rotmats_t = rotmats_t * rigids_mask[..., None, None] + identity[None, None] * (
             ~rigids_mask[..., None, None]
@@ -318,7 +324,7 @@ class MultiSE3Interpolant:
 
         return batch
 
-    @torch.no_grad()
+    # @torch.no_grad()
     def corrupt_dense_batch(self, batch):
         rigids_data = batch["rigids"]
 
@@ -342,11 +348,11 @@ class MultiSE3Interpolant:
             center_mask = rigids_mask * (~rigids_noising_mask)
             fixed_trans_1 = trans_1 * center_mask[..., None]
             fixed_center = fixed_trans_1.sum(dim=1) / center_mask.long().sum(dim=1)[..., None].clip(min=1)
-            global_center = trans_1.sum(dim=1) / rigids_mask.long().sum(dim=1)[..., None].clip(min=1)
+            global_center = (trans_1 * rigids_mask[..., None]).sum(dim=1) / rigids_mask.long().sum(dim=1)[..., None].clip(min=1)
             use_fixed_center = center_mask.any(dim=-1)
             center = fixed_center * use_fixed_center[..., None] + global_center * (~use_fixed_center[..., None])
         else:
-            center = trans_1.sum(dim=1) / rigids_mask.long().sum(dim=1)[..., None].clip(min=1)
+            center = (trans_1 * rigids_mask[..., None]).sum(dim=1) / rigids_mask.long().sum(dim=1)[..., None].clip(min=1)
 
         trans_1 = trans_1 - center[..., None, :]
         # this is just so we can calculate atom14 rmsds
@@ -365,7 +371,7 @@ class MultiSE3Interpolant:
             align_batch = torch.tile(
                 torch.arange(rigids_mask.shape[0])[..., None],
                 (1, rigids_mask.shape[1])
-            )
+            ).to(align_mask.device)
             align_batch = align_batch[align_mask]
 
             _, _, align_rot_mats = du.align_structures(
@@ -378,25 +384,34 @@ class MultiSE3Interpolant:
         if self.use_stochastic_centering:
             trans_0 = trans_0 + torch.randn_like(trans_0) * self.sig_perturb
 
-        t = batch['t']
+        trans_time = batch['trans_t']
+        rot_time = batch['rot_t']
 
         trans_t = self._corrupt_trans(
             trans_1,
             trans_0,
-            t,
+            trans_time,
             rigids_mask,
             rigids_noising_mask.bool(),
         )
         rotmats_t = self._corrupt_rotmats(
             rotmats_1,
             rotmats_0,
-            t,
+            rot_time,
             rigids_mask,
             rigids_noising_mask.bool(),
         )
+
+        rotvecs_t = so3_utils.rotmat_to_rotvec(rotmats_t)
+        angle_t = torch.linalg.vector_norm(rotvecs_t + 1e-8, dim=-1)
+        axis_t = F.normalize(rotvecs_t, dim=-1)
+        rotquats_t = torch.cat([
+            torch.cos(angle_t/2)[..., None], torch.sin(angle_t/2)[..., None] * axis_t
+        ], dim=-1)
         rigids_t = ru.Rigid(
-            rots=ru.Rotation(rot_mats=rotmats_t), trans=trans_t
+            rots=ru.Rotation(quats=rotquats_t), trans=trans_t
         )
+
         rigids_data["rigids_t"] = rigids_t.to_tensor_7()
         rigids_data["rotmats_t"] = rotmats_t
         rigids_data["trans_t"] = trans_t
@@ -467,12 +482,14 @@ class MultiSE3Interpolant:
             trans_1,
             trans_t,
             noising_mask,
+            vf_scale=1
     ):
         add_noise = (self.sampling_noise_mode == "euler")
         use_score = (self.sampling_noise_mode is not None)
         trans_vf = (trans_1 - trans_t) / (1 - t)
 
         step_size = self.trans_step_size if use_score else 1
+        step_size = step_size * vf_scale
         g_t = self.g_t(t)
         gamma = self.trans_gamma
         dW_t = torch.randn_like(trans_t) * torch.sqrt(d_t) * 10
@@ -540,6 +557,7 @@ class MultiSE3Interpolant:
             rotmats_1,
             rotmats_t,
             noising_mask,
+            vf_scale=1
     ):
         add_noise = (self.sampling_noise_mode == "euler")
         use_score = (self.sampling_noise_mode is not None)
@@ -558,7 +576,7 @@ class MultiSE3Interpolant:
         rot_score = self._rots_score(t, rotmats_1, rotmats_t) * use_score
 
         g_t = self.g_t(t)
-        step_size = self.rot_step_size
+        step_size = self.rot_step_size * vf_scale
         gamma = self.rot_gamma
         dB_rot = torch.randn_like(rot_vf) * torch.sqrt(d_t)
         if t > 0.99:

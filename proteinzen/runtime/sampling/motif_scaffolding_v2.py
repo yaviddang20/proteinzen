@@ -104,6 +104,7 @@ class MotifScaffoldingTaskV2(SamplingTask):
         except Exception as e:
             print(f"error with parsing contigs {pdb_contigs} from {pdb}")
             raise e
+
         try:
             self.motif_seq_idx, self.motif_res_is_unindexed = self._parse_idx_str(contigs_idx)
         except Exception as e:
@@ -143,24 +144,28 @@ class MotifScaffoldingTaskV2(SamplingTask):
         return dict_cat(data_chunks)
 
     def _parse_idx_str(self, idx_str):
-        idx_contigs = [c.strip() for c in idx_str.split(",")]
-        idxs = []
+        if len(idx_str) == 0:
+            # blank str means all unindexed
+            idxs = [-1 for _ in self.contigs['aatype']]
+        else:
+            idx_contigs = [c.strip() for c in idx_str.split(",")]
+            idxs = []
 
-        for contig in idx_contigs:
-            if contig.startswith("[") and contig.endswith("]"):
-                # unindexed residue
-                for _ in range(int(contig[1:-1])):
-                    idxs.append(-1)
-            elif "-" in contig:
-                # index range
-                motif_start, motif_end = [int(i) for i in contig.split("-")]
-                for i in range(motif_start, motif_end + 1):
-                    idxs.append(i)
-            else:
-                # there might be some adversarial case where this check holds but this should be fine for now
-                assert str(int(contig)) == contig
-                motif_resid = int(contig)
-                idxs.append(motif_resid)
+            for contig in idx_contigs:
+                if contig.startswith("[") and contig.endswith("]"):
+                    # unindexed residue
+                    for _ in range(int(contig[1:-1])):
+                        idxs.append(-1)
+                elif "-" in contig:
+                    # index range
+                    motif_start, motif_end = [int(i) for i in contig.split("-")]
+                    for i in range(motif_start, motif_end + 1):
+                        idxs.append(i)
+                else:
+                    # there might be some adversarial case where this check holds but this should be fine for now
+                    assert str(int(contig)) == contig
+                    motif_resid = int(contig)
+                    idxs.append(motif_resid)
 
         motif_seq_idx = torch.as_tensor(idxs, dtype=torch.long)
         motif_res_is_unindexed = (motif_seq_idx == -1)

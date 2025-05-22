@@ -11,6 +11,7 @@ import lightning as L
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from proteinzen.harness import TrainingHarness
 from proteinzen.data.datasets.featurize.rigid_assembler import rigids_to_atom14
+from proteinzen.data.openfold import residue_constants
 from proteinzen.utils.openfold import rigid_utils as ru
 from proteinzen.utils.coarse_grain import compute_atom14_from_cg_frames
 
@@ -43,6 +44,14 @@ def t_stratified_loss(batch_t, batch_loss, num_bins=4, loss_name=None):
     return stratified_losses
 
 
+DEFAULT_SEQ_WEIGHT = {
+    c: 1.0
+    for c in 'ACDEFGHIKLMNPQRSTVWY'
+}
+DEFAULT_SEQ_WEIGHT['X'] = 0.
+for c in ['C', 'E', 'H', 'P', 'Q', 'R', 'W']:
+    DEFAULT_SEQ_WEIGHT[c] = 2.0
+
 class ProteinModule(L.LightningModule):
     def __init__(self,
                  model,
@@ -57,7 +66,10 @@ class ProteinModule(L.LightningModule):
                  ema_decay=0.999,
                  use_posthoc_ema=False,
                  use_dense_batch_loss=False,
-                 use_predict_v2=False
+                 use_predict_v2=False,
+                 seq_weight=DEFAULT_SEQ_WEIGHT,
+                 use_euclidean_for_rots=False,
+                 learnable_noise_schedule=False
     ):
         super().__init__()
         self._log = logging.getLogger(__name__)
@@ -72,6 +84,13 @@ class ProteinModule(L.LightningModule):
         self.use_ema = use_ema
         self.use_posthoc_ema = use_posthoc_ema
         self.use_dense_batch_loss = use_dense_batch_loss
+        self.use_euclidean_for_rots = use_euclidean_for_rots
+        self.learnable_noise_schedule = learnable_noise_schedule
+        if learnable_noise_schedule:
+            self.automatic_optimization = False
+
+        seq_weight_tensor = torch.as_tensor([seq_weight[c] for c in residue_constants.restypes_with_x])
+        self.seq_weight = seq_weight_tensor
 
         if use_dense_batch_loss:
             use_predict_v2 = True
@@ -109,20 +128,36 @@ class ProteinModule(L.LightningModule):
         if self.ema_short is not None and self.global_step > 0:
             self.ema_short.update_parameters(self.model, self.global_step-1)
 
+        corrupter = self.training_harness.frame_noiser
+        if self.learnable_noise_schedule:
+            with torch.no_grad():
+                trans_t = self.model.trans_gamma_t(batch['t'])
+                rot_t = self.model.rot_gamma_t(batch['t'])
+            trans_t.requires_grad = True
+            rot_t.requires_grad = True
+            print(trans_t.view(-1).tolist(), rot_t.view(-1).tolist(), batch['t'].view(-1).tolist())
+            batch['trans_t'] = trans_t
+            batch['rot_t'] = rot_t
+        else:
+            batch['trans_t'] = batch['t']
+            batch['rot_t'] = batch['t']
+
+        if self.use_dense_batch_loss:
+            batch = corrupter.corrupt_dense_batch(batch)
+        # else:
+        #     batch = corrupter.corrupt_batch(batch)
+
         if self.use_amp:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 outputs = training_harness.run_eval(self.model, batch)
 
-            if self.use_dense_batch_loss:
-                loss_dict = self._loss_step(batch, outputs)
-            else:
-                loss_dict = training_harness.compute_loss(batch, outputs)
         else:
             outputs = training_harness.run_eval(self.model, batch)
-            if self.use_dense_batch_loss:
-                loss_dict = self._loss_step(batch, outputs)
-            else:
-                loss_dict = training_harness.compute_loss(batch, outputs)
+
+        if self.use_dense_batch_loss:
+            loss_dict = self._loss_step(batch, outputs)
+        else:
+            loss_dict = training_harness.compute_loss(batch, outputs)
 
         log_dict = tree.map_structure(
             lambda x: torch.round(torch.mean(x), decimals=3) if torch.is_tensor(x) else x,
@@ -184,15 +219,64 @@ class ProteinModule(L.LightningModule):
                 sync_dist=True)
 
         # self._log.info(gen_pbar_str(loss_dict))
-        return loss_dict
+        if not self.learnable_noise_schedule:
+            return loss_dict
+        else:
+            opt = self.optimizers()
+            opt.zero_grad()
+            loss = loss_dict['loss']
+            self.manual_backward(loss)
+            loss_per_batch = loss_dict['loss_per_batch']
+            trans_t = batch['trans_t']
+            rot_t = batch['rot_t']
+            t = batch['t']
+            trans_t_copy = self.model.trans_gamma_t(t)
+            rot_t_copy = self.model.rot_gamma_t(t)
+            trans_t_copy.backward(trans_t.grad * loss_per_batch[..., None] * 2)
+            rot_t_copy.backward(rot_t.grad * loss_per_batch[..., None] * 2)
+            # for name, param in self.model.trans_gamma_t.named_parameters():
+            #     if param.grad is not None:
+            #         print("trans", name, param.grad)
+            # for name, param in self.model.rot_gamma_t.named_parameters():
+            #     if param.grad is not None:
+            #         print("rot", name, param.grad)
+            opt.step()
 
 
     def _loss_step(self, inputs, outputs):
+        token_seq = inputs['token']['seq']
+        seq_weight = self.seq_weight.to(token_seq.device)
+        rigids_seq_idx = inputs['rigids']['rigids_seq_idx']
+        rigids_seq = torch.gather(
+            token_seq,
+            -1,
+            rigids_seq_idx,
+        )
+        rigidwise_weight = seq_weight[rigids_seq]
+
+        if self.learnable_noise_schedule:
+            t = inputs['t']
+            log_trans_time_fn = lambda x: torch.log(1 - self.model.trans_gamma_t(x))
+            log_rot_time_fn = lambda x: torch.log(1 - self.model.rot_gamma_t(x))
+            log_trans_t_grad = torch.func.jvp(log_trans_time_fn, (t,), (torch.ones_like(t),))[1]
+            log_rot_t_grad = torch.func.jvp(log_rot_time_fn, (t,), (torch.ones_like(t),))[1]
+            print(log_trans_t_grad, log_rot_t_grad, 1 / (1 - t.clip(max=0.9)))
+            log_trans_t_grad = log_trans_t_grad.clip(min=-10, max=10)
+            log_rot_t_grad = log_rot_t_grad.clip(min=-10, max=10)
+            log_trans_t_grad = log_trans_t_grad * (1 - t.clip(max=0.9))
+            log_rot_t_grad = log_rot_t_grad * (1 - t.clip(max=0.9))
+        else:
+            log_trans_t_grad = 1
+            log_rot_t_grad = 1
+
         frame_fm_loss_dict = multiframe_fm_loss_dense_batch(
-            inputs, outputs, sep_rot_loss=True,
+            inputs, outputs, sep_rot_loss=True, use_euclidean_for_rots=self.use_euclidean_for_rots,
             t_norm_clip=0.9,
             rot_vf_angle_loss_weight=0.5,
             fafe_l2_block_mask_size=1,
+            rigidwise_weight=rigidwise_weight,
+            trans_rigidwise_weight=log_trans_t_grad**2,
+            rot_rigidwise_weight=log_rot_t_grad**2,
         )
 
         frame_vf_loss = (
@@ -204,9 +288,11 @@ class ProteinModule(L.LightningModule):
             frame_fm_loss_dict["unscaled_rot_vf_loss"]
         )
 
+        atomic_seq_weight = seq_weight[token_seq]
         atomic_loss_dict = atomic_losses_dense_batch(
             inputs,
             outputs,
+            seqwise_weight=atomic_seq_weight
         )
 
         atomic_loss = (
@@ -216,19 +302,19 @@ class ProteinModule(L.LightningModule):
 
         loss = (
             frame_vf_loss
-            + 0.5 * frame_fm_loss_dict['scaled_fafe']
-            + atomic_loss
+            # + 0.5 * frame_fm_loss_dict['scaled_fafe']
+            # + atomic_loss
         )
-        loss = loss.mean()
+        loss_dict = {"loss": loss.mean(), "frame_vf_loss": frame_vf_loss, "frame_vf_loss_unscaled": unscaled_frame_vf_loss}
+        loss_dict['loss_per_batch'] = loss
 
-
-        loss_dict = {"loss": loss, "frame_vf_loss": frame_vf_loss, "frame_vf_loss_unscaled": unscaled_frame_vf_loss}
         if 'motif_idx' in outputs:
             pred_motif_idx = outputs['motif_idx']
             gt_motif_idx = inputs['token']['token_seq_idx']
             is_motif_mask = ~inputs['token']['token_is_protein_output_mask'] & ~inputs['token']['token_is_ligand_mask']
             motif_idx_correct = (pred_motif_idx == gt_motif_idx) * is_motif_mask
-            loss_dict['motif_idx_correct'] = motif_idx_correct.sum() / is_motif_mask.sum()
+            if is_motif_mask.sum() > 0:
+                loss_dict['motif_idx_correct'] = motif_idx_correct.sum() / is_motif_mask.sum()
         loss_dict[inputs['task'].name + "_loss"] = loss
         loss_dict[inputs['task'].name + "_seq_loss"] = atomic_loss_dict["seq_loss"]
         loss_dict[inputs['task'].name + "_frame_vf_loss"] = frame_vf_loss
@@ -506,6 +592,8 @@ class ProteinModule(L.LightningModule):
         clean_traj_seqs = _package_traj(clean_traj, -3)
         prot_trajs = _package_traj(prot_traj, -1)
 
+        # TODO: there's smth funky going on here
+        # where seq is fixed and bb is fixed but rigid is not fixed
         fixed_residues = (~rigids_noising_mask).all(dim=-1)[res_mask].split(num_res.tolist(), dim=0)
         fixed_bb_residues = (~rigids_noising_mask[..., 0])[res_mask].split(num_res.tolist(), dim=0)
         fixed_seq_residues = (~seq_noising_mask)[res_mask].split(num_res.tolist(), dim=0)
@@ -648,6 +736,9 @@ class ProteinModule(L.LightningModule):
                 )
             )
 
+            # if self.learnable_noise_schedule:
+            #     trans_vf_scale =
+
             # Take reverse step
             trans_t_2 = frame_noiser._trans_euler_step(
                 d_t_hat,
@@ -756,17 +847,28 @@ class ProteinModule(L.LightningModule):
         # print([t.shape for t in fixed_residues])
 
         fixed_res_idx = [torch.as_tensor([]) for _ in range(output_mask.shape[0])]
-        fixed_bb_res_idx = [torch.as_tensor([]) for _ in range(output_mask.shape[0])]
-        fixed_seq_res_idx = [torch.as_tensor([]) for _ in range(output_mask.shape[0])]
+
+        motif_idx = denoiser_out['motif_idx']
+        motif_bb_mask = (~token_data['token_is_protein_output_mask'] & ~token_data['token_is_ligand_mask'])
+        fixed_bb_res_idx = []
+        fixed_seq_res_idx = []
+        for i in range(motif_idx.shape[0]):
+            motif_idx_ = motif_idx[i, motif_bb_mask[i]]
+            motif_seq_fixed = ~token_data['seq_noising_mask'][i, motif_bb_mask[i]]
+            fixed_bb_res_idx.append(motif_idx_)
+            fixed_seq_res_idx.append(motif_idx_[motif_seq_fixed])
+
 
         res_chain_idx = []
+        fixed_bb_chain_idx = []
+        fixed_seq_chain_idx = []
+        for i in range(motif_idx.shape[0]):
+            _chain_idx = token_data['chain_idx'][i, motif_bb_mask[i]]
+            fixed_bb_chain_idx.append(_chain_idx)
+            motif_seq_fixed = ~token_data['seq_noising_mask'][i, motif_bb_mask[i]]
+            fixed_seq_chain_idx.append(_chain_idx[motif_seq_fixed])
+
         fixed_res_chain_idx = [
-            torch.as_tensor([]) for _ in range(output_mask.shape[0])
-        ]
-        fixed_bb_chain_idx = [
-            torch.as_tensor([]) for _ in range(output_mask.shape[0])
-        ]
-        fixed_seq_chain_idx = [
             torch.as_tensor([]) for _ in range(output_mask.shape[0])
         ]
 

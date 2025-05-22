@@ -15,7 +15,7 @@ class UnconditionalGenerationV2(TrainingTask):
         t_min=0.01,
         t_max=0.99,
     ):
-        assert t_sched in ['lognorm', 'mixed_beta']
+        assert t_sched in ['lognorm', 'mixed_beta', 'uniform']
         self.t_sched = t_sched
         self.lognorm_mu = lognorm_mu
         self.lognorm_sig = lognorm_sig
@@ -38,6 +38,8 @@ class UnconditionalGenerationV2(TrainingTask):
             else:
                 dist = torch.distributions.beta.Beta(self.beta_p1, self.beta_p2)
                 t = dist.sample((1,)).to(device)
+        elif self.t_sched == 'uniform':
+            t = torch.rand(1, device=device).float()
         else:
             raise ValueError(f"self.t_sched={self.t_sched} not recognized")
 
