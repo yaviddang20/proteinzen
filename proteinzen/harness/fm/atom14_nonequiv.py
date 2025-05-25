@@ -71,12 +71,13 @@ class Atom14Interpolation(TrainingHarness):
 
     def __init__(self,
                  protein_noiser: Atom14Interpolant,
+                 task_sampler,
                  aux_loss_t_min=0.25,
                  traj_decay_factor=0.99,
                  preconditioning=False
     ):
         super().__init__()
-        self.atom_noiser = protein_noiser
+        self.frame_noiser = protein_noiser
         self.aux_loss_t_min = aux_loss_t_min
         self.traj_decay_factor = traj_decay_factor
         self.preconditioning = preconditioning
@@ -145,7 +146,7 @@ class Atom14Interpolation(TrainingHarness):
         res_data.update(diff_feats_t)
 
         ##  noise data
-        data = self.atom_noiser.corrupt_batch(data)
+        data = self.frame_noiser.corrupt_batch(data)
 
         seq = res_data['seq']
         polar_mask = (seq[..., None] == self.polar_residues.to(seq.device)[None]).any(dim=-1)
@@ -197,13 +198,13 @@ class Atom14Interpolation(TrainingHarness):
 
         # TODO: this is jenk but i will fix it later
         atom14_0 = (
-            _centered_gaussian(res_data.batch, 14, device) * self.atom_noiser.prior_std
+            _centered_gaussian(res_data.batch, 14, device) * self.frame_noiser.prior_std
         ).reshape(-1, 14, 3)
 
         seq_logits_0 = torch.randn(total_num_res, 20, device=device)
 
         # Set-up time
-        ts = torch.linspace(self.atom_noiser.min_t, 1.0, self.atom_noiser.num_timesteps)
+        ts = torch.linspace(self.frame_noiser.min_t, 1.0, self.frame_noiser.num_timesteps)
         t_1 = ts[0]
 
         prot_traj = [(
@@ -220,7 +221,7 @@ class Atom14Interpolation(TrainingHarness):
             t = torch.ones(batch.num_graphs, device=device) * t_1
             batch["t"] = t
             if model.preconditioning:
-                atom14_var_scaling_dict = self.atom_noiser.var_scaling_factors(t)
+                atom14_var_scaling_dict = self.frame_noiser.var_scaling_factors(t)
                 batch['c_skip'] = atom14_var_scaling_dict['c_skip']
                 batch['c_in'] = atom14_var_scaling_dict['c_in']
                 batch['c_out'] = atom14_var_scaling_dict['c_out']
@@ -243,7 +244,7 @@ class Atom14Interpolation(TrainingHarness):
 
             # Take reverse step
             d_t = t_2 - t_1
-            atom14_t_2 = self.atom_noiser._euler_step(d_t, t_1, pred_atom14, atom14_t_1)
+            atom14_t_2 = self.frame_noiser._euler_step(d_t, t_1, pred_atom14, atom14_t_1)
 
             prot_traj.append(
                 (
@@ -265,7 +266,7 @@ class Atom14Interpolation(TrainingHarness):
         t = torch.ones(batch.num_graphs, device=device) * t_1
         batch["t"] = t
         if model.preconditioning:
-            atom14_var_scaling_dict = self.atom_noiser.var_scaling_factors(t)
+            atom14_var_scaling_dict = self.frame_noiser.var_scaling_factors(t)
             batch['c_skip'] = atom14_var_scaling_dict['c_skip']
             batch['c_in'] = atom14_var_scaling_dict['c_in']
             batch['c_out'] = atom14_var_scaling_dict['c_out']
@@ -322,7 +323,7 @@ class Atom14Interpolation(TrainingHarness):
             "...ij,...kj->...ki",
             inputs['residue']['aug_rot'].transpose(-1, -2),
             outputs['denoised_atom14']
-        )
+        ) # - inputs['residue']['aug_trans'][inputs.batch]
 
         atomic_loss_dict = atom14_fm_losses(
             inputs, outputs,
@@ -339,6 +340,11 @@ class Atom14Interpolation(TrainingHarness):
             atomic_loss_dict["scaled_atom14_mse"] / (3 * 256)
             + atomic_loss_dict["seq_loss"] * 0.25
             + atomic_loss_dict["smooth_lddt"]
+        )
+        print(
+            atomic_loss_dict["scaled_atom14_mse"] / (3 * 256),
+            atomic_loss_dict["seq_loss"] * 0.25,
+            atomic_loss_dict["smooth_lddt"]
         )
 
         loss = (

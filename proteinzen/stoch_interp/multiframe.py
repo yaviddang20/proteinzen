@@ -97,7 +97,8 @@ class MultiSE3Interpolant:
                  sampling_churn=0.4,
                  churn_by_sigma=False,
                  num_timesteps=400,
-                 use_euclidean_for_rots=False
+                 use_euclidean_for_rots=False,
+                 rot_sfm=False
     ):
         self._igso3 = None
 
@@ -135,6 +136,7 @@ class MultiSE3Interpolant:
         self.sig_perturb = sig_perturb
         self.use_uniform_rot_noise = use_uniform_rot_noise
         self.use_euclidean_for_rots = use_euclidean_for_rots
+        self.rot_sfm = rot_sfm
 
     @property
     def igso3(self):
@@ -203,6 +205,13 @@ class MultiSE3Interpolant:
             rotmats_t = so3_utils.rotvec_to_rotmat(rotvecs_t)
         else:
             rotmats_t = so3_utils.geodesic_t(t[..., None], rotmats_1, rotmats_0)
+
+        if self.rot_sfm:
+            eps_t = torch.sqrt(0.01 * t * (1-t) + 1e-4)
+            self.igso3.to(rotmats_1.device)
+            noisy_rotmats = self.igso3.sample(eps_t.view(-1), rotmats_1.shape[1]).to(rotmats_1.device)
+            rotmats_t = torch.einsum("...ij,...jk->...ik", rotmats_t, noisy_rotmats)
+
         identity = torch.eye(3, device=t.device)
         rotmats_t = rotmats_t * rigids_mask[..., None, None] + identity[None, None] * (
             ~rigids_mask[..., None, None]

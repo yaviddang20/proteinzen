@@ -217,7 +217,7 @@ class ScatterUpdate(nn.Module):
             -2,
             atom_to_res_idx[..., None].expand(-1, -1, node_embed.shape[-1]),
             F.relu(self.lin(atom_embed)) * atom_mask[..., None],
-            reduce='mean'
+            reduce='sum'
         )
         out_denom = torch.zeros(node_embed.shape[:-1], device=out.device)
         denom = atom_mask.float()
@@ -226,7 +226,7 @@ class ScatterUpdate(nn.Module):
             atom_to_res_idx,
             denom,
         )
-        out = out / out_denom[..., None]
+        out = out / out_denom[..., None].clip(min=1)
         return out + node_embed
 
 
@@ -496,6 +496,7 @@ class AtomDenoiserCore(nn.Module):
                     c_z=c_z,
                     no_heads=num_heads,
                     n_layers=2,
+                    use_qk_norm=True
                 )
             else:
                 self.trunk[f'tfmr_{b}'] = ConditionedTransformerPairBias(
@@ -504,6 +505,7 @@ class AtomDenoiserCore(nn.Module):
                     c_z=c_z,
                     no_heads=num_heads,
                     n_layers=2,
+                    use_qk_norm=True
                 )
 
             self.trunk[f'broadcast_to_atoms_{b}'] = GatherUpdate(
@@ -705,18 +707,20 @@ class AtomDenoiser(nn.Module):
         else:
             atom14_in = atom14_t / 10
 
-        denoiser_data = self.embedder(
-            seq_idx=seq_idx,
-            t=t,
-            noised_atom14=atom14_in,
-            node_mask=res_mask.view(batch_size, -1),
-            fixed_mask=fixed_mask,
-            sc_atom14=sc_atom14,
-        )
-        denoiser_data['res_mask'] = res_data['res_mask'].view(batch_size, -1)
-        denoiser_data['t'] = t
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            denoiser_data = self.embedder(
+                seq_idx=seq_idx,
+                t=t,
+                noised_atom14=atom14_in,
+                node_mask=res_mask.view(batch_size, -1),
+                fixed_mask=fixed_mask,
+                sc_atom14=sc_atom14,
+            )
+            denoiser_data['res_mask'] = res_data['res_mask'].view(batch_size, -1)
+            denoiser_data['t'] = t
 
-        score_dict = self.denoiser(denoiser_data)
+            score_dict = self.denoiser(denoiser_data)
+
         atompos_out = score_dict['denoised_atompos']
         atom14_out = denoiser_data['to_res_batch'](atompos_out, -2)
         if self.trans_preconditioning:

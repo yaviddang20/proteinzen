@@ -23,7 +23,7 @@ class MotifScaffolding(TrainingTask):
                  max_num_res=40,
                  p_is_unindexed=0.8,
     ):
-        assert t_sched in ['lognorm', 'mixed_beta']
+        assert t_sched in ['lognorm', 'mixed_beta', 'uniform']
         assert mode in ['backbone', 'full_residue', 'inv_rotamer', 'mixed']
         self.t_sched = t_sched
         self.mode = mode
@@ -96,6 +96,8 @@ class MotifScaffolding(TrainingTask):
         if self.t_sched == 'lognorm':
             ln_sig = self.lognorm_mu + torch.randn(num_batch, device=device).float() * self.lognorm_sig
             t = torch.sigmoid(ln_sig)
+        elif self.t_sched == 'uniform':
+            t = torch.rand(num_batch, device=device).float()
         elif self.t_sched == 'mixed_beta':
             u = torch.rand(1)
             if u < 0.02:

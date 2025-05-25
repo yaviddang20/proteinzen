@@ -83,7 +83,7 @@ def skew_matrix_exponential_map_axis_angle(
 
 
 def skew_matrix_exponential_map(
-    angles: torch.Tensor, skew_matrices: torch.Tensor, tol=1e-7
+    angles: torch.Tensor, skew_matrices: torch.Tensor, tol=1e-4 #1e-7
 ) -> torch.Tensor:
     """
     Compute the matrix exponential of a rotation vector in skew matrix representation. Maps the

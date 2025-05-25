@@ -43,7 +43,12 @@ def center_random_aug(trans, mask, batch):
     trans = trans - center[batch]
     rand_rot = _uniform_so3(batch.shape[0], batch.device)
     trans = torch.einsum("...ij,...j->...i", rand_rot, trans) * mask[..., None]
-    return trans, rand_rot
+
+    # trans_noise = torch.randn_like(center)
+    trans_noise = torch.zeros_like(center)
+    trans = trans + trans_noise[batch]
+
+    return trans, rand_rot, trans_noise
 
 class Atom14Interpolant:
     def __init__(self,
@@ -86,7 +91,10 @@ class Atom14Interpolant:
             "loss_weighting": (var_t) / ((1-t) * sig_1 * sig_0)**2
         }
 
-    def _corrupt_x(self, x_1, t, diffuse_mask, batch):
+    def _corrupt_x(self, x_1, t, diffuse_mask, mask, batch):
+        x_1_center = (x_1 * mask[..., None]).sum(dim=(-2, -3)) / mask.sum(dim=(-1, -2))[..., None]
+        x_1 = x_1 - x_1_center[..., None, None, :]
+        print(x_1_center)
         x_0 = torch.randn_like(x_1) * self.prior_std
 
         # we align noise against data
@@ -115,6 +123,7 @@ class Atom14Interpolant:
         res_noising_mask = res_data["res_noising_mask"]
 
         atom14 = res_data['atom14']
+        atom14_mask = res_data['atom14_mask']
 
         # [B]
         t = self.sample_t(batch.num_graphs, atom14.device)
@@ -122,11 +131,17 @@ class Atom14Interpolant:
         nodewise_t = batchwise_to_nodewise(t, res_data.batch)
 
         # Apply corruptions
-        noised_atom14 = self._corrupt_x(atom14, nodewise_t, res_noising_mask, batch=res_data.batch)
+        noised_atom14 = self._corrupt_x(
+            atom14,
+            nodewise_t,
+            res_noising_mask,
+            atom14_mask,
+            batch=res_data.batch
+        )
         noised_atom14 *= res_mask[..., None, None]
         atom_batch = res_data.batch[..., None].expand(-1, 14)
         atom_batch = atom_batch.reshape(-1)
-        noised_atom14, aug_rot = center_random_aug(
+        noised_atom14, aug_rot, aug_trans = center_random_aug(
             noised_atom14.flatten(-3, -2),
             mask=res_mask[atom_batch],
             batch=atom_batch
@@ -134,6 +149,7 @@ class Atom14Interpolant:
         noised_atom14 = noised_atom14.reshape(atom14.shape)
         res_data['noised_atom14'] = noised_atom14
         res_data['aug_rot'] = aug_rot[res_data.batch]
+        res_data['aug_trans'] = aug_trans[res_data.batch]
 
         var_scaling_dict = self.var_scaling_factors(t)
         # print(var_scaling_dict)

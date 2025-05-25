@@ -1158,6 +1158,7 @@ class IpaScoreV2(nn.Module):
                  tfmr_row_dropout_r=0.,
                  use_qk_norm=False,
                  predict_final_rot=False,
+                 detach_grad_pre_seq_pred=False
                  ):
         super().__init__()
         # self.diffuser = diffuser
@@ -1279,6 +1280,7 @@ class IpaScoreV2(nn.Module):
 
         self.torsion_pred = TorsionAngles(c_s, 1)
         self.seq_pred = SeqPredictor(c_s, c_frame)
+        self.detach_grad_pre_seq_pred = detach_grad_pre_seq_pred
 
         if predict_final_rot:
             self.final_rot_head = nn.Sequential(
@@ -1371,12 +1373,20 @@ class IpaScoreV2(nn.Module):
                     node_embed, edge_embed, token_rigids, edge_mask)
                 edge_embed *= edge_mask[..., None]
 
-        seq_logits = self.seq_pred(
-            rigids_embed_flat,
-            rigids_token_uid,
-            rigids_mask_flat,
-            out=torch.zeros_like(node_embed)
-        )
+        if self.detach_grad_pre_seq_pred:
+            seq_logits = self.seq_pred(
+                rigids_embed_flat.detach(),
+                rigids_token_uid,
+                rigids_mask_flat,
+                out=torch.zeros_like(node_embed)
+            )
+        else:
+            seq_logits = self.seq_pred(
+                rigids_embed_flat,
+                rigids_token_uid,
+                rigids_mask_flat,
+                out=torch.zeros_like(node_embed)
+            )
         # print(curr_rigids.shape, input_feats['n_padding'])
         if self.final_rot_head is not None:
             rotvec = self.final_rot_head(rigids_embed_flat)
@@ -1697,8 +1707,15 @@ class MonotonicIncreasingFn(nn.Module):
         self.c_hidden = c_hidden
         self.l1 = nn.Linear(1, 1)
         self.l2 = nn.Linear(1, c_hidden)
-        self.l3 = nn.Linear(c_hidden, c_hidden)
-        self.l4 = nn.Linear(c_hidden, 1)
+        self.l3 = nn.Linear(c_hidden, 1)
+
+        self.len_cond = nn.Sequential(
+            nn.Linear(1, c_hidden // 2),
+            nn.ReLU(),
+            nn.Linear(c_hidden // 2, c_hidden // 2),
+            nn.ReLU(),
+            nn.Linear(c_hidden // 2, c_hidden)
+        )
 
     # def _forward(self, x):
     #     x = F.linear(x, torch.exp(self.l1.weight), torch.exp(self.l1.bias))
@@ -1707,20 +1724,20 @@ class MonotonicIncreasingFn(nn.Module):
     #     out = F.linear(out, torch.exp(self.l4.weight), torch.exp(self.l4.bias))
     #     return out
 
-    def _forward(self, x):
-        x = F.linear(x, torch.square(self.l1.weight), self.l1.bias)
-        out = F.linear(x, torch.square(self.l2.weight), self.l2.bias)
-        out = torch.sigmoid(out)
-        # out = F.linear(out, torch.abs(self.l3.weight), torch.abs(self.l3.bias))
-        # out = torch.sigmoid(out)
-        out = F.linear(out, torch.square(self.l4.weight))
+    def _forward(self, x, l):
+        x = F.linear(x, torch.abs(self.l1.weight), self.l1.bias)
+        out = F.linear(x, torch.abs(self.l2.weight), self.l2.bias)
+        out = torch.sigmoid(out + self.len_cond(l))
+        out = F.linear(out, torch.abs(self.l3.weight))
         return x + out
 
-    def forward(self, x):
-        x_0 = self._forward(torch.zeros_like(x))
-        x_1 = self._forward(torch.ones_like(x))
-        out = self._forward(x)
-        ret = (out - x_0) / (x_1 - x_0).clamp(min=1e-8)
+    def forward(self, x, l):
+        x_0 = self._forward(torch.zeros_like(x), l)
+        x_1 = self._forward(torch.ones_like(x), l)
+        out = self._forward(x, l)
+        # ret = (out - x_0) / (x_1 - x_0).clamp(min=1e-8)
+        print("internals", x_0, x_1, out)
+        ret = (out - x_0) / (x_1 - x_0 + 1e-6)
         # print(x_0, x_1, out, ret)
         return ret
 
@@ -1809,7 +1826,8 @@ class IpaMultiRigidDenoiserV2(nn.Module):
             ipa_row_dropout_r=ipa_row_dropout_r,
             tfmr_row_dropout_r=tfmr_row_dropout_r,
             use_qk_norm=use_qk_norm,
-            predict_final_rot=predict_final_rot
+            predict_final_rot=predict_final_rot,
+            detach_grad_pre_seq_pred=learnable_noise_schedule
         )
 
         self.embedder = EmbedderV2(

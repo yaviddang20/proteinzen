@@ -112,6 +112,18 @@ class ProteinModule(L.LightningModule):
             self.ema_long = None
             self.ema_short = None
 
+        def detect_nan_hook(module, input, output):
+            if isinstance(output, torch.Tensor):
+                if torch.isnan(output).any():
+                    print(f"NaN detected in: {module}")
+            elif isinstance(output, (tuple, list)):
+                for i, out in enumerate(output):
+                    if torch.is_tensor(out) and torch.isnan(out).any():
+                        print(f"NaN detected in output {i} of: {module}")
+
+        for name, module in self.model.named_modules():
+            module.register_forward_hook(detect_nan_hook)
+
 
     def on_train_epoch_start(self):
         super().on_train_epoch_start()
@@ -131,8 +143,9 @@ class ProteinModule(L.LightningModule):
         corrupter = self.training_harness.frame_noiser
         if self.learnable_noise_schedule:
             with torch.no_grad():
-                trans_t = self.model.trans_gamma_t(batch['t'])
-                rot_t = self.model.rot_gamma_t(batch['t'])
+                l = batch['token']['token_is_protein_output_mask'].float().sum(dim=-1) / 100
+                trans_t = self.model.trans_gamma_t(batch['t'], l[..., None])
+                rot_t = self.model.rot_gamma_t(batch['t'], l[..., None])
             trans_t.requires_grad = True
             rot_t.requires_grad = True
             print(trans_t.view(-1).tolist(), rot_t.view(-1).tolist(), batch['t'].view(-1).tolist())
@@ -143,7 +156,8 @@ class ProteinModule(L.LightningModule):
             batch['rot_t'] = batch['t']
 
         if self.use_dense_batch_loss:
-            batch = corrupter.corrupt_dense_batch(batch)
+            with torch.autograd.detect_anomaly():
+                batch = corrupter.corrupt_dense_batch(batch)
         # else:
         #     batch = corrupter.corrupt_batch(batch)
 
@@ -225,15 +239,21 @@ class ProteinModule(L.LightningModule):
             opt = self.optimizers()
             opt.zero_grad()
             loss = loss_dict['loss']
-            self.manual_backward(loss)
-            loss_per_batch = loss_dict['loss_per_batch']
+            with torch.autograd.detect_anomaly():
+                self.manual_backward(loss)
+            loss_per_batch = loss_dict['frame_vf_loss'] # loss_dict['loss_per_batch'].detach()
             trans_t = batch['trans_t']
             rot_t = batch['rot_t']
+            print("trans_t grad is_nan", trans_t.grad)
+            print("rot_t grad is_nan", rot_t.grad)
+
             t = batch['t']
-            trans_t_copy = self.model.trans_gamma_t(t)
-            rot_t_copy = self.model.rot_gamma_t(t)
-            trans_t_copy.backward(trans_t.grad * loss_per_batch[..., None] * 2)
-            rot_t_copy.backward(rot_t.grad * loss_per_batch[..., None] * 2)
+            l = batch['token']['token_is_protein_output_mask'].float().sum(dim=-1) / 100
+            with torch.autograd.detect_anomaly():
+                trans_t_copy = self.model.trans_gamma_t(t, l[..., None])
+                rot_t_copy = self.model.rot_gamma_t(t, l[..., None])
+                trans_t_copy.backward(trans_t.grad * loss_per_batch[..., None] * 2)
+                rot_t_copy.backward(rot_t.grad * loss_per_batch[..., None] * 2)
             # for name, param in self.model.trans_gamma_t.named_parameters():
             #     if param.grad is not None:
             #         print("trans", name, param.grad)
@@ -256,13 +276,19 @@ class ProteinModule(L.LightningModule):
 
         if self.learnable_noise_schedule:
             t = inputs['t']
-            log_trans_time_fn = lambda x: torch.log(1 - self.model.trans_gamma_t(x))
-            log_rot_time_fn = lambda x: torch.log(1 - self.model.rot_gamma_t(x))
+            l = inputs['token']['token_is_protein_output_mask'].float().sum(dim=-1) / 100
+            log_trans_time_fn = lambda x: torch.log(1 - self.model.trans_gamma_t(x, l[..., None]))
+            log_rot_time_fn = lambda x: torch.log(1 - self.model.rot_gamma_t(x, l[..., None]))
             log_trans_t_grad = torch.func.jvp(log_trans_time_fn, (t,), (torch.ones_like(t),))[1]
             log_rot_t_grad = torch.func.jvp(log_rot_time_fn, (t,), (torch.ones_like(t),))[1]
             print(log_trans_t_grad, log_rot_t_grad, 1 / (1 - t.clip(max=0.9)))
-            log_trans_t_grad = log_trans_t_grad.clip(min=-10, max=10)
-            log_rot_t_grad = log_rot_t_grad.clip(min=-10, max=10)
+            log_trans_t_grad = (
+                log_trans_t_grad.clip(min=-10, max=10).detach() / (log_trans_t_grad.detach() + 1e-4)
+            ) * log_trans_t_grad
+            log_rot_t_grad = (
+                log_rot_t_grad.clip(min=-10, max=10).detach() / (log_rot_t_grad.detach() + 1e-4)
+            ) * log_rot_t_grad
+            # log_rot_t_grad = log_rot_t_grad.clip(min=-10, max=10)
             log_trans_t_grad = log_trans_t_grad * (1 - t.clip(max=0.9))
             log_rot_t_grad = log_rot_t_grad * (1 - t.clip(max=0.9))
         else:
@@ -300,11 +326,18 @@ class ProteinModule(L.LightningModule):
             + 1 * atomic_loss_dict["smooth_lddt"]
         )
 
-        loss = (
-            frame_vf_loss
-            # + 0.5 * frame_fm_loss_dict['scaled_fafe']
-            # + atomic_loss
-        )
+        if self.learnable_noise_schedule:
+            loss = (
+                frame_vf_loss
+                + 0.25 * atomic_loss_dict["seq_loss"]
+            )
+        else:
+            loss = (
+                frame_vf_loss
+                + 0.5 * frame_fm_loss_dict['scaled_fafe']
+                + atomic_loss
+            )
+
         loss_dict = {"loss": loss.mean(), "frame_vf_loss": frame_vf_loss, "frame_vf_loss_unscaled": unscaled_frame_vf_loss}
         loss_dict['loss_per_batch'] = loss
 
@@ -849,7 +882,8 @@ class ProteinModule(L.LightningModule):
         fixed_res_idx = [torch.as_tensor([]) for _ in range(output_mask.shape[0])]
 
         motif_idx = denoiser_out['motif_idx']
-        motif_bb_mask = (~token_data['token_is_protein_output_mask'] & ~token_data['token_is_ligand_mask'])
+        motif_bb_mask = (~token_data['token_is_protein_output_mask'] & ~token_data['token_is_ligand_mask'] & token_data['token_mask'])
+        # print(motif_idx, token_data['token_is_protein_output_mask'], token_data['token_is_ligand_mask'], token_data['token_mask'])
         fixed_bb_res_idx = []
         fixed_seq_res_idx = []
         for i in range(motif_idx.shape[0]):

@@ -7,6 +7,7 @@ from proteinzen.data.datasets.collate import collate
 
 from .task import SamplingTask
 from .unconditional import UnconditionalSampling
+from .unconditional_v2 import UnconditionalSamplingV2
 from .motif_scaffolding import MotifScaffoldingTask
 from .motif_scaffolding_v2 import MotifScaffoldingTaskV2
 
@@ -15,7 +16,8 @@ class TaskDispatcher(Dataset):
     name_to_task_class = {
         "motif_scaffolding": MotifScaffoldingTask,
         "motif_scaffolding_v2": MotifScaffoldingTaskV2,
-        "unconditional": UnconditionalSampling
+        "unconditional": UnconditionalSampling,
+        "unconditional_v2": UnconditionalSamplingV2
     }
 
     def __init__(

@@ -508,9 +508,9 @@ class ConditionedPairUpdateV2(nn.Module):
         self.ln_third_edge = LayerNorm(c_z)
         self.emb_third_edge = Linear(c_z, no_heads, bias=False)
 
-        self.trig_attn_start = TriangleAttentionCore(c_z, self.c_hidden, self.no_heads, starting=True)
+        self.trig_attn_start = TriangleAttentionCore(c_z, self.c_hidden, self.no_heads, starting=True, use_qk_norm=True)
         self.trig_bias_start = Linear(c_hidden, no_heads, bias=False)
-        self.trig_attn_end = TriangleAttentionCore(c_z, self.c_hidden, self.no_heads, starting=False)
+        self.trig_attn_end = TriangleAttentionCore(c_z, self.c_hidden, self.no_heads, starting=False, use_qk_norm=True)
         self.trig_bias_end = Linear(c_hidden, no_heads, bias=False)
         self.cond_proj = nn.Sequential(
             LayerNorm(c_s),
@@ -1141,8 +1141,8 @@ class PairEmbedderV2(nn.Module):
                 LayerNorm(c_hidden),
                 Linear(c_hidden, no_heads, bias=False)
             )
-            self.trunk[f'attn_start_{i}'] = TriangleAttentionCore(c_hidden, c_head, no_heads, starting=True)
-            self.trunk[f'attn_end_{i}'] = TriangleAttentionCore(c_hidden, c_head, no_heads, starting=False)
+            self.trunk[f'attn_start_{i}'] = TriangleAttentionCore(c_hidden, c_head, no_heads, starting=True, use_qk_norm=True)
+            self.trunk[f'attn_end_{i}'] = TriangleAttentionCore(c_hidden, c_head, no_heads, starting=False, use_qk_norm=True)
             self.trunk[f'transition_{i}'] = SwishTransition(c_hidden)
 
         self.final_layer = nn.Sequential(
