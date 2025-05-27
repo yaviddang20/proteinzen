@@ -1705,40 +1705,20 @@ class MonotonicIncreasingFn(nn.Module):
     def __init__(self, c_hidden=1024):
         super().__init__()
         self.c_hidden = c_hidden
-        self.l1 = nn.Linear(1, 1)
+        self.l1 = nn.Linear(1, 1, bias=False)
         self.l2 = nn.Linear(1, c_hidden)
         self.l3 = nn.Linear(c_hidden, 1)
 
-        self.len_cond = nn.Sequential(
-            nn.Linear(1, c_hidden // 2),
-            nn.ReLU(),
-            nn.Linear(c_hidden // 2, c_hidden // 2),
-            nn.ReLU(),
-            nn.Linear(c_hidden // 2, c_hidden)
-        )
-
-    # def _forward(self, x):
-    #     x = F.linear(x, torch.exp(self.l1.weight), torch.exp(self.l1.bias))
-    #     out = F.linear(x, torch.exp(self.l2.weight), torch.exp(self.l2.bias))
-    #     out = torch.sigmoid(out)
-    #     out = F.linear(out, torch.exp(self.l4.weight), torch.exp(self.l4.bias))
-    #     return out
-
-    def _forward(self, x, l):
-        x = F.linear(x, torch.abs(self.l1.weight), self.l1.bias)
-        out = F.linear(x, torch.abs(self.l2.weight), self.l2.bias)
-        out = torch.sigmoid(out + self.len_cond(l))
+    def _forward(self, l):
+        l = F.linear(l, torch.abs(self.l1.weight))
+        out = F.linear(l, torch.abs(self.l2.weight), self.l2.bias)
+        out = torch.sigmoid(out)
         out = F.linear(out, torch.abs(self.l3.weight))
-        return x + out
+        return l + out
 
     def forward(self, x, l):
-        x_0 = self._forward(torch.zeros_like(x), l)
-        x_1 = self._forward(torch.ones_like(x), l)
-        out = self._forward(x, l)
-        # ret = (out - x_0) / (x_1 - x_0).clamp(min=1e-8)
-        print("internals", x_0, x_1, out)
-        ret = (out - x_0) / (x_1 - x_0 + 1e-6)
-        # print(x_0, x_1, out, ret)
+        shift_scale = self._forward(l)
+        ret = x / (x * (1 - shift_scale) + shift_scale)
         return ret
 
 

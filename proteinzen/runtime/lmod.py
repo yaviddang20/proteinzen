@@ -24,8 +24,8 @@ from .loss.common import atomic_losses_dense_batch
 
 def t_stratified_loss(batch_t, batch_loss, num_bins=4, loss_name=None):
     """Stratify loss by binning t."""
-    batch_t = batch_t.numpy(force=True)
-    batch_loss = batch_loss.numpy(force=True)
+    batch_t = batch_t.float().numpy(force=True)
+    batch_loss = batch_loss.float().numpy(force=True)
     flat_losses = batch_loss.flatten()
     flat_t = batch_t.flatten()
     bin_edges = np.linspace(0.0, 1.0 + 1e-3, num_bins+1)
@@ -112,17 +112,17 @@ class ProteinModule(L.LightningModule):
             self.ema_long = None
             self.ema_short = None
 
-        def detect_nan_hook(module, input, output):
-            if isinstance(output, torch.Tensor):
-                if torch.isnan(output).any():
-                    print(f"NaN detected in: {module}")
-            elif isinstance(output, (tuple, list)):
-                for i, out in enumerate(output):
-                    if torch.is_tensor(out) and torch.isnan(out).any():
-                        print(f"NaN detected in output {i} of: {module}")
+        # def detect_nan_hook(module, input, output):
+        #     if isinstance(output, torch.Tensor):
+        #         if torch.isnan(output).any():
+        #             print(f"NaN detected in: {module}")
+        #     elif isinstance(output, (tuple, list)):
+        #         for i, out in enumerate(output):
+        #             if torch.is_tensor(out) and torch.isnan(out).any():
+        #                 print(f"NaN detected in output {i} of: {module}")
 
-        for name, module in self.model.named_modules():
-            module.register_forward_hook(detect_nan_hook)
+        # for name, module in self.model.named_modules():
+        #     module.register_forward_hook(detect_nan_hook)
 
 
     def on_train_epoch_start(self):
@@ -184,10 +184,12 @@ class ProteinModule(L.LightningModule):
         }
         t = batch['t']
         for loss_name, loss_list in loss_dict.items():
-            if loss_name in ['loss', 'frameflow_loss']:
+            if loss_name in ['loss', 'frameflow_loss', "frame_vf_loss_unscaled", 'loss_per_batch']:
                 continue
-            if not loss_name.startswith("pt_") and not loss_name.startswith("latent_"):
+            if t.numel() != loss_list.numel():
                 continue
+            # if not loss_name.startswith("pt_") and not loss_name.startswith("latent_"):
+            #     continue
             stratified_losses = t_stratified_loss(
                 t, loss_list, loss_name=loss_name)
             stratified_losses = {
@@ -360,6 +362,10 @@ class ProteinModule(L.LightningModule):
 
 
     def on_before_optimizer_step(self, optimizer):
+        # for name, param in self.model.named_parameters():
+        #     if param.grad is None:
+        #         print(name)
+
         with torch.no_grad():
             norms = []
             norm_dict = {}
@@ -368,11 +374,14 @@ class ProteinModule(L.LightningModule):
                     n = torch.linalg.vector_norm(p.grad.view(-1), dim=-1)
                     norms.append(n)
                     norm_dict[name] = n.item()
+            # import json
             # print(json.dumps(norm_dict, indent=4))
             total_norm = torch.linalg.vector_norm(
                 torch.stack(norms, dim=0),
                 dim=0
             )
+
+            print(total_norm)
 
         self.log(
             "grad_norm",

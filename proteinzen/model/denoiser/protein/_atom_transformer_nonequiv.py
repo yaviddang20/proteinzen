@@ -156,6 +156,7 @@ class SequenceAtomTransformerBlock(nn.Module):
             nn.Sigmoid()
         )
 
+        # self.lin_out = Linear(c_atom, c_atom, bias=False)
         self.lin_out = Linear(c_atom, c_atom)
         self.s_gate_lin = Linear(c_s, c_atom)
         with torch.no_grad():
@@ -199,11 +200,13 @@ class SequenceAtomTransformerBlock(nn.Module):
         a = a + b_ij
         # print(a.shape, atompair_mask.shape)
         a = a - self.inf * (1 - atompair_mask.float()[..., None])
-        a = a.permute(0, 1, 4, 2, 3)
+        a = a.permute(0, 1, 4, 2, 3) / np.sqrt(atom_q.shape[-1])
         a = torch.softmax(a, dim=-1)
 
         atom_out = torch.einsum("bnhqk,bnkhc->bnqhc", a, atom_v)
         atom_out = atom_out.reshape(n_batch, n_atoms, -1)
+        atom_out = atom_out * self.lin_g(atom_features)
+        atom_out = self.lin_out(atom_out)
         atom_gate = torch.sigmoid(self.s_gate_lin(token_features))
         atom_out = atom_out * gather_helper(atom_gate, atom_token_idx)
         return atom_out
@@ -338,10 +341,11 @@ class AtomPairEmbedder(nn.Module):
             atompair_mask = (q_mask * k_mask)
 
         z_flat = z.view(n_batch, 1, n_res ** 2, -1).expand(-1, n_block, -1, -1)
+        z_flat = self.pair_to_atompair(z_flat)
         atompair_embed = torch.gather(
             z_flat,
             -2,
-            atompair_1d_idx[..., None].expand(-1, -1, -1, z.shape[-1])
+            atompair_1d_idx[..., None].expand(-1, -1, -1, z_flat.shape[-1])
         )
         atompair_embed = atompair_embed.view(*atompair_mask.shape, -1) * atompair_mask[..., None]
 
@@ -385,18 +389,21 @@ class AtomPairEmbedder(nn.Module):
             to_queries,
             to_keys
         )
-        atompair_features = atompair_features + self.pair_to_atompair(broadcast_z)
+        # atompair_features = atompair_features + broadcast_z # + self.pair_to_atompair(broadcast_z)
+        atompair_features += broadcast_z # + self.pair_to_atompair(broadcast_z)
 
         atom_embed_q = to_queries(atom_embed)
         atom_embed_k = to_keys(atom_embed)
         atompair_q = self.atom_to_atompair_q(atom_embed_q)
         atompair_k = self.atom_to_atompair_k(atom_embed_k)
-        atompair_features = atompair_features + atompair_q[..., None, :] + atompair_k[..., None, :, :]
+        # atompair_features = atompair_features + atompair_q[..., None, :] + atompair_k[..., None, :, :]
+        atompair_features += atompair_q[..., None, :]
+        atompair_features += atompair_k[..., None, :, :]
 
         if init_atompair_embed is not None:
             atompair_features = atompair_features + init_atompair_embed
 
-        atompair_features = atompair_features + self.ffn(atompair_features)
+        atompair_features += self.ffn(atompair_features)
         atompair_features = atompair_features * atompair_mask[..., None]
 
         return atompair_features, atompair_mask

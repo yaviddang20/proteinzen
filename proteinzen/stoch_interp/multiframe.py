@@ -279,7 +279,11 @@ class MultiSE3Interpolant:
         # this is just so we can calculate atom14 rmsds
         res_data["atom14"] -= center[res_data.batch][..., None,:]
         res_data['atom14_gt_positions'] -= center[res_data.batch][..., None, :]
+        res_data['atom14_gt_positions'] *= res_data['atom14_mask'][..., None]
         res_data['atom14_alt_gt_positions'] -= center[res_data.batch][..., None, :]
+        res_data['atom14_alt_gt_positions'] *= res_data['atom14_mask'][..., None]
+
+        # print("input", batch.name, res_data['atom14_gt_positions'])
 
 
         if self.prealign_noise:
@@ -302,7 +306,9 @@ class MultiSE3Interpolant:
             trans_0 = torch.einsum("nki,nij->nkj", trans_0, align_rot_mats[res_data.batch])
 
         if self.use_stochastic_centering:
-            trans_0 = trans_0 + torch.randn_like(trans_0) * self.sig_perturb
+            stoch_center = torch.randn_like(center) * self.sig_perturb
+            trans_0 = trans_0 + stoch_center[rigidwise_batch] # torch.randn_like(trans_0) * self.sig_perturb
+
 
         trans_t = self._corrupt_trans(
             trans_1,
@@ -391,7 +397,8 @@ class MultiSE3Interpolant:
             trans_0 = torch.einsum("bni,bij->bnj", trans_0, align_rot_mats)
 
         if self.use_stochastic_centering:
-            trans_0 = trans_0 + torch.randn_like(trans_0) * self.sig_perturb
+            stoch_center = torch.randn_like(center) * self.sig_perturb
+            trans_0 = trans_0 + stoch_center[..., None, None, :]
 
         trans_time = batch['trans_t']
         rot_time = batch['rot_t']

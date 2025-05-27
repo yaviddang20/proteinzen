@@ -192,6 +192,17 @@ def multiframe_fm_loss_reduced(
     fafe_l2_block_mask_size=1,
     downweight_K=False
 ):
+    def geodesic_dist(rots1, rots2):
+        R_diff = torch.einsum("...ij,...jk->...ik", rots1.transpose(-2, -1), rots2)
+        R_diff_trace = R_diff.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+        return torch.acos(
+            torch.clamp(
+                (R_diff_trace - 1) / 2,
+                min=-1 + 1e-6,
+                max=1 - 1e-6
+            )
+        )
+
     res_data = batch['residue']
     res_mask = res_data['res_mask']
     rigids_noising_mask = res_data['rigids_noising_mask']
@@ -238,6 +249,11 @@ def multiframe_fm_loss_reduced(
     rots_1 = gt_frames.get_rots().get_rot_mats()
     pred_rot_vf = so3_fm_utils.calc_rot_vf(rots_t, rots_1_pred)
     gt_rot_vf = so3_fm_utils.calc_rot_vf(rots_t, rots_1)
+
+    pred_rot_dist = geodesic_dist(rots_1, rots_1_pred)
+    pred_rot_dist = _nodewise_to_graphwise(pred_rot_dist, res_batch, total_mask)
+    ref_rot_dist = geodesic_dist(rots_1, rots_t)
+    ref_rot_dist = _nodewise_to_graphwise(ref_rot_dist, res_batch, total_mask)
 
     seqwise_weight = 1
     if polar_upweight:
@@ -336,6 +352,8 @@ def multiframe_fm_loss_reduced(
         "unscaled_rot_vf_loss": unscaled_rot_vf_loss,
         "unscaled_trans_vf_loss": unscaled_trans_vf_loss,
         "pred_trans_mse": pred_frame_trans_mse,
+        "pred_rot_dist": pred_rot_dist,
+        "ref_rot_dist": ref_rot_dist,
         "pred_bb_mse": backbone_mse,
         "ref_trans_mse": ref_frame_trans_mse,
         "fafe": fafe,

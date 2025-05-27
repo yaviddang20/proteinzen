@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 
 from proteinzen.data.openfold.residue_constants import restype_order_with_x
+from proteinzen.stoch_interp import utils as du
 
 from .utils import _nodewise_to_graphwise
 from .atomic.atom14 import atom14_mse_loss, chi_loss
@@ -81,6 +82,8 @@ def atomic_losses_reduced(batch,
     seq_loss_mask = res_mask & seq_mask & seq_noising_mask
     pred_atom14_gt_seq = model_outputs['denoised_atom14_gt_seq']
     seq_logits = model_outputs['decoded_seq_logits']
+    # print("loss", batch.name, gt_atom14)
+    # print("pred", batch.name, model_outputs['denoised_atom14_gt_seq'])
 
     seqwise_weight = 1
     if polar_upweight:
@@ -248,7 +251,8 @@ def atom14_fm_losses(batch,
                   use_sidechain_clash_loss=True,
                   polar_upweight=False,
                   sidechain_upweight=False,
-                  preconditioning=False
+                  preconditioning=False,
+                  rigid_align=False
 ):
     res_data = batch['residue']
 
@@ -289,6 +293,17 @@ def atom14_fm_losses(batch,
         sidechain_weight[5:] += 1
         seqwise_weight = seqwise_weight * sidechain_weight[None]
 
+
+    if rigid_align:
+        flat_gt_atom14 = gt_atom14.flatten(0, 1)
+        flat_pred_atom14 = pred_atom14_gt_seq.flatten(0, 1)
+        atom_batch = res_data.batch[..., None].expand(-1, 14).reshape(-1)
+        flat_pred_atom14, _, _ = du.align_structures(
+            flat_pred_atom14,
+            atom_batch,
+            flat_gt_atom14,
+        )
+        pred_atom14_gt_seq = flat_pred_atom14.unflatten(0, (-1, 14))
 
     atom14_mse = atom14_mse_loss(
         gt_atom14,

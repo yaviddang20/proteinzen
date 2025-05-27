@@ -333,19 +333,20 @@ class Atom14Interpolation(TrainingHarness):
             use_sidechain_dists_mse_loss=False,
             use_local_atomic_dist_loss=False,
             use_sidechain_clash_loss=False,
-            preconditioning=self.preconditioning
+            preconditioning=self.preconditioning,
+            # rigid_align=True
         )
 
         atomic_loss = (
-            atomic_loss_dict["scaled_atom14_mse"] / (3 * 256)
+            atomic_loss_dict["scaled_atom14_mse"] / 3 # / 100 # / (3 * 256)
             + atomic_loss_dict["seq_loss"] * 0.25
             + atomic_loss_dict["smooth_lddt"]
         )
-        print(
-            atomic_loss_dict["scaled_atom14_mse"] / (3 * 256),
-            atomic_loss_dict["seq_loss"] * 0.25,
-            atomic_loss_dict["smooth_lddt"]
-        )
+        # print(
+        #     atomic_loss_dict["scaled_atom14_mse"] / (3 * 256),
+        #     atomic_loss_dict["seq_loss"] * 0.25,
+        #     atomic_loss_dict["smooth_lddt"]
+        # )
 
         loss = (
             + atomic_loss

@@ -66,7 +66,8 @@ class Atom14Interpolant:
 
     def sample_t(self, num_batch, device):
         if self.lognorm_t_sched:
-            lognorm_mu, lognorm_sig = -1.2, 1.5
+            # lognorm_mu, lognorm_sig = -1.2, 1.5
+            lognorm_mu, lognorm_sig = 0.0, 1
             ln_sig = lognorm_mu + torch.randn(num_batch, device=device).float() * lognorm_sig
             t = 1 / (1 + torch.exp(ln_sig))
             return t
@@ -94,7 +95,7 @@ class Atom14Interpolant:
     def _corrupt_x(self, x_1, t, diffuse_mask, mask, batch):
         x_1_center = (x_1 * mask[..., None]).sum(dim=(-2, -3)) / mask.sum(dim=(-1, -2))[..., None]
         x_1 = x_1 - x_1_center[..., None, None, :]
-        print(x_1_center)
+        # print(x_1_center)
         x_0 = torch.randn_like(x_1) * self.prior_std
 
         # we align noise against data

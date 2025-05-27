@@ -445,6 +445,9 @@ class Embedder(nn.Module):
             sc_atom_init = torch.zeros_like(atom_init)
             sc_node_init = torch.zeros_like(node_init)
             sc_atompair_embed = torch.zeros_like(atompair_embed)
+        sc_atom_init = torch.zeros_like(atom_init)
+        sc_node_init = torch.zeros_like(node_init)
+        sc_atompair_embed = torch.zeros_like(atompair_embed)
 
         atom_embed = self.atom_adaln(atom_init, sc_atom_init)
         node_embed = self.node_adaln(node_init, sc_node_init)
@@ -495,7 +498,7 @@ class AtomDenoiserCore(nn.Module):
                     c_s=c_s,
                     c_z=c_z,
                     no_heads=num_heads,
-                    n_layers=2,
+                    n_layers=1,#2,
                     use_qk_norm=True
                 )
             else:
@@ -504,7 +507,7 @@ class AtomDenoiserCore(nn.Module):
                     c_cond=c_s,
                     c_z=c_z,
                     no_heads=num_heads,
-                    n_layers=2,
+                    n_layers=1,#2,
                     use_qk_norm=True
                 )
 
@@ -524,7 +527,7 @@ class AtomDenoiserCore(nn.Module):
                 c_atompair,
                 c_s,
                 no_heads=4,
-                num_blocks=1#2
+                num_blocks=3
             )
 
             self.trunk[f'scatter_to_nodes_{b}'] = ScatterUpdate(
@@ -533,6 +536,7 @@ class AtomDenoiserCore(nn.Module):
             )
             self.trunk[f'atom_update_{b}'] = nn.Sequential(
                 LayerNorm(c_atom),
+                # Linear(c_atom, 3, bias=False, init='final')
                 Linear(c_atom, 3, bias=False, init='final')
             )
 
@@ -558,7 +562,8 @@ class AtomDenoiserCore(nn.Module):
         node_embed = node_embed * node_mask[..., None]
         atompos = input_feats['noised_atompos']
         atom_embed = input_feats['atom_embed']
-        atompair_embed = input_feats['atompair_embed']
+        # atompair_embed = input_feats['atompair_embed']
+        atompair_embed_init = input_feats['atompair_embed']
         atompair_mask = input_feats['atompair_mask']
         to_queries = input_feats['to_queries']
         to_keys = input_feats['to_keys']
@@ -588,7 +593,7 @@ class AtomDenoiserCore(nn.Module):
                 atom_mask,
                 to_queries,
                 to_keys,
-                init_atompair_embed=atompair_embed
+                # init_atompair_embed=atompair_embed_init
             )
             atom_embed = self.trunk[f'atom_tfmr_{b}'](
                 atom_embed,
@@ -694,7 +699,7 @@ class AtomDenoiser(nn.Module):
         t = data['t']
         batch_size = t.shape[0]
         fixed_mask = torch.zeros_like(res_mask).view(batch_size, -1)
-        print(fixed_mask.shape)
+        # print(fixed_mask.shape)
 
         if self_condition is not None:
             sc_atom14 = self_condition['denoised_atom14'].view(batch_size, -1, self.atoms_per_residue, 3)
@@ -723,10 +728,13 @@ class AtomDenoiser(nn.Module):
 
         atompos_out = score_dict['denoised_atompos']
         atom14_out = denoiser_data['to_res_batch'](atompos_out, -2)
+        print(atom14_out.square().sum())
+
         if self.trans_preconditioning:
             atom14_out = (atom14_out - atom14_in) * data['c_out'][..., None, None, None] + atom14_t * data['c_skip'][..., None, None, None]
         else:
             atom14_out = atom14_out * 10
+
 
         seq_logits = score_dict['seq_logits']
         ret = {}

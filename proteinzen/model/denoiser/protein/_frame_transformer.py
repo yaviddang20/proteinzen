@@ -1353,8 +1353,10 @@ class FramepairUpdate(nn.Module):
             framepair_embed = framepair_embed + framepair_l + framepair_m
 
         if self.nodepair_to_framepair_broadcast is not None:
-            z_broadcast = self._broadcast_pairs(z, rigids_to_res_idx, rigids_mask, to_pairs)
-            framepair_embed = framepair_embed + self.nodepair_to_framepair_broadcast(z_broadcast)
+            # z_broadcast = self._broadcast_pairs(z, rigids_to_res_idx, rigids_mask, to_pairs)
+            # framepair_embed = framepair_embed + self.nodepair_to_framepair_broadcast(z_broadcast)
+            z_broadcast = self._broadcast_pairs(self.nodepair_to_framepair_broadcast(z), rigids_to_res_idx, rigids_mask, to_pairs)
+            framepair_embed = framepair_embed + z_broadcast
 
         if self.framepair_ffn is not None:
             framepair_embed = framepair_embed + self.framepair_ffn(framepair_embed)
