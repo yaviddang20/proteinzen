@@ -1719,6 +1719,7 @@ class MonotonicIncreasingFn(nn.Module):
     def forward(self, x, l):
         shift_scale = self._forward(l)
         ret = x / (x * (1 - shift_scale) + shift_scale)
+        # print(x, l, shift_scale, ret)
         return ret
 
 

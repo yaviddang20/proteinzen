@@ -274,14 +274,31 @@ class MultiSE3Interpolant:
                 dim_size=(res_data.batch.max().item() + 1),
                 reduce='mean'
             )
+        # print(center)
+
+        # center = torch.zeros_like(center)
 
         trans_1 = trans_1 - center[rigidwise_batch]
+        # print(trans_1.mean(dim=(0, 1)))
+
         # this is just so we can calculate atom14 rmsds
-        res_data["atom14"] -= center[res_data.batch][..., None,:]
-        res_data['atom14_gt_positions'] -= center[res_data.batch][..., None, :]
+        res_data["atom14"] = res_data["atom14"] - center[res_data.batch][..., None,:]
+        res_data['atom14'] *= res_data['atom14_mask'][..., None]
+        res_data['atom14_gt_positions'] = res_data['atom14_gt_positions'] - center[res_data.batch][..., None, :]
         res_data['atom14_gt_positions'] *= res_data['atom14_mask'][..., None]
-        res_data['atom14_alt_gt_positions'] -= center[res_data.batch][..., None, :]
+        res_data['atom14_alt_gt_positions'] = res_data['atom14_alt_gt_positions'] - center[res_data.batch][..., None, :]
         res_data['atom14_alt_gt_positions'] *= res_data['atom14_mask'][..., None]
+
+        # if True:
+        #     from proteinzen.utils.coarse_grain import compute_atom14_from_cg_frames
+        #     _rigids = ru.Rigid(rigids_1.get_rots(), trans_1)
+        #     _atom14 = compute_atom14_from_cg_frames(
+        #         _rigids,
+        #         res_mask=res_data['res_mask'],
+        #         seq=res_data['seq'],
+        #     )
+        #     print(_atom14[res_data['atom14_mask'].bool()].mean(dim=0))
+        #     print(res_data["atom14"][res_data['atom14_mask'].bool()].mean(dim=0))
 
         # print("input", batch.name, res_data['atom14_gt_positions'])
 
@@ -372,11 +389,11 @@ class MultiSE3Interpolant:
         trans_1 = trans_1 - center[..., None, :]
         # this is just so we can calculate atom14 rmsds
         atom_data = batch['atom']
-        atom_data["atom14"] -= center[..., None, None, :]
+        atom_data["atom14"] = atom_data["atom14"] - center[..., None, None, :]
         atom_data["atom14"] *= atom_data['atom14_mask'][..., None]
-        atom_data['atom14_gt_positions'] -= center[..., None, None, :]
+        atom_data['atom14_gt_positions'] = atom_data['atom14_gt_positions'] - center[..., None, None, :]
         atom_data['atom14_gt_positions'] *= atom_data['atom14_mask'][..., None]
-        atom_data['atom14_alt_gt_positions'] -= center[..., None, None, :]
+        atom_data['atom14_alt_gt_positions'] = atom_data['atom14_alt_gt_positions'] - center[..., None, None, :]
         atom_data['atom14_alt_gt_positions'] *= atom_data['atom14_mask'][..., None]
 
 
@@ -394,6 +411,7 @@ class MultiSE3Interpolant:
                 align_batch,
                 trans_1[align_mask]
             )
+            print(trans_0.shape, align_rot_mats.shape)
             trans_0 = torch.einsum("bni,bij->bnj", trans_0, align_rot_mats)
 
         if self.use_stochastic_centering:
@@ -511,13 +529,15 @@ class MultiSE3Interpolant:
         dW_t = torch.randn_like(trans_t) * torch.sqrt(d_t) * 10
         trans_score = self._trans_score(t, trans_1, trans_t) * use_score
 
-        if t > 0.99:
+        # if t > 0.99:
+        if (isinstance(t, torch.Tensor) and (t > 0.99).any()) or (not isinstance(t, torch.Tensor) and t > 0.99):  # TODO: fix hack (what happens if not all t > 0.99?)
             trans_next = trans_t + (trans_vf * d_t) * step_size
         else:
             if add_noise:
                 noise_t = torch.sqrt(2 * g_t * gamma) * dW_t
                 trans_next = trans_t + (trans_vf * d_t + trans_score * g_t * d_t) * step_size + noise_t
             else:
+                # print(trans_vf.shape, d_t.shape, trans_score.shape, g_t.shape, step_size.shape)
                 trans_next = trans_t + (trans_vf * d_t + trans_score * g_t * d_t) * step_size
 
         trans_next[~noising_mask] = trans_t[~noising_mask]
@@ -589,13 +609,17 @@ class MultiSE3Interpolant:
         # i've seen this nan sometimes on fixed residues
         # which leads to some weird behavior downstream
         # current band-aid patch is just to force replace the fixed residues
-        rot_score = self._rots_score(t, rotmats_1, rotmats_t) * use_score
+        if use_score:
+            rot_score = self._rots_score(t, rotmats_1, rotmats_t) * use_score
+        else:
+            rot_score = torch.zeros_like(rot_vf)
 
         g_t = self.g_t(t)
         step_size = self.rot_step_size * vf_scale
         gamma = self.rot_gamma
         dB_rot = torch.randn_like(rot_vf) * torch.sqrt(d_t)
-        if t > 0.99:
+        # if t > 0.99:
+        if (isinstance(t, torch.Tensor) and (t > 0.99).any()) or (not isinstance(t, torch.Tensor) and t > 0.99):  # TODO: fix hack (what happens if not all t > 0.99?)
             mat_t = so3_utils.rotvec_to_rotmat(d_t * rot_vf * step_size)
         else:
             if add_noise:

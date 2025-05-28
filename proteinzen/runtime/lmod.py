@@ -148,7 +148,7 @@ class ProteinModule(L.LightningModule):
                 rot_t = self.model.rot_gamma_t(batch['t'], l[..., None])
             trans_t.requires_grad = True
             rot_t.requires_grad = True
-            print(trans_t.view(-1).tolist(), rot_t.view(-1).tolist(), batch['t'].view(-1).tolist())
+            # print(trans_t.view(-1).tolist(), rot_t.view(-1).tolist(), batch['t'].view(-1).tolist())
             batch['trans_t'] = trans_t
             batch['rot_t'] = rot_t
         else:
@@ -156,8 +156,7 @@ class ProteinModule(L.LightningModule):
             batch['rot_t'] = batch['t']
 
         if self.use_dense_batch_loss:
-            with torch.autograd.detect_anomaly():
-                batch = corrupter.corrupt_dense_batch(batch)
+            batch = corrupter.corrupt_dense_batch(batch)
         # else:
         #     batch = corrupter.corrupt_batch(batch)
 
@@ -241,21 +240,19 @@ class ProteinModule(L.LightningModule):
             opt = self.optimizers()
             opt.zero_grad()
             loss = loss_dict['loss']
-            with torch.autograd.detect_anomaly():
-                self.manual_backward(loss)
+            self.manual_backward(loss)
             loss_per_batch = loss_dict['frame_vf_loss'] # loss_dict['loss_per_batch'].detach()
             trans_t = batch['trans_t']
             rot_t = batch['rot_t']
-            print("trans_t grad is_nan", trans_t.grad)
-            print("rot_t grad is_nan", rot_t.grad)
+            # print("trans_t grad is_nan", trans_t.grad)
+            # print("rot_t grad is_nan", rot_t.grad)
 
             t = batch['t']
             l = batch['token']['token_is_protein_output_mask'].float().sum(dim=-1) / 100
-            with torch.autograd.detect_anomaly():
-                trans_t_copy = self.model.trans_gamma_t(t, l[..., None])
-                rot_t_copy = self.model.rot_gamma_t(t, l[..., None])
-                trans_t_copy.backward(trans_t.grad * loss_per_batch[..., None] * 2)
-                rot_t_copy.backward(rot_t.grad * loss_per_batch[..., None] * 2)
+            trans_t_copy = self.model.trans_gamma_t(t, l[..., None])
+            rot_t_copy = self.model.rot_gamma_t(t, l[..., None])
+            trans_t_copy.backward(trans_t.grad * loss_per_batch[..., None] * 2)
+            rot_t_copy.backward(rot_t.grad * loss_per_batch[..., None] * 2)
             # for name, param in self.model.trans_gamma_t.named_parameters():
             #     if param.grad is not None:
             #         print("trans", name, param.grad)
@@ -283,7 +280,7 @@ class ProteinModule(L.LightningModule):
             log_rot_time_fn = lambda x: torch.log(1 - self.model.rot_gamma_t(x, l[..., None]))
             log_trans_t_grad = torch.func.jvp(log_trans_time_fn, (t,), (torch.ones_like(t),))[1]
             log_rot_t_grad = torch.func.jvp(log_rot_time_fn, (t,), (torch.ones_like(t),))[1]
-            print(log_trans_t_grad, log_rot_t_grad, 1 / (1 - t.clip(max=0.9)))
+            # print(log_trans_t_grad, log_rot_t_grad, 1 / (1 - t.clip(max=0.9)))
             log_trans_t_grad = (
                 log_trans_t_grad.clip(min=-10, max=10).detach() / (log_trans_t_grad.detach() + 1e-4)
             ) * log_trans_t_grad
@@ -482,7 +479,7 @@ class ProteinModule(L.LightningModule):
             compute_atom14_from_cg_frames(
                 ru.Rigid(ru.Rotation(rot_mats=rotmats_0), trans_0),
                 res_data.res_mask,
-                torch.zeros_like(res_data.seq),
+                torch.ones_like(res_data.seq),
                 cg_version=model.cg_version
             )
         )]
@@ -567,14 +564,18 @@ class ProteinModule(L.LightningModule):
             #     print("rot step", t_1)
             #     exit()
 
+            prot_traj_seq = denoiser_out["pred_seq"].clone()
+            prot_traj_seq[seq_noising_mask] = 1  # set to R for vis purposes
+
+            # print(prot_traj_seq)
             prot_traj.append(
                 (trans_t_2,
                  rotmats_t_2,
-                 denoiser_out["pred_seq"].detach().cpu(),
+                 prot_traj_seq.detach().cpu(),
                  compute_atom14_from_cg_frames(
                      ru.Rigid(ru.Rotation(rot_mats=rotmats_t_2), trans_t_2),
                      res_data.res_mask,
-                     denoiser_out["pred_seq"],
+                     prot_traj_seq,
                      cg_version=model.cg_version
                  )
                 )
@@ -633,6 +634,7 @@ class ProteinModule(L.LightningModule):
         clean_trajs = _package_traj(clean_traj, -2)
         clean_traj_seqs = _package_traj(clean_traj, -3)
         prot_trajs = _package_traj(prot_traj, -1)
+        prot_traj_seqs = _package_traj(prot_traj, -2)
 
         # TODO: there's smth funky going on here
         # where seq is fixed and bb is fixed but rigid is not fixed
@@ -676,6 +678,7 @@ class ProteinModule(L.LightningModule):
                 "clean_traj": clean_trajs[i],
                 "clean_traj_seq": clean_traj_seqs[i],
                 "prot_traj": prot_trajs[i],
+                "prot_traj_seq": prot_traj_seqs[i],
                 "input": sample_input,
                 "fixed_res_idx": fixed_res_idx[i],
                 "fixed_bb_res_idx": fixed_bb_res_idx[i],
@@ -683,6 +686,7 @@ class ProteinModule(L.LightningModule):
                 "fixed_res_chain_idx": fixed_res_chain_idx[i],
                 "fixed_bb_chain_idx": fixed_bb_chain_idx[i],
                 "fixed_seq_chain_idx": fixed_seq_chain_idx[i],
+                "chain_idx": sample_input['residue']['chain_idx']
             })
 
         return ret
@@ -778,28 +782,73 @@ class ProteinModule(L.LightningModule):
                 )
             )
 
-            # if self.learnable_noise_schedule:
-            #     trans_vf_scale =
+            if self.learnable_noise_schedule:
+                # TODO: why the heck does jvp not work here
+                l = token_data['token_is_protein_output_mask'].float().sum(dim=-1) / 100
+                # log_trans_time_fn = lambda x: torch.log(1 - self.model.trans_gamma_t(x, l[..., None]))
+                # log_rot_time_fn = lambda x: torch.log(1 - self.model.rot_gamma_t(x, l[..., None]))
+
+                trans_shift_scale = self.model.trans_gamma_t._forward(l[..., None])
+                rot_shift_scale = self.model.trans_gamma_t._forward(l[..., None])
+
+                # log_trans_t_grad = torch.func.jvp(log_trans_time_fn, (t,), (torch.ones_like(t),))[1]
+                # log_rot_t_grad = torch.func.jvp(log_rot_time_fn, (t,), (torch.ones_like(t),))[1]
+                log_trans_t_grad = -1 / ((t - 1) * (trans_shift_scale * (t - 1) - t))
+                log_rot_t_grad = -1 / ((t - 1) * (rot_shift_scale * (t - 1) - t))
+
+                print(log_trans_t_grad, log_rot_t_grad)
+                trans_time = self.model.trans_gamma_t(t, l[..., None])[..., None]
+                rot_time = self.model.rot_gamma_t(t, l[..., None])[..., None]
+                trans_vf_scale = -log_trans_t_grad[..., None] * (1 - trans_time)
+                rot_vf_scale = -log_rot_t_grad[..., None] * (1 - rot_time)
+                trans_d_t_hat = self.model.trans_gamma_t(t + d_t_hat, l[..., None]) - self.model.trans_gamma_t(t, l[..., None])
+                trans_d_t_hat = trans_d_t_hat[..., None]
+                rot_d_t_hat = self.model.rot_gamma_t(t + d_t_hat, l[..., None]) - self.model.rot_gamma_t(t, l[..., None])
+                rot_d_t_hat = rot_d_t_hat[..., None]
+            else:
+                trans_d_t_hat = d_t_hat
+                rot_d_t_hat = d_t_hat
+                trans_time = t
+                rot_time = t
+                trans_vf_scale = 1
+                rot_vf_scale = 1
 
             # Take reverse step
+            # trans_t_2 = frame_noiser._trans_euler_step(
+            #     d_t_hat,
+            #     t_hat,
+            #     pred_trans_1,
+            #     trans_t_hat,
+            #     noising_mask=rigids_noising_mask,
+            #     # add_noise=False,
+            #     # use_score=False
+            # )
+            # rotmats_t_2 = frame_noiser._rots_euler_step(
+            #     d_t_hat,
+            #     t_hat,
+            #     pred_rotmats_1,
+            #     rotmats_t_hat,
+            #     noising_mask=rigids_noising_mask,
+            #     # add_noise=False,
+            #     # use_score=False
+            # )
             trans_t_2 = frame_noiser._trans_euler_step(
-                d_t_hat,
-                t_hat,
+                trans_d_t_hat,
+                trans_time,
                 pred_trans_1,
                 trans_t_hat,
                 noising_mask=rigids_noising_mask,
-                # add_noise=False,
-                # use_score=False
+                vf_scale=trans_vf_scale,
             )
             rotmats_t_2 = frame_noiser._rots_euler_step(
-                d_t_hat,
-                t_hat,
+                rot_d_t_hat,
+                rot_time,
                 pred_rotmats_1,
                 rotmats_t_hat,
                 noising_mask=rigids_noising_mask,
-                # add_noise=False,
-                # use_score=False
+                vf_scale=rot_vf_scale
             )
+
             # if torch.isnan(trans_t_2).any():
             #     print("trans step", t_1)
             #     exit()
@@ -917,6 +966,7 @@ class ProteinModule(L.LightningModule):
 
         samples = []
         seqs = []
+        chain_idxs = []
         max_mask_len = output_mask.sum(dim=-1).max().item()
         for i in range(output_mask.shape[0]):
             seqs.append(
@@ -924,6 +974,9 @@ class ProteinModule(L.LightningModule):
             )
             samples.append(
                 decoded_struct[i][output_mask.to(device=decoded_struct.device)[i, :max_mask_len]]
+            )
+            chain_idxs.append(
+                token_data['chain_idx'][i][output_mask.to(device=decoded_struct.device)[i]]
             )
 
 
@@ -945,6 +998,7 @@ class ProteinModule(L.LightningModule):
                 "fixed_res_chain_idx": fixed_res_chain_idx[i],
                 "fixed_bb_chain_idx": fixed_bb_chain_idx[i],
                 "fixed_seq_chain_idx": fixed_seq_chain_idx[i],
+                "chain_idx": chain_idxs[i]
             })
 
         return ret

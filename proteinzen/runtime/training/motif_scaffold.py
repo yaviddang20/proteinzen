@@ -97,7 +97,8 @@ class MotifScaffolding(TrainingTask):
             ln_sig = self.lognorm_mu + torch.randn(num_batch, device=device).float() * self.lognorm_sig
             t = torch.sigmoid(ln_sig)
         elif self.t_sched == 'uniform':
-            t = torch.rand(num_batch, device=device).float()
+            # t = torch.rand(num_batch, device=device).float()
+            t = torch.ones(num_batch, device=device).float() * 0.99
         elif self.t_sched == 'mixed_beta':
             u = torch.rand(1)
             if u < 0.02:

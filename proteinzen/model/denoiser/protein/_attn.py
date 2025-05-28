@@ -937,7 +937,7 @@ class MultiRigidPairEmbedder(nn.Module):
 
         relpos_feats = relpos(seq_idx, clip=self.relpos_clip)
         relpos_feats = relpos_feats * same_chain_mask[..., None]
-        # relpos_feats[~same_chain_mask][..., -1] += 1
+        relpos_feats[~same_chain_mask][..., -1] += 1  # TODO: delete
 
         z = self.lin_z_ij(relpos_feats)
         a_current = self._featurize_rigids(rigids, distogram=False)

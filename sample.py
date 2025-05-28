@@ -74,15 +74,35 @@ class Experiment:
                 sample_task = sample_data['input']['task'].task_name
                 # sample_task = sample_data['input']['task']['task_name']
 
-                seq_lt = "".join([restypes[i] for i in seq.tolist()])
-                atom91, _ = atom14_to_atom91(seq_lt, sample_coords.numpy(force=True))
-                sample_name = f"len_{sample_len}_protein_{curr_sample_id}"
-                atom91_to_pdb(seq_lt, atom91, sample_name)
+                # seq_lt = "".join([restypes[i] for i in seq.tolist()])
+                # atom91, _ = atom14_to_atom91(seq_lt, sample_coords.numpy(force=True))
+                # sample_name = f"len_{sample_len}_protein_{curr_sample_id}"
+                # atom91_to_pdb(seq_lt, atom91, sample_name)
+
+                chain_idx = sample_data['chain_idx']
+                chains = []
+
+                sample_name = f"len_{sample_len}_protein_{curr_sample_id}.pdb"
+                for i in range(int(chain_idx.max()) + 1):
+                    select = chain_idx == i
+                    chain_seq = seq[select]
+                    chain_seq_lt = "".join([restypes[i] for i in chain_seq.tolist()])
+                    chain_atom91, _ = atom14_to_atom91(chain_seq_lt, sample_coords[select].numpy(force=True))
+                    # atom91_to_pdb(seq_lt, atom91, sample_name)
+                    chain_i = atom91_to_chain(
+                        chain_seq_lt,
+                        chain_atom91,
+                        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[i]
+                    )
+                    chains.append(chain_i)
+                model = chains_to_model(chains, model_id=0)
+                save_struct(models_to_struct([model]), sample_name)
 
                 if self._cfg['save_traj']:
                     clean_traj = sample_data['clean_traj'] # batch['all_R_clean_trajs']
                     clean_traj_seq = sample_data['clean_traj_seq']
                     prot_traj = sample_data['prot_traj']
+                    prot_traj_seq = sample_data['prot_traj_seq']
 
                     clean_traj_name = f"len_{sample_len}_protein_{curr_sample_id}_clean_traj.pdb"
                     prot_traj_name = f"len_{sample_len}_protein_{curr_sample_id}_prot_traj.pdb"
@@ -103,7 +123,10 @@ class Experiment:
                         clean_models.append(clean_model)
 
                         prot = prot_traj[t]
-                        prot_atom91, _ = atom14_to_atom91(clean_seq, prot.numpy(force=True))
+                        prot_seq = prot_traj_seq[t]
+                        print(prot_seq)
+                        prot_seq = "".join([restypes[j] for j in prot_seq.tolist()])
+                        prot_atom91, _ = atom14_to_atom91(prot_seq, prot.numpy(force=True))
                         prot_chain = atom91_to_chain(
                             clean_seq,
                             prot_atom91,

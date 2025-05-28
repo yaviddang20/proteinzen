@@ -107,7 +107,10 @@ class MotifScaffoldingTask(SamplingTask):
                     self.redesign_contigs[chain].add(resid)
 
         try:
-            self.contigs = self._parse_condition_str(contigs)
+            chain_contig_strs = contigs.split("/")
+            self.contigs = []
+            for i, chain_contig in enumerate(chain_contig_strs):
+                self.contigs += self._parse_condition_str(chain_contig, i)
         except Exception as e:
             print(f"error with parsing contigs {contigs} from {pdb}")
             raise e
@@ -119,8 +122,7 @@ class MotifScaffoldingTask(SamplingTask):
         cg_group_mask.append([0.0] * 4)
         self.cg_group_mask = torch.as_tensor(cg_group_mask, dtype=torch.bool)[:, (0, 2, 3)]
 
-
-    def _parse_condition_str(self, contigs_str):
+    def _parse_condition_str(self, contigs_str, chain_idx):
         contigs = [c.strip() for c in contigs_str.split(",")]
         data_chunks = []
 
@@ -130,26 +132,26 @@ class MotifScaffoldingTask(SamplingTask):
                 if "-" in contig:
                     motif_start, motif_end = [int(i) for i in contig[1:].split("-")]
                     # print("scaffold", contig, motif_start, motif_end)
-                    data_chunks.append(self._get_motif_data(chain, motif_start, motif_end))
+                    data_chunks.append(self._get_motif_data(chain, motif_start, motif_end, chain_idx=chain_idx))
                 else:
                     motif_resid = int(contig[1:])
                     # print("scaffold", contig, motif_resid)
-                    data_chunks.append(self._get_motif_data(chain, motif_resid))
+                    data_chunks.append(self._get_motif_data(chain, motif_resid, chain_idx=chain_idx))
             else:
                 if "-" in contig:
                     lower, upper = [int(i) for i in contig.split("-")]
                     # print("design", contig, lower, upper)
-                    chunk_fn = fn.partial(self._get_blank_data, lower=lower, upper=upper)
+                    chunk_fn = fn.partial(self._get_blank_data, lower=lower, upper=upper, chain_idx=chain_idx)
                     data_chunks.append(chunk_fn)
                 else:
                     length = int(contig)
                     # print("design", contig, length)
-                    chunk_fn = fn.partial(self._get_blank_data, lower=length, upper=length)
+                    chunk_fn = fn.partial(self._get_blank_data, lower=length, upper=length, chain_idx=chain_idx)
                     data_chunks.append(chunk_fn)
 
         return data_chunks
 
-    def _get_motif_data(self, chain_id, motif_start, motif_end=None):
+    def _get_motif_data(self, chain_id, motif_start, motif_end=None, chain_idx=0):
         chain = self.structure[0][chain_id]
         atom37 = []
         seq = []
@@ -187,10 +189,11 @@ class MotifScaffoldingTask(SamplingTask):
             'aatype': seq,
             'all_atom_positions': atom37,
             'all_atom_mask': atom37_mask,
-            'redesign_mask': redesign_mask
+            'redesign_mask': redesign_mask,
+            'chain_idx': torch.ones_like(seq) * chain_idx
         }
 
-    def _get_blank_data(self, lower, upper, override=None):
+    def _get_blank_data(self, lower, upper, override=None, chain_idx=0):
         if override is not None:
             num_res = override
         else:
@@ -203,7 +206,8 @@ class MotifScaffoldingTask(SamplingTask):
             'aatype': seq.long(),
             'all_atom_positions': dummy_atom37.double(),
             'all_atom_mask': atom37_mask.double(),
-            'redesign_mask': torch.zeros_like(seq, dtype=torch.bool)
+            'redesign_mask': torch.zeros_like(seq, dtype=torch.bool),
+            'chain_idx': torch.ones_like(seq) * chain_idx
         }
 
     def _sample_init_data(self):
@@ -306,7 +310,7 @@ class MotifScaffoldingTask(SamplingTask):
                 "seq": seq.long(),
                 "seq_mask": torch.ones(num_res).bool(),
                 "seq_noising_mask": (seq == residue_constants.restype_order_with_x['X']),
-                "chain_idx": torch.zeros(num_res),
+                "chain_idx": chain_feats['chain_idx'], # torch.zeros(num_res),
                 "num_res": num_res,
                 "num_nodes": num_res
             }

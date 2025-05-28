@@ -72,19 +72,9 @@ class UnconditionalSamplingV2(SamplingTask):
 
         dummy_motif = torch.zeros((0, 7), device=noisy_rigids.device)
         dummy_motif_seq = torch.zeros((0,), device=noisy_rigids.device)
-        motif_noising_mask = dummy_motif_seq.clone().bool()
 
-        assembler = SampleRigidAssembler(
-            motif_rigids=dummy_motif,
-            motif_seq=dummy_motif_seq,
-            promote_full_motif_to_token=False
-        )
-
-        rigids_data = assembler.assemble(
-            noisy_rigids,
-            motif_noising_mask,
-            dummy_motif_seq.clone(),
-            motif_noising_mask.clone()
+        rigids_data = SampleRigidAssembler.assemble_noise(
+            noisy_rigids
         )
 
         features = {
@@ -132,22 +122,20 @@ class UnconditionalSamplingV2(SamplingTask):
             'seq_mask': torch.ones(self.total_len, dtype=torch.bool),
             'chain_idx': torch.zeros(self.total_len),
         }
-        token_data = features['token']
-        token_data['seq'] = torch.cat([res_data['seq'], dummy_motif_seq], dim=-1)
-        token_data['seq_noising_mask'] = torch.cat([res_data['seq_noising_mask'], torch.zeros_like(dummy_motif_seq).bool()], dim=-1)
-        token_data['seq_mask'] = torch.cat([res_data['seq_mask'], torch.ones_like(dummy_motif_seq).bool()], dim=-1)
-        token_data['chain_idx'] = torch.cat([res_data['chain_idx'], torch.full_like(dummy_motif_seq, fill_value=res_data['chain_idx'][-1])], dim=-1)
-        # token_feats = [
-        #     "seq",
-        #     "seq_noising_mask",
-        #     "seq_mask",
-        #     "chain_idx"
-        # ]
-        # # duplicate the motif residues and update res_data
-        # for key in token_feats:
-        #     tensor = res_data[key]
-        #     tensor_expand = tensor[..., None].expand(-1, 3)
-        #     features['token'][key] = torch.cat([tensor, tensor_expand.flatten(0, 1)], dim=0)
+        # token_data = features['token']
+        # token_data['seq'] = torch.cat([res_data['seq'], dummy_motif_seq], dim=-1)
+        # token_data['seq_noising_mask'] = torch.cat([res_data['seq_noising_mask'], torch.zeros_like(dummy_motif_seq).bool()], dim=-1)
+        # token_data['seq_mask'] = torch.cat([res_data['seq_mask'], torch.ones_like(dummy_motif_seq).bool()], dim=-1)
+        # token_data['chain_idx'] = torch.cat([res_data['chain_idx'], torch.full_like(dummy_motif_seq, fill_value=res_data['chain_idx'][-1])], dim=-1)
+        token_feats = [
+            "seq",
+            "seq_noising_mask",
+            "seq_mask",
+            "chain_idx"
+        ]
+        # duplicate the motif residues and update res_data
+        for key in token_feats:
+            features['token'][key] = res_data[key]
 
         features['residue']['num_nodes'] = torch.as_tensor(features['token']['seq'].numel())
         features['residue']['num_res'] = torch.as_tensor(features['token']['seq'].numel())

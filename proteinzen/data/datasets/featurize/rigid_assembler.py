@@ -582,6 +582,59 @@ class SampleRigidAssembler:
 
         return rigids_dict
 
+    @classmethod
+    def assemble_noise(
+        cls,
+        noisy_rigids,
+    ):
+        flat_rigids = noisy_rigids.flatten(0, 1)
+        num_res = noisy_rigids.shape[0]
+        num_rigids = flat_rigids.shape[0]
+
+        flat_rigids_mask = torch.ones(num_rigids, dtype=torch.bool)
+        flat_noising_mask = torch.ones(num_rigids, dtype=torch.bool)
+        seq_idx = torch.arange(num_res)
+        cg_rigid_idx = torch.tile(
+            torch.arange(cls.num_cg_rigids)[None],
+            (len(seq_idx), 1)
+        )
+        cg_token_rigid_mask = torch.zeros_like(cg_rigid_idx, dtype=torch.bool)
+        cg_token_rigid_mask[..., 0] = True
+
+        _seq_idx = torch.tile(
+            seq_idx[..., None],
+            (1, noisy_rigids.shape[1])
+        ).flatten(0, 1)
+        flat_seq_idx = _seq_idx.clone()
+        flat_rigid_token_uid = flat_seq_idx.clone()
+        flat_rigid_idx = cg_rigid_idx.flatten(0, 1)
+        flat_is_atomized = torch.zeros_like(flat_seq_idx, dtype=torch.bool)
+        flat_is_unindexed = torch.zeros_like(flat_seq_idx, dtype=torch.bool)
+        flat_is_token_rigid = cg_token_rigid_mask.flatten(0, 1)
+        flat_is_ligand = torch.zeros_like(flat_noising_mask, dtype=torch.bool)
+        flat_is_protein_output = torch.ones_like(flat_noising_mask, dtype=torch.bool)
+
+        rigids_dict = {
+            "rigids": flat_rigids,
+            "rigids_mask": flat_rigids_mask.bool(),
+            "rigids_noising_mask": flat_noising_mask.bool(),
+            "seq_idx": flat_seq_idx,
+            "token_uid": flat_rigid_token_uid,
+            "rigid_idx": flat_rigid_idx,
+            "is_atomized_mask": flat_is_atomized.bool(),
+            "is_unindexed_mask": flat_is_unindexed.bool(),
+            "is_token_rigid_mask": flat_is_token_rigid.bool(),
+            "is_ligand_mask": flat_is_ligand.bool(),
+            "is_protein_output_mask": flat_is_protein_output.bool(),
+            "splice_lens": torch.tensor([flat_is_atomized.numel()], dtype=torch.long)
+        }
+
+        is_token_rigid_mask = rigids_dict['is_token_rigid_mask']
+        rigids_dict['token_gather_idx'] = torch.arange(is_token_rigid_mask.numel())[is_token_rigid_mask]
+
+        return rigids_dict
+
+
 
 def rigids_to_atom14(
     rigids,

@@ -198,7 +198,7 @@ class MultiFrameInterpolation(TrainingHarness):
         return ru.Rigid.from_tensor_4x4(tensor_4x4)[:, (0, 2, 3)]
 
 
-    def process_input(self, data: HeteroData, force_t0=False):
+    def process_input(self, data: HeteroData, force_t0=False, force_t=None):
         data = copy.deepcopy(data)
         self.frame_noiser.set_device(data['residue']['atom37'].device)
         res_data = data['residue']
@@ -307,6 +307,9 @@ class MultiFrameInterpolation(TrainingHarness):
         rigidwise_t = task_data['t']
         rigidwise_noising_mask = task_data['rigids_noising_mask']
         seq_noising_mask = task_data['seq_noising_mask']
+        if force_t is not None:
+            rigidwise_t = torch.ones_like(rigidwise_t) * force_t
+
         if force_t0:
             rigidwise_t = torch.zeros_like(rigidwise_t)
         res_data['seq_noising_mask'] = seq_noising_mask

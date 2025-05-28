@@ -101,7 +101,7 @@ def atomic_losses_reduced(batch,
         res_data.batch,
         atom14_gt_mask,
         atom14_alt_gt_mask,
-        minimal_mask,
+        res_data['rigids_noising_mask'][..., 0], #minimal_mask,
         no_bb=False,
         seqwise_weight=seqwise_weight,
         ignore_symmetry=True
