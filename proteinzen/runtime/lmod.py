@@ -471,15 +471,18 @@ class ProteinModule(L.LightningModule):
         t_1 = ts[0]
 
         total_num_res = res_data.num_nodes
+        dummy_seq = res_data['seq'].clone()
+        dummy_seq[seq_noising_mask] = 1  # masked seq as R for vis
+
         device = self.device
         prot_traj = [(
             trans_0,  # trans
             rotmats_0,  # rot
-            torch.ones((total_num_res, 21), device=device).float(),  # seq logits
+            dummy_seq,  # seq
             compute_atom14_from_cg_frames(
                 ru.Rigid(ru.Rotation(rot_mats=rotmats_0), trans_0),
                 res_data.res_mask,
-                torch.ones_like(res_data.seq),
+                dummy_seq,
                 cg_version=model.cg_version
             )
         )]
@@ -527,6 +530,7 @@ class ProteinModule(L.LightningModule):
             #     print("pred", t_1)
             #     exit()
 
+            # print(denoiser_out['pred_seq'].detach().cpu())
             clean_traj.append(
                 (
                     pred_trans_1.detach().cpu(),
@@ -567,7 +571,7 @@ class ProteinModule(L.LightningModule):
             prot_traj_seq = denoiser_out["pred_seq"].clone()
             prot_traj_seq[seq_noising_mask] = 1  # set to R for vis purposes
 
-            # print(prot_traj_seq)
+            # print("test", prot_traj_seq)
             prot_traj.append(
                 (trans_t_2,
                  rotmats_t_2,
@@ -584,6 +588,8 @@ class ProteinModule(L.LightningModule):
 
             if not model.self_conditioning:
                 denoiser_out = None
+
+        print([t[-1][seq_noising_mask] for t in prot_traj])
 
         # We only integrated to min_t, so need to make a final step
         t_1 = ts[-1]
@@ -632,8 +638,8 @@ class ProteinModule(L.LightningModule):
             return list(zip(*unbatched_traj))
 
         clean_trajs = _package_traj(clean_traj, -2)
-        clean_traj_seqs = _package_traj(clean_traj, -3)
         prot_trajs = _package_traj(prot_traj, -1)
+        clean_traj_seqs = _package_traj(clean_traj, -3)
         prot_traj_seqs = _package_traj(prot_traj, -2)
 
         # TODO: there's smth funky going on here
@@ -670,8 +676,10 @@ class ProteinModule(L.LightningModule):
         ret = []
 
         data_list = batch.to_data_list()
+        chain_idx = res_data['chain_idx'][res_mask].split(num_res.tolist(), dim=0)
 
         for i, sample_input in enumerate(data_list):
+            # print(samples[i].shape, sample_input['residue']['chain_idx'].shape, seqs[i].shape)
             ret.append({
                 "sample_coord": samples[i],
                 "seq": seqs[i],
@@ -686,7 +694,7 @@ class ProteinModule(L.LightningModule):
                 "fixed_res_chain_idx": fixed_res_chain_idx[i],
                 "fixed_bb_chain_idx": fixed_bb_chain_idx[i],
                 "fixed_seq_chain_idx": fixed_seq_chain_idx[i],
-                "chain_idx": sample_input['residue']['chain_idx']
+                "chain_idx": chain_idx[i]
             })
 
         return ret
@@ -795,6 +803,8 @@ class ProteinModule(L.LightningModule):
                 # log_rot_t_grad = torch.func.jvp(log_rot_time_fn, (t,), (torch.ones_like(t),))[1]
                 log_trans_t_grad = -1 / ((t - 1) * (trans_shift_scale * (t - 1) - t))
                 log_rot_t_grad = -1 / ((t - 1) * (rot_shift_scale * (t - 1) - t))
+                log_trans_t_grad = log_trans_t_grad.clip(min=-100)
+                log_rot_t_grad = log_rot_t_grad.clip(min=-100)
 
                 print(log_trans_t_grad, log_rot_t_grad)
                 trans_time = self.model.trans_gamma_t(t, l[..., None])[..., None]
