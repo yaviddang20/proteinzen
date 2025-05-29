@@ -84,7 +84,7 @@ class Experiment:
 
                 sample_name = f"len_{sample_len}_protein_{curr_sample_id}.pdb"
                 for i in range(int(chain_idx.max()) + 1):
-                    select = chain_idx == i
+                    select = (chain_idx == i)
                     chain_seq = seq[select]
                     chain_seq_lt = "".join([restypes[i] for i in chain_seq.tolist()])
                     chain_atom91, _ = atom14_to_atom91(chain_seq_lt, sample_coords[select].numpy(force=True))
@@ -112,6 +112,7 @@ class Experiment:
                     for t, _ in enumerate(clean_traj):
                         clean = clean_traj[t]
                         clean_seq = clean_traj_seq[t]
+                        # print(clean_seq)
                         clean_seq = "".join([restypes[j] for j in clean_seq.tolist()])
                         clean_atom91, _ = atom14_to_atom91(clean_seq, clean.numpy(force=True))
                         clean_chain = atom91_to_chain(
@@ -124,11 +125,11 @@ class Experiment:
 
                         prot = prot_traj[t]
                         prot_seq = prot_traj_seq[t]
-                        print(prot_seq)
+                        # print(prot_seq)
                         prot_seq = "".join([restypes[j] for j in prot_seq.tolist()])
                         prot_atom91, _ = atom14_to_atom91(prot_seq, prot.numpy(force=True))
                         prot_chain = atom91_to_chain(
-                            clean_seq,
+                            prot_seq,
                             prot_atom91,
                             "A"
                         )
