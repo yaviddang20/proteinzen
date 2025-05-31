@@ -342,6 +342,12 @@ def atom14_fm_losses(batch,
             ignore_symmetry=True
         )
 
+    # print(unscaled_atom14_mse, ref_atom14_mse)
+    # print(batch.name, 'loss pred', pred_atom14_gt_seq)
+    # print(batch.name, 'loss ref', ref_atom14)
+    # print(batch.name, 'loss gt', gt_atom14)
+    # exit()
+
     seq_loss = seq_cce_loss(
         seq,
         seq_logits,

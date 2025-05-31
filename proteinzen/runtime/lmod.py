@@ -378,7 +378,7 @@ class ProteinModule(L.LightningModule):
                 dim=0
             )
 
-            print(total_norm)
+            print("grad norm", total_norm)
 
         self.log(
             "grad_norm",
@@ -589,7 +589,7 @@ class ProteinModule(L.LightningModule):
             if not model.self_conditioning:
                 denoiser_out = None
 
-        print([t[-1][seq_noising_mask] for t in prot_traj])
+        # print([t[-1][seq_noising_mask] for t in prot_traj])
 
         # We only integrated to min_t, so need to make a final step
         t_1 = ts[-1]
