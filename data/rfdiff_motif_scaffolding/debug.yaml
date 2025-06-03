@@ -1,0 +1,33 @@
+tasks:
+# - task: motif_scaffolding
+#   pdb: /wynton/home/kortemme/alexjli/projects/proteinzen-clone/data/rfdiff_motif_scaffolding/pdbs/1PRW.pdb
+#   contigs: "5-20,A16-35,10-25,A52-71,5-20"
+#   redesign_contigs: "A16-19,A21,A23,A25,A27-30,A32-35,A52-55,A57,A59,A61,A63-66,A68-71"
+#   num_samples: 10
+#   cg_version: 2
+#   total_length: "60-150"
+#   name: 1PRW
+- task: motif_scaffolding
+  pdb: /wynton/home/kortemme/alexjli/projects/proteinzen-clone/data/rfdiff_motif_scaffolding/pdbs/1QJG.pdb
+  contigs: "10-20,A38,15-30,A14,15-30,A99,10-20"
+  redesign_contigs: ""
+  num_samples: 10
+  cg_version: 1
+  total_length: "53-103"
+  name: 1QJG
+# - task: motif_scaffolding
+#   pdb: /wynton/home/kortemme/alexjli/projects/proteinzen-clone/data/rfdiff_motif_scaffolding/pdbs/5YUI.pdb
+#   contigs: "5-30,A93-97,5-20,A118-120,10-35,A198-200,10-30"
+#   redesign_contigs: "A93,A95,A97,A118,A120"
+#   num_samples: 10
+#   cg_version: 1
+#   total_length: "50-100"
+#   name: 5YUI
+# - task: motif_scaffolding
+#   pdb: /wynton/home/kortemme/alexjli/projects/proteinzen-clone/data/rfdiff_motif_scaffolding/pdbs/6E6R.pdb
+#   contigs: "20-95,A23-35,0-5"
+#   redesign_contigs: ""
+#   num_samples: 10
+#   cg_version: 1
+#   total_length: "108"
+#   name: 6E6R_long

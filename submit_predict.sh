@@ -7,13 +7,19 @@
 #$ -q gpu.q
 #$ -pe smp 1
 #$ -l mem_free=32G
-#$ -l h_rt=5:00:00
+#$ -l h_rt=7:00:00
 #$ -l compute_cap=61,gpu_mem=40G
 
 export CUDA_VISIBLE_DEVICES=$SGE_GPU
 export GEOMSTATS_BACKEND=pytorch
 echo $SGE_GPU
 echo $CUDA_VISIBLE_DEVICES
+
+module load Sali cuda
+
+# SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+# source $SCRIPT_DIR/env_vars.sh
+source /wynton/home/kortemme/alexjli/projects/proteinzen/env_vars.sh
 
 ROOT_DIR=$PWD
 cd $1
@@ -32,7 +38,7 @@ else
 fi
 
 ## generate samples
-conda activate proteinzen-flash
+conda activate ${ENV_NAME}
 
 python predict.py --run_dir=$RUN_DIR --out_prefix=$OUTPREFIX --checkpoint_idx=$CHECKPOINTIDX
 
@@ -64,9 +70,9 @@ cd $RUN_DIR
 cd $OUTPREFIX
 mkdir esmfold
 cd esmfold
-bash ~/projects/ligbinddiff/scripts/analysis/esmfold.sh > esmfold.log
+bash ${REPO_ROOT}/scripts/analysis/esmfold.sh > esmfold.log
 
-conda activate proteinzen
-python ~/projects/ligbinddiff/scripts/analysis/esm_analysis.py --esmlog esmfold.log --folded_folder $PWD --samples ../samples | tail -n 3 > ${RUN_DIR}/$OUTPREFIX/num_designable.txt
+conda activate ${ENV_NAME}
+python ${REPO_ROOT}/scripts/analysis/esm_analysis.py --esmlog esmfold.log --folded_folder $PWD --samples ../samples # | tail -n 3 > ${RUN_DIR}/$OUTPREFIX/num_designable.txt
 cd ..
-bash ~/projects/ligbinddiff/scripts/analysis/analysis_suite.sh
+bash ${REPO_ROOT}/scripts/analysis/analysis_suite.sh

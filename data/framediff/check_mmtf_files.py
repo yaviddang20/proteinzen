@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import json
 
-from ligbinddiff.utils.atom_reps import atom37_atom_label, atom37_to_atom14
+from proteinzen.utils.atom_reps import atom37_atom_label, atom37_to_atom14
 
 metadata = pd.read_csv("filtered_metadata.csv")
 import tqdm

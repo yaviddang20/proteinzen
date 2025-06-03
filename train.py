@@ -10,14 +10,15 @@ import torch
 import numpy as np
 
 from lightning import LightningDataModule, LightningModule, Trainer
-from lightning.pytorch.loggers.wandb import WandbLogger
+# from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
 
-import wandb
+# import wandb
 
-from ligbinddiff.runtime.config import config_hydra_store, remove_zen_keys
-from ligbinddiff.tasks.task import single_task_sampler
+from proteinzen.runtime.config import config_hydra_store, remove_zen_keys
+from proteinzen.harness.fm.multiframe import MultiFrameInterpolation
+from proteinzen.runtime.training.task import TaskSampler
 
 
 # A logger for this file
@@ -42,9 +43,10 @@ class Experiment:
             log.info("Debug mode.")
             logger = None
         else:
-            logger = WandbLogger(
-                **remove_zen_keys(self._exp_cfg.wandb),
-            )
+            raise NotImplementedError()
+            # logger = WandbLogger(
+            #     **remove_zen_keys(self._exp_cfg.wandb),
+            # )
 
         # # Checkpoint directory.
         # ckpt_dir = self._exp_cfg.checkpointer.dirpath
@@ -70,7 +72,7 @@ class Experiment:
             enable_progress_bar=True,
             enable_model_summary=True,
             devices=devices,
-            reload_dataloaders_every_n_epochs=1,
+            # reload_dataloaders_every_n_epochs=1,
             # strategy='ddp_find_unused_parameters_true',
             # detect_anomaly=True
         )
@@ -92,21 +94,40 @@ def main(model,
          lmodule,
          datamodule,
          experiment,
+         harness,
          tasks,
          zen_cfg):
     # change into the output directory
     os.chdir(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)
     log.info(f"Experiment started in folder: {os.getcwd()}")
 
+    # assemble task sampler
+    print(tasks)
+    task_freq_keys = [key for key in tasks if key.endswith("_freq")]
+    task_list = []
+    task_probs = []
+    for task_freq_key in task_freq_keys:
+        task_freq = tasks[task_freq_key]
+        task = tasks[task_freq_key[:-len("_freq")]]
+        task_list.append(task)
+        task_probs.append(task_freq)
+    task_sampler = TaskSampler(task_list, task_probs)
+
     # datamodule and optim are all partial'd __init__s
     # so we instantiate instances of each
-    model = lmodule(model, experiment['optim'])
+    harness = harness(corrupter, task_sampler)
+    model = lmodule(model, experiment['optim'], harness)
     checkpointer = experiment['checkpointer']
     os.makedirs(model.val_dir, exist_ok=True)
-    task_sampler = single_task_sampler(tasks(corrupter))
 
+
+    # TODO: this is so jenk
+    if 'force_override_length_batching' in zen_cfg:
+        force_override_length_batching = bool(zen_cfg['force_override_length_batching'])
+    else:
+        force_override_length_batching = False
     # TODO: there's gotta be a nicer way of doing this
-    if hasattr(model.model, "lrange_logn_scale") and model.model.lrange_logn_scale > 0:
+    if not force_override_length_batching and hasattr(model.model, "lrange_logn_scale") and model.model.lrange_logn_scale > 0:
         _model = model.model
         def batch_by_edge_fn(n):
             lrange = round(
@@ -115,9 +136,9 @@ def main(model,
             knn = _model.knn_k
             edges_per_node = min(lrange+knn, n)
             return edges_per_node * n
-        datamodule_inst = datamodule(task_sampler=task_sampler, batch_by_edge_fn=batch_by_edge_fn)
+        datamodule_inst = datamodule(training_harness=harness, batch_by_edge_fn=batch_by_edge_fn)
     else:
-        datamodule_inst = datamodule(task_sampler=task_sampler)
+        datamodule_inst = datamodule(training_harness=harness)
 
     exp = Experiment(
         model=model,

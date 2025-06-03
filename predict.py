@@ -10,6 +10,7 @@ import hydra
 from hydra_zen import zen, load_from_yaml
 import omegaconf
 import torch
+import numpy as np
 
 from lightning import LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers.wandb import WandbLogger
@@ -18,12 +19,11 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 
 import wandb
 
-from ligbinddiff.runtime.config import config_hydra_store, remove_zen_keys
-from ligbinddiff.tasks.task import single_task_sampler
-from ligbinddiff.data.io.atom91 import atom91_to_pdb, atom91_to_chain, chains_to_model, models_to_struct, save_struct
-from ligbinddiff.utils.atom_reps import atom14_to_atom91
-from ligbinddiff.data.openfold.residue_constants import restypes
-from ligbinddiff.runtime.lmod import BackboneModule
+from proteinzen.runtime.config import config_hydra_store, remove_zen_keys
+from proteinzen.data.io.atom91 import atom91_to_pdb, atom91_to_chain, chains_to_model, models_to_struct, save_struct
+from proteinzen.utils.atom_reps import atom14_to_atom91
+from proteinzen.data.openfold.residue_constants import restypes
+from proteinzen.runtime.lmod import ProteinModule
 
 
 # A logger for this file
@@ -122,49 +122,75 @@ class Experiment:
                         atom91, atom91_mask = atom14_to_atom91(seq, atom14)
                         atom91_to_pdb(seq, atom91, f"len_{sample_len}_protein_{sample_id}")
 
-                    # clean_trajs = batch['clean_trajs']
-                    # clean_traj_seqs = batch['clean_traj_seqs']
-                    # prot_trajs = batch['prot_trajs']
-                    # for clean_traj, clean_seq, prot_traj, sample_id in zip(clean_trajs, clean_traj_seqs, prot_trajs, sample_ids):
-                    #     clean_traj_name = f"len_{sample_len}_protein_{sample_id}_clean_traj.pdb"
-                    #     prot_traj_name = f"len_{sample_len}_protein_{sample_id}_prot_traj.pdb"
-                    #     clean_models = []
-                    #     prot_models = []
-                    #     for i, _ in enumerate(clean_traj):
-                    #         clean = clean_traj[i]
-                    #         seq = clean_seq[i].argmax(dim=-1)
-                    #         seq = "".join([restypes[j] for j in seq.tolist()])
-                    #         prot = prot_traj[i]
-                    #         sample_len = clean.shape[0]
-                    #         clean_atom91, _ = atom14_to_atom91(seq, clean.numpy(force=True))
-                    #         clean_chain = atom91_to_chain(
-                    #             seq,
-                    #             clean_atom91,
-                    #             "A"
-                    #         )
-                    #         all_ala = "".join(["A" for _ in range(sample_len)])
-                    #         # prot_atom91, _ = atom14_to_atom91(all_ala, prot.numpy(force=True))
-                    #         # prot_chain = atom91_to_chain(
-                    #         #     all_ala,
-                    #         #     prot_atom91,
-                    #         #     "A"
-                    #         # )
-                    #         clean_model = chains_to_model([clean_chain], model_id=i)
-                    #         # prot_model = chains_to_model([prot_chain], model_id=i)
-                    #         clean_models.append(clean_model)
-                    #         # prot_models.append(prot_model)
-                    #     save_struct(models_to_struct(clean_models), clean_traj_name)
-                    #     # save_struct(models_to_struct(prot_models), prot_traj_name)
+                    if self._cfg.save_traj:
+                        clean_trajs = batch['clean_trajs'] # batch['all_R_clean_trajs']
+                        clean_traj_seqs = batch['clean_traj_seqs']
+                        prot_trajs = batch['prot_trajs']
+                        for clean_traj, clean_seq, prot_traj, sample_id in zip(clean_trajs, clean_traj_seqs, prot_trajs, sample_ids):
+                            sample_len = len(clean_seq[0])
+                            clean_traj_name = f"clean_traj_len_{sample_len}_protein_{sample_id}.pdb"
+                            prot_traj_name = f"prot_traj_len_{sample_len}_protein_{sample_id}.pdb"
+                            clean_models = []
+                            prot_models = []
+                            for i, _ in enumerate(clean_traj):
+                                clean = clean_traj[i]
+                                # seq = clean_seq[i].argmax(dim=-1)
+                                seq = clean_seq[i]
+                                # print("".join([restypes[j] for j in seq.tolist()]))
+                                # seq = "".join(["R" for _ in seq.tolist()])
+                                seq = "".join([restypes[j] for j in seq.tolist()])
+                                # prot = prot_traj[i]
+                                clean_atom91, _ = atom14_to_atom91(seq, clean.numpy(force=True))
+                                clean_chain = atom91_to_chain(
+                                    seq,
+                                    clean_atom91,
+                                    "A"
+                                )
+                                clean_model = chains_to_model([clean_chain], model_id=i)
+                                clean_models.append(clean_model)
+                            save_struct(models_to_struct(reversed(clean_models)), clean_traj_name)
 
+                            for i, _ in enumerate(clean_traj):
+                                prot = prot_traj[i]
+                                seq = "".join(["R" for _ in range(sample_len)])
+                                # all_ala = "".join(["A" for _ in range(sample_len)])
+                                prot_atom91, _ = atom14_to_atom91(seq, prot.numpy(force=True))
+                                prot_chain = atom91_to_chain(
+                                    seq,
+                                    prot_atom91,
+                                    "A"
+                                )
+                                prot_model = chains_to_model([prot_chain], model_id=i)
+                                prot_models.append(prot_model)
+                            save_struct(models_to_struct(reversed(prot_models)), prot_traj_name)
+                        # for i, sample in enumerate(samples):
+                        #     sample_len = sample.shape[0]
+                        #     sample_id = sample_ids[i]
+                        #     for key in [
+                        #         "clean_trajs",
+                        #         "clean_traj_seqs",
+                        #         "prot_trajs",
+                        #         "prot_traj_seqs",
+                        #     ]:
+                        #         print(key, len(list(batch[key])), i)
 
+                        #     data = {
+                        #         key: batch[key][i] for key in [
+                        #             "clean_trajs",
+                        #             "clean_traj_seqs",
+                        #             "prot_trajs",
+                        #             "prot_traj_seqs",
+                        #         ]
+                        #     }
+                        #     torch.save(data, f"len_{sample_len}_protein_{sample_id}_traj_data.pt")
 
 
 def main(model,
          corrupter,
          datamodule,
-         # lmodule,
+         lmodule,
          experiment,
-         tasks,
+         harness,
          zen_cfg):
     # change into the output directory
     # os.chdir(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)
@@ -173,21 +199,49 @@ def main(model,
     # datamodule and optim are all partial'd __init__s
     # so we instantiate instances of each
     # model = lmodule(model, experiment['optim'])
-    model = BackboneModule(model, experiment['optim'])
-    task_sampler = single_task_sampler(tasks(corrupter))
+    # model = BackboneModule(model, experiment['optim'])
+    harness = harness(corrupter, None)
+    model = lmodule(model, experiment['optim'], harness)
 
     # corrupter._sample_cfg.num_timesteps = 200
     # corrupter._sample_cfg.num_timesteps = 500
+    if hasattr(corrupter, "se3_noiser"):
+        corrupter.se3_noiser._sample_cfg.num_timesteps = 400
+        # corrupter.se3_noiser._rots_cfg.exp_rate = 5
+    else:
+        if hasattr(corrupter, "_sample_cfg"):
+            corrupter._sample_cfg.num_timesteps = 400
+        # corrupter.use_rot_sfm = True
+        # corrupter.use_trans_sfm = True
+        # corrupter.rot_sfm_g = 0.5
+        # corrupter.trans_sfm_g = 0.5
+        # corrupter._rots_cfg.sample_schedule = 'linear'
+        # corrupter._rots_cfg.sample_schedule = 'test'
+        # corrupter._rots_cfg.exp_rate = 5
+    # corrupter.se3_noiser._sample_cfg.num_timesteps = 500
     # corrupter._sample_cfg.num_timesteps = 200
     # corrupter._rots_cfg.exp_rate = 5
     # corrupter._rots_cfg.sample_schedule = 'linear'
-    # corrupter.se3_noiser._rots_cfg.exp_rate = 5
+    # corrupter.se3_noiser._rots_cfg.exp_rate = 20
     # corrupter.se3_noiser._rots_cfg.sample_schedule = 'linear'
     # corrupter.sidechain_noiser.sample_sched = 'sigmoid'
     # corrupter.sidechain_noiser.sample_c = 10
 
+    if hasattr(model.model, "lrange_logn_scale") and model.model.lrange_logn_scale > 0:
+        _model = model.model
+        def batch_by_edge_fn(n):
+            lrange = round(
+                max(_model.lrange_k, _model.lrange_logn_scale * np.log2(n) + _model.lrange_logn_offset)
+            )
+            knn = _model.knn_k
+            edges_per_node = min(lrange+knn, n)
+            return edges_per_node * n
+        datamodule_inst = datamodule(training_harness=harness, batch_by_edge_fn=batch_by_edge_fn)
+    else:
+        datamodule_inst = datamodule(training_harness=harness)
 
-    datamodule_inst = datamodule(task_sampler=task_sampler)
+    # datamodule_inst = datamodule(task_sampler=task_sampler)
+
     exp = Experiment(
         model=model,
         datamodule=datamodule_inst,
@@ -223,28 +277,54 @@ if __name__ == '__main__':
     #         )
     #     ))[0]
 
-    ckpt_path = sorted(list(glob.glob(
+    ckpt_list = list(glob.glob(
         os.path.join(
             args.run_dir,
             "lightning_logs/version_0/checkpoints/*.ckpt",
         )
-    )))[args.checkpoint_idx]
+    ))
+    epoch_list = []
+    for ckpt_path in ckpt_list:
+        if ckpt_path.split("/")[-1] == "last.ckpt":
+            epoch_list.append((ckpt_path, 1e6))
+        else:
+            epoch = ckpt_path.split("=")[1].split("-")[0]
+            epoch_list.append((ckpt_path, int(epoch)))
+
+    epoch_list = sorted(epoch_list, key=lambda x: x[1])
+    epoch_list, _ = zip(*epoch_list)
+    ckpt_path = epoch_list[args.checkpoint_idx]
+    print(ckpt_path)
 
 
     cfg = load_from_yaml(config_path)
     cfg['experiment']['warm_start'] = ckpt_path
-    cfg['datamodule']['batch_size'] = 2000
+    # cfg['datamodule']['batch_size'] = 2000
+    cfg['datamodule']['batch_size'] = 6 * 300 * 300
+    # if 'compatibility_mode' not in cfg['model']:
+    #     cfg['model']['compatibility_mode'] = True
+    cfg['save_traj'] = args.save_traj
 
     if cfg['domain']['domain'] == "backbone":
         if args.debug:
             print("debug")
+            # cfg['datamodule']['sample_lengths'] = {
+            #     # 60: 1
+            #     60: 5,
+            #     # 70: 5,
+            #     # 80: 5,
+            #     # 90: 5,
+            #     # 100: 5,
+            #     # 110: 5,
+            #     # 120: 5
+            # }
             cfg['datamodule']['sample_lengths'] = {
                 # 60: 1
                 60: 5,
                 # 70: 5,
-                # 80: 5,
+                80: 5,
                 # 90: 5,
-                # 100: 5,
+                100: 5,
                 # 110: 5,
                 # 120: 5
             }
@@ -263,28 +343,52 @@ if __name__ == '__main__':
     if cfg['domain']['domain'] in ["protein", "protein_multichi"]:
         if args.debug:
             print("debug")
-            cfg['datamodule']['sample_lengths'] = {
-                60: 5,
-                # 70: 5,
-                80: 5,
-                # 90: 5,
-                100: 5,
-                # 200: 5,
-                # 300: 5,
-                # 110: 5,
-                # 120: 1
-                # 230: 1
-            }
+            cfg['datamodule']['batch_size'] = 300 * 300
+            # cfg['datamodule']['sample_lengths'] = {
+            #     # 60: 5,
+            #     # 70: 5,
+            #     # 80: 5,
+            #     # 90: 5,
+            #     # 100: 5,
+            #     # 200: 5,
+            #     300: 5,
+            #     # 110: 5,
+            #     # 120: 1
+            #     # 230: 1
+            # }
+            if cfg['datamodule']['max_len'] == 128 or 'afdb_128' in cfg['datamodule']['data_dir']:
+                cfg['datamodule']['sample_lengths'] = {
+                    60: 10,
+                    70: 10,
+                    80: 10,
+                    90: 10,
+                    100: 10,
+                    110: 10,
+                    120: 10
+                }
+            else:
+                cfg['datamodule']['sample_lengths'] = {
+                    70:  5,
+                    100: 5,
+                    200: 2,
+                    300: 1,
+                }
         else:
-            if cfg['datamodule']['max_len'] == 128:
+            if cfg['datamodule']['max_len'] == 128 or 'afdb_128' in cfg['datamodule']['data_dir']:
                 cfg['datamodule']['sample_lengths'] = {
                     i: 10
                     for i in range(60, 128+1)
                 }
             else:
+                # cfg['datamodule']['sample_lengths'] = {
+                #     i: 50
+                #     for i in range(100, 300+1, 50)
+                # }
                 cfg['datamodule']['sample_lengths'] = {
-                    i: 50
-                    for i in range(100, 300+1, 50)
+                    70: 100,
+                    100: 100,
+                    200: 100,
+                    300: 100,
                 }
 
     samples_dir = os.path.join(args.run_dir, args.out_prefix)

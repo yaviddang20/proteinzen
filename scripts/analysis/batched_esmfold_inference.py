@@ -141,7 +141,10 @@ if __name__ == "__main__":
 
     import glob
 
-    for fasta in glob.glob(os.path.join(args.fasta_folder, "*.fa")):
+    for fasta in sorted(
+        glob.glob(os.path.join(args.fasta_folder, "*.fa")),
+        key=lambda x: float(x.split("/")[-1].split("_")[1])
+    ):
         os.chdir(args.pdb)
         fasta = Path(fasta)
 
@@ -151,6 +154,9 @@ if __name__ == "__main__":
         sample_dir = os.path.splitext(os.path.basename(fasta))[0]
         if not os.path.exists(sample_dir):
             os.mkdir(sample_dir)
+        else:
+            logger.info(f"Skipping {sample_dir} because folder already exists")
+            continue
 
         logger.info("Starting Predictions")
 

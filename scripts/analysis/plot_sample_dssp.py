@@ -27,25 +27,30 @@ if __name__ == '__main__':
     from tqdm import tqdm
 
     results = []
-    for pdb in tqdm(glob.glob("designable_samples_folded/*_sc.pdb")):
-        results.append(compute_dssp(pdb))
-
-    df = pd.DataFrame(results)
-    df.to_csv("dssp_per_designable_sample.csv")
-
-    sns.jointplot(df, x="helix_percent", y="strand_percent", hue="seq_len")
-    plt.xlim(0,1)
-    plt.ylim(0,1)
-    plt.savefig("ss_comp_per_designable_sample.png")
-
-    results = []
     for pdb in tqdm(glob.glob("samples/*.pdb")):
         results.append(compute_dssp(pdb))
 
     df = pd.DataFrame(results)
     df.to_csv("dssp_per_sample.csv")
+    df['frac_helix'] = df['helix_percent']
+    df['frac_strand'] = df['strand_percent']
 
-    sns.jointplot(df, x="helix_percent", y="strand_percent", hue="seq_len")
+    sns.jointplot(df, x="frac_helix", y="frac_strand", hue="seq_len", palette="colorblind")
     plt.xlim(0,1)
     plt.ylim(0,1)
     plt.savefig("ss_comp_per_sample.png")
+
+    results = []
+    for pdb in tqdm(glob.glob("designable_samples_folded/*_sc.pdb")):
+        results.append(compute_dssp(pdb))
+
+    df = pd.DataFrame(results)
+    df.to_csv("dssp_per_designable_sample.csv")
+    df['frac_helix'] = df['helix_percent']
+    df['frac_strand'] = df['strand_percent']
+
+    sns.jointplot(df, x="frac_helix", y="frac_strand", hue="seq_len", palette="colorblind")
+    plt.xlim(0,1)
+    plt.ylim(0,1)
+    plt.title("Secondary structure content of designable samples")
+    plt.savefig("ss_comp_per_designable_sample.png")
