@@ -13,6 +13,7 @@ from proteinzen.model.modules.openfold.layers import (
 from proteinzen.model.modules.openfold.layers_v2 import ConditionedTransition, LayerNorm
 from proteinzen.utils.openfold import rigid_utils as ru
 
+from cuequivariance_torch import triangle_attention
 
 deepspeed_is_installed = importlib.util.find_spec("deepspeed") is not None
 if deepspeed_is_installed:
@@ -27,6 +28,16 @@ try:
 except RuntimeError:
     evoformer_supported = False
 print(f"using deepspeed kernels: {evoformer_supported}")
+
+try:
+    cuda_major, cuda_minor = torch.cuda.get_device_capability(device=None)
+    if cuda_major >= 8:
+        cuet_supported = False # True
+    else:
+        cuet_supported = False
+except RuntimeError:
+    cuet_supported = False
+print(f"using cuet kernels: {cuet_supported}")
 
 
 @torch.jit.ignore
@@ -244,7 +255,21 @@ class TriangleAttentionCore(nn.Module):
                                  apply_scale=False)
 
         global evoformer_supported
-        if evoformer_supported:
+        global cuet_supported
+        if cuet_supported:
+            try:
+                o = triangle_attention(q, k, v, bias=edge_bias, mask=mask_bias)
+                o = o.transpose(-2, -3)
+            except RuntimeError:
+                print("wasn't able to run triangle_attention from cuet, switching it off")
+                cuet_supported = False
+                attn_mask = 0
+                for b in biases:
+                    attn_mask = attn_mask + b
+                o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+                # o = _attention(q, k, v, biases)
+                o = o.transpose(-2, -3)
+        elif evoformer_supported:
             try:
                 o = _deepspeed_evo_attn(q, k, v, biases)
             except RuntimeError:
@@ -445,7 +470,12 @@ class ConditionedPairUpdate(nn.Module):
                 _rbf(distances, D_min=self.D_min, D_max=self.D_max, D_count=self.num_rbf, device=distances.device)
             )
         # [B, I, 1, 1, J, H]
-        mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
+        # mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
+        global cuet_supported
+        if cuet_supported:
+            mask_bias = edge_mask[..., :, None, None, :]
+        else:
+            mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
 
         third_edge = self.emb_third_edge(self.ln_third_edge(edge_embed))
         edge_bias = dist_bias + third_edge
@@ -949,7 +979,11 @@ class MultiRigidPairEmbedder(nn.Module):
         z = z + self.lin_a_ij(torch.cat([a_current, a_sc], dim=-1))
         z = z * edge_mask[..., None]
 
-        mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
+        global cuet_supported
+        if cuet_supported:
+            mask_bias = edge_mask[..., :, None, None, :]
+        else:
+            mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
 
         for i in range(self.no_blocks):
             z = z + self.dropout_row_layer(
@@ -1077,7 +1111,11 @@ class MultiRigidPairEmbedderV2(nn.Module):
         z = z + self.lin_a_ij(torch.cat([a_current, a_sc], dim=-1))
         z = z * edge_mask[..., None]
 
-        mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
+        global cuet_supported
+        if cuet_supported:
+            mask_bias = edge_mask[..., :, None, None, :]
+        else:
+            mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
 
         for i in range(self.no_blocks):
             z = z + self.dropout_row_layer(
@@ -1179,7 +1217,11 @@ class PairEmbedderV2(nn.Module):
         z = z + self.lin_a_ij(torch.cat([a_current, a_sc], dim=-1))
         z = z * edge_mask[..., None]
 
-        mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
+        global cuet_supported
+        if cuet_supported:
+            mask_bias = edge_mask[..., :, None, None, :]
+        else:
+            mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
 
         for i in range(self.no_blocks):
             z = z + self.dropout_row_layer(

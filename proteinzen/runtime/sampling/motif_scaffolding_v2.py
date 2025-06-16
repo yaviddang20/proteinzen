@@ -71,12 +71,12 @@ class MotifScaffoldingTaskV2(SamplingTask):
     def __init__(
         self,
         pdb_contigs,
-        # redesign_contigs,
         contigs_idx,
         pdb,
         num_samples,
         total_length,
         cg_version=1,
+        redesign_contigs=None,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -86,18 +86,18 @@ class MotifScaffoldingTaskV2(SamplingTask):
         self.structure = parser.get_structure("", pdb)
 
         self.redesign_contigs = {}
-        # if len(redesign_contigs) > 1:
-        #     redesign_contigs = [c.strip() for c in redesign_contigs.split(",")]
-        #     for contig in redesign_contigs:
-        #         chain = contig[0]
-        #         if chain not in self.redesign_contigs:
-        #             self.redesign_contigs[chain] = set()
-        #         if "-" in contig:
-        #             start, end = [int(i) for i in contig[1:].split("-")]
-        #             self.redesign_contigs[chain].update(set(range(start, end+1)))
-        #         else:
-        #             resid = int(contig[1:])
-        #             self.redesign_contigs[chain].add(resid)
+        if redesign_contigs is not None and len(redesign_contigs) > 1:
+            redesign_contigs = [c.strip() for c in redesign_contigs.split(",")]
+            for contig in redesign_contigs:
+                chain = contig[0]
+                if chain not in self.redesign_contigs:
+                    self.redesign_contigs[chain] = set()
+                if "-" in contig:
+                    start, end = [int(i) for i in contig[1:].split("-")]
+                    self.redesign_contigs[chain].update(set(range(start, end+1)))
+                else:
+                    resid = int(contig[1:])
+                    self.redesign_contigs[chain].add(resid)
 
         try:
             self.contigs = self._parse_condition_str(pdb_contigs)
@@ -177,15 +177,18 @@ class MotifScaffoldingTaskV2(SamplingTask):
         chain = self.structure[0][chain_id]
         atom37 = []
         seq = []
+        redesign = []
         if motif_end is not None:
             for resid in range(motif_start, motif_end+1):
                 res_atom37, res_seq = residue_to_atom37(chain[resid])
                 atom37.append(res_atom37)
                 seq.append(res_seq)
+                redesign.append(resid in self.redesign_contigs[chain_id] if chain_id in self.redesign_contigs else False)
         else:
             res_atom37, res_seq = residue_to_atom37(chain[motif_start])
             atom37.append(res_atom37)
             seq.append(res_seq)
+            redesign.append(motif_start in self.redesign_contigs[chain_id] if chain_id in self.redesign_contigs else False)
 
         atom37 = torch.stack(atom37).double()
         seq = torch.as_tensor(seq).long()
@@ -196,6 +199,7 @@ class MotifScaffoldingTaskV2(SamplingTask):
             'aatype': seq,
             'all_atom_positions': atom37,
             'all_atom_mask': atom37_mask.float(),
+            'redesign_mask': torch.as_tensor(redesign)
         }
 
 
@@ -258,7 +262,8 @@ class MotifScaffoldingTaskV2(SamplingTask):
         noisy_trans = _centered_gaussian(num_res * 3).unflatten(0, (-1, 3)) * 16
         noisy_quats = _uniform_so3(num_res * 3).unflatten(0, (-1, 3))
         noisy_rigids = torch.cat([noisy_quats, noisy_trans], dim=-1)
-        motif_noising_mask = unresolved_rigid_mask
+        motif_noising_mask = unresolved_rigid_mask.clone()
+        motif_noising_mask[motif_feats['redesign_mask'], 1:] = True
 
         rigids_data = assembler.assemble(
             noisy_rigids,

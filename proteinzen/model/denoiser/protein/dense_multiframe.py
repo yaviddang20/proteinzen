@@ -9,9 +9,9 @@ import functools as fn
 import torch_geometric.utils as pygu
 
 from proteinzen.model.modules.layers.node.attention import ConditionedTransformerPairBias
-from proteinzen.model.modules.openfold.layers import InvariantPointAttention, Dropout
+from proteinzen.model.modules.openfold.layers import InvariantPointAttention, Dropout, TriangleMultiplicationOutgoing, TriangleMultiplicationIncoming, permute_final_dims
 from proteinzen.model.modules.openfold.layers_v2 import (
-    Linear, ConditionedInvariantPointAttention, BackboneUpdate, TorsionAngles, LayerNorm, AdaLN, ConditionedTransition
+    Linear, ConditionedInvariantPointAttention, BackboneUpdate, TorsionAngles, LayerNorm, AdaLN, ConditionedTransition,
 )
 from proteinzen.data.openfold import residue_constants as rc
 
@@ -24,6 +24,7 @@ from proteinzen.utils.coarse_grain import compute_atom14_from_cg_frames
 from proteinzen.stoch_interp.so3_utils import rotquat_to_rotvec
 
 from ._attn import ConditionedPairUpdate, MultiRigidPairEmbedder, MultiRigidPairEmbedderV2
+from ._attn import TriangleAttentionCore, SwishTransition, cuet_supported
 from ._frame_transformer import (
     ScatterUpdate, FramepairEmbedder,
     SequenceFrameTransformerUpdate, ConditionedSequenceFrameTransformerUpdate,
@@ -1444,6 +1445,84 @@ def to_internal_chain_numbering(chain_idx, batch):
     return torch.cat(idx_out, dim=0)
 
 
+class Pairformer(nn.Module):
+    def __init__(
+        self,
+        c_s,
+        c_cond,
+        c_z,
+        num_blocks=8,
+        num_heads=8,
+        num_trig_heads=4,
+    ):
+        super().__init__()
+        self.num_blocks = num_blocks
+        self.inf = 1e8
+        c_head = c_z // num_trig_heads
+
+        self.lin_edge_cond = nn.Sequential(
+            LayerNorm(c_s),
+            Linear(c_s, c_z, bias=False)
+        )
+        self.edge_transition = ConditionedTransition(c_z, c_z)
+        self.trunk = nn.ModuleDict()
+        for i in range(num_blocks):
+            self.trunk[f'mult_out_{i}'] = TriangleMultiplicationOutgoing(c_z, c_z)
+            self.trunk[f'mult_in_{i}'] = TriangleMultiplicationIncoming(c_z, c_z)
+            self.trunk[f'edge_bias_{i}'] = nn.Sequential(
+                LayerNorm(c_z),
+                Linear(c_z, num_trig_heads, bias=False)
+            )
+            self.trunk[f'attn_start_{i}'] = TriangleAttentionCore(c_z, c_head, num_trig_heads, starting=True, use_qk_norm=True)
+            self.trunk[f'attn_end_{i}'] = TriangleAttentionCore(c_z, c_head, num_trig_heads, starting=False, use_qk_norm=True)
+            self.trunk[f'transition_{i}'] = SwishTransition(c_z)
+
+            self.trunk[f'token_attn_{i}'] = ConditionedTransformerPairBias(
+                c_s,
+                c_cond,
+                c_z,
+                num_heads,
+                n_layers=1,
+                use_qk_norm=True
+            )
+
+    def forward(
+        self,
+        s,
+        z,
+        s_cond,
+        node_mask,
+    ):
+        edge_cond = self.lin_edge_cond(s)
+        num_res = s.shape[-2]
+        cond = (
+            torch.tile(edge_cond[..., None, :], (1, 1, num_res, 1))
+            + torch.tile(edge_cond[..., None, :, :], (1, num_res, 1, 1))
+        )
+        z = z + self.edge_transition(z, cond)
+
+        edge_mask = node_mask[..., None] & node_mask[..., None, :]
+        global cuet_supported
+        if cuet_supported:
+            mask_bias = edge_mask[..., :, None, None, :]
+        else:
+            mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
+
+        for i in range(self.num_blocks):
+            z = z + self.trunk[f'mult_out_{i}'](z, edge_mask)
+            z = z + self.trunk[f'mult_in_{i}'](z, edge_mask)
+            edge_bias = self.trunk[f'edge_bias_{i}'](z)
+            edge_bias = permute_final_dims(edge_bias.unsqueeze(-4), (2, 0, 1))
+            z = z + self.trunk[f'attn_start_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
+            z = z + self.trunk[f'attn_end_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
+            z = z + self.trunk[f'transition_{i}'](z)
+
+            s = self.trunk[f'token_attn_{i}'](
+                s, s_cond, z, node_mask)
+
+        return s, z
+
+
 class IpaMultiRigidDenoiser(nn.Module):
     def __init__(self,
                  # diffuser,
@@ -1762,7 +1841,8 @@ class IpaMultiRigidDenoiserV2(nn.Module):
                  use_qk_norm=False,
                  use_amp=False,
                  predict_final_rot=False,
-                 learnable_noise_schedule=False
+                 learnable_noise_schedule=False,
+                 use_pairformer=False
                  ):
         super().__init__()
 
@@ -1828,6 +1908,15 @@ class IpaMultiRigidDenoiserV2(nn.Module):
             use_qk_norm=use_qk_norm,
         )
 
+        if use_pairformer:
+            self.pairformer = Pairformer(
+                c_s=c_s,
+                c_cond=c_cond,
+                c_z=c_z,
+            )
+        else:
+            self.pairformer = None
+
         self.c_s = c_s
         self.trans_preconditioning = trans_preconditioning
         self.rot_preconditioning = rot_preconditioning
@@ -1880,6 +1969,16 @@ class IpaMultiRigidDenoiserV2(nn.Module):
             # input_feats['condition_embed'] = torch.ones_like(input_feats['node_embed'])
             input_feats['token_mask'] = token_data['token_mask']
             input_feats['token_gather_idx'] = token_data['token_gather_idx']
+
+            if self.pairformer is not None:
+                token_embed, edge_embed = self.pairformer(
+                    s=input_feats['node_embed'],
+                    z=input_feats['edge_embed'],
+                    s_cond=input_feats['condition_embed'],
+                    node_mask=input_feats['token_mask']
+                )
+                input_feats['node_embed'] = token_embed
+                input_feats['edge_embed'] = edge_embed
 
             score_dict = self.ipa_score(input_feats)
 

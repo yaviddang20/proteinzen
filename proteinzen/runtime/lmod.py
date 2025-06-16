@@ -156,7 +156,11 @@ class ProteinModule(L.LightningModule):
             batch['rot_t'] = batch['t']
 
         if self.use_dense_batch_loss:
-            batch = corrupter.corrupt_dense_batch(batch)
+            if self.learnable_noise_schedule:
+                with torch.autograd.detect_anomaly():
+                    batch = corrupter.corrupt_dense_batch(batch)
+            else:
+                batch = corrupter.corrupt_dense_batch(batch)
         # else:
         #     batch = corrupter.corrupt_batch(batch)
 
@@ -240,7 +244,8 @@ class ProteinModule(L.LightningModule):
             opt = self.optimizers()
             opt.zero_grad()
             loss = loss_dict['loss']
-            self.manual_backward(loss)
+            with torch.autograd.detect_anomaly():
+                self.manual_backward(loss)
             loss_per_batch = loss_dict['frame_vf_loss'] # loss_dict['loss_per_batch'].detach()
             trans_t = batch['trans_t']
             rot_t = batch['rot_t']
@@ -249,10 +254,11 @@ class ProteinModule(L.LightningModule):
 
             t = batch['t']
             l = batch['token']['token_is_protein_output_mask'].float().sum(dim=-1) / 100
-            trans_t_copy = self.model.trans_gamma_t(t, l[..., None])
-            rot_t_copy = self.model.rot_gamma_t(t, l[..., None])
-            trans_t_copy.backward(trans_t.grad * loss_per_batch[..., None] * 2)
-            rot_t_copy.backward(rot_t.grad * loss_per_batch[..., None] * 2)
+            with torch.autograd.detect_anomaly():
+                trans_t_copy = self.model.trans_gamma_t(t, l[..., None])
+                rot_t_copy = self.model.rot_gamma_t(t, l[..., None])
+                trans_t_copy.backward(trans_t.grad * loss_per_batch[..., None] * 2)
+                rot_t_copy.backward(rot_t.grad * loss_per_batch[..., None] * 2)
             # for name, param in self.model.trans_gamma_t.named_parameters():
             #     if param.grad is not None:
             #         print("trans", name, param.grad)
@@ -818,8 +824,8 @@ class ProteinModule(L.LightningModule):
             else:
                 trans_d_t_hat = d_t_hat
                 rot_d_t_hat = d_t_hat
-                trans_time = t
-                rot_time = t
+                trans_time = t_hat
+                rot_time = t_hat
                 trans_vf_scale = 1
                 rot_vf_scale = 1
 
@@ -842,6 +848,13 @@ class ProteinModule(L.LightningModule):
             #     # add_noise=False,
             #     # use_score=False
             # )
+
+            print(
+                trans_time.shape if isinstance(trans_time, torch.Tensor) else 1,
+                trans_d_t_hat.shape if isinstance(trans_time, torch.Tensor) else 1,
+                pred_trans_1.shape,
+                trans_t_hat.shape,
+            )
             trans_t_2 = frame_noiser._trans_euler_step(
                 trans_d_t_hat,
                 trans_time,

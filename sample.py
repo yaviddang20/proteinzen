@@ -82,7 +82,7 @@ class Experiment:
                 chain_idx = sample_data['chain_idx']
                 chains = []
 
-                sample_name = f"len_{sample_len}_protein_{curr_sample_id}.pdb"
+                sample_name = f"len_{sample_len}_protein_{curr_sample_id}" #.pdb"
                 for i in range(int(chain_idx.max()) + 1):
                     select = (chain_idx == i)
                     chain_seq = seq[select]
@@ -96,7 +96,7 @@ class Experiment:
                     )
                     chains.append(chain_i)
                 model = chains_to_model(chains, model_id=0)
-                save_struct(models_to_struct([model]), sample_name)
+                save_struct(models_to_struct([model]), sample_name + ".pdb")
 
                 if self._cfg['save_traj']:
                     clean_traj = sample_data['clean_traj'] # batch['all_R_clean_trajs']

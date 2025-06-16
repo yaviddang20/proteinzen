@@ -24,7 +24,7 @@ from proteinzen.runtime.lmod import ProteinModule
 from proteinzen.runtime.training.unconditional import UnconditionalGeneration
 from proteinzen.runtime.training.unconditional_v2 import UnconditionalGenerationV2
 from proteinzen.runtime.training.motif_scaffold import BackboneMotifScaffolding, ResidueMotifScaffolding, InverseRotamerMotifScaffolding, MixedMotifScaffolding
-from proteinzen.runtime.training.motif_scaffold_v2 import ResidueMotifScaffoldingV2
+from proteinzen.runtime.training.motif_scaffold_v2 import ResidueMotifScaffoldingV2, MixedMotifScaffoldingV2
 from proteinzen.runtime.training.folding import Folding
 from proteinzen.runtime.training.diffusion_forcing import DiffusionForcing
 from proteinzen.runtime.training.sidechain_design import SidechainDesign
@@ -168,6 +168,7 @@ def config_hydra_store():
         'residue_motif_scaffolding_freq': 0.0,
         'residue_motif_scaffolding_v2_freq': 0.0,
         'mixed_motif_scaffolding_freq': 0.0,
+        'mixed_motif_scaffolding_v2_freq': 0.0,
         'inverse_rotamer_motif_scaffolding_freq': 0.0,
         'folding_freq': 0.0,
         'diffusion_forcing_freq': 0.0,
@@ -179,6 +180,7 @@ def config_hydra_store():
     tasks_store(group='tasks/residue_motif_scaffolding')(builds(ResidueMotifScaffolding), name='default')
     tasks_store(group='tasks/residue_motif_scaffolding_v2')(builds(ResidueMotifScaffoldingV2), name='default')
     tasks_store(group='tasks/mixed_motif_scaffolding')(builds(MixedMotifScaffolding), name='default')
+    tasks_store(group='tasks/mixed_motif_scaffolding_v2')(builds(MixedMotifScaffoldingV2), name='default')
     tasks_store(group='tasks/inverse_rotamer_motif_scaffolding')(builds(InverseRotamerMotifScaffolding), name='default')
     tasks_store(group='tasks/folding')(builds(Folding), name='default')
     tasks_store(group='tasks/diffusion_forcing')(builds(DiffusionForcing), name='default')
@@ -238,6 +240,7 @@ def config_hydra_store():
             {"tasks/residue_motif_scaffolding": "default"},
             {"tasks/residue_motif_scaffolding_v2": "default"},
             {"tasks/mixed_motif_scaffolding": "default"},
+            {"tasks/mixed_motif_scaffolding_v2": "default"},
             {"tasks/inverse_rotamer_motif_scaffolding": "default"},
             {"tasks/folding": "default"},
             {"tasks/diffusion_forcing": "default"},

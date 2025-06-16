@@ -120,17 +120,25 @@ class RigidAssembler:
         flat_is_ligand = torch.zeros_like(flat_noising_mask, dtype=torch.bool)
         flat_is_protein_output = torch.ones_like(flat_noising_mask, dtype=torch.bool)
 
-        motif_rigids_gt_seq_idx = _seq_idx[~rigids_noising_mask.view(-1)]
+        is_motif_res = (~rigids_noising_mask).any(dim=-1)
+        motif_rigids_gt_seq_idx = _seq_idx[is_motif_res[..., None].expand(-1, rigids_noising_mask.shape[-1]).flatten(0, 1)]
+        # motif_rigids_gt_seq_idx = _seq_idx[~rigids_noising_mask.view(-1)]
         flat_gt_seq_idx = torch.cat([
             flat_seq_idx,
             motif_rigids_gt_seq_idx,
         ], dim=-1)
 
         if indexed_motif_mask.any():
-            indexed_cg_rigids = self.cg_rigids.flatten(0, 1)[indexed_motif_mask]
-            indexed_cg_rigids_noising_mask = torch.zeros(indexed_motif_mask.sum().item(), device=indexed_cg_rigids.device)
-            indexed_cg_rigids_seq_idx = _seq_idx[indexed_motif_mask]
-            indexed_cg_rigids_idx = self.cg_rigid_idx.flatten(0, 1)[indexed_motif_mask]
+            is_indexed_res = (~rigids_noising_mask & ~res_is_unindexed_mask[..., None]).any(dim=-1)
+            indexed_cg_rigids = self.cg_rigids[is_indexed_res].flatten(0, 1)
+            indexed_cg_rigids_noising_mask = rigids_noising_mask[is_indexed_res].flatten(0, 1)
+            indexed_cg_rigids_seq_idx = _seq_idx[is_indexed_res[..., None].expand(-1, rigids_noising_mask.shape[-1]).flatten(0, 1)]
+            indexed_cg_rigids_idx = self.cg_rigid_idx[is_indexed_res].flatten(0, 1)
+
+            # indexed_cg_rigids = self.cg_rigids.flatten(0, 1)[indexed_motif_mask]
+            # indexed_cg_rigids_noising_mask = torch.zeros(indexed_motif_mask.sum().item(), device=indexed_cg_rigids.device)
+            # indexed_cg_rigids_seq_idx = _seq_idx[indexed_motif_mask]
+            # indexed_cg_rigids_idx = self.cg_rigid_idx.flatten(0, 1)[indexed_motif_mask]
 
 
             flat_rigids = torch.cat([flat_rigids, indexed_cg_rigids], dim=0)
@@ -187,9 +195,13 @@ class RigidAssembler:
                     (1, self.num_cg_rigids)
                 ).flatten(0, 1)
 
+                # flat_is_token_rigid = torch.cat([
+                #     flat_is_token_rigid,
+                #     self.cg_token_rigid_mask.flatten(0, 1)[indexed_motif_mask]
+                # ], dim=0)
                 flat_is_token_rigid = torch.cat([
                     flat_is_token_rigid,
-                    self.cg_token_rigid_mask.flatten(0, 1)[indexed_motif_mask]
+                    self.cg_token_rigid_mask[indexed_motif_res_mask].flatten(0, 1)
                 ], dim=0)
                 flat_rigid_token_uid = torch.cat([
                     flat_rigid_token_uid,
@@ -198,10 +210,16 @@ class RigidAssembler:
 
 
         if unindexed_motif_mask.any():
-            unindexed_cg_rigids = self.cg_rigids.flatten(0, 1)[unindexed_motif_mask]
-            unindexed_cg_rigids_noising_mask = torch.zeros(unindexed_motif_mask.sum().item(), device=unindexed_cg_rigids.device)
-            unindexed_cg_rigids_seq_idx = _seq_idx[unindexed_motif_mask]
-            unindexed_cg_rigids_idx = self.cg_rigid_idx.flatten(0, 1)[unindexed_motif_mask]
+            is_unindexed_res = (~rigids_noising_mask & res_is_unindexed_mask[..., None]).any(dim=-1)
+            unindexed_cg_rigids = self.cg_rigids[is_unindexed_res].flatten(0, 1)
+            unindexed_cg_rigids_noising_mask = rigids_noising_mask[is_unindexed_res].flatten(0, 1)
+            unindexed_cg_rigids_seq_idx = _seq_idx[is_unindexed_res[..., None].expand(-1, rigids_noising_mask.shape[-1]).flatten(0, 1)]
+            unindexed_cg_rigids_idx = self.cg_rigid_idx[is_unindexed_res].flatten(0, 1)
+
+            # unindexed_cg_rigids = self.cg_rigids.flatten(0, 1)[unindexed_motif_mask]
+            # unindexed_cg_rigids_noising_mask = torch.zeros(unindexed_motif_mask.sum().item(), device=unindexed_cg_rigids.device)
+            # unindexed_cg_rigids_seq_idx = _seq_idx[unindexed_motif_mask]
+            # unindexed_cg_rigids_idx = self.cg_rigid_idx.flatten(0, 1)[unindexed_motif_mask]
 
             max_token_uid = flat_rigid_token_uid.max()
             num_unindexed_rigids = unindexed_motif_mask.long().sum().item()
@@ -262,9 +280,13 @@ class RigidAssembler:
                     (1, self.num_cg_rigids)
                 ).flatten(0, 1)
 
+                # flat_is_token_rigid = torch.cat([
+                #     flat_is_token_rigid,
+                #     self.cg_token_rigid_mask.flatten(0, 1)[unindexed_motif_mask]
+                # ], dim=0)
                 flat_is_token_rigid = torch.cat([
                     flat_is_token_rigid,
-                    self.cg_token_rigid_mask.flatten(0, 1)[unindexed_motif_mask]
+                    self.cg_token_rigid_mask[unindexed_motif_res_mask].flatten(0, 1)
                 ], dim=0)
                 flat_rigid_token_uid = torch.cat([
                     flat_rigid_token_uid,

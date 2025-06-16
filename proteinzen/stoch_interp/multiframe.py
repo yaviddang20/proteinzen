@@ -416,7 +416,7 @@ class MultiSE3Interpolant:
 
         if self.use_stochastic_centering:
             stoch_center = torch.randn_like(center) * self.sig_perturb
-            trans_0 = trans_0 + stoch_center[..., None, None, :]
+            trans_0 = trans_0 + stoch_center[..., None, :]
 
         trans_time = batch['trans_t']
         rot_time = batch['rot_t']

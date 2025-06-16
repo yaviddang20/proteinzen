@@ -92,6 +92,12 @@ class MotifScaffoldingV2(TrainingTask):
             raise NotImplementedError()
             # t[motif_mask, 1:] = 1
             rigids_noising_mask[motif_mask, 1:] = False
+        elif self.mode == 'mixed':
+            mask_bb_only = torch.rand_like(rigids_noising_mask[..., 0], dtype=torch.float32) < 0.5
+            rigids_noising_mask[motif_mask & mask_bb_only, 0] = False
+            rigids_noising_mask[motif_mask & (~mask_bb_only)] = False
+            seq_noising_mask[motif_mask & mask_bb_only] = True
+
 
         res_is_unindexed_mask = torch.rand_like(seq_noising_mask, dtype=torch.float32) < self.p_is_unindexed
         res_is_atomized_mask = torch.zeros_like(res_is_unindexed_mask, dtype=torch.bool)
@@ -107,3 +113,7 @@ class MotifScaffoldingV2(TrainingTask):
 class ResidueMotifScaffoldingV2(MotifScaffoldingV2):
     name: str = "res_motif_scaffolding_v2"
     __init__ = partialmethod(MotifScaffoldingV2.__init__, mode='full_residue')
+
+class MixedMotifScaffoldingV2(MotifScaffoldingV2):
+    name: str = "mixed_motif_scaffolding_v2"
+    __init__ = partialmethod(MotifScaffoldingV2.__init__, mode='mixed')
