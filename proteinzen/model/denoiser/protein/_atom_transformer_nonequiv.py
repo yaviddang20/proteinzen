@@ -141,7 +141,7 @@ class SequenceAtomTransformerBlock(nn.Module):
         self.window_k = window_k
         self.inf = inf
 
-        self.adaln = AdaLN(c_atom, c_s)
+        self.adaln = AdaLN(c_atom, c_atom)
         self.ln_q = LayerNorm(c_atom)
         self.ln_k = LayerNorm(c_atom)
 
@@ -158,16 +158,16 @@ class SequenceAtomTransformerBlock(nn.Module):
 
         # self.lin_out = Linear(c_atom, c_atom, bias=False)
         self.lin_out = Linear(c_atom, c_atom)
-        self.s_gate_lin = Linear(c_s, c_atom)
+        self.s_gate_lin = Linear(c_atom, c_atom)
         with torch.no_grad():
             self.s_gate_lin.bias.fill_(-2.0)
 
-        self.transition = ConditionedTransition(c_atom, c_s)
+        self.transition = ConditionedTransition(c_atom, c_atom)
 
     def attn(
         self,
         atom_features,
-        token_features,
+        atom_cond_features,
         atompair_features,
         atom_token_idx,
         atompair_mask,
@@ -177,9 +177,8 @@ class SequenceAtomTransformerBlock(nn.Module):
         n_batch = atom_features.shape[0]
         n_atoms = atom_features.shape[1]
 
-        token_features_broadcast = gather_helper(token_features, atom_token_idx)
         atom_features = self.adaln(
-            atom_features, token_features_broadcast
+            atom_features, atom_cond_features
         )
 
         atom_q = self.lin_q(atom_features)
@@ -197,24 +196,25 @@ class SequenceAtomTransformerBlock(nn.Module):
         a = torch.einsum("bnqhc,bnkhc->bnqkh", atom_q, atom_k) / np.sqrt(self.c_head)
         # n_batch x n_block x window_q x window_k x n_heads
         b_ij = self.lin_b_ij(atompair_features)
-        a = a + b_ij
-        # print(a.shape, atompair_mask.shape)
-        a = a - self.inf * (1 - atompair_mask.float()[..., None])
-        a = a.permute(0, 1, 4, 2, 3) / np.sqrt(atom_q.shape[-1])
+        # a = a + b_ij
+        # a = a - self.inf * (1 - atompair_mask.float()[..., None])
+        a += b_ij
+        a -= self.inf * (1 - atompair_mask.float()[..., None])
+        a = a.permute(0, 1, 4, 2, 3)
         a = torch.softmax(a, dim=-1)
 
         atom_out = torch.einsum("bnhqk,bnkhc->bnqhc", a, atom_v)
         atom_out = atom_out.reshape(n_batch, n_atoms, -1)
         atom_out = atom_out * self.lin_g(atom_features)
         atom_out = self.lin_out(atom_out)
-        atom_gate = torch.sigmoid(self.s_gate_lin(token_features))
-        atom_out = atom_out * gather_helper(atom_gate, atom_token_idx)
+        atom_gate = torch.sigmoid(self.s_gate_lin(atom_cond_features))
+        atom_out = atom_out * atom_gate
         return atom_out
 
     def forward(
         self,
         atom_features,
-        token_features,
+        atom_cond_features,
         atompair_features,
         atom_token_idx,
         atompos_mask,
@@ -226,7 +226,7 @@ class SequenceAtomTransformerBlock(nn.Module):
 
         atom_update = self.attn(
             atom_features,
-            token_features,
+            atom_cond_features,
             atompair_features,
             atom_token_idx,
             atompair_mask,
@@ -235,8 +235,7 @@ class SequenceAtomTransformerBlock(nn.Module):
         )
         atom_features = atom_features + atom_update * atompos_mask[..., None]
 
-        token_features_broadcast = gather_helper(token_features, atom_token_idx)
-        atom_features = atom_features + self.transition(atom_features, token_features_broadcast) * atompos_mask[..., None]
+        atom_features = atom_features + self.transition(atom_features, atom_cond_features) * atompos_mask[..., None]
 
         return atom_features
 
@@ -264,7 +263,7 @@ class SequenceAtomTransformer(nn.Module):
     def forward(
             self,
             atom_features,
-            token_features,
+            atom_cond_features,
             atompair_features,
             atom_token_idx,
             atompos_mask,
@@ -275,7 +274,7 @@ class SequenceAtomTransformer(nn.Module):
         for tfmr in self.blocks:
             atom_features = tfmr(
                 atom_features,
-                token_features,
+                atom_cond_features,
                 atompair_features,
                 atom_token_idx,
                 atompos_mask,
@@ -294,10 +293,6 @@ class AtomPairEmbedder(nn.Module):
                  c_atompair):
         super().__init__()
 
-        self.pair_to_atompair = nn.Sequential(
-            LayerNorm(c_z),
-            Linear(c_z, c_atompair, bias=False)
-        )
         self.atom_to_atompair_q = nn.Sequential(
             nn.ReLU(c_atom),
             Linear(c_atom, c_atompair, bias=False)
@@ -308,6 +303,74 @@ class AtomPairEmbedder(nn.Module):
         )
         self.dist_vec_proj = Linear(3, c_atompair, bias=False)
         self.dist_proj = Linear(1, c_atompair, bias=False)
+
+    def _gen_atompair_mask(
+        self,
+        atom_mask,
+        to_queries,
+        to_keys
+    ):
+        with torch.no_grad():
+            q_mask = to_queries(atom_mask[..., None])
+            k_mask = to_keys(atom_mask[..., None].float()).transpose(-1, -2).bool()
+            atompair_mask = (q_mask * k_mask)
+
+        return atompair_mask
+
+    def forward(self,
+                atom_embed,
+                atompos,
+                atom_token_idx,
+                atom_mask,
+                to_queries,
+                to_keys,
+                eps=1e-8,
+    ):
+        # n_batch x n_block x window_q x 3
+        atompos_q = to_queries(atompos)
+        # n_batch x n_block x window_k x 3
+        atompos_k = to_keys(atompos)
+        # n_batch x n_block x window_q x window_k x 3
+        dist_vec = atompos_q[..., None, :] - atompos_k[..., None, : ,:]
+        # n_batch x n_block x window_q x window_k x 1
+        dist = torch.linalg.vector_norm(dist_vec + eps, dim=-1, keepdims=True)
+
+        # n_batch x n_block x window_q
+        res_idx_q = to_queries(atom_token_idx[..., None])
+        # n_batch x n_block x window_k
+        res_idx_k = to_keys(atom_token_idx[..., None].float()).long().transpose(-1, -2)
+        # n_batch x n_block x window_q x window_k
+        same_res = (res_idx_q == res_idx_k)
+
+        # n_batch x n_block x window_q x window_k x c_atompair
+        atompair_features = self.dist_vec_proj(dist_vec) + self.dist_proj(1 / dist**2)
+        atompair_features = atompair_features * same_res[..., None]
+
+        atompair_mask = self._gen_atompair_mask(atom_mask, to_queries, to_keys)
+
+        atom_embed_q = to_queries(atom_embed)
+        atom_embed_k = to_keys(atom_embed)
+        atompair_q = self.atom_to_atompair_q(atom_embed_q)
+        atompair_k = self.atom_to_atompair_k(atom_embed_k)
+        # atompair_features = atompair_features + atompair_q[..., None, :] + atompair_k[..., None, :, :]
+        atompair_features += atompair_q[..., None, :]
+        atompair_features += atompair_k[..., None, :, :]
+
+        atompair_features = atompair_features * atompair_mask[..., None]
+
+        return atompair_features, atompair_mask
+
+
+class AtomPairUpdate(nn.Module):
+    def __init__(self,
+                 c_z,
+                 c_atompair):
+        super().__init__()
+
+        self.pair_to_atompair = nn.Sequential(
+            LayerNorm(c_z),
+            Linear(c_z, c_atompair, bias=False)
+        )
 
         self.ffn = nn.Sequential(
             nn.ReLU(),
@@ -352,36 +415,14 @@ class AtomPairEmbedder(nn.Module):
         return atompair_embed, atompair_mask
 
     def forward(self,
-                atom_embed,
-                atompos,
+                atompair_features,
                 z,
                 atom_token_idx,
                 atom_mask,
+                atompair_mask,
                 to_queries,
                 to_keys,
-                eps=1e-8,
-                init_atompair_embed=None
     ):
-        # n_batch x n_block x window_q x 3
-        atompos_q = to_queries(atompos)
-        # n_batch x n_block x window_k x 3
-        atompos_k = to_keys(atompos)
-        # n_batch x n_block x window_q x window_k x 3
-        dist_vec = atompos_q[..., None, :] - atompos_k[..., None, : ,:]
-        # n_batch x n_block x window_q x window_k x 1
-        dist = torch.linalg.vector_norm(dist_vec + eps, dim=-1, keepdims=True)
-
-        # n_batch x n_block x window_q
-        res_idx_q = to_queries(atom_token_idx[..., None])
-        # n_batch x n_block x window_k
-        res_idx_k = to_keys(atom_token_idx[..., None].float()).long().transpose(-1, -2)
-        # n_batch x n_block x window_q x window_k
-        same_res = (res_idx_q == res_idx_k)
-
-        # n_batch x n_block x window_q x window_k x c_atompair
-        atompair_features = self.dist_vec_proj(dist_vec) + self.dist_proj(1 / dist**2)
-        atompair_features = atompair_features * same_res[..., None]
-
         broadcast_z, atompair_mask = self._broadcast_pairs(
             z,
             atom_token_idx,
@@ -389,21 +430,9 @@ class AtomPairEmbedder(nn.Module):
             to_queries,
             to_keys
         )
-        # atompair_features = atompair_features + broadcast_z # + self.pair_to_atompair(broadcast_z)
-        atompair_features += broadcast_z # + self.pair_to_atompair(broadcast_z)
 
-        atom_embed_q = to_queries(atom_embed)
-        atom_embed_k = to_keys(atom_embed)
-        atompair_q = self.atom_to_atompair_q(atom_embed_q)
-        atompair_k = self.atom_to_atompair_k(atom_embed_k)
-        # atompair_features = atompair_features + atompair_q[..., None, :] + atompair_k[..., None, :, :]
-        atompair_features += atompair_q[..., None, :]
-        atompair_features += atompair_k[..., None, :, :]
-
-        if init_atompair_embed is not None:
-            atompair_features = atompair_features + init_atompair_embed
-
+        atompair_features += broadcast_z
         atompair_features += self.ffn(atompair_features)
         atompair_features = atompair_features * atompair_mask[..., None]
 
-        return atompair_features, atompair_mask
+        return atompair_features

@@ -220,7 +220,7 @@ class Atom14Interpolation(TrainingHarness):
             res_data['noised_atom14'] = atom14_t_1
             t = torch.ones(batch.num_graphs, device=device) * t_1
             batch["t"] = t
-            if model.preconditioning:
+            if model.trans_preconditioning:
                 atom14_var_scaling_dict = self.frame_noiser.var_scaling_factors(t)
                 batch['c_skip'] = atom14_var_scaling_dict['c_skip']
                 batch['c_in'] = atom14_var_scaling_dict['c_in']
@@ -265,7 +265,7 @@ class Atom14Interpolation(TrainingHarness):
         res_data['noised_atom14'] = atom14_t_1
         t = torch.ones(batch.num_graphs, device=device) * t_1
         batch["t"] = t
-        if model.preconditioning:
+        if model.trans_preconditioning:
             atom14_var_scaling_dict = self.frame_noiser.var_scaling_factors(t)
             batch['c_skip'] = atom14_var_scaling_dict['c_skip']
             batch['c_in'] = atom14_var_scaling_dict['c_in']
@@ -319,11 +319,13 @@ class Atom14Interpolation(TrainingHarness):
         #     align_rot_mats = align_rot_mats[atom_batch]
         # flat_noised_atom14 = torch.einsum("...ij,...j->...i", align_rot_mats, flat_noised_atom14)
         # outputs['denoised_atom14'] = flat_noised_atom14.view(noised_atom14.shape)
-        outputs['denoised_atom14'] = torch.einsum(
-            "...ij,...kj->...ki",
-            inputs['residue']['aug_rot'].transpose(-1, -2),
-            outputs['denoised_atom14']
-        ) # - inputs['residue']['aug_trans'][inputs.batch]
+        # print("denoiser", outputs['denoised_atom14'])
+        # print(inputs['residue']['aug_rot'].shape)
+        # outputs['denoised_atom14'] = torch.einsum(
+        #     "...ij,...kj->...ki",
+        #     inputs['residue']['aug_rot'].transpose(-1, -2)[inputs['residue'].batch],
+        #     outputs['denoised_atom14']
+        # ) # - inputs['residue']['aug_trans'][inputs.batch]
 
         atomic_loss_dict = atom14_fm_losses(
             inputs, outputs,
@@ -338,7 +340,7 @@ class Atom14Interpolation(TrainingHarness):
         )
 
         atomic_loss = (
-            atomic_loss_dict["scaled_atom14_mse"] / 3 # / 100 # / (3 * 256)
+            atomic_loss_dict["scaled_atom14_mse"]  # / (3 * 256)
             + atomic_loss_dict["seq_loss"] * 0.25
             + atomic_loss_dict["smooth_lddt"]
         )
@@ -361,4 +363,3 @@ class Atom14Interpolation(TrainingHarness):
         loss_dict.update(atomic_loss_dict)
         # loss_dict.update(traj_loss_dict)
         return loss_dict
-

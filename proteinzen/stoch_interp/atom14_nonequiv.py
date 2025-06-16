@@ -41,8 +41,9 @@ def center_random_aug(trans, mask, batch):
     )
     center = center / div_factor.clip(min=1)[..., None]
     trans = trans - center[batch]
-    rand_rot = _uniform_so3(batch.shape[0], batch.device)
-    trans = torch.einsum("...ij,...j->...i", rand_rot, trans) * mask[..., None]
+    # rand_rot = _uniform_so3(batch.shape[0], batch.device)
+    rand_rot = _uniform_so3(int(batch.max() + 1), batch.device)
+    trans = torch.einsum("...ij,...j->...i", rand_rot[batch], trans) * mask[..., None]
 
     # trans_noise = torch.randn_like(center)
     trans_noise = torch.zeros_like(center)
@@ -148,9 +149,12 @@ class Atom14Interpolant:
             batch=atom_batch
         )
         noised_atom14 = noised_atom14.reshape(atom14.shape)
+        # print(batch.name, 'corrupt', noised_atom14)
         res_data['noised_atom14'] = noised_atom14
         res_data['aug_rot'] = aug_rot[res_data.batch]
         res_data['aug_trans'] = aug_trans[res_data.batch]
+
+        res_data['atom14'] = torch.einsum("...ij,...kj->...ki", aug_rot[res_data.batch], res_data['atom14'])
 
         var_scaling_dict = self.var_scaling_factors(t)
         # print(var_scaling_dict)

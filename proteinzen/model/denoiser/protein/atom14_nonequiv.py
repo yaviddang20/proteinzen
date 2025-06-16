@@ -15,7 +15,7 @@ from proteinzen.utils.openfold.rigid_utils import Rigid, batchwise_center
 
 from ._attn import PairUpdate, ConditionedPairUpdateV2, MultiRigidPairEmbedder, PairEmbedderV2
 from ._atom_transformer_nonequiv import (
-    SequenceAtomTransformer, AtomPairEmbedder,
+    SequenceAtomTransformer, AtomPairEmbedder, AtomPairUpdate,
     get_indexing_matrix, single_to_keys
 )
 
@@ -268,26 +268,6 @@ class Embedder(nn.Module):
         self.node_init = Linear(index_embed_size*2, self.c_s, bias=False)
 
         self.atompos_init = Linear(3, self.c_atom, bias=False)
-        self.sc_atompos_init = Linear(3, self.c_atom, bias=False)
-
-        self.atom_tfmr = SequenceAtomTransformer(
-            c_s=c_s,
-            c_atom=c_atom,
-            c_atompair=c_atompair,
-            no_heads=num_heads,
-            num_blocks=n_tfmr_blocks,
-        )
-        self.sc_atom_tfmr = SequenceAtomTransformer(
-            c_s=c_s,
-            c_atom=c_atom,
-            c_atompair=c_atompair,
-            no_heads=num_heads,
-            num_blocks=n_tfmr_blocks,
-        )
-
-        self.atom_gather_update = ScatterUpdate(c_s, c_atom)
-        self.sc_atom_gather_update = ScatterUpdate(c_s, c_atom)
-
 
         self.node_adaln = AdaLN(c_s, c_s)
         self.atom_adaln = AdaLN(c_atom, c_atom)
@@ -298,11 +278,39 @@ class Embedder(nn.Module):
             c_atom,
             c_atompair
         )
+        self.atompair_update = AtomPairUpdate(
+            c_z,
+            c_atompair
+        )
+        self.atom_gather_update = GatherUpdate(c_s, c_atom)
+        self.atom_tfmr = SequenceAtomTransformer(
+            c_s=c_s,
+            c_atom=c_atom,
+            c_atompair=c_atompair,
+            no_heads=num_heads,
+            num_blocks=n_tfmr_blocks,
+        )
+        self.atom_scatter_update = ScatterUpdate(c_s, c_atom)
+
+        self.sc_atompos_init = Linear(3, self.c_atom, bias=False)
         self.sc_atompair_embedder = AtomPairEmbedder(
             c_z,
             c_atom,
             c_atompair
         )
+        self.sc_atompair_update = AtomPairUpdate(
+            c_z,
+            c_atompair
+        )
+        self.sc_atom_gather_update = GatherUpdate(c_s, c_atom)
+        self.sc_atom_tfmr = SequenceAtomTransformer(
+            c_s=c_s,
+            c_atom=c_atom,
+            c_atompair=c_atompair,
+            no_heads=num_heads,
+            num_blocks=n_tfmr_blocks,
+        )
+        self.sc_atom_scatter_update = ScatterUpdate(c_s, c_atom)
         self.pair_embedder = PairEmbedderV2(
             c_z,
             c_hidden,
@@ -356,6 +364,7 @@ class Embedder(nn.Module):
         to_res_batch = fn.partial(
             unpad_and_unflatten, n_padding=n_padding, unflat_shape=(-1, self.atoms_per_residue)
         )
+
         num_batch, num_res = seq_idx.shape
         # Set time step to epsilon=1e-5 for fixed residues.
         fixed_mask = fixed_mask[..., None]
@@ -363,18 +372,19 @@ class Embedder(nn.Module):
             self.timestep_embedder(t)[:, None, :], (1, num_res, 1))
         seq_idx_embed = self.index_embedder(seq_idx)
         node_feats = [t_embed, seq_idx_embed]
-        node_embed = torch.cat(node_feats, dim=-1)
-        node_embed = self.node_init(node_embed)
-        node_embed = self.mask_lin(node_mask[..., None].float()) + node_embed
-        node_init = node_embed
+        node_init = torch.cat(node_feats, dim=-1)
+        node_init = self.node_init(node_init)
+        node_init = self.mask_lin(node_mask[..., None].float()) + node_init
 
-        atom_embed = self.node_to_atom(node_init[..., None, :]).tile((1, 1, self.atoms_per_residue, 1))
-        atom_embed = atom_embed + self.pos_embedder(
-            torch.arange(self.atoms_per_residue, device=atom_embed.device)
+        atom_init = self.node_to_atom(node_init[..., None, :]).tile((1, 1, self.atoms_per_residue, 1))
+        atom_init = atom_init + self.pos_embedder(
+            torch.arange(self.atoms_per_residue, device=atom_init.device)
         )[None, None]
+        atom_init_skip = atom_init
+        atom_cond_skip = to_flat(atom_init, dims=(-2, -3))
+
         atom_to_res_idx = seq_idx[..., None].tile((1, 1, self.atoms_per_residue))
         atom_mask = node_mask[..., None].tile((1, 1, self.atoms_per_residue))
-        atom_init = atom_embed
         atom_init = atom_init + self.atompos_init(noised_atom14)
 
         sc_X_ca = sc_atom14[..., 1, :] if sc_atom14 is not None else None
@@ -385,18 +395,28 @@ class Embedder(nn.Module):
         atom_to_res_idx = to_flat(atom_to_res_idx, dims=(-1, -2))
         atom_mask = to_flat(atom_mask, dims=(-1, -2))
 
-        atompair_embed, atompair_mask = self.atompair_embedder(
+        atom_cond = self.atom_gather_update(node_init, flat_atom_init, atom_to_res_idx, atom_mask)
+
+        atompair_skip, atompair_mask = self.atompair_embedder(
             flat_atom_init,
             flat_atompos,
-            edge_embed,
             atom_to_res_idx,
             atom_mask,
             to_queries,
             to_keys
         )
-        atom_init = self.atom_tfmr(
+        atompair_embed = self.atompair_update(
+            atompair_skip,
+            edge_embed,
+            atom_to_res_idx,
+            atom_mask,
+            atompair_mask,
+            to_queries,
+            to_keys
+        )
+        atom_embed = self.atom_tfmr(
             flat_atom_init,
-            node_embed,
+            atom_cond,
             atompair_embed,
             atom_to_res_idx,
             atom_mask,
@@ -405,60 +425,70 @@ class Embedder(nn.Module):
             to_keys,
         )
 
-        node_init = self.atom_gather_update(
-            atom_init,
-            node_init,
+        node_embed = self.atom_scatter_update(
+            atom_embed,
+            torch.zeros_like(node_init),
             atom_to_res_idx,
             atom_mask
         )
 
         if sc_atom14 is not None:
-            sc_atom_init = atom_embed + self.sc_atompos_init(sc_atom14)
+            sc_atom_init = atom_init_skip + self.sc_atompos_init(sc_atom14)
             flat_sc_atom_init = to_flat(sc_atom_init, dims=(-2, -3))
             flat_sc_atompos = to_flat(sc_atom14, dims=(-2, -3))
-            sc_atompair_embed, _ = self.sc_atompair_embedder(
+
+            sc_atom_cond = self.atom_gather_update(node_init, flat_sc_atom_init, atom_to_res_idx, atom_mask)
+
+            sc_atompair_skip, _ = self.atompair_embedder(
                 flat_sc_atom_init,
                 flat_sc_atompos,
-                edge_embed,
                 atom_to_res_idx,
                 atom_mask,
                 to_queries,
                 to_keys
             )
-            sc_atom_init = self.sc_atom_tfmr(
+            sc_atompair_embed = self.atompair_update(
+                sc_atompair_skip,
+                edge_embed,
+                atom_to_res_idx,
+                atom_mask,
+                atompair_mask,
+                to_queries,
+                to_keys
+            )
+            sc_atom_embed = self.atom_tfmr(
                 flat_sc_atom_init,
-                node_embed,
-                sc_atompair_embed,
+                sc_atom_cond,
+                atompair_embed,
                 atom_to_res_idx,
                 atom_mask,
                 atompair_mask,
                 to_queries,
                 to_keys,
             )
-            sc_node_init = self.sc_atom_gather_update(
-                sc_atom_init,
-                node_embed,
+            sc_node_embed = self.atom_scatter_update(
+                atom_embed,
+                torch.zeros_like(node_init),
                 atom_to_res_idx,
                 atom_mask
             )
         else:
-            sc_atom_init = torch.zeros_like(atom_init)
-            sc_node_init = torch.zeros_like(node_init)
+            sc_atom_embed = torch.zeros_like(atom_embed)
+            sc_node_embed = torch.zeros_like(node_embed)
             sc_atompair_embed = torch.zeros_like(atompair_embed)
-        sc_atom_init = torch.zeros_like(atom_init)
-        sc_node_init = torch.zeros_like(node_init)
-        sc_atompair_embed = torch.zeros_like(atompair_embed)
 
-        atom_embed = self.atom_adaln(atom_init, sc_atom_init)
-        node_embed = self.node_adaln(node_init, sc_node_init)
+        atom_embed = self.atom_adaln(atom_embed, sc_atom_embed)
+        node_embed = self.node_adaln(node_embed, sc_node_embed)
         atompair_embed = self.atompair_adaln(atompair_embed, sc_atompair_embed)
 
         return {
-            "atom_embed": atom_embed,
             "node_embed": node_embed,
+            "atom_cond": atom_cond,
+            "atom_cond_skip": atom_cond_skip,
+            "atom_embed": atom_embed,
+            "atompair_skip_embed": atompair_skip,
             "edge_embed": edge_embed,
             "noised_atompos": flat_atompos,
-            "atompair_embed": atompair_embed,
             "atompair_mask": atompair_mask,
             "to_queries": to_queries,
             "to_keys": to_keys,
@@ -516,9 +546,8 @@ class AtomDenoiserCore(nn.Module):
                 c_atom
             )
 
-            self.trunk[f'atompair_update_{b}'] = AtomPairEmbedder(
+            self.trunk[f'atompair_update_{b}'] = AtomPairUpdate(
                 c_z,
-                c_atom,
                 c_atompair
             )
 
@@ -530,10 +559,11 @@ class AtomDenoiserCore(nn.Module):
                 num_blocks=3
             )
 
-            self.trunk[f'scatter_to_nodes_{b}'] = ScatterUpdate(
+            self.trunk[f'cond_update_{b}'] = GatherUpdate(
                 c_s,
                 c_atom
             )
+
             self.trunk[f'atom_update_{b}'] = nn.Sequential(
                 LayerNorm(c_atom),
                 # Linear(c_atom, 3, bias=False, init='final')
@@ -561,15 +591,20 @@ class AtomDenoiserCore(nn.Module):
         edge_embed = input_feats['edge_embed']
         node_embed = node_embed * node_mask[..., None]
         atompos = input_feats['noised_atompos']
-        atom_embed = input_feats['atom_embed']
-        # atompair_embed = input_feats['atompair_embed']
-        atompair_embed_init = input_feats['atompair_embed']
+        atom_skip_embed = input_feats['atom_embed']
+        atom_cond = input_feats['atom_cond']
+        atom_cond_skip = input_feats['atom_cond_skip']
+        atompair_skip_embed = input_feats['atompair_skip_embed']
         atompair_mask = input_feats['atompair_mask']
         to_queries = input_feats['to_queries']
         to_keys = input_feats['to_keys']
         to_res_batch = input_feats['to_res_batch']
         atom_to_res_idx = input_feats['atom_to_res_idx']
         atom_mask = input_feats['atom_mask']
+
+        # just for linters
+        atom_cond = atom_cond_skip
+        atom_embed = atom_skip_embed
 
         for b in range(self.num_blocks):
             if self.no_time_condition:
@@ -581,23 +616,22 @@ class AtomDenoiserCore(nn.Module):
 
             atom_embed = self.trunk[f'broadcast_to_atoms_{b}'](
                 node_embed,
-                atom_embed,
+                atom_skip_embed,
                 atom_to_res_idx,
                 atom_mask
             )
-            atompair_embed, _ = self.trunk[f'atompair_update_{b}'](
-                atom_embed,
-                atompos,
+            atompair_embed = self.trunk[f'atompair_update_{b}'](
+                atompair_skip_embed,
                 edge_embed,
                 atom_to_res_idx,
                 atom_mask,
+                atompair_mask,
                 to_queries,
                 to_keys,
-                # init_atompair_embed=atompair_embed_init
             )
             atom_embed = self.trunk[f'atom_tfmr_{b}'](
                 atom_embed,
-                node_embed,
+                atom_cond,
                 atompair_embed,
                 atom_to_res_idx,
                 atom_mask,
@@ -605,12 +639,21 @@ class AtomDenoiserCore(nn.Module):
                 to_queries,
                 to_keys,
             )
-            atompos = atompos + self.trunk[f'atom_update_{b}'](atom_embed) * atom_mask[..., None]
+            atompos = atompos + self.trunk[f'atom_update_{b}'](
+                atom_embed
+            ) * atom_mask[..., None]
 
             if b < self.num_blocks-1:
                 edge_embed = self.trunk[f'edge_transition_{b}'](
                     node_embed, edge_embed, to_res_batch(atompos, -2)[..., 1, :], edge_mask)
                 edge_embed *= edge_mask[..., None]
+
+                atom_cond = self.trunk[f'cond_update_{b}'](
+                    node_embed,
+                    atom_cond_skip,
+                    atom_to_res_idx,
+                    atom_mask
+                )
 
         seq_logits = self.seq_pred(to_res_batch(atom_embed, -2))
         model_out = {
@@ -728,7 +771,7 @@ class AtomDenoiser(nn.Module):
 
         atompos_out = score_dict['denoised_atompos']
         atom14_out = denoiser_data['to_res_batch'](atompos_out, -2)
-        print(atom14_out.square().sum())
+        # print(atom14_out.square().sum())
 
         if self.trans_preconditioning:
             atom14_out = (atom14_out - atom14_in) * data['c_out'][..., None, None, None] + atom14_t * data['c_skip'][..., None, None, None]
