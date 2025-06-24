@@ -1,9 +1,10 @@
 import torch
+import numpy as np
 
 from .task import TrainingTask
 
-class UnconditionalGenerationV2(TrainingTask):
-    name: str = "unconditional_v2"
+class PartialSequenceConditionedV2(TrainingTask):
+    name: str = "partial_seq_v2"
     def __init__(
         self,
         prob=0.0,
@@ -14,7 +15,7 @@ class UnconditionalGenerationV2(TrainingTask):
         beta_p2=1.0,
         shift_time_scale=False,
         t_min=0.01,
-        t_max=0.99,
+        t_max=0.99
     ):
         assert t_sched in ['lognorm', 'mixed_beta', 'uniform']
         self.prob = prob
@@ -46,7 +47,15 @@ class UnconditionalGenerationV2(TrainingTask):
             raise ValueError(f"self.t_sched={self.t_sched} not recognized")
 
         rigids_noising_mask = torch.ones(rigids_1.shape[:-1], dtype=torch.bool, device=device)
-        seq_noising_mask = torch.ones_like(rigids_noising_mask[:, 0])
+        # ESM3 masking strategy
+        if np.random.random() < 0.8:
+            mask_rate = torch.distributions.beta.Beta(3, 9).sample((1,))
+        else:
+            mask_rate = np.random.random()
+
+        seq_noising_mask = torch.rand_like(rigids_noising_mask[:, 0], dtype=torch.float32) < mask_rate
+        print(seq_noising_mask, mask_rate)
+
         res_is_unindexed_mask = torch.zeros_like(seq_noising_mask, dtype=torch.bool)
         res_is_atomized_mask = torch.zeros_like(res_is_unindexed_mask, dtype=torch.bool)
 

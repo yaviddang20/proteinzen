@@ -33,6 +33,7 @@ def featurize_input(
         'ligands': {},
         'atom': {},
         'task': task,
+        'name': [data.name]
     }
 
     # compute base features from raw data
@@ -164,8 +165,11 @@ def featurize_input(
         else:
             features['token'][key] = tensor[token_seq_idx]
     token_is_protein_output_mask = features['token']['token_is_protein_output_mask']
-    features['token']['seq_noising_mask'][token_is_protein_output_mask] = True
 
+    unindexed_motif_mask = (~rigids_noising_mask & res_is_unindexed_mask[..., None])
+    if unindexed_motif_mask.any():
+        seq_noising_mask = features['token']['seq_noising_mask']
+        seq_noising_mask[token_is_protein_output_mask] = True
 
     # compute sidechain features
     ## generate data dict
@@ -398,4 +402,6 @@ def collate(data_list):
     ]
     batched_data_list = default_collate(padded_data_list)
     batched_data_list['task'] = [data['task'] for data in data_list]
+    if 'name' in data_list[0]:
+        batched_data_list['name'] = [data['name'] for data in data_list]
     return batched_data_list

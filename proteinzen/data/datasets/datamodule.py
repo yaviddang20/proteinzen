@@ -192,7 +192,7 @@ class FramediffDataModule(L.LightningDataModule):
         if self.use_collate_v2:
             def collate_fn(data_list):
                 task = self.training_harness.task_sampler.sample_task()
-                print(task)
+                # print(task)
                 # corrupter = self.training_harness.frame_noiser
                 data_list = [featurize_input(task, d) for d in data_list]
                 batch = collate(data_list)

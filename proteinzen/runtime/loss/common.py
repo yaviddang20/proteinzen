@@ -210,16 +210,24 @@ def atomic_losses_dense_batch(
     pred_atom14_gt_seq = model_outputs['denoised_atom14_gt_seq']
     seq_logits = model_outputs['decoded_seq_logits']
 
+    flat_masked_seq = (seq * seq_loss_mask).flatten(0, 1)
+    flat_seq_logits = seq_logits.flatten(0, 1)
     seq_loss = F.cross_entropy(
-        seq_logits.flatten(0, 1),
-        (seq * seq_loss_mask).flatten(0, 1),
+        flat_seq_logits,
+        flat_masked_seq,
         reduction='none'
-    ).view(seq.shape) * seq_loss_mask
+    )
+    seq_loss = seq_loss.view(seq.shape)
+    seq_loss = seq_loss * seq_loss_mask
+
+    if (~seq_loss_mask).all(dim=-1).any():
+        print("seq_loss_mask all False", batch['name'], (~seq_loss_mask).all(dim=-1))
+
     seq_loss = seq_loss * seqwise_weight
-    seq_loss = seq_loss.sum(dim=-1) / seq_loss_mask.sum(dim=-1)
+    seq_loss = seq_loss.sum(dim=-1) / seq_loss_mask.sum(dim=-1).clip(min=1)
 
     per_seq_recov = (seq == seq_logits[..., :-1].argmax(dim=-1))
-    per_seq_recov = (per_seq_recov * seq_loss_mask).sum(dim=-1) / seq_loss_mask.sum(dim=-1)
+    per_seq_recov = (per_seq_recov * seq_loss_mask).sum(dim=-1) / seq_loss_mask.sum(dim=-1).clip(min=1)
 
     smooth_lddt = dense_smooth_lddt_loss(
         pred_atom14=pred_atom14_gt_seq,

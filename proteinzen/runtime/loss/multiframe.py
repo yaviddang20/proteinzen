@@ -60,7 +60,8 @@ def multiframe_fm_loss_dense_batch(
     rot_vf_angle_loss_weight=0.5,
     fafe_l2_block_mask_size=1,
     trans_rigidwise_weight=1,
-    rot_rigidwise_weight=1
+    rot_rigidwise_weight=1,
+    direct_rot_vf_loss=False
 ):
     rigids_data = inputs['rigids']
     rigids_mask = rigids_data['rigids_mask']
@@ -114,15 +115,18 @@ def multiframe_fm_loss_dense_batch(
             unscaled_rot_vf_loss = (unscaled_rot_vf_loss * total_mask).sum(dim=-1) / num_rigids_per_batch
 
     else:
-        pred_rot_vf = so3_fm_utils.calc_rot_vf(rots_t, rots_1_pred)
-        gt_rot_vf = so3_fm_utils.calc_rot_vf(rots_t, rots_1)
+        if direct_rot_vf_loss:
+            pred_rot_vf = denoiser_outputs['pred_rot_vf']
+            gt_rot_vf = rigids_data['gt_rot_vf']
+            print("pred", pred_rot_vf)
+            print("gt", gt_rot_vf)
+            # rot_vf_angle_loss_weight = rot_vf_angle_loss_weight / (2.4 ** 2)  # this is roughly the mean of the vector field magnitudes, squared
 
-        if sep_rot_loss:
             rot_vf_loss = angle_axis_rot_vf_loss_dense(
                 pred_rot_vf,
                 gt_rot_vf,
                 total_mask,
-                norm_scale / rot_rigidwise_weight,
+                torch.ones_like(norm_scale) / rot_rigidwise_weight,
                 weight=rigidwise_weight ,
                 angle_loss_weight=rot_vf_angle_loss_weight,
             )
@@ -131,17 +135,37 @@ def multiframe_fm_loss_dense_batch(
                     pred_rot_vf,
                     gt_rot_vf,
                     total_mask,
-                    norm_scale,
+                    torch.ones_like(norm_scale),
                 )
         else:
-            rot_vf_loss = torch.square(pred_rot_vf - gt_rot_vf).sum(dim=-1)
-            unscaled_rot_vf_loss = rot_vf_loss
-            rot_vf_loss = rot_vf_loss * rigidwise_weight
-            rot_vf_loss = rot_vf_loss / (norm_scale[..., None] ** 2)
-            rot_vf_loss = (rot_vf_loss * total_mask).sum(dim=-1) / num_rigids_per_batch
-            with torch.no_grad():
-                unscaled_rot_vf_loss = unscaled_rot_vf_loss / (norm_scale ** 2)[..., None]
-                unscaled_rot_vf_loss = (unscaled_rot_vf_loss * total_mask).sum(dim=-1) / num_rigids_per_batch
+            pred_rot_vf = so3_fm_utils.calc_rot_vf(rots_t, rots_1_pred)
+            gt_rot_vf = so3_fm_utils.calc_rot_vf(rots_t, rots_1)
+
+            if sep_rot_loss:
+                rot_vf_loss = angle_axis_rot_vf_loss_dense(
+                    pred_rot_vf,
+                    gt_rot_vf,
+                    total_mask,
+                    norm_scale / rot_rigidwise_weight,
+                    weight=rigidwise_weight ,
+                    angle_loss_weight=rot_vf_angle_loss_weight,
+                )
+                with torch.no_grad():
+                    unscaled_rot_vf_loss = angle_axis_rot_vf_loss_dense(
+                        pred_rot_vf,
+                        gt_rot_vf,
+                        total_mask,
+                        norm_scale,
+                    )
+            else:
+                rot_vf_loss = torch.square(pred_rot_vf - gt_rot_vf).sum(dim=-1)
+                unscaled_rot_vf_loss = rot_vf_loss
+                rot_vf_loss = rot_vf_loss * rigidwise_weight
+                rot_vf_loss = rot_vf_loss / (norm_scale[..., None] ** 2)
+                rot_vf_loss = (rot_vf_loss * total_mask).sum(dim=-1) / num_rigids_per_batch
+                with torch.no_grad():
+                    unscaled_rot_vf_loss = unscaled_rot_vf_loss / (norm_scale ** 2)[..., None]
+                    unscaled_rot_vf_loss = (unscaled_rot_vf_loss * total_mask).sum(dim=-1) / num_rigids_per_batch
 
     trans_1_pred = denoised_rigids.get_trans()
     trans_1 = gt_rigids.get_trans()
@@ -408,7 +432,7 @@ def fafe_loss_l2(
     trans_dist_loss = torch.sum(
         trans_dist**2 * mask,
         dim=(-2, -1),
-    ) / mask.sum(dim=(-2, -1))
+    ) / mask.sum(dim=(-2, -1)).clip(min=1)
 
     rotpair_mask = mask * clamp_mask
     rot_dist_loss = torch.sum(
@@ -416,5 +440,5 @@ def fafe_loss_l2(
         dim=(-2, -1),
     ) / torch.clamp(mask.sum(dim=(-2, -1)), min=1)
 
-    return torch.sqrt(trans_dist_loss / trans_scale**2 + rot_dist_loss / rot_scale**2)
+    return torch.sqrt(trans_dist_loss / trans_scale**2 + rot_dist_loss / rot_scale**2 + eps_so3)
 

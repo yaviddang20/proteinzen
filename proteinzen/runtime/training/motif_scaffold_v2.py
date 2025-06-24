@@ -4,12 +4,15 @@ import math
 import numpy as np
 import torch
 
+import torch_cluster
+
 from .task import TrainingTask
 
 # inspired by Genie2
 class MotifScaffoldingV2(TrainingTask):
-    name: str = "motif_scaffolding"
+    name: str = "motif_scaffolding_v2"
     def __init__(self,
+                 prob=0.0,
                  t_sched='lognorm',
                  mode='full_residue',
                  lognorm_mu=0.0,
@@ -22,9 +25,11 @@ class MotifScaffoldingV2(TrainingTask):
                  max_frac_res=0.5,
                  max_num_res=40,
                  p_is_unindexed=0.8,
+                 name_override=None
     ):
-        assert t_sched in ['lognorm', 'mixed_beta']
+        assert t_sched in ['lognorm', 'mixed_beta', 'uniform']
         assert mode in ['backbone', 'full_residue', 'inv_rotamer', 'mixed']
+        self.prob = prob
         self.t_sched = t_sched
         self.mode = mode
         self.lognorm_mu = lognorm_mu
@@ -38,6 +43,9 @@ class MotifScaffoldingV2(TrainingTask):
         self.max_frac_res = max_frac_res
         self.max_num_res = max_num_res
         self.p_is_unindexed = p_is_unindexed
+
+        if name_override is not None:
+            self.name = name_override
 
     def generate_motif_mask(self, N):
         num_segments = np.random.randint(1, 5)
@@ -74,6 +82,8 @@ class MotifScaffoldingV2(TrainingTask):
             else:
                 dist = torch.distributions.beta.Beta(self.beta_p1, self.beta_p2)
                 t = dist.sample((1,)).to(device)
+        elif self.t_sched == 'uniform':
+            t = torch.rand(1, device=device).float()
         else:
             raise ValueError(f"self.t_sched={self.t_sched} not recognized")
         rigids_noising_mask = torch.ones(rigids_1.shape[:-1], dtype=bool, device=device)
@@ -97,6 +107,8 @@ class MotifScaffoldingV2(TrainingTask):
             rigids_noising_mask[motif_mask & mask_bb_only, 0] = False
             rigids_noising_mask[motif_mask & (~mask_bb_only)] = False
             seq_noising_mask[motif_mask & mask_bb_only] = True
+        else:
+            raise ValueError()
 
 
         res_is_unindexed_mask = torch.rand_like(seq_noising_mask, dtype=torch.float32) < self.p_is_unindexed
@@ -117,3 +129,104 @@ class ResidueMotifScaffoldingV2(MotifScaffoldingV2):
 class MixedMotifScaffoldingV2(MotifScaffoldingV2):
     name: str = "mixed_motif_scaffolding_v2"
     __init__ = partialmethod(MotifScaffoldingV2.__init__, mode='mixed')
+
+
+# inspired by Genie2
+class ResidueBallMotifScaffoldingV2(TrainingTask):
+    name: str = "motif_scaffolding_v2"
+    def __init__(self,
+                 prob=0.0,
+                 t_sched='lognorm',
+                 mode='full_residue',
+                 lognorm_mu=0.0,
+                 lognorm_sig=1.0,
+                 beta_p1=1.9,
+                 beta_p2=1.0,
+                 shift_time_scale=False,
+                 t_min=0.01,
+                 t_max=0.99,
+                 max_frac_res=0.5,
+                 max_num_res=40,
+                 p_is_unindexed=0.8,
+                 name_override=None
+    ):
+        assert t_sched in ['lognorm', 'mixed_beta', 'uniform']
+        assert mode in ['backbone', 'full_residue', 'inv_rotamer', 'mixed']
+        self.prob = prob
+        self.t_sched = t_sched
+        self.mode = mode
+        self.lognorm_mu = lognorm_mu
+        self.lognorm_sig = lognorm_sig
+        self.beta_p1 = beta_p1
+        self.beta_p2 = beta_p2
+        self.t_min = t_min
+        self.t_max = t_max
+        self.shift_time_scale = shift_time_scale
+
+        self.max_frac_res = max_frac_res
+        self.max_num_res = max_num_res
+        self.p_is_unindexed = p_is_unindexed
+
+        if name_override is not None:
+            self.name = name_override
+
+    def generate_motif_mask(self, coords):
+        radius = torch.rand(1, device=coords.device) * 5 + 5
+        center_idx = np.random.choice(coords.shape[0])
+        center = coords[center_idx]
+        dist = torch.linalg.vector_norm(coords - center[None] + 1e-8, dim=-1)
+        motif_mask = dist < radius
+        return motif_mask
+
+    def sample_t_and_mask(self, data):
+        rigids_1 = data['residue']['rigids_1']
+        device = rigids_1.device
+        if self.t_sched == 'lognorm':
+            ln_sig = self.lognorm_mu + torch.randn(1, device=device).float() * self.lognorm_sig
+            t = torch.sigmoid(ln_sig)
+        elif self.t_sched == 'mixed_beta':
+            u = torch.rand(1)
+            if u < 0.02:
+                t = torch.rand(1, device=device).float()
+            else:
+                dist = torch.distributions.beta.Beta(self.beta_p1, self.beta_p2)
+                t = dist.sample((1,)).to(device)
+        elif self.t_sched == 'uniform':
+            t = torch.rand(1, device=device).float()
+        else:
+            raise ValueError(f"self.t_sched={self.t_sched} not recognized")
+        rigids_noising_mask = torch.ones(rigids_1.shape[:-1], dtype=bool, device=device)
+
+        motif_mask = self.generate_motif_mask(rigids_1[:, 0, 4:])  # CAs
+        seq_noising_mask = ~motif_mask
+        if self.mode == 'backbone':
+            raise NotImplementedError()
+            # t[motif_mask, 0] = 1
+            rigids_noising_mask[motif_mask, 0] = False
+            seq_noising_mask = torch.ones_like(motif_mask)
+        elif self.mode == 'full_residue':
+            # t[motif_mask] = 1
+            rigids_noising_mask[motif_mask] = False
+        elif self.mode == 'inv_rotamer':
+            raise NotImplementedError()
+            # t[motif_mask, 1:] = 1
+            rigids_noising_mask[motif_mask, 1:] = False
+        elif self.mode == 'mixed':
+            mask_bb_only = torch.rand_like(rigids_noising_mask[..., 0], dtype=torch.float32) < 0.5
+            rigids_noising_mask[motif_mask & mask_bb_only, 0] = False
+            rigids_noising_mask[motif_mask & (~mask_bb_only)] = False
+            seq_noising_mask[motif_mask & mask_bb_only] = True
+        else:
+            raise ValueError()
+
+
+        res_is_unindexed_mask = torch.rand_like(seq_noising_mask, dtype=torch.float32) < self.p_is_unindexed
+        res_is_atomized_mask = torch.zeros_like(res_is_unindexed_mask, dtype=torch.bool)
+
+        return {
+            "t": t,
+            "rigids_noising_mask": rigids_noising_mask,
+            "seq_noising_mask": seq_noising_mask,
+            "res_is_unindexed_mask": res_is_unindexed_mask,
+            "res_is_atomized_mask": res_is_atomized_mask
+        }

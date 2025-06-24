@@ -1,6 +1,7 @@
 import logging
 import math
 from functools import partial
+import copy
 
 import numpy as np
 import tqdm
@@ -69,7 +70,8 @@ class ProteinModule(L.LightningModule):
                  use_predict_v2=False,
                  seq_weight=DEFAULT_SEQ_WEIGHT,
                  use_euclidean_for_rots=False,
-                 learnable_noise_schedule=False
+                 learnable_noise_schedule=False,
+                 direct_rot_vf_loss=False
     ):
         super().__init__()
         self._log = logging.getLogger(__name__)
@@ -86,6 +88,7 @@ class ProteinModule(L.LightningModule):
         self.use_dense_batch_loss = use_dense_batch_loss
         self.use_euclidean_for_rots = use_euclidean_for_rots
         self.learnable_noise_schedule = learnable_noise_schedule
+        self.direct_rot_vf_loss = direct_rot_vf_loss
         if learnable_noise_schedule:
             self.automatic_optimization = False
 
@@ -112,17 +115,17 @@ class ProteinModule(L.LightningModule):
             self.ema_long = None
             self.ema_short = None
 
-        # def detect_nan_hook(module, input, output):
-        #     if isinstance(output, torch.Tensor):
-        #         if torch.isnan(output).any():
-        #             print(f"NaN detected in: {module}")
-        #     elif isinstance(output, (tuple, list)):
-        #         for i, out in enumerate(output):
-        #             if torch.is_tensor(out) and torch.isnan(out).any():
-        #                 print(f"NaN detected in output {i} of: {module}")
+        def detect_nan_hook(module, input, output):
+            if isinstance(output, torch.Tensor):
+                if torch.isnan(output).any():
+                    print(f"NaN detected in: {module}")
+            elif isinstance(output, (tuple, list)):
+                for i, out in enumerate(output):
+                    if torch.is_tensor(out) and torch.isnan(out).any():
+                        print(f"NaN detected in output {i} of: {module}")
 
-        # for name, module in self.model.named_modules():
-        #     module.register_forward_hook(detect_nan_hook)
+        for name, module in self.model.named_modules():
+            module.register_forward_hook(detect_nan_hook)
 
 
     def on_train_epoch_start(self):
@@ -130,7 +133,8 @@ class ProteinModule(L.LightningModule):
         if hasattr(self.trainer.train_dataloader.batch_sampler, "epoch"):
             self.trainer.train_dataloader.batch_sampler.set_epoch(self.trainer.current_epoch)
 
-    def training_step(self, batch):
+    def training_step(self, batch, batch_idx):
+        print(batch['task'])
         training_harness = self.training_harness
 
         if self.ema is not None and self.global_step > 0:
@@ -160,7 +164,14 @@ class ProteinModule(L.LightningModule):
                 with torch.autograd.detect_anomaly():
                     batch = corrupter.corrupt_dense_batch(batch)
             else:
-                batch = corrupter.corrupt_dense_batch(batch)
+                try:
+                    batch = corrupter.corrupt_dense_batch(batch)
+                except Exception as e:
+                    print(batch['name'])
+                    torch.set_printoptions(threshold=1000000000000)
+                    print(batch)
+                    raise e
+
         # else:
         #     batch = corrupter.corrupt_batch(batch)
 
@@ -308,6 +319,7 @@ class ProteinModule(L.LightningModule):
             rigidwise_weight=rigidwise_weight,
             trans_rigidwise_weight=log_trans_t_grad**2,
             rot_rigidwise_weight=log_rot_t_grad**2,
+            direct_rot_vf_loss=self.direct_rot_vf_loss
         )
 
         frame_vf_loss = (
@@ -336,6 +348,13 @@ class ProteinModule(L.LightningModule):
                 frame_vf_loss
                 + 0.25 * atomic_loss_dict["seq_loss"]
             )
+
+        elif self.direct_rot_vf_loss:
+            loss = (
+                frame_vf_loss
+                + 0.25 * atomic_loss_dict["seq_loss"]
+                + 0.5 * frame_fm_loss_dict['scaled_fafe']
+            )
         else:
             loss = (
                 frame_vf_loss
@@ -346,13 +365,14 @@ class ProteinModule(L.LightningModule):
         loss_dict = {"loss": loss.mean(), "frame_vf_loss": frame_vf_loss, "frame_vf_loss_unscaled": unscaled_frame_vf_loss}
         loss_dict['loss_per_batch'] = loss
 
-        if 'motif_idx' in outputs:
-            pred_motif_idx = outputs['motif_idx']
-            gt_motif_idx = inputs['token']['token_seq_idx']
-            is_motif_mask = ~inputs['token']['token_is_protein_output_mask'] & ~inputs['token']['token_is_ligand_mask']
-            motif_idx_correct = (pred_motif_idx == gt_motif_idx) * is_motif_mask
-            if is_motif_mask.sum() > 0:
-                loss_dict['motif_idx_correct'] = motif_idx_correct.sum() / is_motif_mask.sum()
+        # TODO: for some reason this does not play well with nccl between different tasks
+        # if 'motif_idx' in outputs:
+        #     pred_motif_idx = outputs['motif_idx']
+        #     gt_motif_idx = inputs['token']['token_seq_idx']
+        #     is_motif_mask = ~inputs['token']['token_is_protein_output_mask'] & ~inputs['token']['token_is_ligand_mask']
+        #     motif_idx_correct = (pred_motif_idx == gt_motif_idx) * is_motif_mask
+        #     if is_motif_mask.sum() > 0:
+        #         loss_dict['motif_idx_correct'] = motif_idx_correct.sum() / is_motif_mask.sum()
         loss_dict[inputs['task'].name + "_loss"] = loss
         loss_dict[inputs['task'].name + "_seq_loss"] = atomic_loss_dict["seq_loss"]
         loss_dict[inputs['task'].name + "_frame_vf_loss"] = frame_vf_loss
@@ -751,8 +771,11 @@ class ProteinModule(L.LightningModule):
             d_t = t_2 - t_1
             # Run model.
             trans_t_1, rotmats_t_1, _, _ = prot_traj[-1]
-            # trans_t_1, center = frame_noiser._center_trans(trans_t_1, res_data.batch, rigids_noising_mask)
-            # global_shift += center
+            # trans_t_1_center = (trans_t_1 * rigids_noising_mask[..., None]).sum(dim=-2) / rigids_noising_mask[..., None].float().sum(dim=-2)
+            # # print(trans_t_1_center.shape, rigids_noising_mask.shape, trans_t_1.shape)
+            # trans_t_1 = trans_t_1 - trans_t_1_center[..., None, :] * rigids_noising_mask[..., None]
+            # # trans_t_1, center = frame_noiser._center_trans(trans_t_1, res_data.batch, rigids_noising_mask)
+            # # global_shift += center
 
             t_hat, d_t_hat, trans_t_hat = frame_noiser._trans_churn(
                 d_t,
@@ -767,110 +790,198 @@ class ProteinModule(L.LightningModule):
                 noising_mask=rigids_noising_mask,
             )
 
-            rigids_data["trans_t"] = trans_t_hat
-            rigids_data["rotmats_t"] = rotmats_t_hat
-            rigids_data['rigids_t'] = ru.Rigid(
-                rots=ru.Rotation(rot_mats=rotmats_t_hat),
-                trans=trans_t_hat
-            ).to_tensor_7()
-            t = torch.ones(num_batch, device=device)[..., None] * t_hat
-            batch["t"] = t
+            if frame_noiser.unconditional_guidance_alpha > 0.0:
+                rigids_data["trans_t"] = trans_t_hat
+                rigids_data["rotmats_t"] = rotmats_t_hat
+                rigids_data['rigids_t'] = ru.Rigid(
+                    rots=ru.Rotation(rot_mats=rotmats_t_hat),
+                    trans=trans_t_hat
+                ).to_tensor_7()
+                t = torch.ones(num_batch, device=device)[..., None] * t_hat
+                batch["t"] = t
 
-            denoiser_out = model(batch, self_condition=denoiser_out)
+                uncond_batch = copy.copy(batch)
+                uncond_batch['rigids']['rigids_mask'] = uncond_batch['rigids']['rigids_mask'] * uncond_batch['rigids']['rigids_noising_mask']
+                uncond_batch['token']['token_mask'] = uncond_batch['token']['token_mask'] * uncond_batch['token']['token_is_protein_output_mask']
 
-            # Process model output.
-            pred_rigids = denoiser_out['denoised_rigids']
-            pred_trans_1 = pred_rigids.get_trans()
-            pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
-            # if torch.isnan(pred_trans_1).any() or torch.isnan(pred_rotmats_1).any():
-            #     print("pred", t_1)
-            #     exit()
+                uncond_denoiser_out = model(uncond_batch, self_condition=denoiser_out)
+                cond_denoiser_out = model(batch, self_condition=denoiser_out)
 
-            clean_traj.append(
-                (
-                    pred_trans_1.detach().cpu(),
-                    pred_rotmats_1.detach().cpu(),
-                    denoiser_out['pred_seq'].detach().cpu(),
-                    denoiser_out['denoised_atom14'].detach().cpu(),
-                    denoiser_out['denoised_atom14_gt_seq'].detach().cpu()
+                # Process model output.
+                pred_cond_rigids = cond_denoiser_out['denoised_rigids']
+                pred_trans_1_cond = pred_cond_rigids.get_trans()
+                pred_rotmats_1_cond = pred_cond_rigids.get_rots().get_rot_mats()
+
+                pred_uncond_rigids = uncond_denoiser_out['denoised_rigids']
+                pred_trans_1_uncond = pred_uncond_rigids.get_trans()
+                pred_rotmats_1_uncond = pred_uncond_rigids.get_rots().get_rot_mats()
+
+                clean_traj.append(
+                    (
+                        pred_trans_1_cond.detach().cpu(),
+                        pred_rotmats_1_cond.detach().cpu(),
+                        cond_denoiser_out['pred_seq'].detach().cpu(),
+                        cond_denoiser_out['denoised_atom14'].detach().cpu(),
+                        cond_denoiser_out['denoised_atom14_gt_seq'].detach().cpu()
+                    )
                 )
-            )
 
-            if self.learnable_noise_schedule:
-                # TODO: why the heck does jvp not work here
-                l = token_data['token_is_protein_output_mask'].float().sum(dim=-1) / 100
-                # log_trans_time_fn = lambda x: torch.log(1 - self.model.trans_gamma_t(x, l[..., None]))
-                # log_rot_time_fn = lambda x: torch.log(1 - self.model.rot_gamma_t(x, l[..., None]))
+                if self.learnable_noise_schedule:
+                    # TODO: why the heck does jvp not work here
+                    l = token_data['token_is_protein_output_mask'].float().sum(dim=-1) / 100
+                    # log_trans_time_fn = lambda x: torch.log(1 - self.model.trans_gamma_t(x, l[..., None]))
+                    # log_rot_time_fn = lambda x: torch.log(1 - self.model.rot_gamma_t(x, l[..., None]))
 
-                trans_shift_scale = self.model.trans_gamma_t._forward(l[..., None])
-                rot_shift_scale = self.model.trans_gamma_t._forward(l[..., None])
+                    trans_shift_scale = self.model.trans_gamma_t._forward(l[..., None])
+                    rot_shift_scale = self.model.trans_gamma_t._forward(l[..., None])
 
-                # log_trans_t_grad = torch.func.jvp(log_trans_time_fn, (t,), (torch.ones_like(t),))[1]
-                # log_rot_t_grad = torch.func.jvp(log_rot_time_fn, (t,), (torch.ones_like(t),))[1]
-                log_trans_t_grad = -1 / ((t - 1) * (trans_shift_scale * (t - 1) - t))
-                log_rot_t_grad = -1 / ((t - 1) * (rot_shift_scale * (t - 1) - t))
-                log_trans_t_grad = log_trans_t_grad.clip(min=-100)
-                log_rot_t_grad = log_rot_t_grad.clip(min=-100)
+                    # log_trans_t_grad = torch.func.jvp(log_trans_time_fn, (t,), (torch.ones_like(t),))[1]
+                    # log_rot_t_grad = torch.func.jvp(log_rot_time_fn, (t,), (torch.ones_like(t),))[1]
+                    log_trans_t_grad = -1 / ((t - 1) * (trans_shift_scale * (t - 1) - t))
+                    log_rot_t_grad = -1 / ((t - 1) * (rot_shift_scale * (t - 1) - t))
+                    log_trans_t_grad = log_trans_t_grad.clip(min=-100)
+                    log_rot_t_grad = log_rot_t_grad.clip(min=-100)
 
-                print(log_trans_t_grad, log_rot_t_grad)
-                trans_time = self.model.trans_gamma_t(t, l[..., None])[..., None]
-                rot_time = self.model.rot_gamma_t(t, l[..., None])[..., None]
-                trans_vf_scale = -log_trans_t_grad[..., None] * (1 - trans_time)
-                rot_vf_scale = -log_rot_t_grad[..., None] * (1 - rot_time)
-                trans_d_t_hat = self.model.trans_gamma_t(t + d_t_hat, l[..., None]) - self.model.trans_gamma_t(t, l[..., None])
-                trans_d_t_hat = trans_d_t_hat[..., None]
-                rot_d_t_hat = self.model.rot_gamma_t(t + d_t_hat, l[..., None]) - self.model.rot_gamma_t(t, l[..., None])
-                rot_d_t_hat = rot_d_t_hat[..., None]
+                    print(log_trans_t_grad, log_rot_t_grad)
+                    trans_time = self.model.trans_gamma_t(t, l[..., None])[..., None]
+                    rot_time = self.model.rot_gamma_t(t, l[..., None])[..., None]
+                    trans_vf_scale = -log_trans_t_grad[..., None] * (1 - trans_time)
+                    rot_vf_scale = -log_rot_t_grad[..., None] * (1 - rot_time)
+                    trans_d_t_hat = self.model.trans_gamma_t(t + d_t_hat, l[..., None]) - self.model.trans_gamma_t(t, l[..., None])
+                    trans_d_t_hat = trans_d_t_hat[..., None]
+                    rot_d_t_hat = self.model.rot_gamma_t(t + d_t_hat, l[..., None]) - self.model.rot_gamma_t(t, l[..., None])
+                    rot_d_t_hat = rot_d_t_hat[..., None]
+                else:
+                    trans_d_t_hat = d_t_hat
+                    rot_d_t_hat = d_t_hat
+                    trans_time = t_hat
+                    rot_time = t_hat
+                    trans_vf_scale = 1
+                    rot_vf_scale = 1
+
+
+                trans_t_2 = frame_noiser._trans_guidance_step(
+                    trans_d_t_hat,
+                    trans_time,
+                    pred_trans_1_cond,
+                    pred_trans_1_uncond,
+                    trans_t_hat,
+                    noising_mask=rigids_noising_mask,
+                    vf_scale=trans_vf_scale,
+                )
+                rotmats_t_2 = frame_noiser._rots_guidance_step(
+                    rot_d_t_hat,
+                    rot_time,
+                    pred_rotmats_1_cond,
+                    pred_rotmats_1_uncond,
+                    rotmats_t_hat,
+                    noising_mask=rigids_noising_mask,
+                    vf_scale=rot_vf_scale
+                )
+                denoiser_out = cond_denoiser_out
+
             else:
-                trans_d_t_hat = d_t_hat
-                rot_d_t_hat = d_t_hat
-                trans_time = t_hat
-                rot_time = t_hat
-                trans_vf_scale = 1
-                rot_vf_scale = 1
+                rigids_data["trans_t"] = trans_t_hat
+                rigids_data["rotmats_t"] = rotmats_t_hat
+                rigids_data['rigids_t'] = ru.Rigid(
+                    rots=ru.Rotation(rot_mats=rotmats_t_hat),
+                    trans=trans_t_hat
+                ).to_tensor_7()
+                t = torch.ones(num_batch, device=device)[..., None] * t_hat
+                batch["t"] = t
 
-            # Take reverse step
-            # trans_t_2 = frame_noiser._trans_euler_step(
-            #     d_t_hat,
-            #     t_hat,
-            #     pred_trans_1,
-            #     trans_t_hat,
-            #     noising_mask=rigids_noising_mask,
-            #     # add_noise=False,
-            #     # use_score=False
-            # )
-            # rotmats_t_2 = frame_noiser._rots_euler_step(
-            #     d_t_hat,
-            #     t_hat,
-            #     pred_rotmats_1,
-            #     rotmats_t_hat,
-            #     noising_mask=rigids_noising_mask,
-            #     # add_noise=False,
-            #     # use_score=False
-            # )
+                denoiser_out = model(batch, self_condition=denoiser_out)
 
-            print(
-                trans_time.shape if isinstance(trans_time, torch.Tensor) else 1,
-                trans_d_t_hat.shape if isinstance(trans_time, torch.Tensor) else 1,
-                pred_trans_1.shape,
-                trans_t_hat.shape,
-            )
-            trans_t_2 = frame_noiser._trans_euler_step(
-                trans_d_t_hat,
-                trans_time,
-                pred_trans_1,
-                trans_t_hat,
-                noising_mask=rigids_noising_mask,
-                vf_scale=trans_vf_scale,
-            )
-            rotmats_t_2 = frame_noiser._rots_euler_step(
-                rot_d_t_hat,
-                rot_time,
-                pred_rotmats_1,
-                rotmats_t_hat,
-                noising_mask=rigids_noising_mask,
-                vf_scale=rot_vf_scale
-            )
+                # Process model output.
+                pred_rigids = denoiser_out['denoised_rigids']
+                pred_trans_1 = pred_rigids.get_trans()
+                pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
+                # if torch.isnan(pred_trans_1).any() or torch.isnan(pred_rotmats_1).any():
+                #     print("pred", t_1)
+                #     exit()
+
+                clean_traj.append(
+                    (
+                        pred_trans_1.detach().cpu(),
+                        pred_rotmats_1.detach().cpu(),
+                        denoiser_out['pred_seq'].detach().cpu(),
+                        denoiser_out['denoised_atom14'].detach().cpu(),
+                        denoiser_out['denoised_atom14_gt_seq'].detach().cpu()
+                    )
+                )
+
+                if self.learnable_noise_schedule:
+                    # TODO: why the heck does jvp not work here
+                    l = token_data['token_is_protein_output_mask'].float().sum(dim=-1) / 100
+                    # log_trans_time_fn = lambda x: torch.log(1 - self.model.trans_gamma_t(x, l[..., None]))
+                    # log_rot_time_fn = lambda x: torch.log(1 - self.model.rot_gamma_t(x, l[..., None]))
+
+                    trans_shift_scale = self.model.trans_gamma_t._forward(l[..., None])
+                    rot_shift_scale = self.model.trans_gamma_t._forward(l[..., None])
+
+                    # log_trans_t_grad = torch.func.jvp(log_trans_time_fn, (t,), (torch.ones_like(t),))[1]
+                    # log_rot_t_grad = torch.func.jvp(log_rot_time_fn, (t,), (torch.ones_like(t),))[1]
+                    log_trans_t_grad = -1 / ((t - 1) * (trans_shift_scale * (t - 1) - t))
+                    log_rot_t_grad = -1 / ((t - 1) * (rot_shift_scale * (t - 1) - t))
+                    log_trans_t_grad = log_trans_t_grad.clip(min=-100)
+                    log_rot_t_grad = log_rot_t_grad.clip(min=-100)
+
+                    print(log_trans_t_grad, log_rot_t_grad)
+                    trans_time = self.model.trans_gamma_t(t, l[..., None])[..., None]
+                    rot_time = self.model.rot_gamma_t(t, l[..., None])[..., None]
+                    trans_vf_scale = -log_trans_t_grad[..., None] * (1 - trans_time)
+                    rot_vf_scale = -log_rot_t_grad[..., None] * (1 - rot_time)
+                    trans_d_t_hat = self.model.trans_gamma_t(t + d_t_hat, l[..., None]) - self.model.trans_gamma_t(t, l[..., None])
+                    trans_d_t_hat = trans_d_t_hat[..., None]
+                    rot_d_t_hat = self.model.rot_gamma_t(t + d_t_hat, l[..., None]) - self.model.rot_gamma_t(t, l[..., None])
+                    rot_d_t_hat = rot_d_t_hat[..., None]
+                else:
+                    trans_d_t_hat = d_t_hat
+                    rot_d_t_hat = d_t_hat
+                    trans_time = t_hat
+                    rot_time = t_hat
+                    trans_vf_scale = 1
+                    rot_vf_scale = 1
+
+                    # rot_vf_scale = (40 * torch.sigmoid(10 * t) * (1 - torch.sigmoid(10 * t)))[..., None]
+
+                # Take reverse step
+                # trans_t_2 = frame_noiser._trans_euler_step(
+                #     d_t_hat,
+                #     t_hat,
+                #     pred_trans_1,
+                #     trans_t_hat,
+                #     noising_mask=rigids_noising_mask,
+                #     # add_noise=False,
+                #     # use_score=False
+                # )
+                # rotmats_t_2 = frame_noiser._rots_euler_step(
+                #     d_t_hat,
+                #     t_hat,
+                #     pred_rotmats_1,
+                #     rotmats_t_hat,
+                #     noising_mask=rigids_noising_mask,
+                #     # add_noise=False,
+                #     # use_score=False
+                # )
+
+                trans_t_2 = frame_noiser._trans_euler_step(
+                    trans_d_t_hat,
+                    trans_time,
+                    pred_trans_1,
+                    trans_t_hat,
+                    noising_mask=rigids_noising_mask,
+                    vf_scale=trans_vf_scale,
+                )
+                rotmats_t_2 = frame_noiser._rots_euler_step(
+                    rot_d_t_hat,
+                    rot_time,
+                    pred_rotmats_1,
+                    rotmats_t_hat,
+                    noising_mask=rigids_noising_mask,
+                    vf_scale=rot_vf_scale,
+                    rot_vf=denoiser_out['pred_rot_vf']
+                )
 
             # if torch.isnan(trans_t_2).any():
             #     print("trans step", t_1)

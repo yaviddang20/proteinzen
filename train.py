@@ -2,6 +2,7 @@
 
 import logging
 import os
+import shutil
 
 import hydra
 from hydra_zen import zen
@@ -103,15 +104,9 @@ def main(model,
 
     # assemble task sampler
     print(tasks)
-    task_freq_keys = [key for key in tasks if key.endswith("_freq")]
-    task_list = []
-    task_probs = []
-    for task_freq_key in task_freq_keys:
-        task_freq = tasks[task_freq_key]
-        task = tasks[task_freq_key[:-len("_freq")]]
-        task_list.append(task)
-        task_probs.append(task_freq)
-    task_sampler = TaskSampler(task_list, task_probs)
+    tasks_config = omegaconf.OmegaConf.load(tasks['config'])
+    task_sampler = hydra.utils.instantiate(tasks_config)['task_sampler']
+    shutil.copy(tasks['config'], os.path.join(os.getcwd(), "task_config.yaml"))
 
     # datamodule and optim are all partial'd __init__s
     # so we instantiate instances of each

@@ -45,6 +45,7 @@ class PdbDataset(data.Dataset):
         self.cache_dir = cache_dir
         self.normalize_cache = normalize_cache
         self._init_metadata()
+        print(f"Training on {len(self.csv)} datapoints")
 
     def _init_metadata(self):
         """Initialize metadata."""

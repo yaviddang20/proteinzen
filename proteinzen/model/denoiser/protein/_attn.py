@@ -32,7 +32,7 @@ print(f"using deepspeed kernels: {evoformer_supported}")
 try:
     cuda_major, cuda_minor = torch.cuda.get_device_capability(device=None)
     if cuda_major >= 8:
-        cuet_supported = False # True
+        cuet_supported = True
     else:
         cuet_supported = False
 except RuntimeError:

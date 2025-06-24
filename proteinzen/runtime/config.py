@@ -161,30 +161,10 @@ def config_hydra_store():
     harness_store(pbuilds(MultiFrameInterpolation), name="multiframefm_v2_protein")
 
     tasks_store = store(group="tasks")
-    tasks_store({
-        'unconditional_freq': 1.0,
-        'unconditional_v2_freq': 0.0,
-        'backbone_motif_scaffolding_freq': 0.0,
-        'residue_motif_scaffolding_freq': 0.0,
-        'residue_motif_scaffolding_v2_freq': 0.0,
-        'mixed_motif_scaffolding_freq': 0.0,
-        'mixed_motif_scaffolding_v2_freq': 0.0,
-        'inverse_rotamer_motif_scaffolding_freq': 0.0,
-        'folding_freq': 0.0,
-        'diffusion_forcing_freq': 0.0,
-        'sidechain_design_freq': 0.0,
-    }, name='default')
-    tasks_store(group='tasks/unconditional')(builds(UnconditionalGeneration), name='default')
-    tasks_store(group='tasks/unconditional_v2')(builds(UnconditionalGenerationV2), name='default')
-    tasks_store(group='tasks/backbone_motif_scaffolding')(builds(BackboneMotifScaffolding), name='default')
-    tasks_store(group='tasks/residue_motif_scaffolding')(builds(ResidueMotifScaffolding), name='default')
-    tasks_store(group='tasks/residue_motif_scaffolding_v2')(builds(ResidueMotifScaffoldingV2), name='default')
-    tasks_store(group='tasks/mixed_motif_scaffolding')(builds(MixedMotifScaffolding), name='default')
-    tasks_store(group='tasks/mixed_motif_scaffolding_v2')(builds(MixedMotifScaffoldingV2), name='default')
-    tasks_store(group='tasks/inverse_rotamer_motif_scaffolding')(builds(InverseRotamerMotifScaffolding), name='default')
-    tasks_store(group='tasks/folding')(builds(Folding), name='default')
-    tasks_store(group='tasks/diffusion_forcing')(builds(DiffusionForcing), name='default')
-    tasks_store(group='tasks/sidechain_design')(builds(SidechainDesign), name='default')
+    tasks_store(
+        {"config": f"{os.environ.get('REPO_ROOT')}/configs/train/tasks/train_128.yaml"},
+        name="train_128"
+    )
 
     exp_store = store(group="experiment")
     exp_store({
@@ -233,18 +213,7 @@ def config_hydra_store():
             {"corrupter": "${paradigm}_${domain}"},
             {"model": "${paradigm}_${domain}"},
             {"harness": "${paradigm}_${domain}"},
-            {"tasks": "default"},
-            {"tasks/unconditional": "default"},
-            {"tasks/unconditional_v2": "default"},
-            {"tasks/backbone_motif_scaffolding": "default"},
-            {"tasks/residue_motif_scaffolding": "default"},
-            {"tasks/residue_motif_scaffolding_v2": "default"},
-            {"tasks/mixed_motif_scaffolding": "default"},
-            {"tasks/mixed_motif_scaffolding_v2": "default"},
-            {"tasks/inverse_rotamer_motif_scaffolding": "default"},
-            {"tasks/folding": "default"},
-            {"tasks/diffusion_forcing": "default"},
-            {"tasks/sidechain_design": "default"},
+            {"tasks": "train_128"},
             {"experiment": "default"},
             {"experiment/optim": "adam"},
             {"experiment/lightning": "default"},

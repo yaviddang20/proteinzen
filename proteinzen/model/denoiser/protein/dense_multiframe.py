@@ -616,7 +616,7 @@ class EmbedderV2(nn.Module):
         visible_seq = seq * seq_mask + self.mask_token * (~seq_mask)
         visible_seq = visible_seq * (~seq_noising_mask) + self.mask_token * seq_noising_mask
         # print(seq_idx)
-        # print(visible_seq)
+        # print(seq, seq_mask, seq_noising_mask, visible_seq)
         # print(is_unindexed_mask)
         seq_embed = F.one_hot(visible_seq, num_classes=self.num_aa).float()
         node_init = (
@@ -1159,6 +1159,7 @@ class IpaScoreV2(nn.Module):
                  tfmr_row_dropout_r=0.,
                  use_qk_norm=False,
                  predict_final_rot=False,
+                 direct_rot_vf_output=False,
                  detach_grad_pre_seq_pred=False
                  ):
         super().__init__()
@@ -1293,6 +1294,15 @@ class IpaScoreV2(nn.Module):
         else:
             self.final_rot_head = None
 
+        if direct_rot_vf_output:
+            self.rot_vf_head = nn.Sequential(
+                LayerNorm(c_frame),
+                Linear(c_frame, c_frame, bias=False),
+                nn.ReLU(),
+                Linear(c_frame, 3, bias=False)
+            )
+        else:
+            self.rot_vf_head = None
 
     def forward(self, input_feats):
         node_embed = input_feats['node_embed']
@@ -1404,6 +1414,27 @@ class IpaScoreV2(nn.Module):
                 trans=curr_rigids.get_trans()
             )
 
+        if self.rot_vf_head is not None:
+            pred_rot_vf = self.rot_vf_head(rigids_embed_flat)
+            axis = F.normalize(pred_rot_vf, dim=-1)
+            angle = torch.linalg.vector_norm(pred_rot_vf + 1e-8, dim=-1)
+            angle = angle * rigids_noising_mask_flat * rigids_mask_flat
+            angle = angle * (1 - input_feats['t'])
+            rotquat = torch.cat([
+                torch.cos(angle/2)[..., None], torch.sin(angle/2)[..., None] * axis
+            ], dim=-1)
+            rel_rot = ru.Rotation(quats=rotquat)
+            new_rot = rel_rot.compose_q(init_rigids.get_rots())
+            curr_rigids = ru.Rigid(
+                rots=new_rot,
+                trans=curr_rigids.get_trans()
+            )
+
+            if input_feats['n_padding'] > 0:
+                pred_rot_vf = pred_rot_vf[..., :-input_feats['n_padding'], :]
+        else:
+            pred_rot_vf = None
+
         if input_feats['n_padding'] > 0:
             curr_rigids = curr_rigids[..., :-input_feats['n_padding']]
         curr_rigids = self.unscale_rigids(curr_rigids)
@@ -1413,6 +1444,7 @@ class IpaScoreV2(nn.Module):
         model_out = {
             'psi': psi_pred,
             'final_rigids': curr_rigids,
+            'pred_rot_vf': pred_rot_vf,
             'node_embed': node_embed,
             'seq_logits': seq_logits
         }
@@ -1841,6 +1873,7 @@ class IpaMultiRigidDenoiserV2(nn.Module):
                  use_qk_norm=False,
                  use_amp=False,
                  predict_final_rot=False,
+                 direct_rot_vf_output=False,
                  learnable_noise_schedule=False,
                  use_pairformer=False
                  ):
@@ -1888,6 +1921,7 @@ class IpaMultiRigidDenoiserV2(nn.Module):
             tfmr_row_dropout_r=tfmr_row_dropout_r,
             use_qk_norm=use_qk_norm,
             predict_final_rot=predict_final_rot,
+            direct_rot_vf_output=direct_rot_vf_output,
             detach_grad_pre_seq_pred=learnable_noise_schedule
         )
 
@@ -1921,6 +1955,7 @@ class IpaMultiRigidDenoiserV2(nn.Module):
         self.trans_preconditioning = trans_preconditioning
         self.rot_preconditioning = rot_preconditioning
         self.cg_version = cg_version
+        self.direct_rot_vf_output = direct_rot_vf_output
 
         if learnable_noise_schedule:
             # self.trans_gamma_t = lambda x: x # MonotonicIncreasingFn()
@@ -1932,6 +1967,8 @@ class IpaMultiRigidDenoiserV2(nn.Module):
         token_data = data['token']
         rigids_data = data['rigids']
         # print(rigids_data['rigids_t'].shape, token_data['token_seq_idx'].shape)
+        # print(token_data['token_is_protein_output_mask'])
+        # print(token_data['token_gather_idx'], rigids_data['rigids_token_uid'])
 
         if self_condition is not None:
             sc_rigids = self_condition['denoised_rigids']
@@ -1969,6 +2006,7 @@ class IpaMultiRigidDenoiserV2(nn.Module):
             # input_feats['condition_embed'] = torch.ones_like(input_feats['node_embed'])
             input_feats['token_mask'] = token_data['token_mask']
             input_feats['token_gather_idx'] = token_data['token_gather_idx']
+            input_feats['t'] = data['t']
 
             if self.pairformer is not None:
                 token_embed, edge_embed = self.pairformer(
@@ -2039,12 +2077,17 @@ class IpaMultiRigidDenoiserV2(nn.Module):
             cg_version=self.cg_version
         )
 
+        if rigids_out.to_tensor_7().isnan().any() or pred_seq.isnan().any():
+            print("caught a nan in forward")
+            exit()
+
         ret = {}
         ret['denoised_rigids'] = rigids_out
         ret['denoised_atom14'] = denoised_atom14_pred_seq
         ret['denoised_atom14_gt_seq'] = denoised_atom14_gt_seq
         ret['decoded_seq_logits'] = seq_logits
         ret['pred_seq'] = pred_seq
+        ret['pred_rot_vf'] = score_dict['pred_rot_vf'].float() if score_dict['pred_rot_vf'] is not None else None
 
         with torch.no_grad():
             bb_rigids = gather_helper(rigids_out.to_tensor_7(), token_data['token_gather_idx'])
@@ -2059,6 +2102,5 @@ class IpaMultiRigidDenoiserV2(nn.Module):
             closest_neighbors = torch.argsort(trans_dist)
             motif_idx = closest_neighbors[..., 0]
             ret['motif_idx'] = motif_idx
-
 
         return ret

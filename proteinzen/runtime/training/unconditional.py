@@ -6,6 +6,7 @@ class UnconditionalGeneration(TrainingTask):
     name: str = "unconditional"
     def __init__(
         self,
+        prob=0.0,
         t_sched='lognorm',
         lognorm_mu=0.0,
         lognorm_sig=1.0,
@@ -24,6 +25,7 @@ class UnconditionalGeneration(TrainingTask):
         self.t_min = t_min
         self.t_max = t_max
         self.shift_time_scale = shift_time_scale
+        self.prob = prob
 
     def sample_t_and_mask(self, batch):
         rigids_1 = batch['residue']['rigids_1']
