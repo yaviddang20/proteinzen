@@ -154,9 +154,9 @@ if __name__ == "__main__":
         sample_dir = os.path.splitext(os.path.basename(fasta))[0]
         if not os.path.exists(sample_dir):
             os.mkdir(sample_dir)
-        else:
-            logger.info(f"Skipping {sample_dir} because folder already exists")
-            continue
+        # else:
+        #     logger.info(f"Skipping {sample_dir} because folder already exists")
+        #     continue
 
         logger.info("Starting Predictions")
 
@@ -194,14 +194,17 @@ if __name__ == "__main__":
             time_string = f"{tottime / len(headers):0.1f}s"
             if len(sequences) > 1:
                 time_string = time_string + f" (amortized, batch size {len(sequences)})"
-            for header, seq, pdb_string, mean_plddt, ptm in zip(
-                headers, sequences, pdbs, output["mean_plddt"], output["ptm"]
+            for header, seq, pdb_string, mean_plddt, ptm, pae in zip(
+                headers, sequences, pdbs, output["mean_plddt"], output["ptm"], output["aligned_confidence_probs"]
             ):
+                pae = (pae.cpu() * torch.arange(64)).mean(-1) * 31
+                pae = pae.mean().numpy(force=True)
+
                 output_file = args.pdb / sample_dir / f"{header}.pdb"
                 output_file.write_text(pdb_string)
                 num_completed += 1
                 logger.info(
                     f"Predicted structure for {header} with length {len(seq)}, pLDDT {mean_plddt:0.1f}, "
-                    f"pTM {ptm:0.3f} in {time_string}. "
+                    f"pTM {ptm:0.3f}, pAE {pae:0.3f} in {time_string}. "
                     f"{num_completed} / {num_sequences} completed."
                 )

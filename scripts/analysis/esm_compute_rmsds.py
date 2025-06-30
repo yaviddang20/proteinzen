@@ -58,6 +58,8 @@ def parse_esm_log(lines):
                     sample_dict["plddt"] = float(substring.split(" ")[1])
                 elif "pTM" in substring:
                     sample_dict["ptm"] = float(substring.split(" ")[1])
+                elif "pAE" in substring:
+                    sample_dict["pae"] = float(substring.split(" ")[1])
             samples[sample_num] = sample_dict
 
         elif "sample=" in l:
@@ -70,8 +72,8 @@ def parse_esm_log(lines):
                 substring = substring.strip()
                 if "pLDDT" in substring:
                     sample_dict["plddt"] = float(substring.split(" ")[1])
-                elif "pTM" in substring:
-                    sample_dict["ptm"] = float(substring.split(" ")[1])
+                elif "pAE" in substring:
+                    sample_dict["pae"] = float(substring.split(" ")[1])
             samples[sample_num] = sample_dict
     ret[name] = samples
 
