@@ -118,8 +118,8 @@ def multiframe_fm_loss_dense_batch(
         if direct_rot_vf_loss:
             pred_rot_vf = denoiser_outputs['pred_rot_vf']
             gt_rot_vf = rigids_data['gt_rot_vf']
-            print("pred", pred_rot_vf)
-            print("gt", gt_rot_vf)
+            # print("pred", pred_rot_vf)
+            # print("gt", gt_rot_vf)
             # rot_vf_angle_loss_weight = rot_vf_angle_loss_weight / (2.4 ** 2)  # this is roughly the mean of the vector field magnitudes, squared
 
             rot_vf_loss = angle_axis_rot_vf_loss_dense(

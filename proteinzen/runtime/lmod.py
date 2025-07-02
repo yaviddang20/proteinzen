@@ -71,7 +71,8 @@ class ProteinModule(L.LightningModule):
                  seq_weight=DEFAULT_SEQ_WEIGHT,
                  use_euclidean_for_rots=False,
                  learnable_noise_schedule=False,
-                 direct_rot_vf_loss=False
+                 direct_rot_vf_loss=False,
+                 rot_angle_weight=0.5
     ):
         super().__init__()
         self._log = logging.getLogger(__name__)
@@ -89,6 +90,7 @@ class ProteinModule(L.LightningModule):
         self.use_euclidean_for_rots = use_euclidean_for_rots
         self.learnable_noise_schedule = learnable_noise_schedule
         self.direct_rot_vf_loss = direct_rot_vf_loss
+        self.rot_angle_weight = rot_angle_weight
         if learnable_noise_schedule:
             self.automatic_optimization = False
 
@@ -314,7 +316,7 @@ class ProteinModule(L.LightningModule):
         frame_fm_loss_dict = multiframe_fm_loss_dense_batch(
             inputs, outputs, sep_rot_loss=True, use_euclidean_for_rots=self.use_euclidean_for_rots,
             t_norm_clip=0.9,
-            rot_vf_angle_loss_weight=0.5,
+            rot_vf_angle_loss_weight=self.rot_angle_weight,
             fafe_l2_block_mask_size=1,
             rigidwise_weight=rigidwise_weight,
             trans_rigidwise_weight=log_trans_t_grad**2,
@@ -353,7 +355,7 @@ class ProteinModule(L.LightningModule):
             loss = (
                 frame_vf_loss
                 + 0.25 * atomic_loss_dict["seq_loss"]
-                + 0.5 * frame_fm_loss_dict['scaled_fafe']
+                # + 0.5 * frame_fm_loss_dict['scaled_fafe']
             )
         else:
             loss = (

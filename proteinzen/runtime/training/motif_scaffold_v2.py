@@ -174,6 +174,7 @@ class ResidueBallMotifScaffoldingV2(TrainingTask):
         radius = torch.rand(1, device=coords.device) * 5 + 5
         center_idx = np.random.choice(coords.shape[0])
         center = coords[center_idx]
+        center = center + torch.randn_like(center)
         dist = torch.linalg.vector_norm(coords - center[None] + 1e-8, dim=-1)
         motif_mask = dist < radius
         return motif_mask
@@ -197,7 +198,8 @@ class ResidueBallMotifScaffoldingV2(TrainingTask):
             raise ValueError(f"self.t_sched={self.t_sched} not recognized")
         rigids_noising_mask = torch.ones(rigids_1.shape[:-1], dtype=bool, device=device)
 
-        motif_mask = self.generate_motif_mask(rigids_1[:, 0, 4:])  # CAs
+        motif_mask = self.generate_motif_mask(rigids_1[:, 1, 4:])  # sidechain "tip"
+
         seq_noising_mask = ~motif_mask
         if self.mode == 'backbone':
             raise NotImplementedError()

@@ -1299,7 +1299,7 @@ class IpaScoreV2(nn.Module):
                 LayerNorm(c_frame),
                 Linear(c_frame, c_frame, bias=False),
                 nn.ReLU(),
-                Linear(c_frame, 3, bias=False)
+                Linear(c_frame, 3, bias=False, init='final')
             )
         else:
             self.rot_vf_head = None
@@ -1875,7 +1875,8 @@ class IpaMultiRigidDenoiserV2(nn.Module):
                  predict_final_rot=False,
                  direct_rot_vf_output=False,
                  learnable_noise_schedule=False,
-                 use_pairformer=False
+                 use_pairformer=False,
+                 rot_vf_scaling=1
                  ):
         super().__init__()
 
@@ -1956,6 +1957,7 @@ class IpaMultiRigidDenoiserV2(nn.Module):
         self.rot_preconditioning = rot_preconditioning
         self.cg_version = cg_version
         self.direct_rot_vf_output = direct_rot_vf_output
+        self.rot_vf_scaling = rot_vf_scaling
 
         if learnable_noise_schedule:
             # self.trans_gamma_t = lambda x: x # MonotonicIncreasingFn()
@@ -2087,7 +2089,13 @@ class IpaMultiRigidDenoiserV2(nn.Module):
         ret['denoised_atom14_gt_seq'] = denoised_atom14_gt_seq
         ret['decoded_seq_logits'] = seq_logits
         ret['pred_seq'] = pred_seq
-        ret['pred_rot_vf'] = score_dict['pred_rot_vf'].float() if score_dict['pred_rot_vf'] is not None else None
+
+        if self.direct_rot_vf_output:
+            pred_rot_vf = score_dict['pred_rot_vf'].float() * self.rot_vf_scaling
+        else:
+            pred_rot_vf = None
+        ret['pred_rot_vf'] = pred_rot_vf
+        # print(pred_rot_vf)
 
         with torch.no_grad():
             bb_rigids = gather_helper(rigids_out.to_tensor_7(), token_data['token_gather_idx'])

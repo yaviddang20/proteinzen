@@ -71,16 +71,16 @@ def frames_to_atom14_pos(
     pred_positions = t_atoms_to_global.apply(frame_null_pos)
     pred_positions = pred_positions * frame_atom_mask
 
-    return pred_positions
+    return pred_positions, frame_atom_mask
 
 
-def compute_atom14_from_cg_frames(rigids, res_mask, seq, cg_version=1):
+def compute_atom14_from_cg_frames(rigids, res_mask, seq, cg_version=1, return_atom_mask=False):
     rigids = ru.Rigid.cat([
         rigids[..., 0:1],
         rigids[..., 0:1],
         rigids[..., 1:],
     ], dim=-1)
-    atom14_pos = frames_to_atom14_pos(
+    atom14_pos, atom14_mask = frames_to_atom14_pos(
         rigids,
         seq,
         cg_version
@@ -93,7 +93,11 @@ def compute_atom14_from_cg_frames(rigids, res_mask, seq, cg_version=1):
     atom37_bb_pos[..., 4, :] = atom14_pos[..., 3, :]
     atom37 = adjust_oxygen_pos(atom37_bb_pos.view(-1, 37, 3), res_mask.view(-1)).view(atom37_bb_pos.shape)
     atom14_pos[..., 3, :] = atom37[..., 4, :]
-    return atom14_pos
+
+    if return_atom_mask:
+        return atom14_pos, atom14_mask
+    else:
+        return atom14_pos
 
 
 def compute_atom14_frames_from_cg_frames(rigids, res_mask, seq, cg_version=1):
@@ -102,7 +106,7 @@ def compute_atom14_frames_from_cg_frames(rigids, res_mask, seq, cg_version=1):
         rigids[..., 0:1],
         rigids[..., 1:],
     ], dim=-1)
-    atom14_pos = frames_to_atom14_pos(
+    atom14_pos, _ = frames_to_atom14_pos(
         rigids_4,
         seq,
         cg_version
