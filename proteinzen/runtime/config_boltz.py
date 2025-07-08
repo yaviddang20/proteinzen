@@ -9,7 +9,7 @@ from datetime import timedelta
 from lightning import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
 
-from proteinzen.data.datasets.datamodule import FramediffDataModule, SamplingDataModule
+from proteinzen.data.datasets.datamodule import BiomoleculeDataModule, BiomoleculeSamplingDataModule
 
 from proteinzen.stoch_interp.atom14_nonequiv import Atom14Interpolant as NonEquivAtom14Interpolant
 from proteinzen.stoch_interp.multiframe import MultiSE3Interpolant
@@ -20,7 +20,7 @@ from proteinzen.model.denoiser.protein.dense_multiframe import IpaMultiRigidDeno
 from proteinzen.harness.fm.atom14_nonequiv import Atom14Interpolation as NonEquivAtom14Interpolation
 from proteinzen.harness.fm.multiframe import MultiFrameInterpolation
 
-from proteinzen.runtime.lmod import ProteinModule
+from proteinzen.runtime.lmod import BiomoleculeModule
 from proteinzen.runtime.optim import get_std_opt
 
 if os.environ.get("REPO_ROOT") is None:
@@ -58,95 +58,42 @@ def config_hydra_store():
 
     ## switches to allow for hot-swapping between paradigms and domains
     paradigm_store = store(group="paradigm")
-    paradigm_store({"paradigm": "nonequiv_atom14fm"}, name="nonequiv_atom14fm")
     paradigm_store({"paradigm": "multiframefm"}, name="multiframefm")
-    paradigm_store({"paradigm": "multiframefm_v2"}, name="multiframefm_v2")
 
     domain_store = store(group="domain")
     domain_store({"domain": "protein"}, name="protein")
 
     corruption_store = store(group="corrupter")
     corruption_store(
-        NonEquivAtom14Interpolant,
-        name="nonequiv_atom14fm_protein")
-    corruption_store(
         MultiSE3Interpolant,
         name="multiframefm_protein")
-    corruption_store(
-        MultiSE3Interpolant,
-        name="multiframefm_v2_protein")
 
     datamodule_store = store(group="datamodule")
     datamodule_store(
         pbuilds(
-            FramediffDataModule,
-            data_dir=f"{os.environ.get('REPO_ROOT')}/data/cath",
-            batch_size=3000,
-            num_workers=4,
-            use_val_split=True,
-            min_ordered_percent=0.0
+            BiomoleculeDataModule,
+            batch_size=1,
+            num_workers=8,
         ),
-        name="cath")
-    datamodule_store(
-        pbuilds(
-            FramediffDataModule,
-            data_dir=f"{os.environ.get('REPO_ROOT')}/data/framediff_clustered",
-            batch_size=3000,
-            num_workers=4
-        ),
-        name="framediff")
-    datamodule_store(
-        pbuilds(
-            FramediffDataModule,
-            data_dir=f"{os.environ.get('REPO_ROOT')}/data/framediff95",
-            batch_size=3000,
-            num_workers=4
-        ),
-        name="framediff95")
-    datamodule_store(
-        pbuilds(
-            FramediffDataModule,
-            data_dir=f"{os.environ.get('REPO_ROOT')}/data/frameflow",
-            batch_size=3000,
-            num_workers=4
-        ),
-        name="frameflow")
-    datamodule_store(
-        pbuilds(
-            FramediffDataModule,
-            data_dir=f"{os.environ.get('REPO_ROOT')}/data/afdb_128",
-            batch_size=3000,
-            num_workers=4
-        ),
+        name="default"
+    )
+
+    dataset_store = store(group="dataset")
+    dataset_store(
+        {
+            "config": f"{os.environ.get('REPO_ROOT')}/configs/train/data/afdb_128.yaml"
+        },
         name="afdb_128")
-    datamodule_store(
-        pbuilds(
-            FramediffDataModule,
-            data_dir=f"{os.environ.get('REPO_ROOT')}/data/afdb_512",
-            batch_size=3000,
-            num_workers=4
-        ),
-        name="afdb_512")
-    datamodule_store(
-        pbuilds(
-            FramediffDataModule,
-            data_dir=f"{os.environ.get('REPO_ROOT')}/data/afdb_512_clusters",
-            batch_size=3000,
-            num_workers=8
-        ),
-        name="afdb_512_clusters")
 
     lmodule_store = store(group="lmodule")
     lmodule_store(
-        pbuilds(ProteinModule),
+        pbuilds(BiomoleculeModule),
         name="protein"
     )
 
     # latent_fm_wrapper = ChimeraLatentWrapper
     model_store = store(group="model")
-    model_store(AtomDenoiser, name="nonequiv_atom14fm_protein")
     model_store(IpaMultiRigidDenoiser, name="multiframefm_protein")
-    model_store(IpaMultiRigidDenoiserV2, name="multiframefm_v2_protein")
 
     harness_store = store(group="harness")
     harness_store(pbuilds(NonEquivAtom14Interpolation), name="nonequiv_atom14fm_protein")
@@ -201,7 +148,8 @@ def config_hydra_store():
         hydra_defaults=[
             {"paradigm": "diffusion"},
             {"domain": "bb"},
-            {"datamodule": "cath"},
+            {"datamodule": "default"},
+            {"dataset": "afdb_128"},
             {"lmodule": "${domain}"},
             {"corrupter": "${paradigm}_${domain}"},
             {"model": "${paradigm}_${domain}"},
@@ -260,7 +208,7 @@ def config_sampling_hydra_store():
     sampler_store = store(group="sampler")
     sampler_store(
         builds(
-            SamplingDataModule
+            BiomoleculeSamplingDataModule
         ),
         name="default"
     )

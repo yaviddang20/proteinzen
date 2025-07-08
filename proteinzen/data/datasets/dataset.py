@@ -2,6 +2,7 @@
 from typing import Dict
 import logging
 import os
+import json
 
 import pandas as pd
 import numpy as np
@@ -9,14 +10,19 @@ import torch
 import torch.utils.data as data
 import tree
 
-
 from torch_geometric.data import HeteroData
+from boltz.data import const
+from boltz.data.types import (
+    Structure,
+    Connection,
+    Record
+)
 
 from proteinzen.data.io import utils as du
 from proteinzen.data.openfold.residue_constants import restype_order_with_x
-
-from proteinzen.data.datasets.featurize.molecule import featurize_props
-# from proteinzen.utils.torsion import get_transformation_mask
+from proteinzen.data.datasets.featurize.cropper import Cropper
+from proteinzen.data.datasets.featurize.tokenize import tokenize_structure
+from proteinzen.data.datasets.featurize.tokenize import Tokenized
 
 
 class PdbDataset(data.Dataset):
@@ -143,6 +149,84 @@ class PdbDataset(data.Dataset):
         chain_feats['csv_idx'] = torch.ones(1, dtype=torch.long) * idx
 
         return chain_feats
+
+
+class MMCIFDataset(data.Dataset):
+    def __init__(
+            self,
+            data_dir,
+            data_sampler,
+            task_sampler,
+            min_num_res=30,
+            max_num_res=5000,
+            min_percent_ordered=0.5,
+            max_resolution=5.0,
+            subset=None,
+            split=None,
+            exclude_mol_types=None
+        ):
+        self._log = logging.getLogger(__name__)
+        self.data_dir = data_dir
+        self.min_num_res = min_num_res
+        self.max_num_res = max_num_res
+        self.subset = subset
+        self.split = split
+        self.min_percent_ordered = min_percent_ordered
+        self.max_resolution = max_resolution
+        self.task_sampler = task_sampler
+        self.data_sampler = data_sampler
+        if exclude_mol_types is None:
+            self.exclude_mol_types = []
+        else:
+            print(exclude_mol_types)
+            self.exclude_mol_types = [const.chain_types.index(s) for s in exclude_mol_types]
+
+
+        self._init_metadata()
+
+        print(f"Training on {len(self.manifest)} datapoints")
+
+    def _init_metadata(self):
+        """Initialize metadata."""
+        manifest_path = os.path.join(self.data_dir, "manifest.json")
+
+        # Process CSV with different filtering criterions.
+        with open(manifest_path) as fp:
+            self.raw_manifest = json.load(fp)
+
+        self.manifest = []
+        for record in self.raw_manifest:
+            # remove records which contain mol types we're excluding
+            _exclude_record = False
+            for chain in record['chains']:
+                if chain['mol_type'] in self.exclude_mol_types:
+                    _exclude_record = True
+                    break
+            if _exclude_record:
+                continue
+            # apply some filtering critera that we might change at train time
+            num_res = sum(chain['num_residues'] for chain in record['chains'])
+            if num_res > self.max_num_res or num_res < self.min_num_res:
+                continue
+            resolution = record['structure']['resolution']
+            if resolution is not None and resolution > self.max_resolution:
+                continue
+            if self.split is not None and record['id'] not in self.split:
+                continue
+            # if record['structure']['coil_percent'] > (1 - self.min_percent_ordered):
+            #     continue
+
+            record['is_af2_struct'] = record['id'].startswith("AF-")
+
+            self.manifest.append(Record.from_dict(record))
+
+    def __len__(self):
+        return len(self.manifest)
+
+    def __getitem__(self, idx):
+        # Sample data example.
+        record = self.manifest[idx]
+        return record
 
 
 class LengthDataset(data.Dataset):

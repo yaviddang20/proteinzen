@@ -10,6 +10,8 @@ import tree
 import lightning as L
 
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
+from boltz.data import const
+
 from proteinzen.harness import TrainingHarness
 from proteinzen.data.datasets.featurize.rigid_assembler import rigids_to_atom14
 from proteinzen.data.openfold import residue_constants
@@ -20,7 +22,23 @@ from .utils import gen_pbar_str
 from .ema import EMAModel
 
 from .loss.multiframe import multiframe_fm_loss_dense_batch
-from .loss.common import atomic_losses_dense_batch
+from .loss.common import atomic_losses_dense_batch, seq_losses_dense_batch
+
+
+DEFAULT_SEQ_WEIGHT = {
+    c: 1.0
+    for c in 'ACDEFGHIKLMNPQRSTVWY'
+}
+DEFAULT_SEQ_WEIGHT['X'] = 0.
+for c in ['C', 'E', 'H', 'P', 'Q', 'R', 'W']:
+    DEFAULT_SEQ_WEIGHT[c] = 2.0
+
+DEFAULT_RESTYPE_WEIGHT = {
+    c: 1.0
+    for c in const.tokens
+}
+for c in ['CYS', 'GLU', 'HIS', 'PRO', 'GLN', 'ARG', 'TRP']:
+    DEFAULT_RESTYPE_WEIGHT[c] = 2.0
 
 
 def t_stratified_loss(batch_t, batch_loss, num_bins=4, loss_name=None):
@@ -45,13 +63,50 @@ def t_stratified_loss(batch_t, batch_loss, num_bins=4, loss_name=None):
     return stratified_losses
 
 
-DEFAULT_SEQ_WEIGHT = {
-    c: 1.0
-    for c in 'ACDEFGHIKLMNPQRSTVWY'
-}
-DEFAULT_SEQ_WEIGHT['X'] = 0.
-for c in ['C', 'E', 'H', 'P', 'Q', 'R', 'W']:
-    DEFAULT_SEQ_WEIGHT[c] = 2.0
+# from https://github.com/huggingface/transformers/blob/main/src/transformers/optimization.py
+def _get_cosine_with_hard_restarts_schedule_with_warmup_lr_lambda(
+    current_step: int, *, num_warmup_steps: int, num_training_steps: int, num_cycles: int
+):
+    if current_step < num_warmup_steps:
+        return float(current_step) / float(max(1, num_warmup_steps))
+    progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+    if progress >= 1.0:
+        return 0.0
+    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * ((float(num_cycles) * progress) % 1.0))))
+
+
+def get_cosine_with_hard_restarts_schedule_with_warmup(
+    optimizer: torch.optim.Optimizer, num_warmup_steps: int, num_training_steps: int, num_cycles: int = 1, last_epoch: int = -1
+):
+    """
+    Create a schedule with a learning rate that decreases following the values of the cosine function between the
+    initial lr set in the optimizer to 0, with several hard restarts, after a warmup period during which it increases
+    linearly between 0 and the initial lr set in the optimizer.
+
+    Args:
+        optimizer ([`~torch.optim.Optimizer`]):
+            The optimizer for which to schedule the learning rate.
+        num_warmup_steps (`int`):
+            The number of steps for the warmup phase.
+        num_training_steps (`int`):
+            The total number of training steps.
+        num_cycles (`int`, *optional*, defaults to 1):
+            The number of hard restarts to use.
+        last_epoch (`int`, *optional*, defaults to -1):
+            The index of the last epoch when resuming training.
+
+    Return:
+        `torch.optim.lr_scheduler.LambdaLR` with the appropriate schedule.
+    """
+
+    lr_lambda = partial(
+        _get_cosine_with_hard_restarts_schedule_with_warmup_lr_lambda,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps,
+        num_cycles=num_cycles,
+    )
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
+
 
 class ProteinModule(L.LightningModule):
     def __init__(self,
@@ -1158,46 +1213,405 @@ class ProteinModule(L.LightningModule):
             return optimizer
 
 
-# from https://github.com/huggingface/transformers/blob/main/src/transformers/optimization.py
-def _get_cosine_with_hard_restarts_schedule_with_warmup_lr_lambda(
-    current_step: int, *, num_warmup_steps: int, num_training_steps: int, num_cycles: int
-):
-    if current_step < num_warmup_steps:
-        return float(current_step) / float(max(1, num_warmup_steps))
-    progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-    if progress >= 1.0:
-        return 0.0
-    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * ((float(num_cycles) * progress) % 1.0))))
+class BiomoleculeModule(L.LightningModule):
+    def __init__(self,
+                 model,
+                 corrupter,
+                 optim,
+                 use_cosine_lr_sched=False,
+                 cosine_warmup_steps=0,
+                 cosine_total_steps=1e6,
+                 use_ema=False,
+                 ema_decay=0.999,
+                 use_posthoc_ema=False,
+                 seq_weight=DEFAULT_RESTYPE_WEIGHT,
+                 use_euclidean_for_rots=False,
+                 learnable_noise_schedule=False,
+                 direct_rot_vf_loss=False,
+                 rot_angle_weight=0.5,
+                 self_condition_rate=0.5,
+    ):
+        super().__init__()
+        self._log = logging.getLogger(__name__)
+        self.model = model
+        self.corrupter = corrupter
+        self.optim = optim
+        self.self_condition_rate = self_condition_rate
+        self.use_cosine_lr_sched = use_cosine_lr_sched
+        self.cosine_warmup_steps = cosine_warmup_steps
+        self.cosine_total_steps = cosine_total_steps
+        self.use_ema = use_ema
+        self.use_posthoc_ema = use_posthoc_ema
+        self.use_euclidean_for_rots = use_euclidean_for_rots
+        self.learnable_noise_schedule = learnable_noise_schedule
+        self.direct_rot_vf_loss = direct_rot_vf_loss
+        self.rot_angle_weight = rot_angle_weight
+        if learnable_noise_schedule:
+            self.automatic_optimization = False
+
+        seq_weight_tensor = torch.as_tensor([seq_weight[c] for c in const.tokens])
+        self.seq_weight = seq_weight_tensor
+
+        if use_ema:
+            self.ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(ema_decay))
+        else:
+            self.ema = None
+
+        if use_posthoc_ema:
+            self.ema_long = EMAModel(model, gamma=6.94)
+            self.ema_short = EMAModel(model, gamma=16.97)
+        else:
+            self.ema_long = None
+            self.ema_short = None
+
+    def training_step(self, batch, batch_idx):
+        # update EMA
+        if self.ema is not None and self.global_step > 0:
+            self.ema.update_parameters(self.model)
+        if self.ema_long is not None and self.global_step > 0:
+            self.ema_long.update_parameters(self.model, self.global_step-1)
+        if self.ema_short is not None and self.global_step > 0:
+            self.ema_short.update_parameters(self.model, self.global_step-1)
+
+        # corrupt data
+        corrupter = self.corrupter
+        batch['trans_t'] = batch['t']
+        batch['rot_t'] = batch['t']
+        batch = corrupter.corrupt_dense_batch(batch)
+
+        # run denoiser, with self-conditioning as necessary
+        model = self.model
+        if model.self_conditioning and np.random.uniform() < self.self_condition_rate:
+            with torch.no_grad():
+                self_conditioning = model(batch)
+        else:
+            self_conditioning = None
+        outputs = model(batch, self_conditioning)
+
+        # compute loss
+        loss_dict = self._loss_step(batch, outputs)
+
+        # log loss
+        log_dict = tree.map_structure(
+            lambda x: torch.round(torch.mean(x), decimals=3) if torch.is_tensor(x) else x,
+            loss_dict
+        )
+        log_dict = {
+            ("train/" + key): value
+            for key, value in
+            sorted(log_dict.items(), key = lambda x: x[0])
+        }
+        t = batch['t']
+        for loss_name, loss_list in loss_dict.items():
+            if loss_name in ['loss', 'frameflow_loss', "frame_vf_loss_unscaled", 'loss_per_batch']:
+                continue
+            if t.numel() != loss_list.numel():
+                continue
+            # if not loss_name.startswith("pt_") and not loss_name.startswith("latent_"):
+            #     continue
+            stratified_losses = t_stratified_loss(
+                t, loss_list, loss_name=loss_name)
+            stratified_losses = {
+                f"train/{k}": torch.round(torch.as_tensor(v, device=log_dict['train/loss'].device), decimals=3)
+                for k,v in stratified_losses.items()
+            }
+            self.log_dict(
+                stratified_losses,
+                prog_bar=False,
+                logger=True,
+                on_step=None,
+                on_epoch=True,
+                batch_size=t.shape[0],
+                sync_dist=False)
+
+        self.log_dict(
+            log_dict,
+            on_step=None,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            batch_size=t.shape[0],
+            sync_dist=True)
+
+        return loss_dict
+
+    def _loss_step(self, inputs, outputs):
+        token_seq = inputs['token']['seq']
+        seq_weight = self.seq_weight.to(token_seq.device)
+        rigids_seq_idx = inputs['rigids']['rigids_seq_idx']
+        rigids_seq = torch.gather(
+            token_seq,
+            -1,
+            rigids_seq_idx,
+        )
+        rigidwise_weight = seq_weight[rigids_seq]
+
+        frame_fm_loss_dict = multiframe_fm_loss_dense_batch(
+            inputs, outputs, sep_rot_loss=True, use_euclidean_for_rots=self.use_euclidean_for_rots,
+            t_norm_clip=0.9,
+            rot_vf_angle_loss_weight=self.rot_angle_weight,
+            fafe_l2_block_mask_size=1,
+            rigidwise_weight=rigidwise_weight,
+            direct_rot_vf_loss=self.direct_rot_vf_loss
+        )
+
+        frame_vf_loss = (
+            frame_fm_loss_dict["trans_vf_loss"] +
+            frame_fm_loss_dict["rot_vf_loss"]
+        )
+        unscaled_frame_vf_loss = (
+            frame_fm_loss_dict["unscaled_trans_vf_loss"] +
+            frame_fm_loss_dict["unscaled_rot_vf_loss"]
+        )
+
+        atomic_seq_weight = seq_weight[token_seq]
+        atomic_loss_dict = seq_losses_dense_batch(
+            inputs,
+            outputs,
+            seqwise_weight=atomic_seq_weight
+        )
+
+        atomic_loss = (
+            0.25 * atomic_loss_dict["seq_loss"]
+        )
+
+        if self.direct_rot_vf_loss:
+            loss = (
+                frame_vf_loss
+                + 0.25 * atomic_loss_dict["seq_loss"]
+                # + 0.5 * frame_fm_loss_dict['scaled_fafe']
+            )
+        else:
+            loss = (
+                frame_vf_loss
+                + 0.5 * frame_fm_loss_dict['scaled_fafe']
+                + atomic_loss
+            )
+
+        loss_dict = {"loss": loss.mean(), "frame_vf_loss": frame_vf_loss, "frame_vf_loss_unscaled": unscaled_frame_vf_loss}
+        # loss_dict['loss_per_batch'] = loss
+
+        # TODO: for some reason this does not play well with nccl between different tasks
+        # if 'motif_idx' in outputs:
+        #     pred_motif_idx = outputs['motif_idx']
+        #     gt_motif_idx = inputs['token']['token_seq_idx']
+        #     is_motif_mask = ~inputs['token']['token_is_protein_output_mask'] & ~inputs['token']['token_is_ligand_mask']
+        #     motif_idx_correct = (pred_motif_idx == gt_motif_idx) * is_motif_mask
+        #     if is_motif_mask.sum() > 0:
+        #         loss_dict['motif_idx_correct'] = motif_idx_correct.sum() / is_motif_mask.sum()
+
+        # loss_dict[inputs['task'].name + "_loss"] = loss
+        # loss_dict[inputs['task'].name + "_seq_loss"] = atomic_loss_dict["seq_loss"]
+        # loss_dict[inputs['task'].name + "_frame_vf_loss"] = frame_vf_loss
+        # loss_dict[inputs['task'].name + "_frame_vf_loss_unscaled"] = unscaled_frame_vf_loss
+
+        loss_dict.update(frame_fm_loss_dict)
+        loss_dict.update(atomic_loss_dict)
+
+        return loss_dict
 
 
-def get_cosine_with_hard_restarts_schedule_with_warmup(
-    optimizer: torch.optim.Optimizer, num_warmup_steps: int, num_training_steps: int, num_cycles: int = 1, last_epoch: int = -1
-):
-    """
-    Create a schedule with a learning rate that decreases following the values of the cosine function between the
-    initial lr set in the optimizer to 0, with several hard restarts, after a warmup period during which it increases
-    linearly between 0 and the initial lr set in the optimizer.
+    def on_before_optimizer_step(self, optimizer):
+        # for name, param in self.model.named_parameters():
+        #     if param.grad is None:
+        #         print(name)
 
-    Args:
-        optimizer ([`~torch.optim.Optimizer`]):
-            The optimizer for which to schedule the learning rate.
-        num_warmup_steps (`int`):
-            The number of steps for the warmup phase.
-        num_training_steps (`int`):
-            The total number of training steps.
-        num_cycles (`int`, *optional*, defaults to 1):
-            The number of hard restarts to use.
-        last_epoch (`int`, *optional*, defaults to -1):
-            The index of the last epoch when resuming training.
+        with torch.no_grad():
+            norms = []
+            norm_dict = {}
+            for name, p in self.model.named_parameters():
+                if p.grad is not None:
+                    n = torch.linalg.vector_norm(p.grad.view(-1), dim=-1)
+                    norms.append(n)
+                    norm_dict[name] = n.item()
+            # import json
+            # print(json.dumps(norm_dict, indent=4))
+            total_norm = torch.linalg.vector_norm(
+                torch.stack(norms, dim=0),
+                dim=0
+            )
 
-    Return:
-        `torch.optim.lr_scheduler.LambdaLR` with the appropriate schedule.
-    """
+            print("grad norm", total_norm)
 
-    lr_lambda = partial(
-        _get_cosine_with_hard_restarts_schedule_with_warmup_lr_lambda,
-        num_warmup_steps=num_warmup_steps,
-        num_training_steps=num_training_steps,
-        num_cycles=num_cycles,
-    )
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
+        self.log(
+            "grad_norm",
+            total_norm,
+            prog_bar=False,
+            logger=True,
+            on_step=None,
+            on_epoch=True,
+            batch_size=1,
+            sync_dist=False
+        )
+
+    def predict_step(self, batch, batch_idx):
+        if self.use_ema:
+            model = self.ema.module
+        else:
+            model = self.model
+        outputs = self._predict_step(model, batch)
+        return outputs
+
+    def _predict_step(
+        self,
+        model,
+        batch
+    ):
+        corrupter = self.corrupter
+        # Set-up time
+        ts = torch.linspace(0.0, 1.0, corrupter.num_timesteps)
+
+        rigids_data = batch['rigids']
+        rigids_data['rigids_t'] = rigids_data['rigids_1']
+        token_data = batch['token']
+        rigids_0 = ru.Rigid.from_tensor_7(rigids_data['rigids_t'])
+        trans_0 = rigids_0.get_trans()
+        rotmats_0 = rigids_0.get_rots().get_rot_mats()
+        rigids_noising_mask = rigids_data['rigids_noising_mask']
+        seq_noising_mask = token_data['seq_noising_mask']
+
+        t_1 = ts[0]
+
+        num_batch, num_res = seq_noising_mask.shape
+        device = self.device
+        denoiser_out = None
+
+        prot_traj = [(
+            trans_0,
+            rotmats_0,
+            None
+        )]
+
+        global_shift = 0
+        for t_2 in tqdm.tqdm(ts[1:]):
+            d_t = t_2 - t_1
+            # Run model.
+            trans_t_1, rotmats_t_1, _ = prot_traj[-1]
+            # trans_t_1_center = (trans_t_1 * rigids_noising_mask[..., None]).sum(dim=-2) / rigids_noising_mask[..., None].float().sum(dim=-2)
+            # # print(trans_t_1_center.shape, rigids_noising_mask.shape, trans_t_1.shape)
+            # trans_t_1 = trans_t_1 - trans_t_1_center[..., None, :] * rigids_noising_mask[..., None]
+            # # trans_t_1, center = frame_noiser._center_trans(trans_t_1, res_data.batch, rigids_noising_mask)
+            # # global_shift += center
+
+            t_hat, d_t_hat, trans_t_hat = corrupter._trans_churn(
+                d_t,
+                t_1,
+                trans_t_1,
+                noising_mask=rigids_noising_mask,
+            )
+            _, _, rotmats_t_hat = corrupter._rot_churn(
+                d_t,
+                t_1,
+                rotmats_t_1,
+                noising_mask=rigids_noising_mask,
+            )
+
+            rigids_data["trans_t"] = trans_t_hat
+            rigids_data["rotmats_t"] = rotmats_t_hat
+            rigids_data['rigids_t'] = ru.Rigid(
+                rots=ru.Rotation(rot_mats=rotmats_t_hat),
+                trans=trans_t_hat
+            ).to_tensor_7()
+            t = torch.ones(num_batch, device=device)[..., None] * t_hat
+            batch["t"] = t
+
+            denoiser_out = model(batch, self_condition=denoiser_out)
+
+            # Process model output.
+            pred_rigids = denoiser_out['denoised_rigids']
+            pred_trans_1 = pred_rigids.get_trans()
+            pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
+
+            trans_d_t_hat = d_t_hat
+            rot_d_t_hat = d_t_hat
+            trans_time = t_hat
+            rot_time = t_hat
+            trans_vf_scale = 1
+            rot_vf_scale = 1
+
+            trans_t_2 = corrupter._trans_euler_step(
+                trans_d_t_hat,
+                trans_time,
+                pred_trans_1,
+                trans_t_hat,
+                noising_mask=rigids_noising_mask,
+                vf_scale=trans_vf_scale,
+            )
+            rotmats_t_2 = corrupter._rots_euler_step(
+                rot_d_t_hat,
+                rot_time,
+                pred_rotmats_1,
+                rotmats_t_hat,
+                noising_mask=rigids_noising_mask,
+                vf_scale=rot_vf_scale,
+                rot_vf=denoiser_out['pred_rot_vf']
+            )
+
+            prot_traj.append(
+                (trans_t_2,
+                 rotmats_t_2,
+                 denoiser_out["pred_seq"].detach().cpu(),
+                )
+            )
+            t_1 = t_2
+
+            if not model.self_conditioning:
+                denoiser_out = None
+
+        # We only integrated to min_t, so need to make a final step
+        t_1 = ts[-1]
+        trans_t_1, rotmats_t_1, _= prot_traj[-1]
+        rigids_data["trans_t"] = trans_t_1
+        rigids_data["rotmats_t"] = rotmats_t_1
+        rigids_data['rigids_t'] = ru.Rigid(
+            rots=ru.Rotation(rot_mats=rotmats_t_1),
+            trans=trans_t_1
+        ).to_tensor_7()
+        t = torch.ones(num_batch, device=device)[..., None] * t_1
+        batch["t"] = t
+
+        denoiser_out = model(batch, self_condition=denoiser_out)
+
+        # Process model output.
+        pred_rigids = denoiser_out['denoised_rigids']
+        pred_trans_1 = pred_rigids.get_trans()
+        pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
+
+        ret = []
+
+        # data_list = batch.to_data_list()
+
+        for i, input_data in enumerate(batch['input_data']):
+            num_rigids = input_data['rigids']['tensor7'].shape[0]
+            num_tokens = input_data['tokens']['token_idx'].shape[0]
+            output_data = copy.deepcopy(input_data)
+            tensor7 = pred_rigids.to_tensor_7().numpy(force=True)
+            tensor7 = tensor7[i, :num_rigids]
+            output_data['rigids']['tensor7'] = tensor7
+            output_data['tokens']['res_type'] = denoiser_out["pred_seq"].numpy(force=True)
+            ret.append({
+                "input_data": input_data,
+                "output_data": output_data
+            })
+
+        return ret
+
+
+    def configure_optimizers(self):
+        optimizer = self.optim(self.model.parameters())
+
+        if self.use_cosine_lr_sched:
+            scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=self.cosine_warmup_steps,
+                num_training_steps=int(self.cosine_total_steps),
+                num_cycles=1
+            )
+            return {
+                'optimizer': optimizer,
+                'lr_scheduler': scheduler
+            }
+        else:
+            return optimizer
+
+

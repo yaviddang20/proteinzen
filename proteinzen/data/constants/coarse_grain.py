@@ -396,10 +396,16 @@ restype_cg_group_default_frame = np.zeros([21, 4, 4, 4], dtype=np.float32)
 
 
 def _make_coarse_grain_atom_positions():
+    # default_positions = torch.zeros(21, 14, 3)
+    # for i, (_, atom_pos_list) in enumerate(residue_constants.rigid_group_atom_positions.items()):
+    #     for j, (_, _, coord) in enumerate(atom_pos_list):
+    #         default_positions[i, j] = torch.as_tensor(coord)
+
     IDEALIZED_POS = torch.tensor(residue_constants.restype_atom14_rigid_group_positions)
     DEFAULT_FRAMES = torch.tensor(residue_constants.restype_rigid_group_default_frame)
     ATOM_MASK = torch.tensor(residue_constants.restype_atom14_mask)
     GROUP_IDX = torch.tensor(residue_constants.restype_atom14_to_rigid_group)
+
     default_rigids = rigid_utils.Rigid.from_tensor_4x4(DEFAULT_FRAMES)
 
     default_rigids_4 = default_rigids[..., 4]
@@ -466,6 +472,7 @@ def _make_coarse_grain_atom_positions():
                     tensor_4x4 = rel_cg_frame.to_tensor_4x4()
                 else:
                     tensor_4x4 = cg_frame.to_tensor_4x4()
+                tensor_4x4 = cg_frame.to_tensor_4x4()
                 restype_cg_group_default_frame[restype, cg_group] = tensor_4x4.numpy()
 
                 for atomname in cg_group_atoms:

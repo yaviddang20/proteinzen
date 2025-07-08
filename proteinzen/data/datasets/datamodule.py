@@ -2,6 +2,7 @@ import os
 from functools import partial
 from typing import List
 import sys
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -10,10 +11,21 @@ from torch_geometric.data import Batch, HeteroData
 import lightning as L
 import pandas as pd
 
-from proteinzen.harness.harness import TrainingHarness
-from proteinzen.runtime.sampling.dispatcher import TaskDispatcher
+from boltz.data.types import (
+    Structure,
+    Connection,
+    Record
+)
+from boltz.data.sample.sampler import Sample
 
-from .dataset import PdbDataset, LengthDataset
+from proteinzen.data.datasets.featurize.cropper import Cropper
+from proteinzen.data.datasets.featurize.tokenize import tokenize_structure, Tokenized
+from proteinzen.data.datasets.featurize.assembler import featurize_training, collate as boltz_collate
+
+from proteinzen.harness.harness import TrainingHarness
+from proteinzen.runtime.sampling.dispatcher import TaskDispatcher, BiomoleculeTaskDispatcher
+
+from .dataset import PdbDataset, MMCIFDataset, LengthDataset
 from .sampler import BatchSampler, LengthBatchSampler, ClusteredBatchSampler, ClusteredLengthBatchSampler
 from .collate import featurize_input, collate
 
@@ -228,6 +240,188 @@ class FramediffDataModule(L.LightningDataModule):
                 collate_fn=collate_fn,
                 batch_size=1
             )
+
+
+def load_input(record, data_dir):
+    """Load the given input data.
+
+    Parameters
+    ----------
+    record : Record
+        The record to load.
+    target_dir : Path
+        The path to the data directory.
+    msa_dir : Path
+        The path to msa directory.
+
+    Returns
+    -------
+    Input
+        The loaded input.
+
+    """
+    # Load the structure
+    structure = np.load(data_dir / "structures" / f"{record.id}.npz")
+
+    # In order to add cyclic_period to chains if it does not exist
+    # Extract the chains array
+    chains = structure["chains"]
+    # Check if the field exists
+    if "cyclic_period" not in chains.dtype.names:
+        # Create a new dtype with the additional field
+        new_dtype = chains.dtype.descr + [("cyclic_period", "i4")]
+        # Create a new array with the new dtype
+        new_chains = np.empty(chains.shape, dtype=new_dtype)
+        # Copy over existing fields
+        for name in chains.dtype.names:
+            new_chains[name] = chains[name]
+        # Set the new field to 0
+        new_chains["cyclic_period"] = 0
+        # Replace old chains array with new one
+        chains = new_chains
+
+    structure = Structure(
+        atoms=structure["atoms"],
+        bonds=structure["bonds"],
+        residues=structure["residues"],
+        chains=chains, # chains var accounting for missing cyclic_period
+        connections=structure["connections"].astype(Connection),
+        interfaces=structure["interfaces"],
+        mask=structure["mask"],
+    )
+
+    return structure
+
+
+class TrainingDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        datasets,
+        max_crop_residues,
+        max_crop_rigids,
+        samples_per_epoch=1000,
+        crop_min_neighbors=0,
+        crop_max_neighbors=40,
+        dataset_probs=None,
+    ):
+        super().__init__()
+        self.datasets = datasets
+        self.max_crop_residues = max_crop_residues
+        self.max_crop_rigids = max_crop_rigids
+        self.samples_per_epoch = samples_per_epoch
+        if dataset_probs is None:
+            self.dataset_probs = [1/len(datasets) for _ in datasets]
+        self.samples = []
+        self.cropper = Cropper(
+            min_neighborhood=crop_min_neighbors,
+            max_neighborhood=crop_max_neighbors
+        )
+
+        for dataset in datasets:
+            records = dataset.manifest
+            iterator = dataset.data_sampler.sample(records, np.random)
+            self.samples.append(iterator)
+
+    def __getitem__(self, idx):
+        dataset_idx = np.random.choice(
+            len(self.datasets),
+            p=self.dataset_probs,
+        )
+        dataset = self.datasets[dataset_idx]
+        task_sampler = dataset.task_sampler
+        sample: Sample = next(self.samples[dataset_idx])
+        task = task_sampler.sample_task()
+
+        struct = load_input(sample.record, Path(dataset.data_dir))
+
+        token_data, rigid_data, token_bonds = tokenize_structure(struct)
+        tokenized_data = Tokenized(
+            tokens=token_data,
+            rigids=rigid_data,
+            bonds=token_bonds,
+            structure=struct
+        )
+        crop_size = self.max_crop_residues - task.max_added_tokens(self.max_crop_residues)
+        if len(tokenized_data.tokens) > crop_size:
+            tokenized_data = self.cropper.crop(
+                tokenized_data,
+                max_tokens=crop_size,
+                random=np.random,
+                chain_id=sample.chain_id,
+                interface_id=sample.interface_id
+            )
+        features = featurize_training(
+            tokenized_data,
+            task,
+            max_tokens=self.max_crop_residues,
+            max_rigids=self.max_crop_rigids
+        )
+        return features
+
+    def __len__(self) -> int:
+        """Get the length of the dataset.
+
+        Returns
+        -------
+        int
+            The length of the dataset.
+
+        """
+        return self.samples_per_epoch
+
+
+class BiomoleculeDataModule(L.LightningDataModule):
+    def __init__(self,
+                 train_dataset: TrainingDataset,
+                 batch_size,  # this is PER GPU
+                 num_workers,
+                 ):
+        super().__init__()
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.train_dataset = train_dataset
+
+    def build_dataloader(self, x, collate_fn):
+        dataloader = DataLoader(
+            x,
+            num_workers=self.num_workers,
+            batch_size=self.batch_size,
+            collate_fn=collate_fn,
+            shuffle=False
+        )
+        return dataloader
+
+    def train_dataloader(self):
+        return self.build_dataloader(self.train_dataset, boltz_collate)
+
+
+class BiomoleculeSamplingDataModule(L.LightningDataModule):
+    def __init__(self,
+                 tasks_yaml,
+                 batch_size,
+                 batching_mode="optimal",
+                 use_collate_for_pad=False
+    ):
+        super().__init__()
+        self.batching_mode = batching_mode
+        self.batch_size = batch_size
+
+        self.task_dispatcher = BiomoleculeTaskDispatcher(
+            tasks_yaml,
+            1, #batch_size,
+            batching_mode,
+            use_collate_for_pad
+        )
+
+    def predict_dataloader(self):
+        dataloader = DataLoader(
+            self.task_dispatcher,
+            batch_size=self.batch_size,
+            collate_fn=boltz_collate,
+            shuffle=False
+        )
+        return dataloader
+
 
 
 class SamplingDataModule(L.LightningDataModule):

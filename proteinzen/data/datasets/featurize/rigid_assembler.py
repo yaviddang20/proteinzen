@@ -3,7 +3,7 @@ import torch.nn.functional as F
 
 from proteinzen.data.openfold import residue_constants as rc
 from proteinzen.utils.openfold import rigid_utils as ru
-from proteinzen.utils.coarse_grain import compute_atom14_from_cg_frames  #, compute_atom14_frames_from_cg_frames
+from proteinzen.utils.coarse_grain import compute_atom14_from_cg_frames, compute_atom14_frames_from_cg_frames
 from proteinzen.utils.framediff.all_atom import adjust_oxygen_pos
 
 

@@ -443,14 +443,15 @@ class MultiSE3Interpolant:
             center = (trans_1 * rigids_mask[..., None]).sum(dim=1) / rigids_mask.long().sum(dim=1)[..., None].clip(min=1)
 
         trans_1 = trans_1 - center[..., None, :]
-        # this is just so we can calculate atom14 rmsds
-        atom_data = batch['atom']
-        atom_data["atom14"] = atom_data["atom14"] - center[..., None, None, :]
-        atom_data["atom14"] *= atom_data['atom14_mask'][..., None]
-        atom_data['atom14_gt_positions'] = atom_data['atom14_gt_positions'] - center[..., None, None, :]
-        atom_data['atom14_gt_positions'] *= atom_data['atom14_mask'][..., None]
-        atom_data['atom14_alt_gt_positions'] = atom_data['atom14_alt_gt_positions'] - center[..., None, None, :]
-        atom_data['atom14_alt_gt_positions'] *= atom_data['atom14_mask'][..., None]
+        if 'atom' in batch:
+            # this is just so we can calculate atom14 rmsds
+            atom_data = batch['atom']
+            atom_data["atom14"] = atom_data["atom14"] - center[..., None, None, :]
+            atom_data["atom14"] *= atom_data['atom14_mask'][..., None]
+            atom_data['atom14_gt_positions'] = atom_data['atom14_gt_positions'] - center[..., None, None, :]
+            atom_data['atom14_gt_positions'] *= atom_data['atom14_mask'][..., None]
+            atom_data['atom14_alt_gt_positions'] = atom_data['atom14_alt_gt_positions'] - center[..., None, None, :]
+            atom_data['atom14_alt_gt_positions'] *= atom_data['atom14_mask'][..., None]
 
 
         if self.prealign_noise:

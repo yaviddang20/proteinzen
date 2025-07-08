@@ -5,6 +5,8 @@ from typing import Optional, Callable, List, Sequence, Union
 import torch.nn.functional as F
 import importlib
 
+from boltz.data import const
+
 from proteinzen.data.datasets.featurize.common import _rbf
 from proteinzen.model.modules.openfold.layers import (
     Linear, flatten_final_dims, permute_final_dims, _deepspeed_evo_attn, DropoutRowwise, DropoutColumnwise,
@@ -889,6 +891,7 @@ class MultiRigidPairEmbedder(nn.Module):
                  relpos_clip=32,
                  dropout=0.25,
                  inf=1e9,
+                 num_bond_types=len(const.bond_types) + 1,
                  use_qk_norm=False
     ):
         super().__init__()
@@ -910,6 +913,7 @@ class MultiRigidPairEmbedder(nn.Module):
 
         # self.ln_relpos = LayerNorm(2*relpos_clip+1)
         self.lin_z_ij = Linear(2*relpos_clip+1, c_hidden)
+        self.lin_token_bonds = nn.Embedding(num_bond_types, c_hidden)
 
         self.lin_a_ij = Linear(2 * self.c_a, c_hidden, bias=False)
 
@@ -956,18 +960,23 @@ class MultiRigidPairEmbedder(nn.Module):
         return torch.cat([quat_rel, unit_edge_dist_vecs, dist_features], dim=-1)
 
 
-    def forward(self, rigids, node_mask, seq_idx, chain_idx, sc_rigids=None):
+    def forward(self,
+                rigids,
+                node_mask,
+                seq_idx,
+                chain_idx,
+                token_is_unindexed_mask,
+                token_bonds,
+                sc_rigids=None
+    ):
         edge_mask = node_mask[..., None] & node_mask[..., None, :]
         same_chain_mask = (chain_idx[..., None] == chain_idx[..., None, :])
-
-        # we only use the bb rigid to featurize here
-        rigids = rigids[..., 0]
-        if sc_rigids is not None:
-            sc_rigids = sc_rigids[..., 0]
+        pair_is_unindexed_mask = token_is_unindexed_mask[..., None] | token_is_unindexed_mask[..., None, :]
 
         relpos_feats = relpos(seq_idx, clip=self.relpos_clip)
         relpos_feats = relpos_feats * same_chain_mask[..., None]
-        relpos_feats[~same_chain_mask][..., -1] += 1  # TODO: delete
+        relpos_feats = relpos_feats * ~pair_is_unindexed_mask[..., None]
+        # relpos_feats[~same_chain_mask][..., -1] += 1
 
         z = self.lin_z_ij(relpos_feats)
         a_current = self._featurize_rigids(rigids, distogram=False)
@@ -977,6 +986,7 @@ class MultiRigidPairEmbedder(nn.Module):
             a_sc = torch.zeros_like(a_current)
 
         z = z + self.lin_a_ij(torch.cat([a_current, a_sc], dim=-1))
+        z += self.lin_token_bonds(token_bonds)
         z = z * edge_mask[..., None]
 
         global cuet_supported
