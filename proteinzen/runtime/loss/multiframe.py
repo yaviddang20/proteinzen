@@ -61,7 +61,8 @@ def multiframe_fm_loss_dense_batch(
     fafe_l2_block_mask_size=1,
     trans_rigidwise_weight=1,
     rot_rigidwise_weight=1,
-    direct_rot_vf_loss=False
+    direct_rot_vf_loss=False,
+    direct_rot_vf_loss_scale=1,
 ):
     rigids_data = inputs['rigids']
     rigids_mask = rigids_data['rigids_mask']
@@ -121,6 +122,13 @@ def multiframe_fm_loss_dense_batch(
             # print("pred", pred_rot_vf)
             # print("gt", gt_rot_vf)
             # rot_vf_angle_loss_weight = rot_vf_angle_loss_weight / (2.4 ** 2)  # this is roughly the mean of the vector field magnitudes, squared
+
+            # unscaled_rot_vf_loss = torch.square(pred_rot_vf - gt_rot_vf).sum(dim=-1)
+            # rot_vf_loss = unscaled_rot_vf_loss * rot_rigidwise_weight * rigidwise_weight
+            # rot_vf_loss = torch.sum(rot_vf_loss * total_mask, dim=-1) / total_mask.sum(dim=-1).clip(min=1)
+            # rot_vf_loss = rot_vf_loss * direct_rot_vf_loss_scale
+            # with torch.no_grad():
+            #     unscaled_rot_vf_loss = torch.sum(unscaled_rot_vf_loss * total_mask, dim=-1) / total_mask.sum(dim=-1).clip(min=1)
 
             rot_vf_loss = angle_axis_rot_vf_loss_dense(
                 pred_rot_vf,

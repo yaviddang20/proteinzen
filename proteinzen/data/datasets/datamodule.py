@@ -299,6 +299,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         datasets,
         max_crop_residues,
         max_crop_rigids,
+        use_cropper=False,
         samples_per_epoch=1000,
         crop_min_neighbors=0,
         crop_max_neighbors=40,
@@ -312,10 +313,13 @@ class TrainingDataset(torch.utils.data.Dataset):
         if dataset_probs is None:
             self.dataset_probs = [1/len(datasets) for _ in datasets]
         self.samples = []
-        self.cropper = Cropper(
-            min_neighborhood=crop_min_neighbors,
-            max_neighborhood=crop_max_neighbors
-        )
+        if use_cropper:
+            self.cropper = Cropper(
+                min_neighborhood=crop_min_neighbors,
+                max_neighborhood=crop_max_neighbors
+            )
+        else:
+            self.cropper = None
 
         for dataset in datasets:
             records = dataset.manifest
@@ -333,29 +337,38 @@ class TrainingDataset(torch.utils.data.Dataset):
         task = task_sampler.sample_task()
 
         struct = load_input(sample.record, Path(dataset.data_dir))
+        task_data = task.sample_t_and_mask(struct)
 
-        token_data, rigid_data, token_bonds = tokenize_structure(struct)
+        token_data, rigid_data, token_bonds = tokenize_structure(
+            struct,
+            task_data
+        )
         tokenized_data = Tokenized(
             tokens=token_data,
             rigids=rigid_data,
             bonds=token_bonds,
             structure=struct
         )
-        crop_size = self.max_crop_residues - task.max_added_tokens(self.max_crop_residues)
-        if len(tokenized_data.tokens) > crop_size:
-            tokenized_data = self.cropper.crop(
-                tokenized_data,
-                max_tokens=crop_size,
-                random=np.random,
-                chain_id=sample.chain_id,
-                interface_id=sample.interface_id
-            )
+
+        if self.cropper is not None:
+            crop_size = self.max_crop_residues - task.max_added_tokens(self.max_crop_residues)
+            if len(tokenized_data.tokens) > crop_size:
+                tokenized_data = self.cropper.crop(
+                    tokenized_data,
+                    max_tokens=crop_size,
+                    random=np.random,
+                    chain_id=sample.chain_id,
+                    interface_id=sample.interface_id
+                )
+
         features = featurize_training(
             tokenized_data,
-            task,
+            task_data,
             max_tokens=self.max_crop_residues,
             max_rigids=self.max_crop_rigids
         )
+        features['task'] = task
+
         return features
 
     def __len__(self) -> int:

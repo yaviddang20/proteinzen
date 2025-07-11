@@ -40,12 +40,12 @@ fi
 ## generate samples
 conda activate ${ENV_NAME}
 
-python sample.py \
+python sample_v2.py \
     model_dir=$RUN_DIR \
     out_prefix=$OUTPREFIX \
     checkpoint_idx=$CHECKPOINTIDX \
     sampler.tasks_yaml=/wynton/home/kortemme/alexjli/projects/proteinzen-clone/data/unconditional_sampling/benchmark_128.yaml \
-    sampler.batch_size=1000000 \
+    sampler.batch_size=10 \
 
 ## sample with ProteinMPNN
 cd ~/software/ProteinMPNN/scripts
@@ -67,7 +67,6 @@ python ../helper_scripts/parse_multiple_chains.py --input_path=$folder_with_pdbs
 
 python ../protein_mpnn_run.py \
         --jsonl_path $path_for_parsed_chains \
-        --fixed_positions_jsonl $path_for_fixed_pos \
         --out_folder $output_dir \
         --num_seq_per_target 8 \
         --sampling_temp "0.1" \

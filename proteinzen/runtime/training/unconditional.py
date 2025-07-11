@@ -29,8 +29,9 @@ class UnconditionalGeneration(TrainingTask):
         self.shift_time_scale = shift_time_scale
 
     def sample_t_and_mask(self, data):
-        rigids_1 = data.rigids['tensor7']
-        # device = rigids_1.device
+        residues = data.residues
+        atoms = data.atoms
+
         device = 'cpu'
         if self.t_sched == 'lognorm':
             ln_sig = self.lognorm_mu + torch.randn(1, device=device).float() * self.lognorm_sig
@@ -47,15 +48,19 @@ class UnconditionalGeneration(TrainingTask):
         else:
             raise ValueError(f"self.t_sched={self.t_sched} not recognized")
 
-        rigids_noising_mask = np.ones(rigids_1.shape[:-1], dtype=bool)
-        seq_noising_mask = np.ones(data.tokens['token_idx'].shape, dtype=bool)
+        atom_noising_mask = np.ones(atoms.shape[0], dtype=bool)
+        res_type_noising_mask = np.ones(residues.shape[0], dtype=bool)
+        copy_indexed_residue_mask = np.zeros_like(res_type_noising_mask)
+        copy_unindexed_residue_mask = np.zeros_like(res_type_noising_mask)
+        copy_atomized_residue_mask = np.zeros_like(res_type_noising_mask)
 
         return {
             "t": t.numpy(force=True),
-            "rigids_noising_mask": rigids_noising_mask,
-            "seq_noising_mask": seq_noising_mask,
-            "copy_indexed_token_mask": None,
-            "copy_unindexed_token_mask": None,
+            "atom_noising_mask": atom_noising_mask,
+            "res_type_noising_mask": res_type_noising_mask,
+            "copy_indexed_residue_mask": copy_indexed_residue_mask,
+            "copy_unindexed_residue_mask": copy_unindexed_residue_mask,
+            "copy_atomized_residue_mask": copy_atomized_residue_mask,
         }
 
     def max_added_tokens(self, _):

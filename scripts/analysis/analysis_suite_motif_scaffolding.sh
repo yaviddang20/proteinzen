@@ -7,6 +7,8 @@ python ${REPO_ROOT}/scripts/analysis/partition_motif_samples.py --folded_folders
 python ${REPO_ROOT}/scripts/analysis/plot_sample_dssp.py
 python ${REPO_ROOT}/scripts/analysis/plot_folded_dssp.py
 python ${REPO_ROOT}/scripts/analysis/folding_over_len_motif.py
+python ${REPO_ROOT}/scripts/analysis/designability_over_len_motif.py
+python ${REPO_ROOT}/scripts/analysis/which_tasks_passed.py
 python ${REPO_ROOT}/scripts/analysis/confusion_matrix.py
 
 # TODO: there's gotta be a better way than this

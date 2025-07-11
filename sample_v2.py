@@ -21,6 +21,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 
 import wandb
 
+from proteinzen.data.datasets.featurize.sampling import infer_structure
 from proteinzen.runtime.config_boltz import config_sampling_hydra_store
 from proteinzen.data.io.atom91 import atom91_to_pdb, atom91_to_chain, chains_to_model, models_to_struct, save_struct
 from proteinzen.utils.atom_reps import atom14_to_atom91
@@ -29,8 +30,9 @@ from proteinzen.data.io.protein import PDB_CHAIN_IDS
 from proteinzen.runtime.lmod import ProteinModule
 from proteinzen.data.datasets.featurize.tokenize import Tokenized
 
-from proteinzen.data.datasets.featurize.tokenize import infer_structure, update_structure
-from proteinzen.data.io.write.mmcif import to_mmcif
+from proteinzen.data.datasets.featurize.tokenize import update_structure
+# from proteinzen.data.io.write.mmcif import to_mmcif
+from proteinzen.data.io.write.pdb import to_pdb
 
 
 # A logger for this file
@@ -93,8 +95,8 @@ class Experiment:
                 struct = infer_structure(sample_output)
                 struct = update_structure(struct, sample_output.rigids['tensor7'])
                 # print(struct)
-                pdb_str = to_mmcif(struct)
-                with open(sample_name + ".cif", 'w') as fp:
+                pdb_str = to_pdb(struct)
+                with open(sample_name + ".pdb", 'w') as fp:
                     fp.write(pdb_str)
 
                 # if self._cfg['save_traj']:

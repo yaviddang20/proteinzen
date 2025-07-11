@@ -10,7 +10,7 @@ mpl.rcParams.update({
     'figure.figsize': (9, 6)
 })
 
-df = pd.read_csv("esmfold/folding_rmsd.csv")
+df = pd.read_csv("esmfold/sc_rmsd.csv")
 df["seq_len"] = pd.to_numeric(df["name"].str.split("_", expand=True)[1], errors="coerce").astype(np.int64)
 
 if len(set(df['seq_len'].tolist())) < 10:
@@ -18,7 +18,7 @@ if len(set(df['seq_len'].tolist())) < 10:
 else:
     discrete = False
 
-designable = pd.to_numeric((df["motif_all_atom_rmsd"] < 1) & (df["global_all_atom_rmsd"] < 2)).astype(np.float32)
+designable = pd.to_numeric((df["motif_all_atom_rmsd"] < 1) & (df["global_bb_rmsd"] < 2)).astype(np.float32)
 if discrete:
     df['perc_designable'] = designable
     percent_designable = df.groupby('seq_len')['perc_designable'].mean()
@@ -57,17 +57,17 @@ cbar.ax.set_position(pos)
 
 ax.axhline(y=1.0, color='red', linestyle='--')
 # plt.suptitle("Sequence-structure consistency over length")
-plt.savefig("folding_motif_rmsd_over_len.png")
+plt.savefig("designable_motif_rmsd_over_len.png")
 
 plt.clf()
 
 ax = plt.gca()
 
 if discrete:
-    sns.stripplot(df, x="seq_len", y="global_all_atom_rmsd", hue="plddt", ax=ax, palette="viridis", legend=False)
+    sns.stripplot(df, x="seq_len", y="global_bb_rmsd", hue="plddt", ax=ax, palette="viridis", legend=False)
 else:
-    sns.scatterplot(df, x="seq_len", y="global_all_atom_rmsd", hue="plddt", ax=ax, palette="viridis", legend=False)
-ax.set(xlabel="Sequence Length", ylabel="Global all-atom RMSD")
+    sns.scatterplot(df, x="seq_len", y="global_bb_rmsd", hue="plddt", ax=ax, palette="viridis", legend=False)
+ax.set(xlabel="Sequence Length", ylabel="Global CA RMSD")
 ax2 = ax.twinx()
 if discrete:
     ref_loc = sorted(set(df['seq_len'].tolist()))
@@ -92,16 +92,16 @@ cbar.ax.set_position(pos)
 
 ax.axhline(y=2.0, color='red', linestyle='--')
 # plt.suptitle("Sequence-structure consistency over length")
-plt.savefig("folding_global_rmsd_over_len.png")
+plt.savefig("designable_global_rmsd_over_len.png")
 
 plt.clf()
 ax = plt.gca()
-g = sns.jointplot(df, x="motif_all_atom_rmsd", y="global_all_atom_rmsd", hue="plddt", ax=ax, palette="viridis")
+g = sns.jointplot(df, x="motif_all_atom_rmsd", y="global_bb_rmsd", hue="plddt", ax=ax, palette="viridis")
 g.ax_joint.axhline(y=2.0, color='red', linestyle='--')
 g.ax_joint.axvline(x=1.0, color='red', linestyle='--')
 g.ax_joint.set_ylim(0, 20)
 g.ax_joint.set_xlim(0, 20)
-plt.savefig("folding_rmsd_dist.png")
+plt.savefig("designable_rmsd_dist.png")
 
 plt.clf()
 fig, axs = plt.subplots(5, 5)
@@ -111,8 +111,8 @@ tasks_sorted = sorted(df['task'].unique().tolist())
 for i, task in tqdm.tqdm(enumerate(tasks_sorted)):
     ax = axs[i // 5, i % 5]
     ax.set_title(task)
-    g = sns.scatterplot(df[df['task'] == task], x="motif_all_atom_rmsd", y="global_all_atom_rmsd", hue="plddt", ax=ax, palette="viridis", legend=False)
+    g = sns.scatterplot(df[df['task'] == task], x="motif_all_atom_rmsd", y="global_bb_rmsd", hue="plddt", ax=ax, palette="viridis", legend=False)
     ax.axhline(y=2.0, color='red', linestyle='--')
     ax.axvline(x=1.0, color='red', linestyle='--')
     ax.axvline(x=1.5, color='orange', linestyle='--')
-plt.savefig("folding_rmsd_dist_by_task.png")
+plt.savefig("designable_rmsd_dist_by_task.png")

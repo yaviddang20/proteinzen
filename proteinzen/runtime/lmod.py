@@ -127,7 +127,10 @@ class ProteinModule(L.LightningModule):
                  use_euclidean_for_rots=False,
                  learnable_noise_schedule=False,
                  direct_rot_vf_loss=False,
-                 rot_angle_weight=0.5
+                 direct_rot_vf_loss_scale=1.,
+                 rot_angle_weight=0.5,
+                 trans_loss_scale=1.,
+                 rot_loss_scale=1.,
     ):
         super().__init__()
         self._log = logging.getLogger(__name__)
@@ -145,7 +148,10 @@ class ProteinModule(L.LightningModule):
         self.use_euclidean_for_rots = use_euclidean_for_rots
         self.learnable_noise_schedule = learnable_noise_schedule
         self.direct_rot_vf_loss = direct_rot_vf_loss
+        self.direct_rot_vf_loss_scale = direct_rot_vf_loss_scale
         self.rot_angle_weight = rot_angle_weight
+        self.trans_loss_scale = trans_loss_scale
+        self.rot_loss_scale = rot_loss_scale
         if learnable_noise_schedule:
             self.automatic_optimization = False
 
@@ -376,12 +382,13 @@ class ProteinModule(L.LightningModule):
             rigidwise_weight=rigidwise_weight,
             trans_rigidwise_weight=log_trans_t_grad**2,
             rot_rigidwise_weight=log_rot_t_grad**2,
-            direct_rot_vf_loss=self.direct_rot_vf_loss
+            direct_rot_vf_loss=self.direct_rot_vf_loss,
+            direct_rot_vf_loss_scale=self.direct_rot_vf_loss_scale
         )
 
         frame_vf_loss = (
-            frame_fm_loss_dict["trans_vf_loss"] +
-            frame_fm_loss_dict["rot_vf_loss"]
+            self.trans_loss_scale * frame_fm_loss_dict["trans_vf_loss"] +
+            self.rot_loss_scale * frame_fm_loss_dict["rot_vf_loss"]
         )
         unscaled_frame_vf_loss = (
             frame_fm_loss_dict["unscaled_trans_vf_loss"] +
@@ -1583,12 +1590,15 @@ class BiomoleculeModule(L.LightningModule):
 
         for i, input_data in enumerate(batch['input_data']):
             num_rigids = input_data['rigids']['tensor7'].shape[0]
-            num_tokens = input_data['tokens']['token_idx'].shape[0]
             output_data = copy.deepcopy(input_data)
             tensor7 = pred_rigids.to_tensor_7().numpy(force=True)
             tensor7 = tensor7[i, :num_rigids]
             output_data['rigids']['tensor7'] = tensor7
-            output_data['tokens']['res_type'] = denoiser_out["pred_seq"].numpy(force=True)
+
+            num_tokens = input_data['tokens']['token_idx'].shape[0]
+            pred_seq = denoiser_out["pred_seq"].numpy(force=True)
+            pred_seq = pred_seq[i, :num_tokens]
+            output_data['tokens']['res_type'] = pred_seq
             ret.append({
                 "input_data": input_data,
                 "output_data": output_data

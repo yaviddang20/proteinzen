@@ -1268,7 +1268,8 @@ class IpaScoreV2(nn.Module):
                  predict_final_rot=False,
                  direct_rot_vf_output=False,
                  detach_grad_pre_seq_pred=False,
-                 num_aa=21
+                 num_aa=21,
+                 accumulate_rot_vf_output=False
                  ):
         super().__init__()
         # self.diffuser = diffuser
@@ -1287,6 +1288,7 @@ class IpaScoreV2(nn.Module):
         self.block_q = block_q
         self.block_k = block_k
         self.num_aa = num_aa
+        self.accumulate_rot_vf_output = accumulate_rot_vf_output
 
         for b in range(num_blocks):
             if use_conditioned_ipa:
@@ -1378,6 +1380,12 @@ class IpaScoreV2(nn.Module):
             if not rigid_transformer_rigid_updates:
                 self.trunk[f'rigids_update_{b}'] = BackboneUpdate(c_frame)
 
+            if direct_rot_vf_output and accumulate_rot_vf_output:
+                self.trunk[f'rot_vf_update_{b}'] = nn.Sequential(
+                    LayerNorm(c_frame),
+                    Linear(c_frame, 3, bias=False, init='final')
+                )
+
             if b < num_blocks-1:
                 # No edge update on the last block.
                 self.trunk[f'edge_transition_{b}'] = ConditionedPairUpdate(
@@ -1393,7 +1401,7 @@ class IpaScoreV2(nn.Module):
         self.seq_pred = SeqPredictor(c_s, c_frame, n_aa=num_aa)
         self.detach_grad_pre_seq_pred = detach_grad_pre_seq_pred
 
-        if predict_final_rot:
+        if predict_final_rot and not accumulate_rot_vf_output:
             self.final_rot_head = nn.Sequential(
                 LayerNorm(c_frame),
                 Linear(c_frame, c_frame, bias=False),
@@ -1436,6 +1444,11 @@ class IpaScoreV2(nn.Module):
         curr_rigids = self.scale_rigids(init_rigids)
         node_embed = node_embed * node_mask[..., None]
         rigids_to_nodes = fn.partial(gather_helper, token_gather_idx=input_feats['token_gather_idx'])
+
+        if self.accumulate_rot_vf_output:
+            pred_rot_vf = 0
+        else:
+            pred_rot_vf = None
 
         # Main trunk
         for b in range(self.num_blocks):
@@ -1486,6 +1499,11 @@ class IpaScoreV2(nn.Module):
                 curr_rigids = curr_rigids.compose_q_update_vec(
                     rigid_update *  rigids_noising_mask_flat[..., None])
 
+            if self.accumulate_rot_vf_output:
+                assert pred_rot_vf is not None
+                rot_vf_update = self.trunk[f'rot_vf_update_{b}'](rigids_embed_flat * rigids_noising_mask_flat[..., None]) * rigids_noising_mask_flat[..., None]
+                pred_rot_vf = pred_rot_vf + rot_vf_update
+
             if b < self.num_blocks-1:
                 curr_rigids_tensor_7 = curr_rigids.to_tensor_7()
                 token_rigids = ru.Rigid.from_tensor_7(rigids_to_nodes(curr_rigids_tensor_7))
@@ -1507,7 +1525,7 @@ class IpaScoreV2(nn.Module):
                 rigids_mask_flat,
                 out=torch.zeros_like(node_embed)
             )
-        # print(curr_rigids.shape, input_feats['n_padding'])
+
         if self.final_rot_head is not None:
             rotvec = self.final_rot_head(rigids_embed_flat)
             axis = F.normalize(rotvec, dim=-1)
@@ -1525,6 +1543,10 @@ class IpaScoreV2(nn.Module):
 
         if self.rot_vf_head is not None:
             pred_rot_vf = self.rot_vf_head(rigids_embed_flat)
+        else:
+            pred_rot_vf = None
+
+        if pred_rot_vf is not None:
             axis = F.normalize(pred_rot_vf, dim=-1)
             angle = torch.linalg.vector_norm(pred_rot_vf + 1e-8, dim=-1)
             angle = angle * rigids_noising_mask_flat * rigids_mask_flat
@@ -1541,8 +1563,6 @@ class IpaScoreV2(nn.Module):
 
             if input_feats['n_padding'] > 0:
                 pred_rot_vf = pred_rot_vf[..., :-input_feats['n_padding'], :]
-        else:
-            pred_rot_vf = None
 
         if input_feats['n_padding'] > 0:
             curr_rigids = curr_rigids[..., :-input_feats['n_padding']]
@@ -2011,6 +2031,7 @@ class IpaMultiRigidDenoiserV2(nn.Module):
                  use_amp=False,
                  predict_final_rot=False,
                  direct_rot_vf_output=False,
+                 accumulate_rot_vf_output=False,
                  learnable_noise_schedule=False,
                  use_pairformer=False,
                  rot_vf_scaling=1,
@@ -2061,7 +2082,9 @@ class IpaMultiRigidDenoiserV2(nn.Module):
             use_qk_norm=use_qk_norm,
             predict_final_rot=predict_final_rot,
             direct_rot_vf_output=direct_rot_vf_output,
-            detach_grad_pre_seq_pred=learnable_noise_schedule
+            detach_grad_pre_seq_pred=learnable_noise_schedule,
+            accumulate_rot_vf_output=accumulate_rot_vf_output
+
         )
 
         self.embedder = EmbedderV2(

@@ -7,7 +7,7 @@
 #$ -q gpu.q
 #$ -pe smp 1
 #$ -l mem_free=32G
-#$ -l h_rt=7:00:00
+#$ -l h_rt=16:00:00
 #$ -l compute_cap=61,gpu_mem=40G
 
 export CUDA_VISIBLE_DEVICES=$SGE_GPU
@@ -45,7 +45,7 @@ python sample.py \
     out_prefix=$OUTPREFIX \
     checkpoint_idx=$CHECKPOINTIDX \
     sampler.tasks_yaml=/wynton/home/kortemme/alexjli/projects/proteinzen-clone/data/rfdiff_motif_scaffolding/config.yaml \
-    sampler.batch_size=540000 \
+    sampler.batch_size=2500000 \
 
 ## sample with ProteinMPNN
 cd ~/software/ProteinMPNN/scripts
@@ -83,4 +83,4 @@ bash ${REPO_ROOT}/scripts/analysis/esmfold.sh > esmfold.log
 conda activate ${ENV_NAME}
 python ${REPO_ROOT}/scripts/analysis/esm_compute_rmsds.py --esmlog esmfold.log --folded_folder $PWD --samples ../samples --samples_metadata ../samples_metadata.json
 cd ..
-bash ${REPO_ROOT}/scripts/analysis/analysis_suite.sh
+bash ${REPO_ROOT}/scripts/analysis/analysis_suite_motif_scaffolding.sh
