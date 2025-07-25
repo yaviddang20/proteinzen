@@ -108,6 +108,47 @@ def get_cosine_with_hard_restarts_schedule_with_warmup(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
+# from https://github.com/huggingface/transformers/blob/main/src/transformers/optimization.py
+def _get_warmup_lr_lambda(
+    current_step: int, *, num_warmup_steps: int
+):
+    if current_step < num_warmup_steps:
+        return float(current_step) / float(max(1, num_warmup_steps))
+    else:
+        return 1.0
+
+
+def get_linear_warmup_schedule(
+    optimizer: torch.optim.Optimizer, num_warmup_steps: int
+):
+    """
+    Create a schedule with a learning rate that decreases following the values of the cosine function between the
+    initial lr set in the optimizer to 0, with several hard restarts, after a warmup period during which it increases
+    linearly between 0 and the initial lr set in the optimizer.
+
+    Args:
+        optimizer ([`~torch.optim.Optimizer`]):
+            The optimizer for which to schedule the learning rate.
+        num_warmup_steps (`int`):
+            The number of steps for the warmup phase.
+        num_training_steps (`int`):
+            The total number of training steps.
+        num_cycles (`int`, *optional*, defaults to 1):
+            The number of hard restarts to use.
+        last_epoch (`int`, *optional*, defaults to -1):
+            The index of the last epoch when resuming training.
+
+    Return:
+        `torch.optim.lr_scheduler.LambdaLR` with the appropriate schedule.
+    """
+
+    lr_lambda = partial(
+        _get_warmup_lr_lambda,
+        num_warmup_steps=num_warmup_steps,
+    )
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 class ProteinModule(L.LightningModule):
     def __init__(self,
                  model,
@@ -131,10 +172,13 @@ class ProteinModule(L.LightningModule):
                  rot_angle_weight=0.5,
                  trans_loss_scale=1.,
                  rot_loss_scale=1.,
+                 compile_model=False,
     ):
         super().__init__()
         self._log = logging.getLogger(__name__)
         self.model = model
+        if compile_model:
+            self.model.compile()
         self.optim = optim
         self.training_harness = training_harness
         self.val_dir = val_dir
@@ -1228,6 +1272,8 @@ class BiomoleculeModule(L.LightningModule):
                  use_cosine_lr_sched=False,
                  cosine_warmup_steps=0,
                  cosine_total_steps=1e6,
+                 use_linear_warmup=False,
+                 linear_warmup_steps=0,
                  use_ema=False,
                  ema_decay=0.999,
                  use_posthoc_ema=False,
@@ -1237,14 +1283,20 @@ class BiomoleculeModule(L.LightningModule):
                  direct_rot_vf_loss=False,
                  rot_angle_weight=0.5,
                  self_condition_rate=0.5,
+                 atom_rigid_upweight=True,
+                 compile_model=False
     ):
         super().__init__()
         self._log = logging.getLogger(__name__)
         self.model = model
+        if compile_model:
+            self.model.compile()
         self.corrupter = corrupter
         self.optim = optim
         self.self_condition_rate = self_condition_rate
         self.use_cosine_lr_sched = use_cosine_lr_sched
+        self.use_linear_warmup = use_linear_warmup
+        self.linear_warmup_steps = linear_warmup_steps
         self.cosine_warmup_steps = cosine_warmup_steps
         self.cosine_total_steps = cosine_total_steps
         self.use_ema = use_ema
@@ -1253,6 +1305,7 @@ class BiomoleculeModule(L.LightningModule):
         self.learnable_noise_schedule = learnable_noise_schedule
         self.direct_rot_vf_loss = direct_rot_vf_loss
         self.rot_angle_weight = rot_angle_weight
+        self.atom_rigid_upweight = atom_rigid_upweight
         if learnable_noise_schedule:
             self.automatic_optimization = False
 
@@ -1359,7 +1412,8 @@ class BiomoleculeModule(L.LightningModule):
             rot_vf_angle_loss_weight=self.rot_angle_weight,
             fafe_l2_block_mask_size=1,
             rigidwise_weight=rigidwise_weight,
-            direct_rot_vf_loss=self.direct_rot_vf_loss
+            direct_rot_vf_loss=self.direct_rot_vf_loss,
+            upweight_atomic=self.atom_rigid_upweight
         )
 
         frame_vf_loss = (
@@ -1489,6 +1543,8 @@ class BiomoleculeModule(L.LightningModule):
             None
         )]
 
+        clean_traj = []
+
         global_shift = 0
         for t_2 in tqdm.tqdm(ts[1:]):
             d_t = t_2 - t_1
@@ -1529,6 +1585,13 @@ class BiomoleculeModule(L.LightningModule):
             pred_trans_1 = pred_rigids.get_trans()
             pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
 
+            clean_traj.append(
+                (pred_trans_1,
+                 pred_rotmats_1,
+                 denoiser_out["pred_seq"].detach().cpu(),
+                )
+            )
+
             trans_d_t_hat = d_t_hat
             rot_d_t_hat = d_t_hat
             trans_time = t_hat
@@ -1562,6 +1625,7 @@ class BiomoleculeModule(L.LightningModule):
             )
             t_1 = t_2
 
+
             if not model.self_conditioning:
                 denoiser_out = None
 
@@ -1588,7 +1652,10 @@ class BiomoleculeModule(L.LightningModule):
 
         # data_list = batch.to_data_list()
 
+        prot_traj = prot_traj[1:]
+
         for i, input_data in enumerate(batch['input_data']):
+            # print(input_data)
             num_rigids = input_data['rigids']['tensor7'].shape[0]
             output_data = copy.deepcopy(input_data)
             tensor7 = pred_rigids.to_tensor_7().numpy(force=True)
@@ -1599,9 +1666,58 @@ class BiomoleculeModule(L.LightningModule):
             pred_seq = denoiser_out["pred_seq"].numpy(force=True)
             pred_seq = pred_seq[i, :num_tokens]
             output_data['tokens']['res_type'] = pred_seq
+
+            # if we copy any tokens, figure out what generated residue corresponds to these fixed tokens
+            # select masks
+            token_data = output_data['tokens']
+            token_is_copy_mask = token_data['is_copy']
+            motif_idx = denoiser_out["motif_idx"][i, :num_tokens]
+            motif_select_mask = (token_is_copy_mask & token_data['resolved_mask'])
+            motif_seq_fixed = ~token_data['seq_noising_mask']
+            # actual idxs
+            fixed_bb_res_idx = motif_idx[motif_select_mask]
+            fixed_seq_res_idx = motif_idx[motif_seq_fixed]
+            fixed_bb_chain_idx = token_data['asym_id'][motif_select_mask]
+            fixed_seq_chain_idx = token_data['asym_id'][motif_seq_fixed]
+
+            prot_traj_i = [(_trans[i], _rot[i], _seq[i]) for _trans, _rot, _seq in prot_traj]
+            ret_prot_traj = []
+            for _trans, _rot, _seq in prot_traj_i:
+                traj_data = copy.deepcopy(input_data)
+                _quat = ru.rot_to_quat(_rot)
+                _tensor7 = torch.cat([_quat, _trans], dim=-1)
+                _tensor7 = _tensor7[:num_rigids].numpy(force=True)
+                traj_data['rigids']['tensor7'] = _tensor7
+
+                num_tokens = input_data['tokens']['token_idx'].shape[0]
+                _seq = _seq[:num_tokens].numpy(force=True)
+                traj_data['tokens']['res_type'] = _seq
+                ret_prot_traj.append(traj_data)
+
+            clean_traj_i = [(_trans[i], _rot[i], _seq[i]) for _trans, _rot, _seq in clean_traj]
+            ret_clean_traj = []
+            for _trans, _rot, _seq in clean_traj_i:
+                traj_data = copy.deepcopy(input_data)
+                _quat = ru.rot_to_quat(_rot)
+                _tensor7 = torch.cat([_quat, _trans], dim=-1)
+                _tensor7 = _tensor7[:num_rigids].numpy(force=True)
+                traj_data['rigids']['tensor7'] = _tensor7
+
+                num_tokens = input_data['tokens']['token_idx'].shape[0]
+                _seq = _seq[:num_tokens].numpy(force=True)
+                traj_data['tokens']['res_type'] = _seq
+                ret_clean_traj.append(traj_data)
+
             ret.append({
                 "input_data": input_data,
-                "output_data": output_data
+                "output_data": output_data,
+                "prot_traj": ret_prot_traj,
+                "clean_traj": ret_clean_traj,
+                "fixed_bb_res_idx": fixed_bb_res_idx,
+                "fixed_seq_res_idx": fixed_seq_res_idx,
+                "fixed_bb_chain_idx": fixed_bb_chain_idx,
+                "fixed_seq_chain_idx": fixed_seq_chain_idx,
+                "name": batch["task"][i]
             })
 
         return ret
@@ -1616,6 +1732,15 @@ class BiomoleculeModule(L.LightningModule):
                 num_warmup_steps=self.cosine_warmup_steps,
                 num_training_steps=int(self.cosine_total_steps),
                 num_cycles=1
+            )
+            return {
+                'optimizer': optimizer,
+                'lr_scheduler': scheduler
+            }
+        elif self.use_linear_warmup:
+            scheduler = get_linear_warmup_schedule(
+                optimizer,
+                num_warmup_steps=self.linear_warmup_steps,
             )
             return {
                 'optimizer': optimizer,

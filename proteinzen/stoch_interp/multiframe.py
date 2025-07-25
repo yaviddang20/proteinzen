@@ -772,6 +772,7 @@ class MultiSE3Interpolant:
                 mat_t = so3_utils.rotvec_to_rotmat(rotvec_t * step_size + noise_t)
             else:
                 rotvec_t = d_t * rot_vf + d_t * g_t * rot_score
+                # print(rotvec_t.shape, step_size.shape)
                 mat_t = so3_utils.rotvec_to_rotmat(step_size * rotvec_t)
 
         rotmats_next = torch.einsum("...ij,...jk->...ik", rotmats_t, mat_t)

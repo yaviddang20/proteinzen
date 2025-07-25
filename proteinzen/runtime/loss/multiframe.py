@@ -63,6 +63,7 @@ def multiframe_fm_loss_dense_batch(
     rot_rigidwise_weight=1,
     direct_rot_vf_loss=False,
     direct_rot_vf_loss_scale=1,
+    upweight_atomic=False
 ):
     rigids_data = inputs['rigids']
     rigids_mask = rigids_data['rigids_mask']
@@ -70,6 +71,11 @@ def multiframe_fm_loss_dense_batch(
     noised_rigids = ru.Rigid.from_tensor_7(rigids_data['rigids_t'])
 
     total_mask = rigids_mask * rigids_noising_mask
+
+    if upweight_atomic:
+        rigid_is_atomized = inputs['rigids']['rigids_is_atom_mask'].float()
+        atom_rigid_upweight = (1 - rigid_is_atomized) + 10 * (rigid_is_atomized)
+        rigidwise_weight = rigidwise_weight * atom_rigid_upweight
 
     denoised_rigids = denoiser_outputs['denoised_rigids']
     gt_rigids = ru.Rigid.from_tensor_7(rigids_data['rigids_1'])
@@ -123,28 +129,28 @@ def multiframe_fm_loss_dense_batch(
             # print("gt", gt_rot_vf)
             # rot_vf_angle_loss_weight = rot_vf_angle_loss_weight / (2.4 ** 2)  # this is roughly the mean of the vector field magnitudes, squared
 
-            # unscaled_rot_vf_loss = torch.square(pred_rot_vf - gt_rot_vf).sum(dim=-1)
-            # rot_vf_loss = unscaled_rot_vf_loss * rot_rigidwise_weight * rigidwise_weight
-            # rot_vf_loss = torch.sum(rot_vf_loss * total_mask, dim=-1) / total_mask.sum(dim=-1).clip(min=1)
-            # rot_vf_loss = rot_vf_loss * direct_rot_vf_loss_scale
-            # with torch.no_grad():
-            #     unscaled_rot_vf_loss = torch.sum(unscaled_rot_vf_loss * total_mask, dim=-1) / total_mask.sum(dim=-1).clip(min=1)
-
-            rot_vf_loss = angle_axis_rot_vf_loss_dense(
-                pred_rot_vf,
-                gt_rot_vf,
-                total_mask,
-                torch.ones_like(norm_scale) / rot_rigidwise_weight,
-                weight=rigidwise_weight ,
-                angle_loss_weight=rot_vf_angle_loss_weight,
-            )
+            unscaled_rot_vf_loss = torch.square(pred_rot_vf - gt_rot_vf).sum(dim=-1)
+            rot_vf_loss = unscaled_rot_vf_loss * rot_rigidwise_weight * rigidwise_weight
+            rot_vf_loss = torch.sum(rot_vf_loss * total_mask, dim=-1) / total_mask.sum(dim=-1).clip(min=1)
+            rot_vf_loss = rot_vf_loss * direct_rot_vf_loss_scale
             with torch.no_grad():
-                unscaled_rot_vf_loss = angle_axis_rot_vf_loss_dense(
-                    pred_rot_vf,
-                    gt_rot_vf,
-                    total_mask,
-                    torch.ones_like(norm_scale),
-                )
+                unscaled_rot_vf_loss = torch.sum(unscaled_rot_vf_loss * total_mask, dim=-1) / total_mask.sum(dim=-1).clip(min=1)
+
+            # rot_vf_loss = angle_axis_rot_vf_loss_dense(
+            #     pred_rot_vf,
+            #     gt_rot_vf,
+            #     total_mask,
+            #     torch.ones_like(norm_scale) / rot_rigidwise_weight,
+            #     weight=rigidwise_weight ,
+            #     angle_loss_weight=rot_vf_angle_loss_weight,
+            # )
+            # with torch.no_grad():
+            #     unscaled_rot_vf_loss = angle_axis_rot_vf_loss_dense(
+            #         pred_rot_vf,
+            #         gt_rot_vf,
+            #         total_mask,
+            #         torch.ones_like(norm_scale),
+            #     )
         else:
             pred_rot_vf = so3_fm_utils.calc_rot_vf(rots_t, rots_1_pred)
             gt_rot_vf = so3_fm_utils.calc_rot_vf(rots_t, rots_1)
@@ -184,6 +190,9 @@ def multiframe_fm_loss_dense_batch(
     trans_vf_loss *= 0.01  # Angstroms to nm
     unscaled_trans_vf_loss = (unscaled_trans_vf_loss * total_mask).sum(dim=-1) / num_rigids_per_batch
     unscaled_trans_vf_loss *= 0.01  # Angstroms to nm
+
+    # torch.set_printoptions(threshold=1000001)
+    # print(trans_1_pred, trans_1)
 
     if isinstance(rigidwise_weight, torch.Tensor):
         framepair_weight = rigidwise_weight[..., None] * rigidwise_weight[..., None, :]

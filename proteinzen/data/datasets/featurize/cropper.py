@@ -221,6 +221,19 @@ class Cropper:
             elif interface_id is not None:
                 interface = interfaces[interface_id]
                 query = pick_interface_token(valid_tokens, interface, random)
+
+            # if any of the rigids are not noised, this suggests we have a motif
+            # so we try to keep it in the crop
+            elif (~data.rigids['rigids_noising_mask']).any():
+                fixed_rigids_mask = ~data.rigids['rigids_noising_mask'] & data.rigids['is_present']
+                fixed_rigids = data.rigids[fixed_rigids_mask]
+                com_coord = fixed_rigids['tensor7'][..., 4:].mean(axis=0)
+                rigid_sq_dist_to_com = np.sum((fixed_rigids['tensor7'][..., 4:] - com_coord[None]) ** 2, axis=-1)
+                rigid_select_weights = 1 / (rigid_sq_dist_to_com ** 1.5 + 1e-5)  # cubic inverse distance
+                rigid_select_probs = rigid_select_weights / rigid_select_weights.sum()
+                rigid_select = np.random.choice(fixed_rigids, p=rigid_select_probs)
+                # print(rigid_select, set(fixed_rigids['token_idx']))
+                query = token_data[rigid_select['token_idx']]
             elif valid_interfaces.size:
                 idx = random.randint(len(valid_interfaces))
                 interface = valid_interfaces[idx]

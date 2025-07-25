@@ -12,7 +12,11 @@ from boltz.data import const
 from boltz.data.types import Structure
 
 
-def to_pdb(structure: Structure, plddts: Optional[Tensor] = None) -> str:  # noqa: PLR0915
+def to_pdb(
+    structure: Structure,
+    plddts: Optional[Tensor] = None,
+    rename_chains: bool = False
+) -> str:  # noqa: PLR0915
     """Write a structure into a PDB file.
 
     Parameters
@@ -52,14 +56,23 @@ def to_pdb(structure: Structure, plddts: Optional[Tensor] = None) -> str:  # noq
     chain_tag_idx = 0
     chain_tag_mapping = {}
 
+    # use the structure mask
+    # so we have an easy way of controlling which chains are outputted
+    chains = structure.chains[structure.mask]
+
     # Add all atom sites.
-    for chain in structure.chains:
+    for chain in chains:
         # We rename the chains in alphabetical order
         chain_idx = chain["asym_id"]
-        if chain["name"] not in chain_tag_mapping:
-            chain_tag_mapping[chain["name"]] = CHAIN_ALPHABET[chain_tag_idx]
-            chain_tag_idx += 1
-        chain_tag = chain_tag_mapping[chain["name"]]
+
+        if rename_chains:
+            if chain["name"] not in chain_tag_mapping:
+                chain_tag_mapping[chain["name"]] = CHAIN_ALPHABET[chain_tag_idx]
+                chain_tag_idx += 1
+            chain_tag = chain_tag_mapping[chain["name"]]
+        else:
+            chain_tag = chain["name"]
+            assert len(chain_tag) == 1, f"chain tags must be single characters but we encountered chain tag {chain_tag}"
 
         res_start = chain["res_idx"]
         res_end = chain["res_idx"] + chain["res_num"]
@@ -70,16 +83,18 @@ def to_pdb(structure: Structure, plddts: Optional[Tensor] = None) -> str:  # noq
             atom_end = residue["atom_idx"] + residue["atom_num"]
             atoms = structure.atoms[atom_start:atom_end]
             atom_coords = atoms["coords"]
+
+            record_type = (
+                "ATOM"
+                if chain["mol_type"] != const.chain_type_ids["NONPOLYMER"]
+                else "HETATM"
+            )
+
             for i, atom in enumerate(atoms):
                 # This should not happen on predictions, but just in case.
                 if not atom["is_present"]:
                     continue
 
-                record_type = (
-                    "ATOM"
-                    if chain["mol_type"] != const.chain_type_ids["NONPOLYMER"]
-                    else "HETATM"
-                )
                 name = atom["name"]
                 name = [chr(c + 32) for c in name if c != 0]
                 name = "".join(name)

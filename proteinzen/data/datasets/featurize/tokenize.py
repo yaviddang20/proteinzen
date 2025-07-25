@@ -193,6 +193,7 @@ def get_unk_token(chain: np.ndarray) -> int:
 def standard_residue_to_frames(residue, atoms):
     res_name = residue['name']
     atoms = atoms[atoms['is_present']]  # only select present atoms
+    dummy_rigid_idx = [0]
 
     bb_frame = ['N', 'CA', 'C']
     # bb_frame = ['C', 'CA', 'N']
@@ -202,9 +203,16 @@ def standard_residue_to_frames(residue, atoms):
     # use bb frame if frame2 doesn't exist
     if len(frame2) == 0:
         frame2 = bb_frame
+        dummy_rigid_idx.append(dummy_rigid_idx[-1])
+    else:
+        dummy_rigid_idx.append(dummy_rigid_idx[-1]+1)
     # use frame2 frame if frame3 doesn't exist
     if len(frame3) == 0:
         frame3 = frame2
+        dummy_rigid_idx.append(dummy_rigid_idx[-1])
+    else:
+        dummy_rigid_idx.append(dummy_rigid_idx[-1]+1)
+
 
     frame_atom_names = [bb_frame, frame2, frame3]
     # figure out which frames are resolved enough for us to model
@@ -247,7 +255,7 @@ def standard_residue_to_frames(residue, atoms):
         else:
             rigid_tensor7.append(IDENTITY_TENSOR7.copy())
 
-    return np.stack(rigid_tensor7, axis=0), np.array(rigid_mask)
+    return np.stack(rigid_tensor7, axis=0), np.array(rigid_mask), dummy_rigid_idx
 
 
 def arbitrary_atom_to_frame(
@@ -270,7 +278,9 @@ def arbitrary_atom_to_frame(
         atom_name = "".join(atom_name)
         # print(atom, atom_name)
         neighbors = []
+
     np.random.shuffle(neighbors)
+
     if len(neighbors) == 0:
         quat = Rotation.random().as_quat(canonical=True)
         trans = atom["coords"]
@@ -388,7 +398,7 @@ def tokenize_structure(  # noqa: C901, PLR0915
         atoms = struct.atoms[atom_start:atom_end]
         noise_atoms = atom_noising_mask[atom_start:atom_end]
 
-        rigid_tensor7, rigid_mask = standard_residue_to_frames(
+        rigid_tensor7, rigid_mask, dummy_rigid_idx = standard_residue_to_frames(
             res, atoms
         )
 
@@ -435,10 +445,19 @@ def tokenize_structure(  # noqa: C901, PLR0915
             atom_name = "".join(atom_name)
             atom_to_rigid[atom_start + i] = _rigid_idx + atom_name_to_cg_idx[atom_name]
 
+        _noise_rigid = []
         # Update rigid_idx to token_idx
         for i in range(3):
             cg_atom_idxs = cg_idx_to_atom_idx[i]
-            noise_rigid = noise_atoms[cg_atom_idxs].any()
+            # we figure out if we're noising the rigid
+            # by checking if any of its component atoms are being noised
+            # we also need to check if its a dummy rigid
+            # and if so, copy the noising status of its corresponding non-dummy rigid
+            if len(cg_atom_idxs) > 0:
+                noise_rigid = noise_atoms[cg_atom_idxs].any()
+            else:
+                noise_rigid = _noise_rigid[dummy_rigid_idx[i]]
+            _noise_rigid.append(noise_rigid)
 
             rigid = RigidData(
                 rigid_idx=_rigid_idx,
@@ -559,10 +578,10 @@ def tokenize_structure(  # noqa: C901, PLR0915
 
                 if copy_indexed_residue_mask[res_start + i]:
                     if copy_atomized_residue_mask[res_start + i]:
-                        ret_tokens, ret_rigids, _, _ = _get_nonstandard_residue_data(res, {}, {}, 0, 0)
+                        ret_tokens, _ret_rigids, _, _ = _get_nonstandard_residue_data(res, {}, {}, 0, 0)
                         copy_data.extend([
                             {"token": t, "rigids": [r], "indexed?": True, "atomized?": True}
-                            for t, r in zip(ret_tokens, ret_rigids)
+                            for t, r in zip(ret_tokens, _ret_rigids)
                         ])
                     else:
                         copy_token = copy.deepcopy(token)
@@ -570,13 +589,14 @@ def tokenize_structure(  # noqa: C901, PLR0915
                             "token": copy_token, "rigids": ret_rigids, "indexed?": True, "atomized?": False
                         })
                     token = replace(token, seq_noising_mask=True)
+                    ret_rigids = [replace(r, rigids_noising_mask=True) for r in ret_rigids]
 
                 elif copy_unindexed_residue_mask[res_start + i]:
                     if copy_atomized_residue_mask[res_start + i]:
-                        ret_tokens, ret_rigids, _, _ = _get_nonstandard_residue_data(res, {}, {}, 0, 0)
+                        ret_tokens, _ret_rigids, _, _ = _get_nonstandard_residue_data(res, {}, {}, 0, 0)
                         copy_data.extend([
                             {"token": t, "rigids": [r], "indexed?": False, "atomized?": True}
-                            for t, r in zip(ret_tokens, ret_rigids)
+                            for t, r in zip(ret_tokens, _ret_rigids)
                         ])
                     else:
                         copy_token = copy.deepcopy(token)
@@ -584,6 +604,7 @@ def tokenize_structure(  # noqa: C901, PLR0915
                             "token": copy_token, "rigids": ret_rigids, "indexed?": False, "atomized?": False
                         })
                     token = replace(token, seq_noising_mask=True)
+                    ret_rigids = [replace(r, rigids_noising_mask=True) for r in ret_rigids]
 
                 token_data.append(astuple(token))
                 rigid_data.extend([astuple(r) for r in ret_rigids])

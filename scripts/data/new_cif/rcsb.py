@@ -2,6 +2,7 @@
 Modified from Boltz
 https://github.com/jwohlwend/boltz/blob/main/scripts/process/rcsb.py
 """
+import os
 import argparse
 import json
 import multiprocessing
@@ -10,7 +11,7 @@ import traceback
 from dataclasses import asdict, dataclass, replace
 from functools import partial
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Callable
 
 import numpy as np
 import rdkit
@@ -28,6 +29,7 @@ from boltz.data.filter.static.polymer import (
     UnknownFilter,
 )
 from boltz.data.types import ChainInfo, InterfaceInfo, Record, Target
+from boltz.data import const
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,13 +62,37 @@ class Resource:
         return out
 
 
+class ClusterResource:
+    """A shared resource for processing."""
+
+    def __init__(self, host: str, port: int) -> None:
+        """Initialize the redis database."""
+        self._redis = Redis(host=host, port=port)
+
+    def get(self, key: str, default=None) -> Any:  # noqa: ANN401
+        """Get an item from the Redis database."""
+        value = self._redis.get(key)
+        if value is not None:
+            return value.decode("utf-8")
+        else:
+            return default
+
+    def __getitem__(self, key: str) -> Any:  # noqa: ANN401
+        """Get an item from the resource."""
+        out = self.get(key)
+        if out is None:
+            raise KeyError(key)
+        return out
+
+
 def fetch(datadir: Path, max_file_size: Optional[int] = None) -> list[PDB]:
     """Fetch the PDB files."""
     data = []
     excluded = 0
-    for file in datadir.rglob("*.cif*"):
+    for file in tqdm(datadir.rglob("*.cif*")):
         # The clustering file is annotated by pdb_entity id
-        pdb_id = str(file.stem).lower()
+        pdb_id = str(file.stem)
+        pdb_id = pdb_id.lower()
 
         # Check file size and skip if too large
         if max_file_size is not None and (file.stat().st_size > max_file_size):
@@ -95,7 +121,7 @@ def finalize(outdir: Path) -> None:
 
     failed_count = 0
     records = []
-    for record in records_dir.iterdir():
+    for record in records_dir.rglob("*.json"):
         path = record
         try:
             with path.open("r") as f:
@@ -134,14 +160,15 @@ def parse(data: PDB, resource: Resource, clusters: dict) -> Target:
     pdb_id = data.id.lower()
 
     # Parse structure
-    parsed = parse_mmcif(data.path, resource)
+    parsed = parse_mmcif(data.path, resource, ignore_connections=True)
     structure = parsed.data
     structure_info = parsed.info
 
     # Create chain metadata
     chain_info = []
     for i, chain in enumerate(structure.chains):
-        key = f"{pdb_id}_{chain['entity_id']}"
+        key = f"{pdb_id}_{chain['entity_id'] + 1}"  # TODO: this is if we 1-index entities as the PDB but the parsing script doesn't
+        # print(key, int(chain["res_num"]))
         chain_info.append(
             ChainInfo(
                 chain_id=i,
@@ -150,6 +177,7 @@ def parse(data: PDB, resource: Resource, clusters: dict) -> Target:
                 mol_type=int(chain["mol_type"]),
                 cluster_id=clusters.get(key, -1),
                 num_residues=int(chain["res_num"]),
+                entity_id=int(chain['entity_id']),
             )
         )
 
@@ -178,10 +206,10 @@ def parse(data: PDB, resource: Resource, clusters: dict) -> Target:
 
 def process_structure(
     data: PDB,
-    resource: Resource,
+    get_resource: Callable[[], Resource],
     outdir: Path,
     filters: list[StaticFilter],
-    clusters: dict,
+    get_clusters: Callable[[], ClusterResource],
 ) -> None:
     """Process a target.
 
@@ -195,9 +223,25 @@ def process_structure(
         The output directory.
 
     """
+
+    resource = get_resource()
+    clusters = get_clusters()
+
     # Check if we need to process
-    struct_path = outdir / "structures" / f"{data.id}.npz"
-    record_path = outdir / "records" / f"{data.id}.json"
+    if "af-" in data.id:
+        mid = data.id[6:8]
+    else:
+        mid = data.id[1:3]
+
+    mid_out_dir = outdir / "structures" / mid
+    mid_record_dir = outdir / "records" / mid
+    if not mid_out_dir.exists():
+        mid_out_dir.mkdir(parents=True, exist_ok=True)
+    if not mid_record_dir.exists():
+        mid_record_dir.mkdir(parents=True, exist_ok=True)
+
+    struct_path = outdir / "structures" / mid /f"{data.id}.npz"
+    record_path = outdir / "records" / mid / f"{data.id}.json"
 
     if struct_path.exists() and record_path.exists():
         return
@@ -254,11 +298,6 @@ def process(args) -> None:
     structure_dir = args.outdir / "structures"
     structure_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load clusters
-    with Path(args.clusters).open("r") as f:
-        clusters: dict[str, str] = json.load(f)
-        clusters = {k.lower(): v.lower() for k, v in clusters.items()}
-
     # Load filters
     filters = [
         ExcludedLigands(),
@@ -273,7 +312,10 @@ def process(args) -> None:
     rdkit.Chem.SetDefaultPickleProperties(pickle_option)
 
     # Load shared data from redis
-    resource = Resource(host=args.redis_host, port=args.redis_port)
+    def get_resource() -> Resource:
+        return Resource(host=args.redis_host, port=args.redis_port)
+    def get_cluster_resource() -> ClusterResource:
+        return ClusterResource(host=args.clusters_host, port=args.clusters_port)
 
     # Get data points
     print("Fetching data...")
@@ -290,9 +332,9 @@ def process(args) -> None:
         # Create processing function
         fn = partial(
             process_structure,
-            resource=resource,
+            get_resource=get_resource,
             outdir=args.outdir,
-            clusters=clusters,
+            get_clusters=get_cluster_resource,
             filters=filters,
         )
         # Run processing in parallel
@@ -301,9 +343,9 @@ def process(args) -> None:
         for item in tqdm(data):
             process_structure(
                 item,
-                resource=resource,
+                get_resource=get_resource,
                 outdir=args.outdir,
-                clusters=clusters,
+                get_clusters=get_cluster_resource,
                 filters=filters,
             )
 
@@ -320,10 +362,16 @@ if __name__ == "__main__":
         help="The data containing the MMCIF files.",
     )
     parser.add_argument(
-        "--clusters",
-        type=Path,
-        required=True,
-        help="Path to the cluster file.",
+        "--clusters-host",
+        type=str,
+        default="localhost",
+        help="The Redis host.",
+    )
+    parser.add_argument(
+        "--clusters-port",
+        type=int,
+        default=7778,
+        help="The Redis port.",
     )
     parser.add_argument(
         "--outdir",
@@ -348,6 +396,10 @@ if __name__ == "__main__":
         type=int,
         default=7777,
         help="The Redis port.",
+    )
+    parser.add_argument(
+        "--load-redis-into-memory",
+        action="store_true"
     )
     parser.add_argument(
         "--use-assembly",

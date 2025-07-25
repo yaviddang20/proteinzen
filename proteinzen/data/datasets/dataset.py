@@ -160,10 +160,12 @@ class MMCIFDataset(data.Dataset):
             min_num_res=30,
             max_num_res=5000,
             min_percent_ordered=0.5,
-            max_resolution=5.0,
+            max_resolution=3.0,
             subset=None,
             split=None,
-            exclude_mol_types=None
+            exclude_mol_types=None,
+            overfit_num=None,
+            count_on_protein_res=False
         ):
         self._log = logging.getLogger(__name__)
         self.data_dir = data_dir
@@ -175,12 +177,13 @@ class MMCIFDataset(data.Dataset):
         self.max_resolution = max_resolution
         self.task_sampler = task_sampler
         self.data_sampler = data_sampler
+        self.overfit_num = overfit_num
+        self.count_on_protein_res = count_on_protein_res
         if exclude_mol_types is None:
             self.exclude_mol_types = []
         else:
-            print(exclude_mol_types)
+            print("Excluding molecules that contain chains of types:", exclude_mol_types)
             self.exclude_mol_types = [const.chain_types.index(s) for s in exclude_mol_types]
-
 
         self._init_metadata()
 
@@ -205,7 +208,10 @@ class MMCIFDataset(data.Dataset):
             if _exclude_record:
                 continue
             # apply some filtering critera that we might change at train time
-            num_res = sum(chain['num_residues'] for chain in record['chains'])
+            if self.count_on_protein_res:
+                num_res = sum(chain['num_residues'] for chain in record['chains'] if chain['mol_type'] == 0)
+            else:
+                num_res = sum(chain['num_residues'] for chain in record['chains'])
             if num_res > self.max_num_res or num_res < self.min_num_res:
                 continue
             resolution = record['structure']['resolution']
@@ -219,6 +225,10 @@ class MMCIFDataset(data.Dataset):
             record['is_af2_struct'] = record['id'].startswith("AF-")
 
             self.manifest.append(Record.from_dict(record))
+
+        if self.overfit_num is not None:
+            self.manifest = self.manifest[-self.overfit_num:]
+            print("overfit entries:", self.manifest)
 
     def __len__(self):
         return len(self.manifest)

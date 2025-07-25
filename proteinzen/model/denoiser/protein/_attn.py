@@ -1,3 +1,6 @@
+from abc import ABC
+from functools import partialmethod
+
 import torch
 import math
 from torch import nn
@@ -15,7 +18,7 @@ from proteinzen.model.modules.openfold.layers import (
 from proteinzen.model.modules.openfold.layers_v2 import ConditionedTransition, LayerNorm
 from proteinzen.utils.openfold import rigid_utils as ru
 
-from cuequivariance_torch import triangle_attention
+from cuequivariance_torch import triangle_attention, triangle_multiplicative_update
 
 deepspeed_is_installed = importlib.util.find_spec("deepspeed") is not None
 if deepspeed_is_installed:
@@ -295,6 +298,130 @@ class TriangleAttentionCore(nn.Module):
             o = o.transpose(-2, -3)
 
         return o
+
+
+# class TriangleMultiplicativeUpdate(nn.Module):
+#     """
+#     Implements Algorithms 11 and 12.
+#     """
+#     def __init__(self, c_z, c_hidden, _outgoing=True):
+#         """
+#         Args:
+#             c_z:
+#                 Input channel dimension
+#             c:
+#                 Hidden channel dimension
+#         """
+#         super().__init__()
+#
+#         self.c_z = c_z
+#         self.c_hidden = c_hidden
+#         self._outgoing = _outgoing
+#
+#         self.layer_norm_in = LayerNorm(self.c_z)
+#         self.layer_norm_out = LayerNorm(self.c_hidden)
+#
+#         self.sigmoid = nn.Sigmoid()
+#
+#         self.linear_p_in = Linear(self.c_z, 2 * self.c_hidden, bias=False)
+#         self.linear_g_in = Linear(self.c_z, 2 * self.c_hidden, bias=False, init="gating")
+#         self.linear_p_out = Linear(self.c_hidden, self.c_z, bias=False, init="final")
+#         self.linear_g_out = Linear(self.c_z, self.c_z, bias=False, init="gating")
+#
+#     def _combine_projections(self,
+#         a: torch.Tensor,
+#         b: torch.Tensor,
+#         _inplace_chunk_size: Optional[int] = None
+#     ) -> torch.Tensor:
+#         if(self._outgoing):
+#             a = permute_final_dims(a, (2, 0, 1))
+#             b = permute_final_dims(b, (2, 1, 0))
+#         else:
+#             a = permute_final_dims(a, (2, 1, 0))
+#             b = permute_final_dims(b,  (2, 0, 1))
+#
+#         if(_inplace_chunk_size is not None):
+#             # To be replaced by torch vmap
+#             for i in range(0, a.shape[-3], _inplace_chunk_size):
+#                 a_chunk = a[..., i: i + _inplace_chunk_size, :, :]
+#                 b_chunk = b[..., i: i + _inplace_chunk_size, :, :]
+#                 a[..., i: i + _inplace_chunk_size, :, :] = (
+#                     torch.matmul(
+#                         a_chunk,
+#                         b_chunk,
+#                     )
+#                 )
+#
+#             p = a
+#         else:
+#             p = torch.matmul(a, b)
+#
+#         return permute_final_dims(p, (1, 2, 0))
+#
+#     def forward(self,
+#         z: torch.Tensor,
+#         mask: Optional[torch.Tensor] = None,
+#     ) -> torch.Tensor:
+#         """
+#         Args:
+#             x:
+#                 [*, N_res, N_res, C_z] input tensor
+#             mask:
+#                 [*, N_res, N_res] input mask
+#         Returns:
+#             [*, N_res, N_res, C_z] output tensor
+#         """
+#         global cuet_supported
+#         if cuet_supported:
+#             x = triangle_multiplicative_update(
+#                 z,
+#                 direction="outgoing" if self._outgoing else "incoming",
+#                 mask=mask,
+#                 norm_in_weight=self.layer_norm_in.weight,
+#                 norm_in_bias=self.layer_norm_in.bias,
+#                 p_in_weight=self.linear_p_in.weight,
+#                 g_in_weight=self.linear_g_in.weight,
+#                 norm_out_weight=self.layer_norm_out.weight,
+#                 norm_out_bias=self.layer_norm_out.bias,
+#                 p_out_weight=self.linear_p_out.weight,
+#                 g_out_weight=self.linear_g_out.weight,
+#             )
+#             return x
+#         else:
+#             if mask is None:
+#                 mask = z.new_ones(z.shape[:-1])
+#
+#             mask = mask.unsqueeze(-1)
+#
+#             z = self.layer_norm_in(z)
+#             ab = mask
+#             ab = ab * self.sigmoid(self.linear_g_in(z))
+#             ab = ab * self.linear_p_in(z)
+#             a, b = torch.chunk(ab, 2, dim=-1)
+#
+#             x = torch.einsum("bkid,bkjd->bijd", a, b)
+#
+#             del a, b
+#             x = self.layer_norm_out(x)
+#             x = self.linear_p_out(x)
+#             g = self.sigmoid(self.linear_g_out(z))
+#             x = x * g
+#
+#             return x
+#
+#
+# class TriangleMultiplicationIncoming(TriangleMultiplicativeUpdate):
+#     """
+#     Implements Algorithm 12.
+#     """
+#     __init__ = partialmethod(TriangleMultiplicativeUpdate.__init__, _outgoing=False)
+#
+#
+# class TriangleMultiplicationOutgoing(TriangleMultiplicativeUpdate):
+#     """
+#     Implements Algorithm 11.
+#     """
+#     __init__ = partialmethod(TriangleMultiplicativeUpdate.__init__, _outgoing=True)
 
 
 # inspired by Pallatom
@@ -986,7 +1113,7 @@ class MultiRigidPairEmbedder(nn.Module):
             a_sc = torch.zeros_like(a_current)
 
         z = z + self.lin_a_ij(torch.cat([a_current, a_sc], dim=-1))
-        z += self.lin_token_bonds(token_bonds)
+        z += self.lin_token_bonds(token_bonds) # * (token_bonds == 0)[..., None]
         z = z * edge_mask[..., None]
 
         global cuet_supported
@@ -996,20 +1123,24 @@ class MultiRigidPairEmbedder(nn.Module):
             mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
 
         for i in range(self.no_blocks):
-            z = z + self.dropout_row_layer(
-                self.trunk[f'mult_out_{i}'](z, edge_mask)
-            )
-            z = z + self.dropout_row_layer(
-                self.trunk[f'mult_in_{i}'](z, edge_mask)
-            )
+            # z = z + self.dropout_row_layer(
+            #     self.trunk[f'mult_out_{i}'](z, edge_mask)
+            # )
+            # z = z + self.dropout_row_layer(
+            #     self.trunk[f'mult_in_{i}'](z, edge_mask)
+            # )
+            z = z + self.trunk[f'mult_out_{i}'](z, edge_mask)
+            z = z + self.trunk[f'mult_in_{i}'](z, edge_mask)
             edge_bias = self.trunk[f'edge_bias_{i}'](z)
             edge_bias = permute_final_dims(edge_bias.unsqueeze(-4), (2, 0, 1))
-            z = z + self.dropout_row_layer(
-                self.trunk[f'attn_start_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
-            )
-            z = z + self.dropout_col_layer(
-                self.trunk[f'attn_end_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
-            )
+            # z = z + self.dropout_row_layer(
+            #     self.trunk[f'attn_start_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
+            # )
+            # z = z + self.dropout_col_layer(
+            #     self.trunk[f'attn_end_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
+            # )
+            z = z + self.trunk[f'attn_start_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
+            z = z + self.trunk[f'attn_end_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
             z = z + self.trunk[f'transition_{i}'](z)
 
         return self.final_layer(z) * edge_mask[..., None]
@@ -1128,20 +1259,24 @@ class MultiRigidPairEmbedderV2(nn.Module):
             mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
 
         for i in range(self.no_blocks):
-            z = z + self.dropout_row_layer(
-                self.trunk[f'mult_out_{i}'](z, edge_mask)
-            )
-            z = z + self.dropout_row_layer(
-                self.trunk[f'mult_in_{i}'](z, edge_mask)
-            )
+            # z = z + self.dropout_row_layer(
+            #     self.trunk[f'mult_out_{i}'](z, edge_mask)
+            # )
+            # z = z + self.dropout_row_layer(
+            #     self.trunk[f'mult_in_{i}'](z, edge_mask)
+            # )
+            z = z + self.trunk[f'mult_out_{i}'](z, edge_mask)
+            z = z + self.trunk[f'mult_in_{i}'](z, edge_mask)
             edge_bias = self.trunk[f'edge_bias_{i}'](z)
             edge_bias = permute_final_dims(edge_bias.unsqueeze(-4), (2, 0, 1))
-            z = z + self.dropout_row_layer(
-                self.trunk[f'attn_start_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
-            )
-            z = z + self.dropout_col_layer(
-                self.trunk[f'attn_end_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
-            )
+            # z = z + self.dropout_row_layer(
+            #     self.trunk[f'attn_start_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
+            # )
+            # z = z + self.dropout_col_layer(
+            #     self.trunk[f'attn_end_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
+            # )
+            z = z + self.trunk[f'attn_start_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
+            z = z + self.trunk[f'attn_end_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
             z = z + self.trunk[f'transition_{i}'](z)
 
         return self.final_layer(z) * edge_mask[..., None]

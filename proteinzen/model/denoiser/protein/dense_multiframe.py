@@ -331,6 +331,8 @@ class Embedder(nn.Module):
         element_mask = (rigids_element != -1)
         element_embed = self.rigid_element_embed(rigids_element * element_mask) * element_mask[..., None]
         charge_embed = self.rigid_charge_embed(rigids_charge.unsqueeze(-1))
+        # print(rigids_element)
+        # print(rigids_charge)
         # is_unindexed_embed = self.rigid_is_unindexed_embed(rigids_is_unindexed_mask[..., None].float())
 
         rigids_init = (

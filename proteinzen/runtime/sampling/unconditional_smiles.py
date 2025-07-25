@@ -16,9 +16,10 @@ from boltz.data.types import Structure
 
 from proteinzen.data.openfold import residue_constants, data_transforms
 from proteinzen.utils.openfold import rigid_utils as ru
-from proteinzen.data.datasets.featurize.tokenize import sample_noise_tokenized_structure, Tokenized
-from proteinzen.data.datasets.featurize.sampling import generate_protein_structure_template, sample_noise_from_struct_template
-from proteinzen.data.datasets.featurize.assembler import featurize_inference
+from proteinzen.data.datasets.featurize.mol.sampling import smiles_to_struct
+from proteinzen.data.datasets.featurize.tokenize import Tokenized
+from proteinzen.data.datasets.featurize.sampling import sample_noise_from_struct_template
+from proteinzen.data.datasets.featurize.assembler import featurize_inference_v2
 
 
 from .task import SamplingTask
@@ -50,28 +51,25 @@ def _uniform_so3(num_rigids):
     )
 
 
-class UnconditionalSampling(SamplingTask):
-    task_name: str = "unconditional"
+class UnconditionalSamplingFromSMILES(SamplingTask):
+    task_name: str = "unconditional_smiles"
 
     def __init__(
         self,
-        sample_length: int,
+        smiles: str,
         num_samples: int,
         **kwargs
     ):
         super().__init__(**kwargs)
 
-        self.sample_length = sample_length
+        self.smiles = smiles
         self.num_samples = num_samples
 
     def sample_data(self):
+        struct = smiles_to_struct(self.smiles)
         for _ in range(self.num_samples):
-            chain_lens = {
-                'A': self.sample_length
-            }
-            struct = generate_protein_structure_template(chain_lens)
-            token_data, rigid_data, token_bonds, _ = sample_noise_from_struct_template(
-                struct
+            token_data, rigid_data, token_bonds = sample_noise_from_struct_template(
+                struct,
             )
             data = Tokenized(
                 tokens=token_data,
@@ -79,20 +77,11 @@ class UnconditionalSampling(SamplingTask):
                 bonds=token_bonds,
                 structure=struct
             )
-
-            rigids_1 = data.rigids['tensor7']
-            rigids_noising_mask = np.ones(rigids_1.shape[:-1], dtype=bool)
-            seq_noising_mask = np.ones(data.tokens['token_idx'].shape, dtype=bool)
-
             task_data = {
                 "t": np.array([1.0], dtype=float),
-                "rigids_noising_mask": rigids_noising_mask,
-                "seq_noising_mask": seq_noising_mask,
-                "copy_indexed_token_mask": None,
-                "copy_unindexed_token_mask": None,
             }
 
-            yield featurize_inference(data, task_data)
+            yield featurize_inference_v2(data, task_data)
 
     def pad_data(self, data, n_padding):
         return NotImplemented

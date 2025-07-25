@@ -834,6 +834,7 @@ def parse_connection(
 def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
     path: str,
     components: dict[str, Mol],
+    ignore_connections: bool = False,
     use_assembly: bool = True,
 ) -> ParsedStructure:
     """Parse a structure in MMCIF format.
@@ -982,18 +983,19 @@ def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
 
     # Parse covalent connections
     connections: list[ParsedConnection] = []
-    for connection in structure.connections:
-        # Skip non-covalent connections
-        connection: gemmi.Connection
-        if connection.type.name != "Covale":
-            continue
+    if not ignore_connections:
+        for connection in structure.connections:
+            # Skip non-covalent connections
+            connection: gemmi.Connection
+            if connection.type.name != "Covale":
+                continue
 
-        parsed_connection = parse_connection(
-            connection=connection,
-            chains=chains,
-            subchain_map=subchain_map,
-        )
-        connections.append(parsed_connection)
+            parsed_connection = parse_connection(
+                connection=connection,
+                chains=chains,
+                subchain_map=subchain_map,
+            )
+            connections.append(parsed_connection)
 
     # Create tables
     atom_data = []
@@ -1029,6 +1031,7 @@ def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
                 atom_num,
                 res_idx,
                 res_num,
+                0  # dummy for cyclic period
             )
         )
         chain_to_idx[chain.name] = asym_id

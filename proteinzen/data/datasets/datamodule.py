@@ -3,6 +3,7 @@ from functools import partial
 from typing import List
 import sys
 from pathlib import Path
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -16,6 +17,7 @@ from boltz.data.types import (
     Connection,
     Record
 )
+from boltz.data import const
 from boltz.data.sample.sampler import Sample
 
 from proteinzen.data.datasets.featurize.cropper import Cropper
@@ -261,7 +263,18 @@ def load_input(record, data_dir):
 
     """
     # Load the structure
-    structure = np.load(data_dir / "structures" / f"{record.id}.npz")
+    try:
+        # find the subdirectory
+        if "AF-" in record.id:
+            mid = record.id[6:8]
+        elif "af-" in record.id:
+            mid = record.id[6:8]
+        else:
+            mid = record.id[1:3]
+        structure = np.load(data_dir / "structures" / mid / f"{record.id}.npz")
+    except:
+        # original boltz format
+        structure = np.load(data_dir / "structures" / f"{record.id}.npz")
 
     # In order to add cyclic_period to chains if it does not exist
     # Extract the chains array
@@ -293,17 +306,36 @@ def load_input(record, data_dir):
     return structure
 
 
+def mask_nonstandard_residues(struct: Structure):
+    residues = struct.residues
+    atoms = struct.atoms
+
+    residues_copy = residues.copy()
+    residues_copy['is_present'] = residues['is_present'] & residues['is_standard']
+    atoms_copy = atoms.copy()
+    for residue in residues:
+        atom_idx = residue['atom_idx']
+        atom_num = residue['atom_num']
+        res_atoms = atoms_copy[atom_idx:atom_idx+atom_num]
+        if not residue['is_standard']:
+            res_atoms['is_present'] = False
+
+    return replace(struct, atoms=atoms_copy, residues=residues_copy)
+
+
 class TrainingDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         datasets,
         max_crop_residues,
         max_crop_rigids,
-        use_cropper=False,
-        samples_per_epoch=1000,
+        use_cropper=True,
+        samples_per_epoch=1000,  # this is PER GPU
         crop_min_neighbors=0,
         crop_max_neighbors=40,
         dataset_probs=None,
+        remove_mol_types=None,
+        mask_nonstandard=False
     ):
         super().__init__()
         self.datasets = datasets
@@ -312,6 +344,8 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.samples_per_epoch = samples_per_epoch
         if dataset_probs is None:
             self.dataset_probs = [1/len(datasets) for _ in datasets]
+        else:
+            self.dataset_probs = dataset_probs
         self.samples = []
         if use_cropper:
             self.cropper = Cropper(
@@ -320,6 +354,13 @@ class TrainingDataset(torch.utils.data.Dataset):
             )
         else:
             self.cropper = None
+
+        if remove_mol_types is None:
+            self.remove_mol_types = []
+        else:
+            print("Removing chains of types:", remove_mol_types)
+            self.remove_mol_types = [const.chain_types.index(s) for s in remove_mol_types]
+        self.mask_nonstandard = mask_nonstandard
 
         for dataset in datasets:
             records = dataset.manifest
@@ -337,6 +378,14 @@ class TrainingDataset(torch.utils.data.Dataset):
         task = task_sampler.sample_task()
 
         struct = load_input(sample.record, Path(dataset.data_dir))
+        chain_mask = struct.mask
+        remove_chain_masks = [struct.chains['mol_type'] == i for i in self.remove_mol_types]
+        for remove_mask in remove_chain_masks:
+            chain_mask[remove_mask] = False
+
+        if self.mask_nonstandard:
+            struct = mask_nonstandard_residues(struct)
+
         task_data = task.sample_t_and_mask(struct)
 
         token_data, rigid_data, token_bonds = tokenize_structure(
@@ -351,7 +400,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         )
 
         if self.cropper is not None:
-            crop_size = self.max_crop_residues - task.max_added_tokens(self.max_crop_residues)
+            crop_size = self.max_crop_residues - task.max_added_tokens(token_data.shape[0])
             if len(tokenized_data.tokens) > crop_size:
                 tokenized_data = self.cropper.crop(
                     tokenized_data,

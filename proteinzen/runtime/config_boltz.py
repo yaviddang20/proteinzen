@@ -222,6 +222,7 @@ def config_sampling_hydra_store():
         model_dir="",
         out_prefix="samples",
         save_traj=False,
+        output_motif_chains=False,
         checkpoint_idx=-1,
         hydra_defaults=[
             {"sampler": "default"},

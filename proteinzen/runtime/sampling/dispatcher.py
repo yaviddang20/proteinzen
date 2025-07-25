@@ -8,6 +8,7 @@ from proteinzen.data.datasets.collate import collate
 from .task import SamplingTask
 from .unconditional import UnconditionalSampling
 from .unconditional_v2 import UnconditionalSamplingV2
+from .unconditional_smiles import UnconditionalSamplingFromSMILES
 from .motif_scaffolding import MotifScaffoldingTask
 from .motif_scaffolding_v2 import MotifScaffoldingTaskV2
 
@@ -17,7 +18,7 @@ class TaskDispatcher(Dataset):
         "motif_scaffolding": MotifScaffoldingTask,
         "motif_scaffolding_v2": MotifScaffoldingTaskV2,
         "unconditional": UnconditionalSampling,
-        "unconditional_v2": UnconditionalSamplingV2
+        "unconditional_v2": UnconditionalSamplingV2,
     }
 
     def __init__(
@@ -141,7 +142,8 @@ class BiomoleculeTaskDispatcher(Dataset):
         "motif_scaffolding": MotifScaffoldingTask,
         "motif_scaffolding_v2": MotifScaffoldingTaskV2,
         "unconditional": UnconditionalSampling,
-        "unconditional_v2": UnconditionalSamplingV2
+        "unconditional_v2": UnconditionalSamplingV2,
+        "unconditional_smiles": UnconditionalSamplingFromSMILES
     }
 
     def __init__(

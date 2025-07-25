@@ -486,7 +486,10 @@ class Dropout(nn.Module):
                 shape[bd] = 1
         mask = x.new_ones(shape)
         mask = self.dropout(mask)
-        x *= mask
+        if x.is_contiguous():
+            x *= mask
+        else:
+            x = x * mask
         return x
 
 

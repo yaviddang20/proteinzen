@@ -4,7 +4,49 @@ import math
 import numpy as np
 import torch
 
+from boltz.data import const
+
+from proteinzen.data.constants import coarse_grain as cg
+from proteinzen.data.datasets.featurize.tokenize import convert_atom_name
+
 from .task import TrainingTask
+
+
+def rigid_noise_to_atom_noise(residue, atoms, rigid_noising_mask):
+    res_name = residue['name']
+
+    bb_group = ['N', 'CA', 'C', 'O', 'CB']
+    # bb_frame = ['C', 'CA', 'N']
+    group2 = cg.coarse_grain_sidechain_groups[res_name][2]
+    group3 = cg.coarse_grain_sidechain_groups[res_name][3]
+    # construct dummy frames as necessary
+    # use bb frame if frame2 doesn't exist
+    if len(group2) == 0:
+        group2 = bb_group
+    # use frame2 frame if frame3 doesn't exist
+    if len(group3) == 0:
+        group3 = group2
+
+    atom_noise_mapping = {}
+    frame_atom_groups = [bb_group, group2, group3]
+    for i, atom_groups in enumerate(frame_atom_groups):
+        noise_atom = rigid_noising_mask[i]
+        for atom_name in atom_groups:
+            atom_id = convert_atom_name(atom_name)
+            atom_noise_mapping[atom_id] = noise_atom
+
+    atom_noising_mask = []
+    for atom in atoms:
+        atom_name_tuple = tuple(atom["name"])
+        if atom_name_tuple in atom_noise_mapping:
+            atom_noising_mask.append(
+                atom_noise_mapping[atom_name_tuple]
+            )
+        else:
+            atom_noising_mask.append(True)
+
+    return np.array(atom_noising_mask)
+
 
 # inspired by Genie2
 class MotifScaffolding(TrainingTask):
@@ -68,8 +110,9 @@ class MotifScaffolding(TrainingTask):
         return torch.as_tensor(M, dtype=torch.bool)
 
     def sample_t_and_mask(self, data):
-        rigids_1 = data.rigids['tensor7']
-        # device = rigids_1.device
+        residues = data.residues
+        atoms = data.atoms
+
         device = 'cpu'
         if self.t_sched == 'lognorm':
             ln_sig = self.lognorm_mu + torch.randn(1, device=device).float() * self.lognorm_sig
@@ -86,32 +129,69 @@ class MotifScaffolding(TrainingTask):
         else:
             raise ValueError(f"self.t_sched={self.t_sched} not recognized")
 
-        rigids_noising_mask = torch.ones(rigids_1.shape[:-1], dtype=bool, device=device)
+        resolved_mask = data.residues['is_present']
+        num_resolved_residues = resolved_mask.sum()
+        motif_mask = self.generate_motif_mask(num_resolved_residues)
+        residue_noising_mask = np.ones_like(resolved_mask)
+        residue_noising_mask[resolved_mask] = ~motif_mask
+        res_type_noising_mask = residue_noising_mask.copy()
 
-        motif_mask = self.generate_motif_mask(rigids_1.shape[0])
-        seq_noising_mask = ~motif_mask
+        atom_noising_mask = []
         if self.mode == 'mixed':
-            mask_bb_only = torch.rand_like(rigids_noising_mask[..., 0], dtype=torch.float32) < 0.5
-            rigids_noising_mask[motif_mask & mask_bb_only, 0] = False
-            rigids_noising_mask[motif_mask & (~mask_bb_only)] = False
-            seq_noising_mask[motif_mask & mask_bb_only] = True
+            noise_select = torch.rand_like(torch.as_tensor(residue_noising_mask), dtype=torch.float32).numpy(force=True)
+            # fix_tip = noise_select < 0.33
+            # noise_sidechain_only = noise_select > 0.67
+            fix_tip = np.zeros(noise_select.shape, dtype=bool)
+            noise_sidechain_only = noise_select > 0.5
+            res_type_noising_mask[~residue_noising_mask & fix_tip] = False
+            res_type_noising_mask[~residue_noising_mask & noise_sidechain_only] = True
+
+            for chain in data.chains:
+                # Get residue indices
+                res_start = chain["res_idx"]
+                res_end = chain["res_idx"] + chain["res_num"]
+                is_protein = chain["mol_type"] == const.chain_type_ids["PROTEIN"]
+
+                for i, residue in enumerate(data.residues[res_start:res_end]):
+                    atom_idx = residue['atom_idx']
+                    atom_num = residue['atom_num']
+                    atoms = data.atoms[atom_idx:atom_idx+atom_num]
+                    if residue["is_standard"] and (residue['name'] != 'UNK') and is_protein:
+                        if fix_tip[i] & (~residue_noising_mask[i]):
+                            rigid_noise_mask = [True, False, True]
+                        elif noise_sidechain_only[i] & (~residue_noising_mask[i]):
+                            rigid_noise_mask = [False, True, True]
+                        elif ~residue_noising_mask[i]:
+                            rigid_noise_mask = [False for _ in range(3)]
+                        else:
+                            rigid_noise_mask = [True for _ in range(3)]
+                        atom_noising_mask.append(rigid_noise_to_atom_noise(residue, atoms, rigid_noise_mask))
+                    else:
+                        atom_noising_mask.append([True for _ in atoms])
+
         else:
             raise ValueError()
+        atom_noising_mask = np.concatenate(atom_noising_mask)
 
+        is_unindexed_residue = torch.rand_like(torch.as_tensor(residue_noising_mask), dtype=torch.float32) < self.p_is_unindexed
+        is_unindexed_residue = is_unindexed_residue.numpy(force=True)
 
-        res_is_unindexed_mask = torch.rand_like(seq_noising_mask, dtype=torch.float32) < self.p_is_unindexed
-        res_is_atomized_mask = torch.zeros_like(res_is_unindexed_mask, dtype=torch.bool)
+        copy_indexed_residue_mask = ~residue_noising_mask & ~is_unindexed_residue
+        copy_unindexed_residue_mask = ~residue_noising_mask & is_unindexed_residue
+        copy_atomized_residue_mask = np.zeros_like(res_type_noising_mask)
 
         return {
             "t": t.numpy(force=True),
-            "rigids_noising_mask": rigids_noising_mask,
-            "seq_noising_mask": seq_noising_mask,
-            "copy_indexed_token_mask": None,
-            "copy_unindexed_token_mask": None,
+            "atom_noising_mask": atom_noising_mask,
+            "res_type_noising_mask": res_type_noising_mask,
+            "copy_indexed_residue_mask": copy_indexed_residue_mask,
+            "copy_unindexed_residue_mask": copy_unindexed_residue_mask,
+            "copy_atomized_residue_mask": copy_atomized_residue_mask,
         }
 
-    def max_added_tokens(self, _):
-        return 0
+    def max_added_tokens(self, N):
+        res_cap = min(math.ceil(self.max_frac_res * N), self.max_num_res)
+        return res_cap
 
 
 class BackboneMotifScaffolding(MotifScaffolding):

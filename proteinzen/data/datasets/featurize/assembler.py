@@ -95,11 +95,11 @@ def process_token_features(
     rigid_idx = 0
     for _, token in enumerate(token_data):
         res_idx = token['res_idx']
-        if res_idx not in seq_index_ref:
-            seq_index_ref[res_idx] = curr_seq_idx
+        if token['is_unindexed']:
             seq_index.append(curr_seq_idx)
             curr_seq_idx += 1
-        elif token['is_unindexed']:
+        elif res_idx not in seq_index_ref:
+            seq_index_ref[res_idx] = curr_seq_idx
             seq_index.append(curr_seq_idx)
             curr_seq_idx += 1
         else:
@@ -224,11 +224,11 @@ def process_rigid_features(
     seq_index = []
     for _, token in enumerate(token_data):
         res_idx = token['res_idx']
-        if res_idx not in seq_index_ref:
-            seq_index_ref[res_idx] = curr_seq_idx
+        if token['is_unindexed']:
             seq_index.append(curr_seq_idx)
             curr_seq_idx += 1
-        elif token['is_unindexed']:
+        elif res_idx not in seq_index_ref:
+            seq_index_ref[res_idx] = curr_seq_idx
             seq_index.append(curr_seq_idx)
             curr_seq_idx += 1
         else:
@@ -318,7 +318,7 @@ def process_rigid_features(
         # ref_space_uid = pad_dim(ref_space_uid, 0, pad_len)
         rigid_to_token = pad_dim(rigid_to_token, 0, pad_len)
         sidechain_idx = pad_dim(sidechain_idx, 0, pad_len)
-        new_rigids_noising_mask = pad_dim(new_rigids_noising_mask, 0, pad_len)
+        new_rigids_noising_mask = pad_dim(new_rigids_noising_mask, 0, pad_len, value=True)
         rigids_seq_idx = pad_dim(rigids_seq_idx, 0, pad_len)
 
         tensor7_pad = torch.zeros((pad_len, 7), device=tensor7.device, dtype=tensor7.dtype)
@@ -334,8 +334,8 @@ def process_rigid_features(
         "rigids_is_atom_mask": is_atom_mask,
         "rigids_ref_element": ref_element.long(),
         "rigids_ref_charge": ref_charge.float(),
-        "rigids_resolved_mask": resolved_mask,
-        "rigids_pad_mask": pad_mask,
+        "rigids_resolved_mask": resolved_mask.bool(),
+        "rigids_pad_mask": pad_mask.bool(),
         "rigids_to_token": rigid_to_token,
         "rigids_1": tensor7,
         # keeping these to test the system
@@ -484,8 +484,8 @@ def process_token_features_old(
     for token_bond in token_bonds:
         token_1 = tok_to_idx[token_bond["token_1"]]
         token_2 = tok_to_idx[token_bond["token_2"]]
-        bonds[token_1, token_2] = token_bond["type"] # 1
-        bonds[token_2, token_1] = token_bond["type"] # 1
+        bonds[token_1, token_2] = token_bond["type"] + 1 # 1
+        bonds[token_2, token_1] = token_bond["type"] + 1 # 1
 
     # bonds = bonds.unsqueeze(-1)
 
@@ -703,6 +703,40 @@ def featurize_inference(
         "token": token_features,
         "rigids": rigid_features
     }
+
+
+def featurize_inference_v2(
+    data: Tokenized,
+    task_data,
+    task_name: Optional[str] = 'sample',
+    max_tokens: Optional[int] = None,
+    max_rigids: Optional[int] = None,
+    rigids_per_window_queries: int = 16,
+):
+    token_features = process_token_features(
+        data,
+        # task_data['seq_noising_mask'],
+        # task_data['copy_indexed_token_mask'],
+        # task_data['copy_unindexed_token_mask'],
+        max_tokens
+    )
+    rigid_features = process_rigid_features(
+        data,
+        # task_data['rigids_noising_mask'],
+        # task_data['copy_indexed_token_mask'],
+        # task_data['copy_unindexed_token_mask'],
+        rigids_per_window_queries,
+        max_rigids
+    )
+
+    return {
+        "t": task_data['t'],
+        "task": task_name,
+        "input_data": data,
+        "token": token_features,
+        "rigids": rigid_features
+    }
+
 
 
 def collate(data_list):
