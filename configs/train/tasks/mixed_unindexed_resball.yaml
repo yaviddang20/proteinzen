@@ -12,7 +12,5 @@ task_sampler:
       shift_time_scale: false
       t_min: 0.01
       t_max: 0.99
-      max_frac_res: 0.5
-      max_num_res: 20
       p_is_unindexed: 1.0
       name_override: resball_motif_scaffold_unindexed

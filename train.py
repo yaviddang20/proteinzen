@@ -18,8 +18,6 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 # import wandb
 
 from proteinzen.runtime.config import config_hydra_store, remove_zen_keys
-from proteinzen.harness.fm.multiframe import MultiFrameInterpolation
-from proteinzen.runtime.training.task import TaskSampler
 
 
 # A logger for this file
@@ -93,47 +91,25 @@ class Experiment:
 def main(model,
          corrupter,
          lmodule,
+         dataset,
          datamodule,
          experiment,
-         harness,
-         tasks,
          zen_cfg):
     # change into the output directory
     os.chdir(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)
     log.info(f"Experiment started in folder: {os.getcwd()}")
 
     # assemble task sampler
-    print(tasks)
-    tasks_config = omegaconf.OmegaConf.load(tasks['config'])
-    task_sampler = hydra.utils.instantiate(tasks_config)['task_sampler']
-    shutil.copy(tasks['config'], os.path.join(os.getcwd(), "task_config.yaml"))
+    print(dataset)
+    dataset_config = omegaconf.OmegaConf.load(dataset['config'])
+    train_dataset = hydra.utils.instantiate(dataset_config)
+    shutil.copy(dataset['config'], os.path.join(os.getcwd(), "dataset_config.yaml"))
+    datamodule_inst = datamodule(train_dataset=train_dataset)
 
     # datamodule and optim are all partial'd __init__s
     # so we instantiate instances of each
-    harness = harness(corrupter, task_sampler)
-    model = lmodule(model, experiment['optim'], harness)
+    model = lmodule(model, corrupter, experiment['optim'])
     checkpointer = experiment['checkpointer']
-    os.makedirs(model.val_dir, exist_ok=True)
-
-
-    # TODO: this is so jenk
-    if 'force_override_length_batching' in zen_cfg:
-        force_override_length_batching = bool(zen_cfg['force_override_length_batching'])
-    else:
-        force_override_length_batching = False
-    # TODO: there's gotta be a nicer way of doing this
-    if not force_override_length_batching and hasattr(model.model, "lrange_logn_scale") and model.model.lrange_logn_scale > 0:
-        _model = model.model
-        def batch_by_edge_fn(n):
-            lrange = round(
-                max(_model.lrange_k, _model.lrange_logn_scale * np.log2(n) + _model.lrange_logn_offset)
-            )
-            knn = _model.knn_k
-            edges_per_node = min(lrange+knn, n)
-            return edges_per_node * n
-        datamodule_inst = datamodule(training_harness=harness, batch_by_edge_fn=batch_by_edge_fn)
-    else:
-        datamodule_inst = datamodule(training_harness=harness)
 
     exp = Experiment(
         model=model,

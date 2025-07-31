@@ -28,8 +28,8 @@ import numpy as np
 import tree
 import torch
 
-from proteinzen.data.openfold import residue_constants
-from proteinzen.utils.openfold import rigid_utils
+from proteinzen.openfold.data import residue_constants
+from proteinzen.openfold.utils import rigid_utils
 
 
 # Atoms positions relative to the 4 CG groups as inspired by Equifold

@@ -17,12 +17,8 @@ import pyrosetta
 
 from pyrosetta.rosetta.core.simple_metrics.metrics import RMSDMetric
 
-from proteinzen.data.io.atom91 import pdb_to_structure, struct_to_atom91
-from proteinzen.data.io.protein import from_pdb_string, to_pdb, Protein
-from proteinzen.data.openfold.data_transforms import make_atom14_masks_np, make_atom14_positions_np
-from proteinzen.utils.openfold.feats import atom14_to_atom37
-from proteinzen.utils.openfold.tensor_utils import tree_map, tensor_tree_map
-from io import StringIO
+from proteinzen.openfold.utils.feats import atom14_to_atom37
+from proteinzen.openfold.utils.tensor_utils import tree_map, tensor_tree_map
 
 RMSD_ALL_HEAVY_TYPE = pyrosetta.rosetta.core.scoring.rmsd_atoms.rmsd_all_heavy
 RMSD_PROTEIN_BB_HEAVY_TYPE = pyrosetta.rosetta.core.scoring.rmsd_atoms.rmsd_protein_bb_heavy

@@ -26,8 +26,9 @@ import tree
 from torch_geometric.data import HeteroData
 import numpy as np
 
-from proteinzen.data.openfold import residue_constants, data_transforms
-from proteinzen.utils.openfold import rigid_utils as ru
+from proteinzen.openfold.data import residue_constants
+from proteinzen.openfold.data import data_transforms
+from proteinzen.openfold.utils import rigid_utils as ru
 from .task import SamplingTask
 
 

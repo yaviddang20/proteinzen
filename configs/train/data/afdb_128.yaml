@@ -1,11 +1,20 @@
 _target_: proteinzen.data.datasets.datamodule.TrainingDataset
-max_crop_residues: 160
+max_crop_residues: 128
 max_crop_rigids: 512
+use_cropper: true
+dataset_probs: [0.25, 0.75]
+samples_per_epoch: 2500
+remove_mol_types:
+  - "DNA"
+  - "RNA"
+  - "NONPOLYMER"
 datasets:
   - _target_: proteinzen.data.datasets.dataset.MMCIFDataset
-    data_dir: /wynton/group/kortemme/alexjli/data/boltz_data/rcsb_processed_targets
+    max_num_res: 160
+    count_on_protein_res: true
+    data_dir: /wynton/group/kortemme/alexjli/data/framediff_boltz
     data_sampler:
-      _target_: boltz.data.sample.cluster.ClusterSampler
+      _target_: proteinzen.boltz.data.sample.cluster.ClusterSampler
     task_sampler:
       _target_: proteinzen.runtime.training.task.TaskSampler
       task_list:
@@ -19,6 +28,20 @@ datasets:
           shift_time_scale: false
           t_min: 0.01
           t_max: 0.99
-    exclude_mol_types:
-      - "DNA"
-      - "RNA"
+  - _target_: proteinzen.data.datasets.dataset.MMCIFDataset
+    data_dir: /wynton/group/kortemme/alexjli/data/afdb_128_boltz
+    data_sampler:
+      _target_: proteinzen.boltz.data.sample.random.RandomSampler
+    task_sampler:
+      _target_: proteinzen.runtime.training.task.TaskSampler
+      task_list:
+        - _target_: proteinzen.runtime.training.unconditional.UnconditionalGeneration
+          prob: 1.0
+          t_sched: lognorm
+          lognorm_mu: 0.0
+          lognorm_sig: 1.0
+          beta_p1: 1.9
+          beta_p2: 1.0
+          shift_time_scale: false
+          t_min: 0.01
+          t_max: 0.99

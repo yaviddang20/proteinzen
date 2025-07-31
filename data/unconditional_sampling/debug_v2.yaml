@@ -1,0 +1,11 @@
+tasks:
+- task: unconditional_v2
+  sample_length: 60
+  num_samples: 5
+- task: unconditional_v2
+  sample_length: 80
+  num_samples: 5
+# - task: unconditional
+#   sample_length: 100
+#   num_samples: 5
+#

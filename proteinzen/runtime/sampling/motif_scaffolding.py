@@ -35,12 +35,13 @@ import numpy as np
 from proteinzen.boltz.data.types import Structure, Atom, Residue, Chain
 from proteinzen.boltz.data import const
 
-from proteinzen.data.openfold import residue_constants, data_transforms
+from proteinzen.openfold.data import residue_constants
 from proteinzen.data.constants import coarse_grain as cg
-from proteinzen.utils.openfold import rigid_utils as ru
-from proteinzen.data.datasets.featurize.tokenize import sample_noise_tokenized_structure, Tokenized, convert_atom_name
-from proteinzen.data.datasets.featurize.sampling import generate_protein_structure_template, sample_noise_from_struct_template, ResidueData, AtomData, ChainData
-from proteinzen.data.datasets.featurize.assembler import featurize_inference_v2
+from proteinzen.openfold.data import data_transforms
+from proteinzen.openfold.utils import rigid_utils as ru
+from proteinzen.data.featurize.tokenize import sample_noise_tokenized_structure, Tokenized, convert_atom_name
+from proteinzen.data.featurize.sampling import generate_protein_structure_template, sample_noise_from_struct_template, ResidueData, AtomData, ChainData
+from proteinzen.data.featurize.assembler import featurize_inference_v2
 from .task import SamplingTask
 
 

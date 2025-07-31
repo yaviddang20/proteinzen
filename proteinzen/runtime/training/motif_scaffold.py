@@ -7,7 +7,7 @@ import torch
 from proteinzen.boltz.data import const
 
 from proteinzen.data.constants import coarse_grain as cg
-from proteinzen.data.datasets.featurize.tokenize import convert_atom_name
+from proteinzen.data.featurize.tokenize import convert_atom_name
 
 from .task import TrainingTask
 

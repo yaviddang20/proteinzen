@@ -1,9 +1,17 @@
 # conda env create -n proteinzen
 # conda activate proteinzen
-pip install torch==2.6 torchvision torchaudio "numpy<1.25"
-pip install torch_geometric
-pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.4.0+cu124.html
-pip install lightning torchmetrics pandas
+pip install torch==2.6 torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu126 \
+
+pip install cuequivariance cuequivariance-torch \
+    cuequivariance-ops-torch-cu12 \
+
+pip install \
+    torch_geometric \
+    pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv \
+    lightning torchmetrics pandas \
+    -f https://data.pyg.org/whl/torch-2.6.0+cu126.html
+
 conda install -y -c https://conda.rosettacommons.org \
     pyrosetta
 # conda install -y -c conda-forge cxx-compiler
@@ -12,8 +20,8 @@ pip install \
     mdtraj \
     biopython \
     black \
+    boltz==2.1.1 \
     darglint \
-    deepspeed \
     dill \
     dm-tree \
     e3nn \
@@ -22,13 +30,12 @@ pip install \
     isort \
     mypy \
     ninja \
-    opt-einsum \
-    opt-einsum-fx \
     pylint \
     pytest \
     rdkit \
     seaborn \
-    tmtools \
-    wandb
+    wandb \
+    # deepspeed \
+
 
 pip install -e .
