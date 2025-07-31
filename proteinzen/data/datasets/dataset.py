@@ -11,8 +11,8 @@ import torch.utils.data as data
 import tree
 
 from torch_geometric.data import HeteroData
-from boltz.data import const
-from boltz.data.types import (
+from proteinzen.boltz.data import const
+from proteinzen.boltz.data.types import (
     Structure,
     Connection,
     Record

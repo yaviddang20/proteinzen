@@ -25,21 +25,22 @@ from proteinzen.runtime.optim import get_std_opt
 
 if os.environ.get("REPO_ROOT") is None:
     print("Didn't find REPO_ROOT as an env var, so let's try to load it from the repo")
-    import pathlib
-    # import pprint
-    import shlex
-    import subprocess
-    script_dir = pathlib.Path(__file__).parent.resolve()
-    script_dir = os.path.abspath(os.path.join(script_dir, "../.."))
+    os.environ["REPO_ROOT"] = "/wynton/home/kortemme/alexjli/projects/proteinzen-clone"
+    # import pathlib
+    # # import pprint
+    # import shlex
+    # import subprocess
+    # script_dir = pathlib.Path(__file__).parent.resolve()
+    # script_dir = os.path.abspath(os.path.join(script_dir, "../.."))
 
-    command = shlex.split(f"bash -c 'set -a && source {script_dir}/env_vars.sh && env'")
-    proc = subprocess.Popen(command, stdout = subprocess.PIPE)
-    for line in proc.stdout:
-        (key, _, value) = line.partition(b"=")
-        os.environ[key.decode()] = value.decode().strip()
-    proc.communicate()
+    # command = shlex.split(f"bash -c 'set -a && source {script_dir}/env_vars.sh && env'")
+    # proc = subprocess.Popen(command, stdout = subprocess.PIPE)
+    # for line in proc.stdout:
+    #     (key, _, value) = line.partition(b"=")
+    #     os.environ[key.decode()] = value.decode().strip()
+    # proc.communicate()
 
-    # pprint.pprint(dict(os.environ))
+    # # pprint.pprint(dict(os.environ))
 print("REPO_ROOT:", os.environ.get("REPO_ROOT"))
 
 # targets ZenStore

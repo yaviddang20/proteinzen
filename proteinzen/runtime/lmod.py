@@ -10,7 +10,7 @@ import tree
 import lightning as L
 
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
-from boltz.data import const
+from proteinzen.boltz.data import const
 
 from proteinzen.harness import TrainingHarness
 from proteinzen.data.datasets.featurize.rigid_assembler import rigids_to_atom14
@@ -1263,6 +1263,10 @@ class ProteinModule(L.LightningModule):
         else:
             return optimizer
 
+RES_TO_AA = {}
+for i, aa in enumerate(residue_constants.resnames):
+    RES_TO_AA[const.token_ids[aa]] = i
+AA_TO_RES = {j: i for i, j in RES_TO_AA.items()}
 
 class BiomoleculeModule(L.LightningModule):
     def __init__(self,
@@ -1284,7 +1288,8 @@ class BiomoleculeModule(L.LightningModule):
                  rot_angle_weight=0.5,
                  self_condition_rate=0.5,
                  atom_rigid_upweight=True,
-                 compile_model=False
+                 compile_model=False,
+                 apply_self_folding=False
     ):
         super().__init__()
         self._log = logging.getLogger(__name__)
@@ -1306,6 +1311,7 @@ class BiomoleculeModule(L.LightningModule):
         self.direct_rot_vf_loss = direct_rot_vf_loss
         self.rot_angle_weight = rot_angle_weight
         self.atom_rigid_upweight = atom_rigid_upweight
+        self.apply_self_folding = apply_self_folding
         if learnable_noise_schedule:
             self.automatic_optimization = False
 
@@ -1323,6 +1329,48 @@ class BiomoleculeModule(L.LightningModule):
         else:
             self.ema_long = None
             self.ema_short = None
+
+
+        self.aatype_to_restype_tensor = torch.zeros(const.num_tokens)
+        for aatype, restype in AA_TO_RES.items():
+            self.aatype_to_restype_tensor[aatype] = restype
+
+    def _generate_folding_batch(self, batch, pred_aatype):
+        pred_seq_batch = copy.deepcopy(batch)
+
+        # convert aatype to restype
+        aa_to_res = self.aatype_to_restype_tensor.to(pred_aatype.device)
+        pred_restype = aa_to_res[pred_aatype]
+        restype = batch['token']['res_type'].clone()
+        is_protein = batch['token']['mol_type'] == const.chain_type_ids["PROTEIN"]
+        new_restype = restype * ~is_protein + pred_restype * is_protein
+
+        # replace res_type (and seq which is here for legacy reasons)
+        pred_seq_batch['token']['res_type'] = new_restype.long()
+        pred_seq_batch['token']['seq'] = new_restype.long()
+        # also don't noise sequence internally
+        seq_noising_mask = pred_seq_batch['token']['seq_noising_mask'].clone()
+        seq_noising_mask[is_protein] = False
+        pred_seq_batch['token']['seq_noising_mask'] = seq_noising_mask
+
+        # we'll also mask out any copy residues
+        # since the idea here is to evaluate the denoiser output designability
+        # without influence from conditioning
+        token_mask = pred_seq_batch['token']['token_mask'].clone()
+        token_is_copy_mask = pred_seq_batch['token']['token_is_copy_mask']
+        token_mask[token_is_copy_mask] = False
+        pred_seq_batch['token']['token_mask'] = token_mask
+        # we also need to mask the corresponding rigids
+        rigids_mask = pred_seq_batch['rigids']['rigids_mask'].clone()
+        rigids_to_token = pred_seq_batch['rigids']['rigids_to_token']
+        new_rigids_mask = torch.gather(
+            token_mask,
+            -1,
+            rigids_to_token
+        )
+        pred_seq_batch['rigids']['rigids_mask'] = rigids_mask & new_rigids_mask
+
+        return pred_seq_batch
 
     def training_step(self, batch, batch_idx):
         # update EMA
@@ -1344,9 +1392,19 @@ class BiomoleculeModule(L.LightningModule):
         if model.self_conditioning and np.random.uniform() < self.self_condition_rate:
             with torch.no_grad():
                 self_conditioning = model(batch)
+
+                # run denoising with the predicted seq of the self conditioning denoising step
+                if self.apply_self_folding:
+                    pred_seq_batch = self._generate_folding_batch(batch, self_conditioning['pred_seq'])
+                    # run "folding"
+                    self_folding = model(pred_seq_batch)
+                else:
+                    self_folding = None
+
         else:
             self_conditioning = None
-        outputs = model(batch, self_conditioning)
+            self_folding = None
+        outputs = model(batch, self_conditioning, self_folding)
 
         # compute loss
         loss_dict = self._loss_step(batch, outputs)
@@ -1466,8 +1524,30 @@ class BiomoleculeModule(L.LightningModule):
         # loss_dict[inputs['task'].name + "_frame_vf_loss"] = frame_vf_loss
         # loss_dict[inputs['task'].name + "_frame_vf_loss_unscaled"] = unscaled_frame_vf_loss
 
+        loss_by_task = {}
+        for i, task in enumerate(inputs['task']):
+            if task.name + "_loss" not in loss_by_task:
+                loss_by_task[task.name + "_loss"] = []
+            if task.name + "_seq_loss" not in loss_by_task:
+                loss_by_task[task.name + "_seq_loss"] = []
+            if task.name + "_frame_vf_loss" not in loss_by_task:
+                loss_by_task[task.name + "_frame_vf_loss"] = []
+            if task.name + "_frame_vf_loss_unscaled" not in loss_by_task:
+                loss_by_task[task.name + "_frame_vf_loss_unscaled"] = []
+
+            loss_by_task[task.name + "_loss"].append(loss[i])
+            loss_by_task[task.name + "_seq_loss"].append(atomic_loss_dict["seq_loss"][i])
+            loss_by_task[task.name + "_frame_vf_loss"].append(frame_vf_loss[i])
+            loss_by_task[task.name + "_frame_vf_loss_unscaled"].append(unscaled_frame_vf_loss[i])
+
+        loss_by_task = {
+            key: torch.stack(values).mean()
+            for key, values in loss_by_task.items()
+        }
+
         loss_dict.update(frame_fm_loss_dict)
         loss_dict.update(atomic_loss_dict)
+        loss_dict.update(loss_by_task)
 
         return loss_dict
 
@@ -1578,7 +1658,13 @@ class BiomoleculeModule(L.LightningModule):
             t = torch.ones(num_batch, device=device)[..., None] * t_hat
             batch["t"] = t
 
-            denoiser_out = model(batch, self_condition=denoiser_out)
+            if self.apply_self_folding and denoiser_out is not None:
+                pred_seq_batch = self._generate_folding_batch(batch, denoiser_out['pred_seq'])
+                folding_out = model(pred_seq_batch, self_folding=denoiser_out)
+            else:
+                folding_out = None
+
+            denoiser_out = model(batch, self_condition=denoiser_out, self_folding=folding_out)
 
             # Process model output.
             pred_rigids = denoiser_out['denoised_rigids']

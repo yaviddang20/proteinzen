@@ -7,8 +7,8 @@ from rdkit.Chem.rdchem import Conformer, Mol
 
 import numpy as np
 
-from boltz.data import const
-from boltz.data.types import (
+from proteinzen.boltz.data import const
+from proteinzen.boltz.data.types import (
     Residue, Atom, Chain, Structure, Bond
 )
 

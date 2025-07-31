@@ -12,13 +12,13 @@ from torch_geometric.data import Batch, HeteroData
 import lightning as L
 import pandas as pd
 
-from boltz.data.types import (
+from proteinzen.boltz.data.types import (
     Structure,
     Connection,
     Record
 )
-from boltz.data import const
-from boltz.data.sample.sampler import Sample
+from proteinzen.boltz.data import const
+from proteinzen.boltz.data.sample.sampler import Sample
 
 from proteinzen.data.datasets.featurize.cropper import Cropper
 from proteinzen.data.datasets.featurize.tokenize import tokenize_structure, Tokenized

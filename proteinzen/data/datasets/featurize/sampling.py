@@ -9,8 +9,8 @@ import torch
 import networkx as nx
 from scipy.spatial.transform import Rotation
 
-from boltz.data import const
-from boltz.data.types import (
+from proteinzen.boltz.data import const
+from proteinzen.boltz.data.types import (
     Residue, Atom, Chain, Structure
 )
 

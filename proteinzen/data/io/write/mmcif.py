@@ -13,8 +13,8 @@ from modelcif.model import AbInitioModel, Atom, ModelGroup
 from rdkit import Chem
 from torch import Tensor
 
-from boltz.data import const
-from boltz.data.types import Structure
+from proteinzen.boltz.data import const
+from proteinzen.boltz.data.types import Structure
 
 
 def to_mmcif(structure: Structure, plddts: Optional[Tensor] = None) -> str:  # noqa: C901, PLR0915, PLR0912

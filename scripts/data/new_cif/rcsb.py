@@ -20,16 +20,16 @@ from p_tqdm import p_umap
 from redis import Redis
 from tqdm import tqdm
 
-from boltz.data.filter.static.filter import StaticFilter
-from boltz.data.filter.static.ligand import ExcludedLigands
-from boltz.data.filter.static.polymer import (
+from proteinzen.boltz.data.filter.static.filter import StaticFilter
+from proteinzen.boltz.data.filter.static.ligand import ExcludedLigands
+from proteinzen.boltz.data.filter.static.polymer import (
     ClashingChainsFilter,
     ConsecutiveCA,
     MinimumLengthFilter,
     UnknownFilter,
 )
-from boltz.data.types import ChainInfo, InterfaceInfo, Record, Target
-from boltz.data import const
+from proteinzen.boltz.data.types import ChainInfo, InterfaceInfo, Record, Target
+from proteinzen.boltz.data import const
 
 
 @dataclass(frozen=True, slots=True)

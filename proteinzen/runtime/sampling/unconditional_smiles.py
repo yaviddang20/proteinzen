@@ -12,7 +12,7 @@ import tree
 from torch_geometric.data import HeteroData
 import numpy as np
 
-from boltz.data.types import Structure
+from proteinzen.boltz.data.types import Structure
 
 from proteinzen.data.openfold import residue_constants, data_transforms
 from proteinzen.utils.openfold import rigid_utils as ru

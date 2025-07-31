@@ -14,8 +14,8 @@ from rdkit.Chem import AllChem
 from rdkit.Chem.rdchem import Conformer, Mol
 from sklearn.neighbors import KDTree
 
-from boltz.data import const
-from boltz.data.types import (
+from proteinzen.boltz.data import const
+from proteinzen.boltz.data.types import (
     Atom,
     Bond,
     Chain,

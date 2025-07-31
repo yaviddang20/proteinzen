@@ -8,7 +8,7 @@ import functools as fn
 
 import torch_geometric.utils as pygu
 
-from boltz.data import const
+from proteinzen.boltz.data import const
 
 from proteinzen.model.modules.layers.node.attention import ConditionedTransformerPairBias
 from proteinzen.model.modules.openfold.layers import InvariantPointAttention, Dropout, TriangleMultiplicationOutgoing, TriangleMultiplicationIncoming, permute_final_dims
@@ -164,6 +164,7 @@ class Embedder(nn.Module):
                  index_embed_size=256,
                  max_rigids_idx=3+14,
                  use_sc_rigid_transformer=False,
+                 use_self_folding=False,
                  rigid_transformer_add_vanilla_transformer=False,
                  rigid_transformer_add_second_transformer=False,
                  rigid_transformer_add_full_transformer=False,
@@ -232,6 +233,7 @@ class Embedder(nn.Module):
             ablate_ipa_down_z=ablate_ipa_down_z,
             use_qk_norm=use_qk_norm,
         )
+
         self.use_sc_rigid_transformer = use_sc_rigid_transformer
         if use_sc_rigid_transformer:
             self.sc_framepair_init = FramepairEmbedder(
@@ -261,11 +263,41 @@ class Embedder(nn.Module):
             self.frame_adaln = AdaLN(c_frame, c_frame)
             self.framepair_adaln = AdaLN(c_framepair, c_framepair)
 
+        self.use_self_folding = use_self_folding
+        if use_self_folding:
+            self.sf_framepair_init = FramepairEmbedder(
+                c_framepair
+            )
+            self.sf_frame_tfmr = SequenceFrameTransformerUpdate(
+                c_s,
+                c_z,
+                c_frame,
+                c_framepair,
+                num_heads=num_heads,
+                n_blocks=n_tfmr_blocks,
+                block_q=block_q,
+                block_k=block_k,
+                do_rigid_updates=False,
+                broadcast_singles=True,
+                broadcast_pairs=True,
+                framepair_init=True,
+                framepair_ffn=True,
+                add_vanilla_transformer=rigid_transformer_add_vanilla_transformer,
+                add_second_transformer=rigid_transformer_add_second_transformer,
+                use_ipa_gating=use_ipa_gating,
+                ablate_ipa_down_z=ablate_ipa_down_z,
+                use_qk_norm=use_qk_norm,
+            )
+            self.sf_node_adaln = AdaLN(c_s, c_s)
+            self.sf_frame_adaln = AdaLN(c_frame, c_frame)
+            self.sf_framepair_adaln = AdaLN(c_framepair, c_framepair)
+
         self.pair_embedder = MultiRigidPairEmbedder(
             c_z,
             c_hidden,
             no_blocks=n_pair_embed_blocks,
-            use_qk_norm=use_qk_norm
+            use_qk_norm=use_qk_norm,
+            use_self_folding=use_self_folding
         )
 
     def _gen_node_features(
@@ -278,7 +310,8 @@ class Embedder(nn.Module):
         token_gather_idx,
         is_unindexed_mask,
         # is_atomized_mask,
-        sc_rigids=None
+        sc_rigids=None,
+        sf_rigids=None
     ):
         rigids_to_nodes = fn.partial(gather_helper, token_gather_idx=token_gather_idx)
         # print(token_gather_idx, rigids.shape)
@@ -289,6 +322,11 @@ class Embedder(nn.Module):
             node_sc_rigids = ru.Rigid.from_tensor_7(rigids_to_nodes(sc_rigids.to_tensor_7()))
         else:
             node_sc_rigids = None
+        if sf_rigids is not None:
+            # node_sc_rigids = rigids_to_nodes(sc_rigids)
+            node_sf_rigids = ru.Rigid.from_tensor_7(rigids_to_nodes(sf_rigids.to_tensor_7()))
+        else:
+            node_sf_rigids = None
 
         node_seq_idx_embed = self.index_embedder(seq_idx)
         node_init = self.node_init(node_seq_idx_embed) * (~is_unindexed_mask[..., None])
@@ -309,6 +347,7 @@ class Embedder(nn.Module):
             "node_init": node_init,
             "node_rigids": ru.Rigid.from_tensor_7(node_rigids),
             "node_sc_rigids": node_sc_rigids,
+            "node_sf_rigids": node_sf_rigids,
         }
 
     def _gen_rigid_features(
@@ -354,7 +393,7 @@ class Embedder(nn.Module):
     ):
         padded_data = {}
         for key, value in rigids_data.items():
-            if key in ("rigids_t", "sc_rigids"):
+            if key in ("rigids_t", "sc_rigids", "sf_rigids"):
                 rigids = value
                 if rigids is not None:
                     n_batch = rigids.shape[0]
@@ -406,6 +445,7 @@ class Embedder(nn.Module):
             # rigids_is_unindexed_mask,
             token_bonds,
             sc_rigids=None,
+            sf_rigids=None
         ):
 
         # build the indexing matrices
@@ -438,7 +478,8 @@ class Embedder(nn.Module):
             token_gather_idx,
             token_is_unindexed_mask,
             # token_is_atomized_mask,
-            sc_rigids
+            sc_rigids=sc_rigids,
+            sf_rigids=sf_rigids
         )
         node_init = node_data['node_init']
 
@@ -450,6 +491,7 @@ class Embedder(nn.Module):
             token_is_unindexed_mask,
             token_bonds,
             sc_rigids=node_data['node_sc_rigids'],
+            sf_rigids=node_data['node_sf_rigids'],
         )
 
         rigids_init = self._gen_rigid_features(
@@ -466,6 +508,7 @@ class Embedder(nn.Module):
         rigids_inputs = {
             "rigids_t": ru.Rigid.from_tensor_7(rigids),
             "sc_rigids": sc_rigids if sc_rigids is not None else None,
+            "sf_rigids": sf_rigids if sf_rigids is not None else None,
             "rigids_init": rigids_init,
             "rigids_mask": rigids_mask,
             "rigids_token_uid": rigids_token_uid,
@@ -538,6 +581,38 @@ class Embedder(nn.Module):
             node_embed = self.node_adaln(node_embed, sc_node_embed)
             rigids_embed = self.frame_adaln(rigids_embed, sc_rigids_embed_flat)
             framepair_embed = self.framepair_adaln(framepair_embed, sc_framepair_embed)
+
+        if self.use_self_folding:
+            sf_rigids = rigids_data['sf_rigids']
+            if sf_rigids is not None:
+                sf_framepair_init = self.sf_framepair_init(
+                    sf_rigids,
+                    rigids_token_uid,
+                    rigids_mask,
+                    to_queries,
+                    to_keys
+                )
+                sf_rigids_embed_flat, sf_node_embed, sf_framepair_embed, _ = self.sf_frame_tfmr(
+                    node_init,
+                    edge_embed,
+                    sf_framepair_init,
+                    sf_rigids,
+                    rigids_init,
+                    rigids_token_uid,
+                    rigids_mask,
+                    None,
+                    to_queries,
+                    to_keys,
+                    to_pairs,
+                )
+            else:
+                sf_rigids_embed_flat = torch.zeros_like(rigids_init)
+                sf_node_embed = torch.zeros_like(node_init)
+                sf_framepair_embed = torch.zeros_like(framepair_embed)
+
+            node_embed = node_embed + self.sf_node_adaln(node_embed, sf_node_embed)
+            rigids_embed = rigids_embed + self.sf_frame_adaln(rigids_embed, sf_rigids_embed_flat)
+            framepair_embed = framepair_embed + self.sf_framepair_adaln(framepair_embed, sf_framepair_embed)
 
         ret = {
             "node_init": node_init,
@@ -1729,7 +1804,9 @@ class IpaMultiRigidDenoiser(nn.Module):
                  learnable_noise_schedule=False,
                  use_pairformer=False,
                  rot_vf_scaling=1,
-                 self_conditioning=True
+                 self_conditioning=True,
+                 self_folding=False,
+                 use_residue_indexing=False
                  ):
         super().__init__()
 
@@ -1741,6 +1818,8 @@ class IpaMultiRigidDenoiser(nn.Module):
         self.lrange_logn_offset = 10000
 
         self.use_amp = use_amp
+        self.self_folding = self_folding
+        self.use_residue_indexing = use_residue_indexing
 
         self.ipa_score = IpaScoreV2(
             c_s=c_s,
@@ -1795,6 +1874,7 @@ class IpaMultiRigidDenoiser(nn.Module):
             use_ipa_gating=use_ipa_gating,
             ablate_ipa_down_z=ablate_ipa_down_z,
             use_qk_norm=use_qk_norm,
+            use_self_folding=self_folding
         )
 
         if use_pairformer:
@@ -1819,7 +1899,7 @@ class IpaMultiRigidDenoiser(nn.Module):
             self.trans_gamma_t = MonotonicIncreasingFn()
             # self.rot_gamma_t = lambda x: x # MonotonicIncreasingFn()
 
-    def forward(self, data, self_condition=None):
+    def forward(self, data, self_condition=None, self_folding=None):
         token_data = data['token']
         rigids_data = data['rigids']
         # print(rigids_data['rigids_t'].shape, token_data['token_seq_idx'].shape)
@@ -1831,10 +1911,15 @@ class IpaMultiRigidDenoiser(nn.Module):
         else:
             sc_rigids = None
 
+        if self.self_folding and self_folding is not None:
+            sf_rigids = self_folding['denoised_rigids']
+        else:
+            sf_rigids = None
+
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_amp):
             input_feats = self.embedder(
                 token_mask=token_data['token_mask'],
-                token_seq_idx=token_data['token_seq_idx'],
+                token_seq_idx=token_data['token_seq_idx'] if not self.use_residue_indexing else token_data['residue_idx'],
                 token_seq=token_data['res_type'],
                 token_seq_mask=token_data['token_mask'],
                 token_seq_noising_mask=token_data['seq_noising_mask'],
@@ -1855,6 +1940,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                 rigids_noising_mask=rigids_data['rigids_noising_mask'],
                 token_bonds=token_data['token_bonds'],
                 sc_rigids=sc_rigids,
+                sf_rigids=sf_rigids
             )
 
             # for k, v in input_feats.items():

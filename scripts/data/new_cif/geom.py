@@ -21,7 +21,7 @@ from redis import Redis
 from tqdm import tqdm
 import hashlib
 
-from boltz.data.types import ChainInfo, StructureInfo, InterfaceInfo, Record, Target
+from proteinzen.boltz.data.types import ChainInfo, StructureInfo, InterfaceInfo, Record, Target
 
 from proteinzen.data.datasets.featurize.mol.sampling import mol_to_struct
 
@@ -195,7 +195,7 @@ def process(args) -> None:
     structure_dir.mkdir(parents=True, exist_ok=True)
 
     datadir = Path(args.datadir)
-    with open(datadir / "summary_qm9.json") as fp:
+    with open(datadir / f"summary_{args.dataset}.json") as fp:
         metadata = json.load(fp)
         metadata = [t for t in metadata.items() if len(t[0]) > 1]
 
@@ -240,6 +240,11 @@ if __name__ == "__main__":
         help="The data containing the MMCIF files.",
     )
     parser.add_argument(
+        "--dataset",
+        type=str,
+        required=True,
+    )
+    parser.add_argument(
         "--outdir",
         type=Path,
         default="data",
@@ -252,4 +257,5 @@ if __name__ == "__main__":
         help="The number of processes.",
     )
     args = parser.parse_args()
+    assert args.dataset in ['qm9', 'drugs']
     process(args)

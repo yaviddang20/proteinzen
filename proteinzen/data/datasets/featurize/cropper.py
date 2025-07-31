@@ -8,9 +8,9 @@ from typing import Optional
 import numpy as np
 from scipy.spatial.distance import cdist
 
-from boltz.data import const
+from proteinzen.boltz.data import const
 from proteinzen.data.datasets.featurize.tokenize import Tokenized
-# from boltz.data.types import Tokenized
+# from proteinzen.boltz.data.types import Tokenized
 
 
 def pick_random_token(

@@ -32,8 +32,8 @@ import tree
 from torch_geometric.data import HeteroData
 import numpy as np
 
-from boltz.data.types import Structure, Atom, Residue, Chain
-from boltz.data import const
+from proteinzen.boltz.data.types import Structure, Atom, Residue, Chain
+from proteinzen.boltz.data import const
 
 from proteinzen.data.openfold import residue_constants, data_transforms
 from proteinzen.data.constants import coarse_grain as cg

@@ -22,7 +22,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 
 import wandb
 
-from boltz.data.types import Structure
+from proteinzen.boltz.data.types import Structure
 
 from proteinzen.data.datasets.featurize.sampling import construct_atoms, infer_structure
 from proteinzen.runtime.config_boltz import config_sampling_hydra_store

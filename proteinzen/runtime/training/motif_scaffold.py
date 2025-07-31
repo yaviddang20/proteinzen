@@ -4,7 +4,7 @@ import math
 import numpy as np
 import torch
 
-from boltz.data import const
+from proteinzen.boltz.data import const
 
 from proteinzen.data.constants import coarse_grain as cg
 from proteinzen.data.datasets.featurize.tokenize import convert_atom_name

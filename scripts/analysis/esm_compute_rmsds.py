@@ -103,17 +103,29 @@ def compute_rmsds(
 ):
     design_pose = pyrosetta.pose_from_pdb(design_path)
 
-    fixed_res_selector = pyrosetta.rosetta.core.select.residue_selector.ResidueIndexSelector()
     all_res_selector = pyrosetta.rosetta.core.select.residue_selector.TrueResidueSelector()
     pdb_resids = [f"{resid}{chain}" for resid, chain in zip(fixed_seq, fixed_seq_chain)]
     res_str = ",".join(pdb_resids)
     bb_resids = [f"{resid}{chain}" for resid, chain in zip(fixed_bb, fixed_bb_chain)]
     bb_str = ",".join(bb_resids)
 
+    # esmfold automatically sets the chain to A
+    # so we need a different residue selector
+    esmfold_pdb_resids = [f"{resid}A" for resid, chain in zip(fixed_seq, fixed_seq_chain)]
+    esmfold_res_str = ",".join(esmfold_pdb_resids)
+    esmfold_bb_resids = [f"{resid}A" for resid, chain in zip(fixed_bb, fixed_bb_chain)]
+    esmfold_bb_str = ",".join(esmfold_bb_resids)
+
+    fixed_res_selector = pyrosetta.rosetta.core.select.residue_selector.ResidueIndexSelector()
     if len(res_str) == 0 and len(bb_str) > 0:
         fixed_res_selector.set_index(bb_str)
     else:
         fixed_res_selector.set_index(res_str)
+    esmfold_fixed_res_selector = pyrosetta.rosetta.core.select.residue_selector.ResidueIndexSelector()
+    if len(esmfold_res_str) == 0 and len(esmfold_bb_str) > 0:
+        esmfold_fixed_res_selector.set_index(esmfold_bb_str)
+    else:
+        esmfold_fixed_res_selector.set_index(esmfold_res_str)
 
     fixed_bb_selector = pyrosetta.rosetta.core.select.residue_selector.ResidueIndexSelector()
     if len(bb_str) > 0:
@@ -121,6 +133,11 @@ def compute_rmsds(
     else:
         fixed_bb_selector = None
     print(res_str, bb_str)
+    esmfold_fixed_bb_selector = pyrosetta.rosetta.core.select.residue_selector.ResidueIndexSelector()
+    if len(esmfold_bb_str) > 0:
+        esmfold_fixed_bb_selector.set_index(esmfold_bb_str)
+    else:
+        esmfold_fixed_bb_selector = None
 
     rmsd_metric = RMSDMetric()
     rmsd_metric.set_comparison_pose(design_pose)
@@ -140,23 +157,25 @@ def compute_rmsds(
 
     try:
         rmsd_metric.set_rmsd_type(RMSD_ALL_HEAVY_TYPE)
-        rmsd_metric.set_residue_selector(fixed_res_selector)
-        rmsd_metric.set_residue_selector_super(fixed_res_selector)
+        rmsd_metric.set_residue_selector(esmfold_fixed_res_selector)
+        rmsd_metric.set_residue_selector_reference(fixed_res_selector)
         design_data['motif_all_atom_rmsd'] = rmsd_metric.calculate(folded_pose)
         rmsd_metric.set_residue_selector(all_res_selector)
-        rmsd_metric.set_residue_selector_super(all_res_selector)
+        rmsd_metric.set_residue_selector_reference(all_res_selector)
         design_data['global_all_atom_rmsd'] = rmsd_metric.calculate(folded_pose)
 
         rmsd_metric.set_rmsd_type(RMSD_PROTEIN_BB_HEAVY_TYPE)
         if fixed_bb_selector is not None:
-            rmsd_metric.set_residue_selector(fixed_bb_selector)
-            rmsd_metric.set_residue_selector_super(fixed_bb_selector)
+            rmsd_metric.set_residue_selector(esmfold_fixed_bb_selector)
+            rmsd_metric.set_residue_selector_reference(fixed_bb_selector)
         design_data['motif_bb_rmsd'] = rmsd_metric.calculate(folded_pose)
         rmsd_metric.set_residue_selector(all_res_selector)
-        rmsd_metric.set_residue_selector_super(all_res_selector)
+        rmsd_metric.set_residue_selector_reference(all_res_selector)
         design_data['global_bb_rmsd'] = rmsd_metric.calculate(folded_pose)
     except Exception as e:
         print(f"got error {e}, for path {folded_path}, assigning rmsds to 10")
+        print(res_str, bb_str, esmfold_res_str, esmfold_bb_str)
+        raise e
         design_data['motif_all_atom_rmsd'] = 10.
         design_data['global_all_atom_rmsd'] = 10.
         design_data['motif_bb_rmsd'] = 10.
@@ -173,19 +192,20 @@ def compute_rmsds(
                 pmpnn_pose = pyrosetta.Pose()
                 pyrosetta.rosetta.core.import_pose.pose_from_pdbstring(pmpnn_pose, fp.read())
             rmsd_metric.set_rmsd_type(RMSD_ALL_HEAVY_TYPE)
-            rmsd_metric.set_residue_selector(fixed_res_selector)
-            rmsd_metric.set_residue_selector_super(fixed_res_selector)
+            rmsd_metric.set_residue_selector(esmfold_fixed_res_selector)
+            rmsd_metric.set_residue_selector_reference(fixed_res_selector)
             _data['motif_all_atom_rmsd'] = rmsd_metric.calculate(pmpnn_pose)
             rmsd_metric.set_rmsd_type(RMSD_PROTEIN_BB_HEAVY_TYPE)
             if fixed_bb_selector is not None:
-                rmsd_metric.set_residue_selector(fixed_bb_selector)
-                rmsd_metric.set_residue_selector_super(fixed_bb_selector)
+                rmsd_metric.set_residue_selector(esmfold_fixed_bb_selector)
+                rmsd_metric.set_residue_selector_reference(fixed_bb_selector)
             _data['motif_bb_rmsd'] = rmsd_metric.calculate(pmpnn_pose)
             rmsd_metric.set_residue_selector(all_res_selector)
-            rmsd_metric.set_residue_selector_super(all_res_selector)
+            rmsd_metric.set_residue_selector_reference(all_res_selector)
             _data['global_bb_rmsd'] = rmsd_metric.calculate(pmpnn_pose)
         except Exception as e:
             print(f"got error {e}, for path {path}, assigning rmsds to 10")
+            raise e
             _data = {
                 'motif_all_atom_rmsd': 10.,
                 'motif_bb_rmsd': 10.,

@@ -8,8 +8,8 @@ from torch import Tensor, from_numpy
 import torch.nn.functional as F
 from torch.utils.data import default_collate
 
-from boltz.data import const
-from boltz.data.pad import pad_dim
+from proteinzen.boltz.data import const
+from proteinzen.boltz.data.pad import pad_dim
 
 from proteinzen.data.datasets.featurize.tokenize import Tokenized
 
@@ -90,6 +90,8 @@ def process_token_features(
     seq_index_ref = {}
     curr_seq_idx = 0
     seq_index = []
+    res_index = []
+    max_res_idx = token_data['res_idx'].max()
 
     token_to_rep_rigid = []
     rigid_idx = 0
@@ -98,19 +100,28 @@ def process_token_features(
         if token['is_unindexed']:
             seq_index.append(curr_seq_idx)
             curr_seq_idx += 1
+            res_index.append(
+                max(*res_index, max_res_idx) + 1
+            )
         elif res_idx not in seq_index_ref:
             seq_index_ref[res_idx] = curr_seq_idx
             seq_index.append(curr_seq_idx)
             curr_seq_idx += 1
+            res_index.append(res_idx)
         else:
             seq_index.append(seq_index_ref[res_idx])
+            res_index.append(res_idx)
 
         token_to_rep_rigid.append(rigid_idx)
         rigid_idx += token['rigid_num']
 
+
     # Token core features
     token_index = torch.arange(len(token_data), dtype=torch.long)
-    residue_index = from_numpy(token_data["res_idx"].copy()).long()
+    residue_index = torch.as_tensor(res_index).long()
+    # to avoid exceeding our sinusoidal embedding capacity with really large residue indices
+    residue_index = residue_index - residue_index.min()
+
     asym_id = from_numpy(token_data["asym_id"].copy()).long()
     entity_id = from_numpy(token_data["entity_id"].copy()).long()
     sym_id = from_numpy(token_data["sym_id"].copy()).long()

@@ -8,8 +8,8 @@ from typing import Optional
 from rdkit import Chem
 from torch import Tensor
 
-from boltz.data import const
-from boltz.data.types import Structure
+from proteinzen.boltz.data import const
+from proteinzen.boltz.data.types import Structure
 
 
 def to_pdb(

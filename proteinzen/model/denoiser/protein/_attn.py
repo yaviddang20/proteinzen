@@ -8,7 +8,7 @@ from typing import Optional, Callable, List, Sequence, Union
 import torch.nn.functional as F
 import importlib
 
-from boltz.data import const
+from proteinzen.boltz.data import const
 
 from proteinzen.data.datasets.featurize.common import _rbf
 from proteinzen.model.modules.openfold.layers import (
@@ -1019,7 +1019,8 @@ class MultiRigidPairEmbedder(nn.Module):
                  dropout=0.25,
                  inf=1e9,
                  num_bond_types=len(const.bond_types) + 1,
-                 use_qk_norm=False
+                 use_qk_norm=False,
+                 use_self_folding=False
     ):
         super().__init__()
 
@@ -1042,7 +1043,12 @@ class MultiRigidPairEmbedder(nn.Module):
         self.lin_z_ij = Linear(2*relpos_clip+1, c_hidden)
         self.lin_token_bonds = nn.Embedding(num_bond_types, c_hidden)
 
-        self.lin_a_ij = Linear(2 * self.c_a, c_hidden, bias=False)
+        self.use_self_folding = use_self_folding
+        if use_self_folding:
+            self.lin_a_ij = Linear(3 * self.c_a, c_hidden, bias=False)
+        else:
+            self.lin_a_ij = Linear(2 * self.c_a, c_hidden, bias=False)
+
 
         c_head = c_hidden // no_heads
 
@@ -1094,7 +1100,8 @@ class MultiRigidPairEmbedder(nn.Module):
                 chain_idx,
                 token_is_unindexed_mask,
                 token_bonds,
-                sc_rigids=None
+                sc_rigids=None,
+                sf_rigids=None,
     ):
         edge_mask = node_mask[..., None] & node_mask[..., None, :]
         same_chain_mask = (chain_idx[..., None] == chain_idx[..., None, :])
@@ -1112,7 +1119,16 @@ class MultiRigidPairEmbedder(nn.Module):
         else:
             a_sc = torch.zeros_like(a_current)
 
-        z = z + self.lin_a_ij(torch.cat([a_current, a_sc], dim=-1))
+        if sf_rigids is not None:
+            a_sf = self._featurize_rigids(sf_rigids, distogram=True)
+        else:
+            a_sf = torch.zeros_like(a_current)
+
+        if self.use_self_folding:
+            z = z + self.lin_a_ij(torch.cat([a_current, a_sc, a_sf], dim=-1))
+        else:
+            z = z + self.lin_a_ij(torch.cat([a_current, a_sc], dim=-1))
+
         z += self.lin_token_bonds(token_bonds) # * (token_bonds == 0)[..., None]
         z = z * edge_mask[..., None]
 
