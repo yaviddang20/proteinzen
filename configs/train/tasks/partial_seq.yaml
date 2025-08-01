@@ -1,0 +1,23 @@
+task_sampler:
+  _target_: proteinzen.runtime.training.task.TaskSampler
+  task_list:
+    - _target_: proteinzen.runtime.training.unconditional_v2.UnconditionalGenerationV2
+      prob: 0.5
+      t_sched: lognorm
+      lognorm_mu: 0.0
+      lognorm_sig: 1.0
+      beta_p1: 1.9
+      beta_p2: 1.0
+      shift_time_scale: false
+      t_min: 0.01
+      t_max: 0.99
+    - _target_: proteinzen.runtime.training.partial_seq_v2.PartialSequenceConditionedV2
+      prob: 0.5
+      t_sched: lognorm
+      lognorm_mu: 0.0
+      lognorm_sig: 1.0
+      beta_p1: 1.9
+      beta_p2: 1.0
+      shift_time_scale: false
+      t_min: 0.01
+      t_max: 0.99

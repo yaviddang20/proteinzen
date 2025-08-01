@@ -124,3 +124,6 @@ prelim_experiments/
 analysis/esmfold/pdbs
 analysis/esmfold_designability/esmfold
 lightning_logs/
+scripts/submit_scripts/train/tmp*
+scripts/submit_scripts/test/*
+scripts/submit_scripts/debug/*

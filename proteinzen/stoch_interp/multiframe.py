@@ -6,17 +6,114 @@ import copy
 from functools import partial
 from scipy.optimize import linear_sum_assignment, differential_evolution, Bounds, NonlinearConstraint
 
-from proteinzen.utils.framediff import all_atom
-from proteinzen.utils.openfold import rigid_utils as ru
-from proteinzen.model.utils.graph import batchwise_to_nodewise
+from proteinzen.openfold.utils import rigid_utils as ru
 
 from torch_geometric.data import HeteroData, Batch
 from torch_geometric.utils import scatter
+from torch_scatter import scatter_add
 import dataclasses
 import numpy as np
 
 from . import so3_utils
-from . import utils as du
+# from . import utils as du
+
+def center_zero(pos: torch.Tensor, batch_indexes: torch.LongTensor) -> torch.Tensor:
+    """
+    Move the molecule center to zero for sparse position tensors.
+
+    Args:
+        pos: [N, 3] batch positions of atoms in the molecule in sparse batch format.
+        batch_indexes: [N] batch index for each atom in sparse batch format.
+
+    Returns:
+        pos: [N, 3] zero-centered batch positions of atoms in the molecule in sparse batch format.
+    """
+    assert len(pos.shape) == 2 and pos.shape[-1] == 3, "pos must have shape [N, 3]"
+
+    means = scatter(pos, batch_indexes, dim=0, reduce="mean")
+    return pos - means[batch_indexes]
+
+@torch.no_grad()
+def align_structures(
+    batch_positions: torch.Tensor,
+    batch_indices: torch.Tensor,
+    reference_positions: torch.Tensor,
+    broadcast_reference: bool = False,
+):
+    """
+    Align structures in a ChemGraph batch to a reference, e.g. for RMSD computation. This uses the
+    sparse formulation of pytorch geometric. If the ChemGraph is composed of a single system, then
+    the reference can be given as a single structure and broadcasted. Returns the structure
+    coordinates shifted to the geometric center and the batch structures rotated to match the
+    reference structures. Uses the Kabsch algorithm (see e.g. [kabsch_align1]_). No permutation of
+    atoms is carried out.
+
+    Args:
+        batch_positions (Tensor): Batch of structures (e.g. from ChemGraph) which should be aligned
+          to a reference.
+        batch_indices (Tensor): Index tensor mapping each node / atom in batch to the respective
+          system (e.g. batch attribute of ChemGraph batch).
+        reference_positions (Tensor): Reference structure. Can either be a batch of structures or a
+          single structure. In the second case, broadcasting is possible if the input batch is
+          composed exclusively of this structure.
+        broadcast_reference (bool, optional): If reference batch contains only a single structure,
+          broadcast this structure to match the ChemGraph batch. Defaults to False.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Tensors containing the centered positions of batch
+          structures rotated into the reference and the centered reference batch.
+
+    References
+    ----------
+    .. [kabsch_align1] Lawrence, Bernal, Witzgall:
+       A purely algebraic justification of the Kabsch-Umeyama algorithm.
+       Journal of research of the National Institute of Standards and Technology, 124, 1. 2019.
+    """
+    # Minimize || Q @ R.T - P ||, which is the same as || Q - P @ R ||
+    # batch_positions     -> P [BN x 3]
+    # reference_positions -> Q [B / BN x 3]
+
+    if batch_positions.shape[0] != reference_positions.shape[0]:
+        if broadcast_reference:
+            # Get number of systems in batch and broadcast reference structure.
+            # This assumes, all systems in the current batch correspond to the reference system.
+            # Typically always the case during evaluation.
+            num_molecules = int(torch.max(batch_indices) + 1)
+            reference_positions = reference_positions.repeat(num_molecules, 1)
+        else:
+            raise ValueError("Mismatch in batch dimensions.")
+
+    # Center structures at origin (takes care of translation alignment)
+    batch_positions = center_zero(batch_positions, batch_indices)
+    reference_positions = center_zero(reference_positions, batch_indices)
+
+    # Compute covariance matrix for optimal rotation (Q.T @ P) -> [B x 3 x 3].
+    cov = scatter_add(
+        batch_positions[:, None, :] * reference_positions[:, :, None], batch_indices, dim=0
+    )
+
+    # Perform singular value decomposition. (all [B x 3 x 3])
+    u, _, v_t = torch.linalg.svd(cov)
+    # Convenience transposes.
+    u_t = u.transpose(1, 2)
+    v = v_t.transpose(1, 2)
+
+    # Compute rotation matrix correction for ensuring right-handed coordinate system
+    # For comparison with other sources: det(AB) = det(A)*det(B) and det(A) = det(A.T)
+    sign_correction = torch.sign(torch.linalg.det(torch.bmm(v, u_t)))
+    # Correct transpose of U: diag(1, 1, sign_correction) @ U.T
+    u_t[:, 2, :] = u_t[:, 2, :] * sign_correction[:, None]
+
+    # Compute optimal rotation matrix (R = V @ diag(1, 1, sign_correction) @ U.T).
+    rotation_matrices = torch.bmm(v, u_t)
+
+    # Rotate batch positions P to optimal alignment with Q (P @ R)
+    batch_positions_rotated = torch.bmm(
+        batch_positions[:, None, :],
+        rotation_matrices[batch_indices],
+    ).squeeze(1)
+
+    return batch_positions_rotated, reference_positions, rotation_matrices
 
 # from eigenfold
 class HarmonicPrior:
@@ -84,10 +181,12 @@ class MultiSE3Interpolant:
                  beta_p2=1.0,
                  shift_time_scale=False,
                  use_diffusion_forcing=False,
-                 use_stochastic_centering=False,
-                 center_on_motif=False,
-                 sig_perturb=2.0,
+                 use_stochastic_centering=True,
+                 center_on_motif=True,
+                 sig_perturb=4.0,
                  use_uniform_rot_noise=False,
+                 use_unwrapped_rot_noise=False,
+                 unwrapped_rot_noise_sig=1.5,
                  trans_gamma=0.16,
                  trans_step_size=1.5,
                  rot_gamma=0.16,
@@ -98,7 +197,9 @@ class MultiSE3Interpolant:
                  churn_by_sigma=False,
                  num_timesteps=400,
                  use_euclidean_for_rots=False,
-                 rot_sfm=False
+                 rot_sfm=False,
+                 unconditional_guidance_alpha=0.0,
+                 dynamic_cfg=False
     ):
         self._igso3 = None
 
@@ -137,6 +238,12 @@ class MultiSE3Interpolant:
         self.use_uniform_rot_noise = use_uniform_rot_noise
         self.use_euclidean_for_rots = use_euclidean_for_rots
         self.rot_sfm = rot_sfm
+        self.use_unwrapped_rot_noise = use_unwrapped_rot_noise
+        self.unwrapped_rot_noise_sig = unwrapped_rot_noise_sig
+
+        self.unconditional_guidance_alpha = unconditional_guidance_alpha
+        self.dynamic_cfg = dynamic_cfg
+
 
     @property
     def igso3(self):
@@ -191,7 +298,27 @@ class MultiSE3Interpolant:
         return rotmats_0
 
     def _corrupt_rotmats(self, rotmats_1, rotmats_0, t, rigids_mask, diffuse_mask):
-        if self.use_euclidean_for_rots:
+        if self.use_unwrapped_rot_noise:
+            noise_rotvec = torch.randn(rotmats_1.shape[:-1], device=rotmats_1.device) * self.unwrapped_rot_noise_sig
+
+            # regularize the rotvec we apply to generate the rotation at time t
+            noise_rotvec_t = noise_rotvec * (1 - t)[..., None]
+            noise_rotvec_t_theta = torch.linalg.vector_norm(noise_rotvec_t, dim=-1)
+            noise_rotvec_t_axis = F.normalize(noise_rotvec_t, dim=-1)
+            k = torch.floor(noise_rotvec_t_theta / (2 * torch.pi))
+            noise_rotvec_t_angle = noise_rotvec_t_theta - 2 * k * torch.pi
+            reverse_axis = noise_rotvec_t_angle > torch.pi
+            noise_rotvec_t_angle = noise_rotvec_t_angle * (~reverse_axis) + (2 * torch.pi - noise_rotvec_t_angle) * reverse_axis
+            noise_rotvec_t_axis = noise_rotvec_t_axis * (1 - 2 * reverse_axis.float())[..., None]
+            noise_rotvec_t = noise_rotvec_t_axis * noise_rotvec_t_angle[..., None]
+
+            rotmats_t = so3_utils.apply_rotvec_to_rotmat(rotmats_1, noise_rotvec_t)
+
+            # there's def a better way of doing this but im lazy
+            rot_vf_axis = so3_utils.calc_rot_vf(rotmats_t, rotmats_1)
+            rot_vf = F.normalize(rot_vf_axis, dim=-1) * torch.linalg.vector_norm(noise_rotvec, dim=-1)[..., None]
+
+        elif self.use_euclidean_for_rots:
             rotvecs_1 = so3_utils.rotmat_to_rotvec(rotmats_1)
             # rotvecs_0 = torch.randn_like(rotvecs_1) * torch.pi
             rotvecs_0 = so3_utils.rotmat_to_rotvec(rotmats_0)
@@ -203,20 +330,32 @@ class MultiSE3Interpolant:
             axis_t = F.normalize(rotvecs_t, dim=-1) * (1 - 2 * flip_rotvec)[..., None]
             rotvecs_t = axis_t * angle_t[..., None]
             rotmats_t = so3_utils.rotvec_to_rotmat(rotvecs_t)
+            rot_vf = so3_utils.calc_rot_vf(rotmats_t, rotmats_1) / (1 - t)[..., None]
         else:
             rotmats_t = so3_utils.geodesic_t(t[..., None], rotmats_1, rotmats_0)
+            rot_vf = so3_utils.calc_rot_vf(rotmats_t, rotmats_1) / (1 - t)[..., None]
 
         if self.rot_sfm:
             eps_t = torch.sqrt(0.01 * t * (1-t) + 1e-4)
             self.igso3.to(rotmats_1.device)
             noisy_rotmats = self.igso3.sample(eps_t.view(-1), rotmats_1.shape[1]).to(rotmats_1.device)
             rotmats_t = torch.einsum("...ij,...jk->...ik", rotmats_t, noisy_rotmats)
+            rot_vf = so3_utils.calc_rot_vf(rotmats_t, rotmats_1) / (1 - t)[..., None]
+
 
         identity = torch.eye(3, device=t.device)
         rotmats_t = rotmats_t * rigids_mask[..., None, None] + identity[None, None] * (
             ~rigids_mask[..., None, None]
         )
-        return _rots_diffuse_mask(rotmats_t, rotmats_1, diffuse_mask)
+
+        rot_vf = rot_vf * rigids_mask[..., None] + torch.zeros_like(rot_vf) * (
+            ~rigids_mask[..., None]
+        )
+        rot_vf = rot_vf * diffuse_mask[..., None] + torch.zeros_like(rot_vf) * (
+            ~diffuse_mask[..., None]
+        )
+
+        return _rots_diffuse_mask(rotmats_t, rotmats_1, diffuse_mask), rot_vf
 
 
     @torch.no_grad()
@@ -315,12 +454,26 @@ class MultiSE3Interpolant:
             align_mask = res_mask[..., None] * rigids_noising_mask
             align_batch = rigidwise_batch[align_mask]
 
-            _, _, align_rot_mats = du.align_structures(
+            _, _, align_rot_mats = align_structures(
                 trans_0[align_mask],
                 align_batch,
                 trans_1[align_mask]
             )
-            trans_0 = torch.einsum("nki,nij->nkj", trans_0, align_rot_mats[res_data.batch])
+            # num_batch = trans_0.shape[0]
+            # batch_represented_mask = scatter(
+            #     torch.ones_like(align_batch, dtype=torch.bool),
+            #     align_batch,
+            #     dim=0,
+            #     dim_size=num_batch,
+            #     reduce='any'
+            # )
+            # align_rot_mats_safe = torch.zeros((num_batch, 3, 3), device=align_rot_mats.device, dtype=align_rot_mats.dtype)
+            # align_rot_mats_safe[batch_represented_mask] = align_rot_mats
+            # print("align_rot_mats", align_rot_mats, align_rot_mats.shape)
+            # print("batch_represented_mask", batch_represented_mask, batch_represented_mask.shape)
+            # print("align_rot_mats_safe", align_rot_mats_safe, align_rot_mats_safe.shape)
+            align_rot_mats_safe = align_rot_mats
+            trans_0 = torch.einsum("nki,nij->nkj", trans_0, align_rot_mats_safe[res_data.batch])
 
         if self.use_stochastic_centering:
             stoch_center = torch.randn_like(center) * self.sig_perturb
@@ -334,7 +487,7 @@ class MultiSE3Interpolant:
             res_mask[..., None],
             rigids_noising_mask,
         )
-        rotmats_t = self._corrupt_rotmats(
+        rotmats_t, rot_vf = self._corrupt_rotmats(
             rotmats_1,
             rotmats_0,
             rigidwise_t,
@@ -387,14 +540,15 @@ class MultiSE3Interpolant:
             center = (trans_1 * rigids_mask[..., None]).sum(dim=1) / rigids_mask.long().sum(dim=1)[..., None].clip(min=1)
 
         trans_1 = trans_1 - center[..., None, :]
-        # this is just so we can calculate atom14 rmsds
-        atom_data = batch['atom']
-        atom_data["atom14"] = atom_data["atom14"] - center[..., None, None, :]
-        atom_data["atom14"] *= atom_data['atom14_mask'][..., None]
-        atom_data['atom14_gt_positions'] = atom_data['atom14_gt_positions'] - center[..., None, None, :]
-        atom_data['atom14_gt_positions'] *= atom_data['atom14_mask'][..., None]
-        atom_data['atom14_alt_gt_positions'] = atom_data['atom14_alt_gt_positions'] - center[..., None, None, :]
-        atom_data['atom14_alt_gt_positions'] *= atom_data['atom14_mask'][..., None]
+        if 'atom' in batch:
+            # this is just so we can calculate atom14 rmsds
+            atom_data = batch['atom']
+            atom_data["atom14"] = atom_data["atom14"] - center[..., None, None, :]
+            atom_data["atom14"] *= atom_data['atom14_mask'][..., None]
+            atom_data['atom14_gt_positions'] = atom_data['atom14_gt_positions'] - center[..., None, None, :]
+            atom_data['atom14_gt_positions'] *= atom_data['atom14_mask'][..., None]
+            atom_data['atom14_alt_gt_positions'] = atom_data['atom14_alt_gt_positions'] - center[..., None, None, :]
+            atom_data['atom14_alt_gt_positions'] *= atom_data['atom14_mask'][..., None]
 
 
         if self.prealign_noise:
@@ -406,17 +560,42 @@ class MultiSE3Interpolant:
             ).to(align_mask.device)
             align_batch = align_batch[align_mask]
 
-            _, _, align_rot_mats = du.align_structures(
+            _, _, align_rot_mats = align_structures(
                 trans_0[align_mask],
                 align_batch,
                 trans_1[align_mask]
             )
-            print(trans_0.shape, align_rot_mats.shape)
-            trans_0 = torch.einsum("bni,bij->bnj", trans_0, align_rot_mats)
+            # print(trans_0.shape, align_rot_mats.shape)
+            num_batch = trans_0.shape[0]
+
+            if align_rot_mats.shape[0] != num_batch:
+                num_pad = num_batch - align_rot_mats.shape[0]
+                eye = torch.eye(3, device=align_rot_mats.device, dtype=align_rot_mats.dtype)
+                align_rot_mats_safe = torch.cat([
+                    align_rot_mats,
+                    eye[None].expand(num_pad, -1, -1)
+                ], dim=0)
+                # batch_represented_mask = scatter(
+                #     torch.ones_like(align_batch, dtype=torch.bool),
+                #     align_batch,
+                #     dim=0,
+                #     dim_size=num_batch,
+                #     reduce='any'
+                # )
+                # align_rot_mats_safe = torch.zeros((num_batch, 3, 3), device=align_rot_mats.device, dtype=align_rot_mats.dtype)
+                # # print("align_rot_mats", align_rot_mats, align_rot_mats.shape)
+                # # print("batch_represented_mask", batch_represented_mask, batch_represented_mask.shape)
+                # # print("align_rot_mats_safe", align_rot_mats_safe, align_rot_mats_safe.shape)
+                # align_rot_mats_safe[batch_represented_mask] = align_rot_mats
+                # # print("align_rot_mats_safe", align_rot_mats_safe, align_rot_mats_safe.shape)
+            else:
+                align_rot_mats_safe = align_rot_mats
+
+            trans_0 = torch.einsum("bni,bij->bnj", trans_0, align_rot_mats_safe)
 
         if self.use_stochastic_centering:
             stoch_center = torch.randn_like(center) * self.sig_perturb
-            trans_0 = trans_0 + stoch_center[..., None, None, :]
+            trans_0 = trans_0 + stoch_center[..., None, :]
 
         trans_time = batch['trans_t']
         rot_time = batch['rot_t']
@@ -428,7 +607,7 @@ class MultiSE3Interpolant:
             rigids_mask,
             rigids_noising_mask.bool(),
         )
-        rotmats_t = self._corrupt_rotmats(
+        rotmats_t, rot_vf = self._corrupt_rotmats(
             rotmats_1,
             rotmats_0,
             rot_time,
@@ -455,6 +634,7 @@ class MultiSE3Interpolant:
             rots=ru.Rotation(rot_mats=rotmats_1), trans=trans_1
         )
         rigids_data["rigids_1"] = rigids_1.to_tensor_7()
+        rigids_data["gt_rot_vf"] = rot_vf
 
         return batch
 
@@ -544,6 +724,64 @@ class MultiSE3Interpolant:
         return trans_next
 
 
+    def _trans_guidance_step(
+            self,
+            d_t,
+            t,
+            trans_1_cond,
+            trans_1_uncond,
+            trans_t,
+            noising_mask,
+            vf_scale=1
+    ):
+        add_noise = (self.sampling_noise_mode == "euler")
+        use_score = (self.sampling_noise_mode is not None)
+
+        if self.dynamic_cfg:
+            tau1 = 1 - 0.5
+            tau2 = 1 - 0.9
+            _t = t[0]
+            if t < tau2:
+                guidance_alpha = 0
+            elif t < tau1:
+                guidance_alpha = (tau1 - t) / (tau1 - tau2)
+            else:
+                guidance_alpha = 1
+
+            if self.unconditional_guidance_alpha != 0:
+                guidance_alpha = guidance_alpha * self.unconditional_guidance_alpha
+        else:
+            guidance_alpha = self.unconditional_guidance_alpha
+
+
+        trans_vf_cond = (trans_1_cond - trans_t) / (1 - t)
+        trans_vf_uncond = (trans_1_uncond - trans_t) / (1 - t)
+        trans_vf = trans_vf_cond * (1 - guidance_alpha) + trans_vf_uncond * guidance_alpha
+
+        step_size = self.trans_step_size if use_score else 1
+        step_size = step_size * vf_scale
+        g_t = self.g_t(t)
+        gamma = self.trans_gamma
+        dW_t = torch.randn_like(trans_t) * torch.sqrt(d_t) * 10
+        trans_score_cond = self._trans_score(t, trans_1_cond, trans_t) * use_score
+        trans_score_uncond = self._trans_score(t, trans_1_uncond, trans_t) * use_score
+        trans_score = trans_score_cond * (1 - guidance_alpha) + trans_score_uncond * guidance_alpha
+
+        # if t > 0.99:
+        if (isinstance(t, torch.Tensor) and (t > 0.99).any()) or (not isinstance(t, torch.Tensor) and t > 0.99):  # TODO: fix hack (what happens if not all t > 0.99?)
+            trans_next = trans_t + (trans_vf * d_t) * step_size
+        else:
+            if add_noise:
+                noise_t = torch.sqrt(2 * g_t * gamma) * dW_t
+                trans_next = trans_t + (trans_vf * d_t + trans_score * g_t * d_t) * step_size + noise_t
+            else:
+                # print(trans_vf.shape, d_t.shape, trans_score.shape, g_t.shape, step_size.shape)
+                trans_next = trans_t + (trans_vf * d_t + trans_score * g_t * d_t) * step_size
+
+        trans_next[~noising_mask] = trans_t[~noising_mask]
+        return trans_next
+
+
     def _rot_churn(self, d_t, t, rotmats_t, noising_mask):
         if self.sampling_noise_mode == "churn":
             gamma = self.rot_gamma
@@ -593,17 +831,20 @@ class MultiSE3Interpolant:
             rotmats_1,
             rotmats_t,
             noising_mask,
-            vf_scale=1
+            vf_scale=1,
+            rot_vf=None
     ):
         add_noise = (self.sampling_noise_mode == "euler")
         use_score = (self.sampling_noise_mode is not None)
 
-        if self.rot_sample_schedule == "linear":
-            rot_vf = so3_utils.calc_rot_vf(rotmats_t, rotmats_1) / (1 - t)
-        elif self.rot_sample_schedule == "exp":
-            rot_vf = so3_utils.calc_rot_vf(rotmats_t, rotmats_1)
-        else:
-            raise ValueError(f"unrecognized rot_sample_schedule {self.rot_sample_schedule}")
+        if rot_vf is None:
+            if self.rot_sample_schedule == "linear":
+                rot_vf = so3_utils.calc_rot_vf(rotmats_t, rotmats_1) / (1 - t)
+            elif self.rot_sample_schedule == "exp":
+                rot_vf = so3_utils.calc_rot_vf(rotmats_t, rotmats_1)
+            else:
+                raise ValueError(f"unrecognized rot_sample_schedule {self.rot_sample_schedule}")
+        rot_vf = rot_vf.float()
 
         # TODO: this is probably numerically unstable for fixed residues
         # i've seen this nan sometimes on fixed residues
@@ -613,6 +854,65 @@ class MultiSE3Interpolant:
             rot_score = self._rots_score(t, rotmats_1, rotmats_t) * use_score
         else:
             rot_score = torch.zeros_like(rot_vf)
+
+        g_t = self.g_t(t)
+        step_size = self.rot_step_size * vf_scale
+        gamma = self.rot_gamma
+        dB_rot = torch.randn_like(rot_vf) * torch.sqrt(d_t)
+        # if t > 0.99:
+        if (isinstance(t, torch.Tensor) and (t > 0.99).any()) or (not isinstance(t, torch.Tensor) and t > 0.99):  # TODO: fix hack (what happens if not all t > 0.99?)
+            mat_t = so3_utils.rotvec_to_rotmat(d_t * rot_vf * step_size)
+        else:
+            if add_noise:
+                rotvec_t = d_t * rot_vf + d_t * g_t * rot_score
+                noise_t = torch.sqrt(2 * g_t * gamma) * dB_rot
+                mat_t = so3_utils.rotvec_to_rotmat(rotvec_t * step_size + noise_t)
+            else:
+                rotvec_t = d_t * rot_vf + d_t * g_t * rot_score
+                # print(rotvec_t.shape, step_size.shape)
+                mat_t = so3_utils.rotvec_to_rotmat(step_size * rotvec_t)
+
+        rotmats_next = torch.einsum("...ij,...jk->...ik", rotmats_t, mat_t)
+
+        rotmats_next[~noising_mask] = rotmats_t[~noising_mask]
+        return rotmats_next
+
+
+    def _rots_guidance_step(
+            self,
+            d_t,
+            t,
+            rotmats_1_cond,
+            rotmats_1_uncond,
+            rotmats_t,
+            noising_mask,
+            vf_scale=1
+    ):
+        add_noise = (self.sampling_noise_mode == "euler")
+        use_score = (self.sampling_noise_mode is not None)
+
+        if self.rot_sample_schedule == "linear":
+            rot_vf_cond = so3_utils.calc_rot_vf(rotmats_t, rotmats_1_cond) / (1 - t)
+            rot_vf_uncond = so3_utils.calc_rot_vf(rotmats_t, rotmats_1_uncond) / (1 - t)
+        elif self.rot_sample_schedule == "exp":
+            rot_vf_cond = so3_utils.calc_rot_vf(rotmats_t, rotmats_1_cond)
+            rot_vf_uncond = so3_utils.calc_rot_vf(rotmats_t, rotmats_1_uncond)
+        else:
+            raise ValueError(f"unrecognized rot_sample_schedule {self.rot_sample_schedule}")
+
+        # TODO: this is probably numerically unstable for fixed residues
+        # i've seen this nan sometimes on fixed residues
+        # which leads to some weird behavior downstream
+        # current band-aid patch is just to force replace the fixed residues
+        if use_score:
+            rot_score_cond = self._rots_score(t, rotmats_1_cond, rotmats_t) * use_score
+            rot_score_uncond = self._rots_score(t, rotmats_1_uncond, rotmats_t) * use_score
+        else:
+            rot_score_cond = torch.zeros_like(rot_vf_cond)
+            rot_score_uncond = torch.zeros_like(rot_vf_uncond)
+
+        rot_vf = rot_vf_cond * (1 - self.unconditional_guidance_alpha) + rot_vf_uncond * self.unconditional_guidance_alpha
+        rot_score = rot_score_cond * (1 - self.unconditional_guidance_alpha) + rot_score_uncond * self.unconditional_guidance_alpha
 
         g_t = self.g_t(t)
         step_size = self.rot_step_size * vf_scale

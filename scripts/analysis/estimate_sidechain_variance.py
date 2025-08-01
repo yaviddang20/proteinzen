@@ -10,7 +10,7 @@ from proteinzen.stoch_interp.interpolate.se3 import SE3InterpolantConfig
 from proteinzen.data.datasets.datamodule import FramediffDataModule
 from proteinzen.tasks.task import single_task_sampler
 from proteinzen.tasks.fm.atom10 import ProteinAtom10Interpolant, ProteinAtom10Interpolation
-from proteinzen.utils.openfold.rigid_utils import Rigid
+from proteinzen.openfold.utils.rigid_utils import Rigid
 
 
 # A logger for this file

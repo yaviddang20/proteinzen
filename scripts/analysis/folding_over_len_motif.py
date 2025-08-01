@@ -3,6 +3,7 @@ import numpy as np
 import seaborn as sns
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+import tqdm
 
 mpl.rcParams.update({
     'font.size': 18,
@@ -92,3 +93,26 @@ cbar.ax.set_position(pos)
 ax.axhline(y=2.0, color='red', linestyle='--')
 # plt.suptitle("Sequence-structure consistency over length")
 plt.savefig("folding_global_rmsd_over_len.png")
+
+plt.clf()
+ax = plt.gca()
+g = sns.jointplot(df, x="motif_all_atom_rmsd", y="global_all_atom_rmsd", hue="plddt", ax=ax, palette="viridis")
+g.ax_joint.axhline(y=2.0, color='red', linestyle='--')
+g.ax_joint.axvline(x=1.0, color='red', linestyle='--')
+g.ax_joint.set_ylim(0, 20)
+g.ax_joint.set_xlim(0, 20)
+plt.savefig("folding_rmsd_dist.png")
+
+plt.clf()
+fig, axs = plt.subplots(5, 5)
+fig.set_size_inches(25, 25)
+plt.subplots_adjust(wspace=0.35, hspace=0.35)
+tasks_sorted = sorted(df['task'].unique().tolist())
+for i, task in tqdm.tqdm(enumerate(tasks_sorted)):
+    ax = axs[i // 5, i % 5]
+    ax.set_title(task)
+    g = sns.scatterplot(df[df['task'] == task], x="motif_all_atom_rmsd", y="global_all_atom_rmsd", hue="plddt", ax=ax, palette="viridis", legend=False)
+    ax.axhline(y=2.0, color='red', linestyle='--')
+    ax.axvline(x=1.0, color='red', linestyle='--')
+    ax.axvline(x=1.5, color='orange', linestyle='--')
+plt.savefig("folding_rmsd_dist_by_task.png")

@@ -7,7 +7,7 @@
 #$ -q gpu.q
 #$ -pe smp 1
 #$ -l mem_free=32G
-#$ -l h_rt=4:00:00
+#$ -l h_rt=0:20:00
 #$ -l compute_cap=61,gpu_mem=40G
 
 export CUDA_VISIBLE_DEVICES=$SGE_GPU

@@ -18,8 +18,13 @@ If you wish to redesign the sequence identity as well, modify the input PDB resi
 import copy
 import string
 import functools as fn
+from dataclasses import astuple
+
+from rdkit import Chem
 
 from Bio.PDB.PDBParser import PDBParser
+from Bio.PDB.Structure import Structure as BPStructure
+
 from scipy.spatial.transform import Rotation
 import torch
 import torch.nn.functional as F
@@ -27,9 +32,16 @@ import tree
 from torch_geometric.data import HeteroData
 import numpy as np
 
-from proteinzen.data.openfold import residue_constants, data_transforms
+from proteinzen.boltz.data.types import Structure, Atom, Residue, Chain
+from proteinzen.boltz.data import const
+
+from proteinzen.openfold.data import residue_constants
 from proteinzen.data.constants import coarse_grain as cg
-from proteinzen.utils.openfold import rigid_utils as ru
+from proteinzen.openfold.data import data_transforms
+from proteinzen.openfold.utils import rigid_utils as ru
+from proteinzen.data.featurize.tokenize import sample_noise_tokenized_structure, Tokenized, convert_atom_name
+from proteinzen.data.featurize.sampling import generate_protein_structure_template, sample_noise_from_struct_template, ResidueData, AtomData, ChainData
+from proteinzen.data.featurize.assembler import featurize_inference_v2
 from .task import SamplingTask
 
 
@@ -63,37 +75,105 @@ def _uniform_so3(num_rigids):
     )
 
 
+def biopython_to_boltz(residue, res_idx, atom_idx, noise_bb=True, noise_tip=True, noise_sidechain=True):
+    # Load periodic table for element mapping
+    periodic_table = Chem.GetPeriodicTable()
+
+    res_name = residue.get_resname()
+    res_ref_atoms = const.ref_atoms[res_name]
+    ordered_atom_list = []
+
+    atom_noising_mask = []
+
+    for atom_name in res_ref_atoms:
+        if atom_name in residue:
+            atom = residue[atom_name]
+            element_idx = periodic_table.GetAtomicNumber(atom.element)
+            atom_data = AtomData(
+                name=np.array(convert_atom_name(atom_name)),
+                element=element_idx,
+                charge=0,  # TODO: probs should get this from a reference
+                coords=np.array(atom.coord),
+                conformer=np.array((0.0, 0.0, 0.0)),  # not used by proteinzen
+                is_present=atom.is_disordered() == 0,
+                chirality=0  # TODO: probs should get this from a reference
+            )
+            ordered_atom_list.append(
+                astuple(atom_data)
+            )
+            if atom_name in ['N', 'CA', 'C', 'O', 'CB']:
+                atom_noising_mask.append(noise_bb)
+            else:
+                if atom_name in cg.coarse_grain_sidechain_groups[res_name][2]:
+                    atom_noising_mask.append(noise_sidechain and noise_tip)
+                else:
+                    atom_noising_mask.append(noise_sidechain)
+        else:
+            element_idx = periodic_table.GetAtomicNumber(atom_name[0])
+            atom_data = AtomData(
+                name=np.array(convert_atom_name(atom_name)),
+                element=element_idx,
+                charge=0, # TODO: probs should get this from a reference
+                coords=np.array((0.0, 0.0, 0.0)),
+                conformer=np.array((0.0, 0.0, 0.0)),  # not used by proteinzen
+                is_present=False,
+                chirality=0  # TODO: probs should get this from a reference
+            )
+            ordered_atom_list.append(
+                astuple(atom_data)
+            )
+            atom_noising_mask.append(True)
+
+    res_data = ResidueData(
+        name=res_name,
+        res_type=const.token_ids[res_name],
+        res_idx=res_idx,
+        atom_idx=atom_idx,
+        atom_num=len(res_ref_atoms),
+        atom_center=1,
+        atom_disto=1,
+        is_standard=True,
+        is_present=True
+    )
+    new_atom_idx = atom_idx + len(res_ref_atoms)
+    return astuple(res_data), ordered_atom_list, atom_noising_mask, new_atom_idx
+
+
 class MotifScaffoldingTask(SamplingTask):
     chain_alphabet: str = string.ascii_uppercase
     task_name: str = "motif_scaffolding"
 
     def __init__(
         self,
-        contigs,
+        pdb_contigs,
+        contigs_idx,
         pdb,
         num_samples,
-        redesign_contigs,
-        total_length=None,
+        total_length,
+        sample_chain_name='A',
         cg_version=1,
+        redesign_contigs=None,
         **kwargs
     ):
         super().__init__(**kwargs)
 
+        self.sample_chain_name = sample_chain_name
         self.generator = np.random.default_rng()
         parser = PDBParser()
-        self.structure = parser.get_structure("", pdb)
-        self.num_samples = num_samples
-        self.cg_version = cg_version
 
-        if total_length is not None:
-            self.total_len = [int(i) for i in total_length.split("-")]
-            assert len(self.total_len) in (1, 2)
-        else:
-            self.total_len = None
+        # a little roundabout but this makes mypy happy
+        structure = parser.get_structure("", pdb)
+        assert isinstance(structure, BPStructure)
+        self.structure: BPStructure = structure
+
+        try:
+            self.motif_seq_idx, self.motif_res_is_unindexed = self._parse_idx_str(contigs_idx, pdb_contigs)
+        except Exception as e:
+            print(f"error with parsing idx contigs {contigs_idx}")
+            raise e
 
         self.redesign_contigs = {}
-
-        if len(redesign_contigs) > 1:
+        if redesign_contigs is not None and len(redesign_contigs) > 1:
             redesign_contigs = [c.strip() for c in redesign_contigs.split(",")]
             for contig in redesign_contigs:
                 chain = contig[0]
@@ -107,13 +187,16 @@ class MotifScaffoldingTask(SamplingTask):
                     self.redesign_contigs[chain].add(resid)
 
         try:
-            chain_contig_strs = contigs.split("/")
-            self.contigs = []
-            for i, chain_contig in enumerate(chain_contig_strs):
-                self.contigs += self._parse_condition_str(chain_contig, i)
+            self.condition_struct, self.atom_noising_mask, self.res_type_noising_mask = self._parse_condition_str(pdb_contigs)
         except Exception as e:
-            print(f"error with parsing contigs {contigs} from {pdb}")
+            print(f"error with parsing contigs {pdb_contigs} from {pdb}")
             raise e
+
+        self.num_samples = num_samples
+        self.cg_version = cg_version
+
+        self.total_len = [int(i) for i in total_length.split("-")]
+        assert len(self.total_len) in (1, 2)
 
         cg_group_mask = [
             cg.cg_group_mask[residue_constants.restype_1to3[resname]]
@@ -122,228 +205,204 @@ class MotifScaffoldingTask(SamplingTask):
         cg_group_mask.append([0.0] * 4)
         self.cg_group_mask = torch.as_tensor(cg_group_mask, dtype=torch.bool)[:, (0, 2, 3)]
 
-    def _parse_condition_str(self, contigs_str, chain_idx):
+
+    def _parse_idx_str(self, idx_str, pdb_contigs_str):
+        if len(idx_str) == 0:
+            # blank str means all unindexed
+            idxs = []
+            pdb_contigs = [c.strip() for c in pdb_contigs_str.split(",")]
+            for contig in pdb_contigs:
+                if contig[0] in self.chain_alphabet:
+                    if "-" in contig:
+                        motif_start, motif_end = [int(i) for i in contig[1:].split("-")]
+                        for _ in range(motif_start, motif_end + 1):
+                            idxs.append(-1)
+                    else:
+                        idxs.append(-1)
+                else:
+                    raise ValueError()
+        else:
+            idx_contigs = [c.strip() for c in idx_str.split(",")]
+            idxs = []
+
+            for contig in idx_contigs:
+                if contig.startswith("[") and contig.endswith("]"):
+                    # unindexed residue
+                    for _ in range(int(contig[1:-1])):
+                        idxs.append(-1)
+                elif "-" in contig:
+                    # index range
+                    motif_start, motif_end = [int(i) for i in contig.split("-")]
+                    for i in range(motif_start, motif_end + 1):
+                        idxs.append(i)
+                else:
+                    # there might be some adversarial case where this check holds but this should be fine for now
+                    assert str(int(contig)) == contig
+                    motif_resid = int(contig)
+                    idxs.append(motif_resid)
+
+        motif_seq_idx = torch.as_tensor(idxs, dtype=torch.long)
+        motif_res_is_unindexed = (motif_seq_idx == -1)
+        motif_seq_idx[motif_res_is_unindexed] = 0
+
+        return motif_seq_idx, motif_res_is_unindexed
+
+
+    def _parse_condition_str(self, contigs_str):
         contigs = [c.strip() for c in contigs_str.split(",")]
-        data_chunks = []
+        motif_residues = []
 
         for contig in contigs:
             if contig[0] in self.chain_alphabet:
                 chain = contig[0]
                 if "-" in contig:
                     motif_start, motif_end = [int(i) for i in contig[1:].split("-")]
-                    # print("scaffold", contig, motif_start, motif_end)
-                    data_chunks.append(self._get_motif_data(chain, motif_start, motif_end, chain_idx=chain_idx))
+                    for resid in range(motif_start, motif_end + 1):
+                        motif_residues.append((chain, resid))
                 else:
                     motif_resid = int(contig[1:])
-                    # print("scaffold", contig, motif_resid)
-                    data_chunks.append(self._get_motif_data(chain, motif_resid, chain_idx=chain_idx))
+                    motif_residues.append((chain, motif_resid))
             else:
-                if "-" in contig:
-                    lower, upper = [int(i) for i in contig.split("-")]
-                    # print("design", contig, lower, upper)
-                    chunk_fn = fn.partial(self._get_blank_data, lower=lower, upper=upper, chain_idx=chain_idx)
-                    data_chunks.append(chunk_fn)
-                else:
-                    length = int(contig)
-                    # print("design", contig, length)
-                    chunk_fn = fn.partial(self._get_blank_data, lower=length, upper=length, chain_idx=chain_idx)
-                    data_chunks.append(chunk_fn)
+                raise ValueError()
 
-        return data_chunks
+        # this is a little confusing
+        # so motif_idx is "where we are in the motif currently"
+        # and unindexed_res_idx is "what res_idx we should assign a new unindexed residue"
+        # we then create "output_res_idx" which is the actual res_idx assigned to the residue
+        # based on whether or not the residue is indexed
 
-    def _get_motif_data(self, chain_id, motif_start, motif_end=None, chain_idx=0):
-        chain = self.structure[0][chain_id]
-        atom37 = []
-        seq = []
-        redesign_mask = []
-        if motif_end is not None:
-            for resid in range(motif_start, motif_end+1):
-                res_atom37, res_seq = residue_to_atom37(chain[resid])
-                if chain.id in self.redesign_contigs and resid in self.redesign_contigs[chain.id]:
-                    res_atom37[3:] = torch.nan
-                    atom37.append(res_atom37)
-                    seq.append(residue_constants.restype_order_with_x['X'])
-                    redesign_mask.append(True)
-                else:
-                    atom37.append(res_atom37)
-                    seq.append(res_seq)
-                    redesign_mask.append(False)
-        else:
-            res_atom37, res_seq = residue_to_atom37(chain[motif_start])
-            if chain.id in self.redesign_contigs and motif_start in self.redesign_contigs[chain.id]:
-                res_atom37[3:] = torch.nan
-                atom37.append(res_atom37)
-                seq.append(residue_constants.restype_order_with_x['X'])
-                redesign_mask.append(True)
+        motif_idx = 0
+        unindexed_res_idx = 0
+        curr_atom_idx = 0
+        atoms = []
+        residues = []
+        atom_noising_mask = []
+        redesign = []
+        chain_ids = []
+        chain_data = {}
+
+        for chain_id, resid in motif_residues:
+            chain = self.structure[0][chain_id]
+            residue = chain[resid]
+            if self.motif_res_is_unindexed[motif_idx]:
+                output_res_idx = unindexed_res_idx
+                unindexed_res_idx += 1
             else:
-                atom37.append(res_atom37)
-                seq.append(res_seq)
-                redesign_mask.append(False)
+                output_res_idx = self.motif_seq_idx[motif_idx]
+            res_data, atom_data, _atom_noising_mask, new_atom_idx = biopython_to_boltz(
+                residue, output_res_idx, curr_atom_idx,
+                noise_bb=False,
+                noise_tip=False,
+                noise_sidechain=False
+            )
+            residues.append(res_data)
+            atoms.extend(atom_data)
+            atom_noising_mask.extend(_atom_noising_mask)
+            redesign.append(resid in self.redesign_contigs[chain_id] if chain_id in self.redesign_contigs else False)
 
-        atom37 = torch.stack(atom37).double()
-        seq = torch.as_tensor(seq).long()
-        atom37_mask = torch.isfinite(atom37).all(dim=-1)
-        redesign_mask = torch.as_tensor(redesign_mask, dtype=torch.bool)
-
-        return {
-            'aatype': seq,
-            'all_atom_positions': atom37,
-            'all_atom_mask': atom37_mask,
-            'redesign_mask': redesign_mask,
-            'chain_idx': torch.ones_like(seq) * chain_idx
-        }
-
-    def _get_blank_data(self, lower, upper, override=None, chain_idx=0):
-        if override is not None:
-            num_res = override
-        else:
-            num_res = self.generator.integers(lower, upper, endpoint=True)
-        dummy_atom37 = torch.full((num_res, 37, 3), torch.nan)
-        atom37_mask = torch.ones((num_res, 37))
-        seq = torch.full((num_res,), residue_constants.restype_order_with_x['X'])
-
-        return {
-            'aatype': seq.long(),
-            'all_atom_positions': dummy_atom37.double(),
-            'all_atom_mask': atom37_mask.double(),
-            'redesign_mask': torch.zeros_like(seq, dtype=torch.bool),
-            'chain_idx': torch.ones_like(seq) * chain_idx
-        }
-
-    def _sample_init_data(self):
-        data_chunks = []
-        # print(len(self.contigs))
-        for i, c in enumerate(self.contigs):
-            if isinstance(c, dict):
-                data_chunks.append(c)
-            elif callable(c):
-                if i == len(self.contigs)-1 and self.total_len is not None and len(self.total_len) == 1:
-                    curr_len = sum([d['aatype'].numel() for d in data_chunks])
-                    min_len = self.total_len[0] - curr_len
-                    max_len = self.total_len[-1] - curr_len
-                    if min_len == max_len:
-                        override_len = max_len
-                    else:
-                        override_len = self.generator.integers(min_len, max_len, endpoint=True)
-                    if override_len > 0:
-                        data_chunks.append(c(override=override_len))
-                else:
-                    data_chunks.append(c())
+            if chain_id in chain_ids:
+                chain_data[chain_id]['res_num'] = chain_data[chain_id]['res_num'] + 1
+                chain_data[chain_id]['atom_num'] = chain_data[chain_id]['atom_num'] + len(atom_data)
             else:
-                raise ValueError(f"we dont recognize condition {c}")
-            # print(i, data_chunks[-1]['aatype'].numel())
-            # print({k: v.shape for k,v in data_chunks[-1].items()})
-        # print(sum([d['aatype'].numel() for d in data_chunks]))
+                chain_data[chain_id] = {
+                    "name": chain_id,
+                    "mol_type": const.chain_type_ids["PROTEIN"],
+                    "entity_id": len(chain_ids),
+                    "sym_id": len(chain_ids),
+                    "asym_id": len(chain_ids),
+                    "cyclic_period": 0,
+                    "atom_idx": curr_atom_idx,
+                    "atom_num": len(atom_data),
+                    "res_idx": output_res_idx,
+                    "res_num": 1
+                }
+                chain_ids.append(chain_id)
 
-        chain_feats = dict_cat(data_chunks)
+            motif_idx += 1
+            curr_atom_idx = new_atom_idx
 
-        # TODO: the nans stuff doesn't work unless every atom in the residue is nan
-        chain_feats = data_transforms.atom37_to_cg_frames(chain_feats, cg_version=self.cg_version)
-        chain_feats = data_transforms.atom37_to_torsion_angles(prefix="")(chain_feats)  # TODO: uncurry this
+        atoms = np.array(atoms, dtype=Atom)
+        residues = np.array(residues, dtype=Residue)
+        chains = np.array([astuple(ChainData(**c)) for c in chain_data.values()], dtype=Chain)
 
-        for key, value in chain_feats.items():
-            if value.dtype == torch.float64:
-                chain_feats[key] = value.float()
-
-        chain_feats = data_transforms.make_atom14_masks(chain_feats)
-        chain_feats = data_transforms.make_atom14_positions(chain_feats)
-        seq = chain_feats['aatype']
-        redesign_mask = chain_feats['redesign_mask']
-
-        # compute rigids from data
-        # a lot of these will be nan
-        rigids_1 = ru.Rigid.from_tensor_4x4(
-            torch.nan_to_num(chain_feats['cg_groups_gt_frames'], nan=0.0)
-        )[:, (0, 2, 3)]
-
-        rigids_1_tensor_7 = rigids_1.to_tensor_7()
-
-        # TODO: man this is really clunky
-        # we copy over dummy rigids where available
-        rigids_mask = chain_feats["cg_groups_gt_exists"][:, (0, 2, 3)].bool()
-        rigids_mask_from_seq = self.cg_group_mask.to(rigids_mask.device)[seq]
-        mask_AG = (seq == residue_constants.restype_order['G']) | (seq == residue_constants.restype_order['A'])
-        mask_not_X = (seq != residue_constants.restype_order_with_x['X'])
-        dummy_rigid = rigids_1_tensor_7[..., 0, :] * mask_AG[..., None] + rigids_1_tensor_7[..., 1, :] * (~mask_AG & mask_not_X)[..., None]
-        dummy_rigid_location = (~rigids_mask_from_seq) * mask_not_X[..., None]
-
-        unresolved_rigids_mask = rigids_mask_from_seq & ~rigids_mask
-        unresolved_dummy_rigid_mask = (
-            (unresolved_rigids_mask[..., 0] * (mask_AG & mask_not_X))
-            |
-            (unresolved_rigids_mask[..., 1] * (~mask_AG & mask_not_X))
+        struct = Structure(
+            atoms=atoms,
+            bonds=np.array([]),
+            residues=residues,
+            chains=chains,
+            connections=np.array([]),
+            interfaces=np.array([]),
+            mask=np.array([True], dtype=bool)
         )
-        dummy_rigid_location[unresolved_dummy_rigid_mask] = False
+        redesign = np.array(redesign)
+        atom_noising_mask = np.array(atom_noising_mask)
 
-        rigids_1_tensor_7[dummy_rigid_location] = 0
-        rigids_1_tensor_7 += dummy_rigid[..., None, :] * dummy_rigid_location[..., None]
+        return struct, atom_noising_mask, redesign
 
-        rigids_mask[dummy_rigid_location] = True
-        rigids_noising_mask = ~rigids_mask
-        rigids_noising_mask[redesign_mask, 0] = False
-        rigids_noising_mask[redesign_mask, 1:] = True
-        rigids_noising_mask[unresolved_rigids_mask] = True
-
-        # print(rigids_noising_mask)
-
-        # center the motif rigids
-        motif_rigids_1_tensor_7 = rigids_1_tensor_7[~rigids_noising_mask]
-        center = motif_rigids_1_tensor_7[..., 4:].mean(dim=0)
-        motif_rigids_1_tensor_7[..., 4:] -= center[None]
-        rigids_1_tensor_7[~rigids_noising_mask] = motif_rigids_1_tensor_7
-
-        # replace all the remaining nans with centered noise
-        num_noise_rigids = int(rigids_noising_mask.long().sum())
-        trans_0 = _centered_gaussian(num_noise_rigids) * 16 # 10
-        rotquats_0 = _uniform_so3(num_noise_rigids)
-        noise_tensor_7 = torch.cat([rotquats_0, trans_0], dim=-1)
-        rigids_1_tensor_7[rigids_noising_mask] = noise_tensor_7
-
-        # construct the input heterodata object
-        num_res = seq.numel()
-        data = HeteroData(
-            residue={
-                "res_mask": torch.ones(num_res).bool(),
-                "rigids_t": rigids_1_tensor_7,
-                "rigids_mask": torch.ones((num_res, 3)).bool(),
-                "rigids_noising_mask": rigids_noising_mask.bool(),
-                "seq": seq.long(),
-                "seq_mask": torch.ones(num_res).bool(),
-                "seq_noising_mask": (seq == residue_constants.restype_order_with_x['X']),
-                "chain_idx": chain_feats['chain_idx'], # torch.zeros(num_res),
-                "num_res": num_res,
-                "num_nodes": num_res
-            }
-        )
-        data['task'] = self
-        return data
 
     def sample_data(self):
         for _ in range(self.num_samples):
-            yield self._sample_init_data()
+            if len(self.total_len) == 2:
+                sample_length = np.random.randint(self.total_len[0], self.total_len[1] + 1)
+            else:
+                sample_length = self.total_len[0]
+
+            chain_lens = {
+                self.sample_chain_name: sample_length
+            }
+
+
+            struct = generate_protein_structure_template(
+                chain_lens,
+                extra_mols=self.condition_struct
+            )
+
+            # we concat on dummy masks for the new struct residues
+            # since the generated residue masks only apply to motif residues
+            residue_is_unindexed_mask = np.concatenate([
+                np.zeros(sample_length, dtype=bool),
+                self.motif_res_is_unindexed,
+            ], axis=0)
+            res_type_noising_mask = np.concatenate([
+                np.ones(sample_length, dtype=bool),
+                self.res_type_noising_mask
+            ], axis=0)
+
+            task_data = {
+                "atom_noising_mask": self.atom_noising_mask,
+                "res_type_noising_mask": res_type_noising_mask,
+                "residue_is_unindexed_mask": residue_is_unindexed_mask
+            }
+
+            token_data, rigid_data, token_bonds, fixed_rigids_com = sample_noise_from_struct_template(
+                struct,
+                task_masks=task_data
+            )
+            struct.atoms['coords'] -= fixed_rigids_com[None]
+
+            data = Tokenized(
+                tokens=token_data,
+                rigids=rigid_data,
+                bonds=token_bonds,
+                structure=struct
+            )
+
+            rigids_noising_mask = rigid_data['rigids_noising_mask']
+            # print(rigids_noising_mask)
+            seq_noising_mask = token_data['seq_noising_mask']
+
+            task_data = {
+                "t": np.array([1.0], dtype=float),
+                "rigids_noising_mask": rigids_noising_mask,
+                "seq_noising_mask": seq_noising_mask,
+                "copy_indexed_token_mask": None,
+                "copy_unindexed_token_mask": None,
+            }
+
+            yield featurize_inference_v2(data, task_data, task_name=self.kwargs.get("name", self.task_name))
 
     def pad_data(self, data, n_padding):
-        data = copy.copy(data)
-        res_data = data['residue']
-        res_data["res_mask"] = F.pad(res_data["res_mask"], pad=(0, n_padding), value=False)
-        rigid_padding = ru.Rigid.identity(
-            (n_padding, *(res_data["rigids_t"].shape[1:-1]))
-        ).to_tensor_7()
-        rigids_t = res_data["rigids_t"]
-        res_data["rigids_t"] = torch.cat(
-            [
-                rigids_t,
-                rigid_padding.to(device=rigids_t.device)
-            ],
-            dim=0
-        )
-        res_data["rigids_mask"] = F.pad(res_data["rigids_mask"], pad=(0, 0, 0, n_padding), value=False)
-        res_data["rigids_noising_mask"] = F.pad(res_data["rigids_noising_mask"], pad=(0, 0, 0, n_padding), value=False)
-        res_data["seq"] = F.pad(res_data["seq"], pad=(0, n_padding), value=residue_constants.restype_order_with_x['X'])
-        res_data["seq_mask"] = F.pad(res_data["seq_mask"], pad=(0, n_padding), value=False)
-        res_data["seq_noising_mask"] = F.pad(res_data["seq_noising_mask"], pad=(0, n_padding), value=False)
-        res_data["chain_idx"] = F.pad(res_data["chain_idx"], pad=(0, n_padding), value=res_data["chain_idx"][-1])
-        res_data["num_nodes"] = res_data["num_nodes"] + n_padding
+        return NotImplemented
 
-        return data
+
 

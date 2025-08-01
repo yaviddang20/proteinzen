@@ -2,146 +2,101 @@
 from typing import Dict
 import logging
 import os
+import json
 
-import pandas as pd
-import numpy as np
 import torch
 import torch.utils.data as data
-import tree
+
+from proteinzen.boltz.data import const
+from proteinzen.boltz.data.types import Record
 
 
-from torch_geometric.data import HeteroData
-
-from proteinzen.data.io import utils as du
-from proteinzen.data.openfold.residue_constants import restype_order_with_x
-
-from proteinzen.data.datasets.featurize.molecule import featurize_props
-# from proteinzen.utils.torsion import get_transformation_mask
-
-
-class PdbDataset(data.Dataset):
+class MMCIFDataset(data.Dataset):
     def __init__(
             self,
-            csv_path,
+            data_dir,
+            data_sampler,
+            task_sampler,
             min_num_res=30,
-            max_num_res=500,
-            min_percent_ordered=None,
-            max_resolution=5.0,
+            max_num_res=5000,
+            min_percent_ordered=0.5,
+            max_resolution=3.0,
             subset=None,
             split=None,
-            use_tmpdir=False,
-            cache_dir=None,
-            normalize_cache=False,
+            exclude_mol_types=None,
+            overfit_num=None,
+            count_on_protein_res=False
         ):
         self._log = logging.getLogger(__name__)
-        self.csv_path = csv_path
+        self.data_dir = data_dir
         self.min_num_res = min_num_res
         self.max_num_res = max_num_res
         self.subset = subset
         self.split = split
         self.min_percent_ordered = min_percent_ordered
         self.max_resolution = max_resolution
-        self.use_tmpdir = use_tmpdir
-        self.cache_dir = cache_dir
-        self.normalize_cache = normalize_cache
+        self.task_sampler = task_sampler
+        self.data_sampler = data_sampler
+        self.overfit_num = overfit_num
+        self.count_on_protein_res = count_on_protein_res
+        if exclude_mol_types is None:
+            self.exclude_mol_types = []
+        else:
+            print("Excluding molecules that contain chains of types:", exclude_mol_types)
+            self.exclude_mol_types = [const.chain_types.index(s) for s in exclude_mol_types]
+
         self._init_metadata()
+
+        print(f"Training on {len(self.manifest)} datapoints")
 
     def _init_metadata(self):
         """Initialize metadata."""
+        manifest_path = os.path.join(self.data_dir, "manifest.json")
 
         # Process CSV with different filtering criterions.
-        pdb_csv = pd.read_csv(self.csv_path)
-        self.raw_csv = pdb_csv
-        pdb_csv = pdb_csv[pdb_csv.modeled_seq_len <= self.max_num_res]
-        pdb_csv = pdb_csv[pdb_csv.modeled_seq_len >= self.min_num_res]
-        if "resolution" in pdb_csv.columns:
-            # a resolution filter for structures which have resolutions
-            pdb_csv = pdb_csv[(pdb_csv.resolution <= self.max_resolution) | pdb_csv.resolution.isna()]
-        if self.subset is not None:
-            pdb_csv = pdb_csv.iloc[:self.subset]
+        with open(manifest_path) as fp:
+            self.raw_manifest = json.load(fp)
 
-        pdb_csv["is_af2_struct"] = pdb_csv.pdb_name.str.startswith("AF-")
+        self.manifest = []
+        for record in self.raw_manifest:
+            # remove records which contain mol types we're excluding
+            _exclude_record = False
+            for chain in record['chains']:
+                if chain['mol_type'] in self.exclude_mol_types:
+                    _exclude_record = True
+                    break
+            if _exclude_record:
+                continue
+            # apply some filtering critera that we might change at train time
+            if self.count_on_protein_res:
+                num_res = sum(chain['num_residues'] for chain in record['chains'] if chain['mol_type'] == 0)
+            else:
+                num_res = sum(chain['num_residues'] for chain in record['chains'])
+            if num_res > self.max_num_res or num_res < self.min_num_res:
+                continue
+            resolution = record['structure']['resolution']
+            if resolution is not None and resolution > self.max_resolution:
+                continue
+            if self.split is not None and record['id'] not in self.split:
+                continue
+            # if record['structure']['coil_percent'] > (1 - self.min_percent_ordered):
+            #     continue
 
-        pdb_csv = pdb_csv.sort_values('modeled_seq_len', ascending=False)
+            record['is_af2_struct'] = record['id'].startswith("AF-")
 
-        if self.split is not None:
-            pdb_csv = pdb_csv[pdb_csv.splits == self.split]
+            self.manifest.append(Record.from_dict(record))
 
-        # this is kinda hacky but im doing this for backwards compatibility
-        # TODO: get rid of the backward compatible stuff
-        if self.min_percent_ordered is None:
-            if "frameflow" in self.csv_path:
-                self.min_percent_ordered = 0
-            elif "framediff" in self.csv_path:
-                self.min_percent_ordered = 0.5
-            elif "afdb" in self.csv_path:
-                self.min_percent_ordered = 0.5
-
-        pdb_csv = pdb_csv[pdb_csv["coil_percent"] < (1 - self.min_percent_ordered)]
-
-        self.csv = pdb_csv
-
-    def precompute_motif_params(self):
-        seq_lens = self.csv['modeled_seq_len'].to_numpy()
-        num_segments = np.random.randint(1, 5, size=seq_lens.shape)
-        num_motif_res = np.random.randint(num_segments, seq_lens * 0.5)
-        self.csv['motif_num_res'] = num_motif_res
-        self.csv['motif_num_segments'] = num_segments
-
-    def _process_csv_row(self, processed_file_path):
-        processed_feats = du.read_pkl(processed_file_path)
-        processed_feats = du.parse_chain_feats(processed_feats)
-
-        # Only take modeled residues.
-        modeled_idx = processed_feats['modeled_idx']
-        min_idx = np.min(modeled_idx)
-        max_idx = np.max(modeled_idx)
-        del processed_feats['modeled_idx']
-        processed_feats = tree.map_structure(
-            lambda x: x[min_idx:(max_idx+1)], processed_feats)
-        res_idx = processed_feats['residue_index']
-        processed_feats['residue_index'] = res_idx - np.min(res_idx) + 1
-        num_nodes = max_idx - min_idx + 1
-
-        res_data = {
-            "atom37": processed_feats["atom_positions"],
-            "atom37_mask": processed_feats["atom_mask"],
-            "seq": processed_feats["aatype"],
-            "seq_mask": (processed_feats["aatype"] != restype_order_with_x.get("X")),
-            "chain_idx": processed_feats["chain_index"],
-            "res_idx": processed_feats["residue_index"],
-            "res_ca": processed_feats["bb_positions"],
-            "res_mask": processed_feats['bb_mask'].astype(bool),
-            "num_nodes": num_nodes,
-            "data_lens": [num_nodes],
-            "dssp_helix": processed_feats["ss"] == "H",
-            "dssp_sheet": processed_feats["ss"] == "E",
-            "dssp_coil": processed_feats["ss"] == "C",
-        }
-        # print({k: v.shape if hasattr(v, "shape") else processed_feats["ss"] for k, v in res_data.items() })
-        # print(processed_file_path)
-
-        graph = HeteroData(
-            residue={
-                k: torch.as_tensor(t)
-                for k, t in res_data.items()
-            }
-        )
-        return graph
+        if self.overfit_num is not None:
+            self.manifest = self.manifest[-self.overfit_num:]
+            print("overfit entries:", self.manifest)
 
     def __len__(self):
-        return len(self.csv)
+        return len(self.manifest)
 
     def __getitem__(self, idx):
         # Sample data example.
-        example_idx = idx
-        csv_row = self.csv.iloc[example_idx]
-        processed_file_path = csv_row['processed_path']
-        chain_feats = self._process_csv_row(processed_file_path)
-        chain_feats['name'] = csv_row['pdb_name']
-        chain_feats['csv_idx'] = torch.ones(1, dtype=torch.long) * idx
-
-        return chain_feats
+        record = self.manifest[idx]
+        return record
 
 
 class LengthDataset(data.Dataset):

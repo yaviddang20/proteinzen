@@ -7,7 +7,7 @@
 #$ -cwd
 #$ -q gpu.q
 #$ -pe smp NUMGPU
-#$ -l mem_free=32G
+#$ -l mem_free=16G
 #$ -l h_rt=TRAINHOURS:00:00
 #$ -l h=qb3-idgpu18
 
@@ -22,6 +22,7 @@ echo $SGE_GPU
 echo $CUDA_VISIBLE_DEVICES
 
 module load Sali cuda
+nvcc --version
 
 gpuprof=$(dcgmi group -c mygpus -a $SGE_GPU | awk '{print $10}')
 dcgmi stats -g $gpuprof -e

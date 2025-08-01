@@ -25,18 +25,10 @@ get_ax_idx = lambda x: (x // 3, x % 3)
 loss_terms = [
     'train/loss_epoch',
     'train/frame_vf_loss_epoch',
-    'train/atom14_rmsd_epoch',
-    'train/scaled_fafe_epoch'
-    'train/scaled_pred_bb_mse_epoch',
-    'train/scaled_dist_mat_loss_epoch',
-    'train/scaled_atom14_mse_epoch',
+    'train/rot_vf_loss_epoch',
+    'train/trans_vf_loss_epoch',
     'train/seq_loss_epoch',
     'train/smooth_lddt_epoch',
-    'train/traj_bb_loss_epoch',
-    'train/traj_rigids_loss_epoch',
-    'train/traj_pred_dist_loss_epoch',
-    'train/traj_seq_loss_epoch',
-    'train/traj_seqpair_loss_epoch',
 ]
 
 for idx, l in enumerate(loss_terms):
