@@ -1106,18 +1106,18 @@ class Pairformer(nn.Module):
 
 class IpaMultiRigidDenoiser(nn.Module):
     def __init__(self,
-                 c_s=256,
-                 c_cond=256,
+                 c_s=768,
+                 c_cond=768,
                  c_z=128,
-                 c_frame=64,
-                 c_framepair=16,
+                 c_frame=256,
+                 c_framepair=64,
                  c_hidden=16,
                  c_hidden_trig=32,
                  c_hidden_trig_embedder=64,
                  num_heads=16,
                  num_qk_points=8,
                  num_v_points=12,
-                 num_blocks=8,
+                 num_blocks=12,
                  trans_preconditioning=False,
                  rot_preconditioning=False,
                  block_q=16,
@@ -1131,17 +1131,17 @@ class IpaMultiRigidDenoiser(nn.Module):
                  rigid_transformer_add_vanilla_transformer=False,
                  rigid_transformer_add_second_transformer=False,
                  rigid_transformer_add_full_transformer=False,
-                 use_embedder_sc_rigid_transformer=False,
+                 use_embedder_sc_rigid_transformer=True,
                  rel_quat_pair_updates=False,
-                 z_broadcast=False,
+                 z_broadcast=True,
                  compile_ipa=False,
                  use_ipa_gating=False,
                  ablate_ipa_down_z=False,
                  ipa_row_dropout_r=0.,
                  tfmr_row_dropout_r=0.,
                  cg_version=1,
-                 use_qk_norm=False,
-                 use_amp=False,
+                 use_qk_norm=True,
+                 use_amp=True,
                  predict_final_rot=False,
                  direct_rot_vf_output=False,
                  learnable_noise_schedule=False,
@@ -1149,7 +1149,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                  rot_vf_scaling=1,
                  self_conditioning=True,
                  self_folding=False,
-                 use_residue_indexing=False
+                 use_residue_indexing=True
                  ):
         super().__init__()
 
@@ -1262,7 +1262,9 @@ class IpaMultiRigidDenoiser(nn.Module):
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_amp):
             input_feats = self.embedder(
                 token_mask=token_data['token_mask'],
-                token_seq_idx=token_data['token_seq_idx'] if not self.use_residue_indexing else token_data['residue_idx'],
+                token_seq_idx=(
+                    token_data['residue_idx'] if self.use_residue_indexing
+                    else  token_data['token_seq_idx']),
                 token_seq=token_data['res_type'],
                 token_seq_mask=token_data['token_mask'],
                 token_seq_noising_mask=token_data['seq_noising_mask'],

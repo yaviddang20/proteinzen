@@ -1,6 +1,6 @@
 _target_: proteinzen.data.datasets.datamodule.TrainingDataset
-max_crop_residues: 384
-max_crop_rigids: 1152
+max_crop_residues: 512
+max_crop_rigids: 1536
 use_cropper: true
 dataset_probs: [0.25, 0.75]
 remove_mol_types:

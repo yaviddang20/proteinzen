@@ -161,7 +161,7 @@ class BiomoleculeModule(L.LightningModule):
                  cosine_total_steps=1e6,
                  use_linear_warmup=False,
                  linear_warmup_steps=0,
-                 use_ema=False,
+                 use_ema=True,
                  ema_decay=0.999,
                  use_posthoc_ema=False,
                  seq_weight=DEFAULT_RESTYPE_WEIGHT,

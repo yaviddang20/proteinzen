@@ -65,7 +65,10 @@ class MotifScaffolding(TrainingTask):
                  max_frac_res=0.5,
                  max_num_res=40,
                  p_is_unindexed=0.8,
-                 name_override=None
+                 name_override=None,
+                 p_fix_tip=0.0,
+                 p_fix_bb=0.5,
+                 p_fix_all=0.5
     ):
         assert t_sched in ['lognorm', 'mixed_beta', 'uniform']
         assert mode in ['mixed']
@@ -83,6 +86,11 @@ class MotifScaffolding(TrainingTask):
         self.max_frac_res = max_frac_res
         self.max_num_res = max_num_res
         self.p_is_unindexed = p_is_unindexed
+
+        self.p_fix_tip = p_fix_tip
+        self.p_fix_bb = p_fix_bb
+        self.p_fix_all = p_fix_all
+        assert np.isclose(sum([p_fix_tip, p_fix_bb, p_fix_all]), 1.0)
 
         if name_override is not None:
             self.name = name_override
@@ -139,10 +147,8 @@ class MotifScaffolding(TrainingTask):
         atom_noising_mask = []
         if self.mode == 'mixed':
             noise_select = torch.rand_like(torch.as_tensor(residue_noising_mask), dtype=torch.float32).numpy(force=True)
-            # fix_tip = noise_select < 0.33
-            # noise_sidechain_only = noise_select > 0.67
-            fix_tip = np.zeros(noise_select.shape, dtype=bool)
-            noise_sidechain_only = noise_select > 0.5
+            fix_tip = noise_select < self.p_fix_tip
+            noise_sidechain_only = noise_select > (1 - self.p_fix_bb)
             res_type_noising_mask[~residue_noising_mask & fix_tip] = False
             res_type_noising_mask[~residue_noising_mask & noise_sidechain_only] = True
 
