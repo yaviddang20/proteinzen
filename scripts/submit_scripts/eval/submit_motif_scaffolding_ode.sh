@@ -40,7 +40,7 @@ fi
 ## generate samples
 conda activate ${ENV_NAME}
 
-python sample_v2.py \
+python sample.py \
     model_dir=$RUN_DIR \
     out_prefix=$OUTPREFIX \
     checkpoint_idx=$CHECKPOINTIDX \
