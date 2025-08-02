@@ -1,4 +1,4 @@
-bash submit_train_h100_v2.sh 8 14 \
+bash submit_train_h100.sh 8 14 \
     domain=protein \
     paradigm=multiframefm \
     datamodule.batch_size=4 \
@@ -24,7 +24,7 @@ bash submit_train_h100_v2.sh 8 14 \
     experiment.lightning.devices=8 \
     experiment.lightning.strategy=ddp_find_unused_parameters_true \
     experiment.checkpointer.train_time_interval=null \
-    experiment.checkpointer.every_n_steps=20000 \
+    experiment.checkpointer.every_n_train_steps=20000 \
     hydra.run.dir="./outputs/pretrain/phase1_0"
 
 sleep 1s
