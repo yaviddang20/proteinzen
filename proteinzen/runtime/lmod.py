@@ -297,6 +297,38 @@ class BiomoleculeModule(L.LightningModule):
             lambda x: torch.round(torch.mean(x), decimals=3) if torch.is_tensor(x) else x,
             loss_dict
         )
+
+        loss_by_task = {}
+        for i, task in enumerate(batch['task']):
+            if task.name + "_loss" not in loss_by_task:
+                loss_by_task[task.name + "_loss"] = []
+            if task.name + "_seq_loss" not in loss_by_task:
+                loss_by_task[task.name + "_seq_loss"] = []
+            if task.name + "_frame_vf_loss" not in loss_by_task:
+                loss_by_task[task.name + "_frame_vf_loss"] = []
+            if task.name + "_frame_vf_loss_unscaled" not in loss_by_task:
+                loss_by_task[task.name + "_frame_vf_loss_unscaled"] = []
+
+            loss_by_task[task.name + "_loss"].append(loss_dict['loss_per_batch'][i])
+            loss_by_task[task.name + "_seq_loss"].append(loss_dict["seq_loss"][i])
+            loss_by_task[task.name + "_frame_vf_loss"].append(loss_dict['frame_vf_loss'][i])
+            loss_by_task[task.name + "_frame_vf_loss_unscaled"].append(loss_dict['frame_vf_loss_unscaled'][i])
+
+        loss_by_task = {
+            key: torch.stack(values)
+            for key, values in loss_by_task.items()
+        }
+        for key, value in loss_by_task.items():
+            self.log(
+                "task/" + key,
+                value.mean(),
+                prog_bar=False,
+                logger=True,
+                on_step=None,
+                on_epoch=True,
+                batch_size=value.shape[0],
+                sync_dist=False)
+
         log_dict = {
             ("train/" + key): value
             for key, value in
@@ -391,7 +423,7 @@ class BiomoleculeModule(L.LightningModule):
             )
 
         loss_dict = {"loss": loss.mean(), "frame_vf_loss": frame_vf_loss, "frame_vf_loss_unscaled": unscaled_frame_vf_loss}
-        # loss_dict['loss_per_batch'] = loss
+        loss_dict['loss_per_batch'] = loss
 
         # TODO: for some reason this does not play well with nccl between different tasks
         # if 'motif_idx' in outputs:
@@ -407,30 +439,10 @@ class BiomoleculeModule(L.LightningModule):
         # loss_dict[inputs['task'].name + "_frame_vf_loss"] = frame_vf_loss
         # loss_dict[inputs['task'].name + "_frame_vf_loss_unscaled"] = unscaled_frame_vf_loss
 
-        loss_by_task = {}
-        for i, task in enumerate(inputs['task']):
-            if task.name + "_loss" not in loss_by_task:
-                loss_by_task[task.name + "_loss"] = []
-            if task.name + "_seq_loss" not in loss_by_task:
-                loss_by_task[task.name + "_seq_loss"] = []
-            if task.name + "_frame_vf_loss" not in loss_by_task:
-                loss_by_task[task.name + "_frame_vf_loss"] = []
-            if task.name + "_frame_vf_loss_unscaled" not in loss_by_task:
-                loss_by_task[task.name + "_frame_vf_loss_unscaled"] = []
-
-            loss_by_task[task.name + "_loss"].append(loss[i])
-            loss_by_task[task.name + "_seq_loss"].append(atomic_loss_dict["seq_loss"][i])
-            loss_by_task[task.name + "_frame_vf_loss"].append(frame_vf_loss[i])
-            loss_by_task[task.name + "_frame_vf_loss_unscaled"].append(unscaled_frame_vf_loss[i])
-
-        loss_by_task = {
-            key: torch.stack(values).mean()
-            for key, values in loss_by_task.items()
-        }
 
         loss_dict.update(frame_fm_loss_dict)
         loss_dict.update(atomic_loss_dict)
-        loss_dict.update(loss_by_task)
+        # loss_dict.update(loss_by_task)
 
         return loss_dict
 
