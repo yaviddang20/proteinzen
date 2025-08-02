@@ -30,6 +30,8 @@ dcgmi stats -g $gpuprof -s $JOB_ID
 
 # magic memory flag
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# on-demand tuning for trig mult update kernel
+export CUEQ_TRITON_TUNING_MODE="ONDEMAND"
 ulimit -n 2048
 cd ${REPO_ROOT}
 python train.py "$@" +job_id=${JOB_ID} +num_days=TRAINDAYS
