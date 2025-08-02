@@ -1,4 +1,4 @@
 Getting Started
 ===============
 
-This page details how to get started with ligbinddiff. 
+This page details how to get started with proteinzen.

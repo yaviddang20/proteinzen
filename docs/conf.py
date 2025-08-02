@@ -22,7 +22,7 @@ import proteinzen
 
 # -- Project information -----------------------------------------------------
 
-project = 'ligbinddiff'
+project = 'proteinzen'
 copyright = ("2023, Alex J Li. Project structure based on the "
              "Computational Molecular Science Python Cookiecutter version 1.1")
 author = 'Alex J Li'
@@ -117,7 +117,7 @@ html_static_path = ['_static']
 # -- Options for HTMLHelp output ---------------------------------------------
 
 # Output file base name for HTML help builder.
-htmlhelp_basename = 'ligbinddiffdoc'
+htmlhelp_basename = 'proteinzendoc'
 
 
 # -- Options for LaTeX output ------------------------------------------------
@@ -144,8 +144,8 @@ latex_elements = {
 # (source start file, target name, title,
 #  author, documentclass [howto, manual, or own class]).
 latex_documents = [
-    (master_doc, 'ligbinddiff.tex', 'ligbinddiff Documentation',
-     'ligbinddiff', 'manual'),
+    (master_doc, 'proteinzen.tex', 'proteinzen Documentation',
+     'proteinzen', 'manual'),
 ]
 
 
@@ -154,7 +154,7 @@ latex_documents = [
 # One entry per manual page. List of tuples
 # (source start file, name, description, authors, manual section).
 man_pages = [
-    (master_doc, 'ligbinddiff', 'ligbinddiff Documentation',
+    (master_doc, 'proteinzen', 'proteinzen Documentation',
      [author], 1)
 ]
 
@@ -165,8 +165,8 @@ man_pages = [
 # (source start file, target name, title, author,
 #  dir menu entry, description, category)
 texinfo_documents = [
-    (master_doc, 'ligbinddiff', 'ligbinddiff Documentation',
-     author, 'ligbinddiff', 'Substrate-conditioned diffusion for ligand-binding protein generation',
+    (master_doc, 'proteinzen', 'proteinzen Documentation',
+     author, 'proteinzen', 'Substrate-conditioned diffusion for ligand-binding protein generation',
      'Miscellaneous'),
 ]
 

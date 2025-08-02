@@ -1,8 +1,8 @@
-ligbinddiff
+proteinzen
 ==============================
 [//]: # (Badges)
-[![GitHub Actions Build Status](https://github.com/alexjli/ligbinddiff/workflows/CI/badge.svg)](https://github.com/alexjli/ligbinddiff/actions?query=workflow%3ACI)
-[![codecov](https://codecov.io/gh/alexjli/ligbinddiff/branch/main/graph/badge.svg)](https://codecov.io/gh/alexjli/ligbinddiff/branch/main)
+[![GitHub Actions Build Status](https://github.com/alexjli/proteinzen/workflows/CI/badge.svg)](https://github.com/alexjli/proteinzen/actions?query=workflow%3ACI)
+[![codecov](https://codecov.io/gh/alexjli/proteinzen/branch/main/graph/badge.svg)](https://codecov.io/gh/alexjli/proteinzen/branch/main)
 
 
 Substrate-conditioned diffusion for ligand-binding protein generation
