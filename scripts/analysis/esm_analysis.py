@@ -12,6 +12,7 @@ from scipy.spatial.transform import Rotation
 import tqdm
 from Bio.PDB.Superimposer import Superimposer
 from Bio.PDB.PDBIO import PDBIO
+from Bio.PDB.PDBParser import PDBParser
 import pyrosetta
 
 from proteinzen.openfold.utils.feats import atom14_to_atom37
