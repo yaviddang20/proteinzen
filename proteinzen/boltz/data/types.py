@@ -128,6 +128,19 @@ Residue = [
     ("is_present", np.dtype("?")),
 ]
 
+SamplingResidue = [
+    ("name", np.dtype("<U5")),
+    ("res_type", np.dtype("i1")),
+    ("res_idx", np.dtype("i4")),
+    ("atom_idx", np.dtype("i4")),
+    ("atom_num", np.dtype("i4")),
+    ("atom_center", np.dtype("i4")),
+    ("atom_disto", np.dtype("i4")),
+    ("is_standard", np.dtype("?")),
+    ("is_present", np.dtype("?")),
+    ("is_copy", np.dtype("?")),
+]
+
 Chain = [
     ("name", np.dtype("<U5")),
     ("mol_type", np.dtype("i1")),

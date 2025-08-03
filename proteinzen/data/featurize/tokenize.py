@@ -331,8 +331,9 @@ def arbitrary_atom_to_frame(
 
 def tokenize_structure(  # noqa: C901, PLR0915
     struct: Structure,
-    task_data: dict[str, np.array],
-    shuffle_chains: bool = False
+    task_data: dict[str, np.ndarray],
+    shuffle_chains: bool = False,
+    shuffle_copied_fragments: bool = True
 ) -> Tuple[np.ndarray, np.array, np.ndarray]:
     """Tokenize a structure.
 
@@ -621,6 +622,37 @@ def tokenize_structure(  # noqa: C901, PLR0915
                 token_data.extend([astuple(t) for t in ret_tokens])
                 rigid_data.extend([astuple(r) for r in ret_rigids])
 
+
+    if shuffle_copied_fragments and len(copy_data) > 0:
+        # we swap around the order of copied segments
+        # since the ordering of these segments in the model inputs
+        # could potentially serve to leak the ground truth ordering of these segments
+        frag_idx = 0
+        token_0 = asdict(copy_data[0]['token'])
+        last_res_idx = token_0['res_idx']
+        last_chain_id = token_0['asym_id']
+        frag_mapping = {}
+        for i, copy_dict in enumerate(copy_data):
+            token = asdict(copy_dict['token'])
+            chain_id = token['asym_id']
+            if abs(last_res_idx - token['res_idx']) > 1 or chain_id != last_chain_id:
+                frag_idx += 1
+            if frag_idx not in frag_mapping:
+                frag_mapping[frag_idx] = [copy_dict]
+            else:
+                frag_mapping[frag_idx].append(copy_dict)
+
+            last_res_idx = token['res_idx']
+            last_chain_id = chain_id
+
+        frag_order = np.random.permutation(frag_idx)
+        _new_copy_data = []
+        for i in frag_order:
+            _new_copy_data.extend(frag_mapping[i])
+        copy_data = _new_copy_data
+
+
+
     # append our copied residues onto the tokenized data
     # this preserves res_idx but assigns the correct token_idx and rigid_idx
     # as well as specifying proper bookkeeping values
@@ -632,7 +664,7 @@ def tokenize_structure(  # noqa: C901, PLR0915
         token['is_copy'] = True
         token['token_idx'] = token_idx
         token['rigid_idx'] = rigid_idx
-        token['is_unindexed'] = ~copy_dict["indexed?"]
+        token['is_unindexed'] = not copy_dict["indexed?"]
         token['is_atomized'] = copy_dict['atomized?']
         token_data.append(astuple(TokenData(**token)))
 

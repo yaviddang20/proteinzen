@@ -32,7 +32,7 @@ import tree
 from torch_geometric.data import HeteroData
 import numpy as np
 
-from proteinzen.boltz.data.types import Structure, Atom, Residue, Chain
+from proteinzen.boltz.data.types import Structure, Atom, Residue, Chain, SamplingResidue
 from proteinzen.boltz.data import const
 
 from proteinzen.openfold.data import residue_constants
@@ -133,12 +133,15 @@ def biopython_to_boltz(residue, res_idx, atom_idx, noise_bb=True, noise_tip=True
         atom_center=1,
         atom_disto=1,
         is_standard=True,
-        is_present=True
+        is_present=True,
+        is_copy=True
     )
     new_atom_idx = atom_idx + len(res_ref_atoms)
     return astuple(res_data), ordered_atom_list, atom_noising_mask, new_atom_idx
 
 
+# TODO: idx strings dont take into account chain
+# and automatically assigned to sample_chain_name
 class MotifScaffoldingTask(SamplingTask):
     chain_alphabet: str = string.ascii_uppercase
     task_name: str = "motif_scaffolding"
@@ -146,10 +149,11 @@ class MotifScaffoldingTask(SamplingTask):
     def __init__(
         self,
         pdb_contigs,
-        contigs_idx,
         pdb,
         num_samples,
         total_length,
+        contigs_idx="",
+        sample_contigs_idx_config=None,
         sample_chain_name='A',
         cg_version=1,
         redesign_contigs=None,
@@ -166,11 +170,21 @@ class MotifScaffoldingTask(SamplingTask):
         assert isinstance(structure, BPStructure)
         self.structure: BPStructure = structure
 
-        try:
-            self.motif_seq_idx, self.motif_res_is_unindexed = self._parse_idx_str(contigs_idx, pdb_contigs)
-        except Exception as e:
-            print(f"error with parsing idx contigs {contigs_idx}")
-            raise e
+
+        if len(contigs_idx) > 0:
+            assert sample_contigs_idx_config is None, "sample_contigs_idx_config and contigs_idx are mutually exclusive"
+        if sample_contigs_idx_config is not None:
+            assert len(contigs_idx) == 0, "sample_contigs_idx_config and contigs_idx are mutually exclusive"
+
+        self.contigs_idx = contigs_idx
+        self.pdb_contigs = pdb_contigs
+        self.sample_contigs_idx_config = sample_contigs_idx_config
+
+        # try:
+        #     self.motif_seq_idx, self.motif_res_is_unindexed = self._parse_idx_str(contigs_idx, pdb_contigs)
+        # except Exception as e:
+        #     print(f"error with parsing idx contigs {contigs_idx}")
+        #     raise e
 
         self.redesign_contigs = {}
         if redesign_contigs is not None and len(redesign_contigs) > 1:
@@ -186,11 +200,11 @@ class MotifScaffoldingTask(SamplingTask):
                     resid = int(contig[1:])
                     self.redesign_contigs[chain].add(resid)
 
-        try:
-            self.condition_struct, self.atom_noising_mask, self.res_type_noising_mask = self._parse_condition_str(pdb_contigs)
-        except Exception as e:
-            print(f"error with parsing contigs {pdb_contigs} from {pdb}")
-            raise e
+        # try:
+        #     self.condition_struct, self.atom_noising_mask, self.res_type_noising_mask = self._parse_condition_str(pdb_contigs)
+        # except Exception as e:
+        #     print(f"error with parsing contigs {pdb_contigs} from {pdb}")
+        #     raise e
 
         self.num_samples = num_samples
         self.cg_version = cg_version
@@ -205,6 +219,35 @@ class MotifScaffoldingTask(SamplingTask):
         cg_group_mask.append([0.0] * 4)
         self.cg_group_mask = torch.as_tensor(cg_group_mask, dtype=torch.bool)[:, (0, 2, 3)]
 
+
+    def _sample_idx_str(self, contigs_str):
+        contigs = [c.strip() for c in contigs_str.split(",")]
+        idx = []
+
+        current_idx = 0
+
+        for contig in contigs:
+            if contig[0] in self.chain_alphabet:
+                chain = contig[0]
+                if "-" in contig:
+                    motif_start, motif_end = [int(i) for i in contig[1:].split("-")]
+                    for _ in range(motif_start, motif_end+1):
+                        idx.append(current_idx)
+                        current_idx += 1
+                else:
+                    motif_resid = int(contig[1:])
+                    idx.append(current_idx)
+                    current_idx += 1
+            else:
+                if "-" in contig:
+                    lower, upper = [int(i) for i in contig.split("-")]
+                    length = np.random.randint(lower, upper+1)
+                    current_idx += length
+                else:
+                    length = int(contig)
+                    current_idx += length
+
+        return ",".join([str(i) for i in idx])
 
     def _parse_idx_str(self, idx_str, pdb_contigs_str):
         if len(idx_str) == 0:
@@ -246,7 +289,6 @@ class MotifScaffoldingTask(SamplingTask):
         motif_seq_idx[motif_res_is_unindexed] = 0
 
         return motif_seq_idx, motif_res_is_unindexed
-
 
     def _parse_condition_str(self, contigs_str):
         contigs = [c.strip() for c in contigs_str.split(",")]
@@ -313,7 +355,7 @@ class MotifScaffoldingTask(SamplingTask):
                     "cyclic_period": 0,
                     "atom_idx": curr_atom_idx,
                     "atom_num": len(atom_data),
-                    "res_idx": output_res_idx,
+                    "res_idx": motif_idx, # output_res_idx,
                     "res_num": 1
                 }
                 chain_ids.append(chain_id)
@@ -322,7 +364,13 @@ class MotifScaffoldingTask(SamplingTask):
             curr_atom_idx = new_atom_idx
 
         atoms = np.array(atoms, dtype=Atom)
-        residues = np.array(residues, dtype=Residue)
+        residues = np.array(residues, dtype=SamplingResidue)
+
+        # # reset the chain res_idx such that the first chain starts at res_idx=0
+        # min_chain_res_idx = min([c['res_idx'] for c in chain_data.values()])
+        # for c in chain_data.values():
+        #     c['res_idx'] = c['res_idx'] - min_chain_res_idx
+
         chains = np.array([astuple(ChainData(**c)) for c in chain_data.values()], dtype=Chain)
 
         struct = Structure(
@@ -342,8 +390,27 @@ class MotifScaffoldingTask(SamplingTask):
 
     def sample_data(self):
         for _ in range(self.num_samples):
+
+            if self.sample_contigs_idx_config is not None:
+                contigs_idx = self._sample_idx_str(self.sample_contigs_idx_config)
+                print(contigs_idx, self.total_len)
+
+                max_idx = max([int(i) for i in contigs_idx.split(",")])
+                max_len_str = str(max(self.total_len))
+                assert max_idx < max(self.total_len), (
+                    "the idx contig provided " +
+                    self.sample_contigs_idx_config +
+                    " is capable of sampling indicies for the motif " +
+                    "which are outside the max total length for the protein " +
+                    max_len_str
+                )
+            else:
+                contigs_idx = self.contigs_idx
+
             if len(self.total_len) == 2:
-                sample_length = np.random.randint(self.total_len[0], self.total_len[1] + 1)
+                max_idx = max([int(i) for i in contigs_idx.split(",")])
+                min_len = max(self.total_len[0], max_idx)
+                sample_length = np.random.randint(min_len, self.total_len[1] + 1)
             else:
                 sample_length = self.total_len[0]
 
@@ -351,10 +418,22 @@ class MotifScaffoldingTask(SamplingTask):
                 self.sample_chain_name: sample_length
             }
 
+            try:
+                self.motif_seq_idx, self.motif_res_is_unindexed = self._parse_idx_str(contigs_idx, self.pdb_contigs)
+            except Exception as e:
+                print(f"error with parsing idx contigs {self.contigs_idx}")
+                raise e
+
+            try:
+                self.condition_struct, self.atom_noising_mask, self.res_type_noising_mask = self._parse_condition_str(self.pdb_contigs)
+            except Exception as e:
+                print(f"error with parsing contigs PDB contigs {self.pdb_contigs}")
+                raise e
 
             struct = generate_protein_structure_template(
                 chain_lens,
-                extra_mols=self.condition_struct
+                extra_mols=self.condition_struct,
+                extra_mols_residue_is_unindexed_mask=self.motif_res_is_unindexed
             )
 
             # we concat on dummy masks for the new struct residues

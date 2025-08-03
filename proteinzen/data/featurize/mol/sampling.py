@@ -9,7 +9,7 @@ import numpy as np
 
 from proteinzen.boltz.data import const
 from proteinzen.boltz.data.types import (
-    Residue, Atom, Chain, Structure, Bond
+    Residue, Atom, Chain, Structure, Bond, SamplingResidue
 )
 
 from proteinzen.data.featurize.tokenize import convert_atom_name
@@ -206,6 +206,7 @@ def smiles_to_struct(
             atom_disto=0,  # Placeholder, no center
             is_standard=False,
             is_present=True,
+            is_copy=False
         )
         residue_data.append(astuple(residue))
 
@@ -276,6 +277,7 @@ def smiles_to_struct(
             atom_disto=0,  # Placeholder, no center
             is_standard=False,
             is_present=True,
+            is_copy=False,
         )
         residue_data.append(astuple(residue))
 
@@ -294,7 +296,7 @@ def smiles_to_struct(
 
     atoms = np.array(atom_data, dtype=Atom)
     bonds = np.array(bond_data, dtype=Bond)
-    residues = np.array(residue_data, dtype=Residue)
+    residues = np.array(residue_data, dtype=SamplingResidue)
     chains = np.array([astuple(chain_data)], dtype=Chain)
 
     struct = Structure(
@@ -389,6 +391,7 @@ def mol_to_struct(
             atom_disto=0,  # Placeholder, no center
             is_standard=False,
             is_present=True,
+            is_copy=False
         )
         residue_data.append(astuple(residue))
 
@@ -459,6 +462,7 @@ def mol_to_struct(
             atom_disto=0,  # Placeholder, no center
             is_standard=False,
             is_present=True,
+            is_copy=False
         )
         residue_data.append(astuple(residue))
 
@@ -477,7 +481,7 @@ def mol_to_struct(
 
     atoms = np.array(atom_data, dtype=Atom)
     bonds = np.array(bond_data, dtype=Bond)
-    residues = np.array(residue_data, dtype=Residue)
+    residues = np.array(residue_data, dtype=SamplingResidue)
     chains = np.array([astuple(chain_data)], dtype=Chain)
 
     struct = Structure(
