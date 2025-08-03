@@ -29,6 +29,9 @@ loss_terms = [
     'train/trans_vf_loss_epoch',
     'train/seq_loss_epoch',
     'train/smooth_lddt_epoch',
+    'task/motif_scaffold_unindexed_frame_vf_loss_epoch',
+    'task/motif_scaffold_indexed_frame_vf_loss_epoch',
+    'task/unconditional_frame_vf_loss_epoch',
 ]
 
 for idx, l in enumerate(loss_terms):
