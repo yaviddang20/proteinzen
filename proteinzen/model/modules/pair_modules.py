@@ -1129,7 +1129,7 @@ class MultiRigidPairEmbedder(nn.Module):
         else:
             z = z + self.lin_a_ij(torch.cat([a_current, a_sc], dim=-1))
 
-        z += self.lin_token_bonds(token_bonds) # * (token_bonds == 0)[..., None]
+        z += self.lin_token_bonds(token_bonds) # TODO: * (token_bonds == 0)[..., None]
         z = z * edge_mask[..., None]
 
         global cuet_supported

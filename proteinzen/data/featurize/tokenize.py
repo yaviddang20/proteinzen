@@ -15,6 +15,7 @@ from proteinzen.boltz.data.types import (
 
 from proteinzen.openfold.data import residue_constants as rc
 from proteinzen.data.constants import coarse_grain as cg
+from proteinzen.data.constants.atomize import get_standard_protein_residue_bonds
 from proteinzen.utils import coarse_grain as cg_utils
 from proteinzen.openfold.utils import rigid_utils as ru
 from proteinzen.openfold.utils.rigid_utils import rot_to_quat
@@ -328,7 +329,8 @@ def arbitrary_atom_to_frame(
         tensor7 = np.concatenate([quat, trans], axis=-1)
         return tensor7
 
-
+# TODO: this is such a crazy function i should probably modularize it
+# also some of the logic here feels really clunky
 def tokenize_structure(  # noqa: C901, PLR0915
     struct: Structure,
     task_data: dict[str, np.ndarray],
@@ -357,6 +359,9 @@ def tokenize_structure(  # noqa: C901, PLR0915
     # Create token data and rigid data
     token_data = []
     rigid_data = []
+    # Create token bonds
+    token_bonds = []
+    atomized_bond_store = {}
 
     # Keep track of atom_idx, rigid_idx to token_idx
     token_idx = 0
@@ -483,8 +488,12 @@ def tokenize_structure(  # noqa: C901, PLR0915
         atom_to_rigid,
         rigid_to_token,
         _token_idx,
-        _rigid_idx
+        _rigid_idx,
+        bond_graph_override=None
     ):
+        if bond_graph_override is None:
+            bond_graph_override = bond_graph
+
         ret_tokens = []
         ret_rigids = []
         # Get atom indices
@@ -513,7 +522,7 @@ def tokenize_structure(  # noqa: C901, PLR0915
                 atom_idx,
                 valid_neighbors,
                 valid_neighbor_coords,
-                bond_graph
+                bond_graph_override
             )
 
             # Create token
@@ -579,30 +588,40 @@ def tokenize_structure(  # noqa: C901, PLR0915
 
                 if copy_indexed_residue_mask[res_start + i]:
                     if copy_atomized_residue_mask[res_start + i]:
-                        ret_tokens, _ret_rigids, _, _ = _get_nonstandard_residue_data(res, {}, {}, 0, 0)
+                        aa_bond_data = get_standard_protein_residue_bonds(res['name'], atom_idx=0)
+                        _bond_graph_override = nx.Graph([(bond["atom_1"], bond["atom_2"]) for bond in aa_bond_data])
+                        ret_tokens, _ret_rigids, _, _ = _get_nonstandard_residue_data(res, {}, {}, 0, 0, bond_graph_override=_bond_graph_override)
+
+                        atomized_bond_store[(chain['asym_id'], res['res_idx'])] = aa_bond_data
+
                         copy_data.extend([
-                            {"token": t, "rigids": [r], "indexed?": True, "atomized?": True}
-                            for t, r in zip(ret_tokens, _ret_rigids)
+                            {"token": t, "rigids": [r], "indexed?": True, "atomized?": True, "res_internal_idx": i}
+                            for i, (t, r) in enumerate(zip(ret_tokens, _ret_rigids))
                         ])
                     else:
                         copy_token = copy.deepcopy(token)
                         copy_data.append({
-                            "token": copy_token, "rigids": ret_rigids, "indexed?": True, "atomized?": False
+                            "token": copy_token, "rigids": ret_rigids, "indexed?": True, "atomized?": False, "res_internal_idx": 0
                         })
                     token = replace(token, seq_noising_mask=True)
                     ret_rigids = [replace(r, rigids_noising_mask=True) for r in ret_rigids]
 
                 elif copy_unindexed_residue_mask[res_start + i]:
                     if copy_atomized_residue_mask[res_start + i]:
-                        ret_tokens, _ret_rigids, _, _ = _get_nonstandard_residue_data(res, {}, {}, 0, 0)
+                        aa_bond_data = get_standard_protein_residue_bonds(res['name'], atom_idx=0)
+                        _bond_graph_override = nx.Graph([(bond["atom_1"], bond["atom_2"]) for bond in aa_bond_data])
+                        ret_tokens, _ret_rigids, _, _ = _get_nonstandard_residue_data(res, {}, {}, 0, 0, bond_graph_override=_bond_graph_override)
+
+                        atomized_bond_store[(chain['asym_id'], res['res_idx'])] = aa_bond_data
+
                         copy_data.extend([
-                            {"token": t, "rigids": [r], "indexed?": False, "atomized?": True}
-                            for t, r in zip(ret_tokens, _ret_rigids)
+                            {"token": t, "rigids": [r], "indexed?": False, "atomized?": True, "res_internal_idx": i}
+                            for i, (t, r) in enumerate(zip(ret_tokens, _ret_rigids))
                         ])
                     else:
                         copy_token = copy.deepcopy(token)
                         copy_data.append({
-                            "token": copy_token, "rigids": ret_rigids, "indexed?": False, "atomized?": False
+                            "token": copy_token, "rigids": ret_rigids, "indexed?": False, "atomized?": False, "res_internal_idx": 0
                         })
                     token = replace(token, seq_noising_mask=True)
                     ret_rigids = [replace(r, rigids_noising_mask=True) for r in ret_rigids]
@@ -637,6 +656,7 @@ def tokenize_structure(  # noqa: C901, PLR0915
             chain_id = token['asym_id']
             if abs(last_res_idx - token['res_idx']) > 1 or chain_id != last_chain_id:
                 frag_idx += 1
+
             if frag_idx not in frag_mapping:
                 frag_mapping[frag_idx] = [copy_dict]
             else:
@@ -645,14 +665,13 @@ def tokenize_structure(  # noqa: C901, PLR0915
             last_res_idx = token['res_idx']
             last_chain_id = chain_id
 
-        frag_order = np.random.permutation(frag_idx)
+        frag_order = np.random.permutation(frag_idx+1)
         _new_copy_data = []
         for i in frag_order:
             _new_copy_data.extend(frag_mapping[i])
         copy_data = _new_copy_data
 
-
-
+    copy_atomized_bonds = []
     # append our copied residues onto the tokenized data
     # this preserves res_idx but assigns the correct token_idx and rigid_idx
     # as well as specifying proper bookkeeping values
@@ -668,6 +687,14 @@ def tokenize_structure(  # noqa: C901, PLR0915
         token['is_atomized'] = copy_dict['atomized?']
         token_data.append(astuple(TokenData(**token)))
 
+        token_res_tag = (token['asym_id'], token['res_idx'])
+        if token_res_tag in atomized_bond_store and copy_dict['res_internal_idx'] == 0:
+            copy_bond_data = atomized_bond_store[token_res_tag]
+            copy_bond_data['atom_1'] += token_idx
+            copy_bond_data['atom_2'] += token_idx
+            copy_bond_data['type'] += 1
+            copy_atomized_bonds.append(copy_bond_data.astype(TokenBond))
+
         for r in rigids:
             r['token_idx'] = token_idx
             r['rigid_idx'] = rigid_idx
@@ -675,10 +702,6 @@ def tokenize_structure(  # noqa: C901, PLR0915
             rigid_idx += 1
 
         token_idx += 1
-
-
-    # Create token bonds
-    token_bonds = []
 
     # Add atom-atom bonds from ligands
     for bond in struct.bonds:
@@ -700,6 +723,9 @@ def tokenize_structure(  # noqa: C901, PLR0915
     token_data = np.array(token_data, dtype=Token)
     token_bonds = np.array(token_bonds, dtype=TokenBond)
     rigid_data = np.array(rigid_data, dtype=Rigid)
+
+    if len(copy_atomized_bonds) > 0:
+        token_bonds = np.concatenate([token_bonds] + copy_atomized_bonds)
 
     return token_data, rigid_data, token_bonds
 

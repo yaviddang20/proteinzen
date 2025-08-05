@@ -594,46 +594,33 @@ def construct_atoms(
                 atom_idx += 1
 
         else:
-            raise NotImplementedError()
-            res_name = 'LIG'
-            atom_num = len(token_set)
-
             res = ResidueData(
-                name=res_name,
-                res_type=token_set[0]['res_type'],
+                name=residue['name'],
+                res_type=residue['res_type'],
                 res_idx=res_idx,
                 atom_idx=atom_idx,
-                atom_num=atom_num,
-                atom_center=1,
-                atom_disto=1,
-                is_standard=True,
+                atom_num=residue['atom_num'],
+                atom_center=0,
+                atom_disto=0,
+                is_standard=False,
                 is_present=True,
                 is_copy=False
             )
+            new_residues.append(astuple(res))
+            atom_num = len(token_set)
+
+            atom_start = residue['atom_idx']
+            atom_end = residue['atom_idx'] + residue['atom_num']
+            atoms = struct.atoms[atom_start:atom_end]
+
             # construct the rest of the atom data
             for i, token in enumerate(token_set):
                 rigid = rigids_data[token['rigid_idx']]
-                atom_name = np.array(convert_atom_name("X"))
-                atom_element = res_atom_name[0]  # TODO: im pretty sure this works but might be good to have smth less error prone
-                atom_element = periodic_table.GetAtomicNumber(atom_element)
-                atom_charge = 0
-                atom_conformer = np.zeros_like(atom_coords)
-                atom_chirality = 0
-                coords = atom_coords[i]
-                is_present = atom_is_present[i]
-                atom_conformer = np.zeros_like(coords)
-
-                atom = AtomData(
-                    name=atom_name,
-                    element=atom_element,
-                    charge=atom_charge,
-                    coords=coords,
-                    conformer=atom_conformer,
-                    is_present=is_present,
-                    chirality=atom_chirality
-                )
-                atom_data.append(astuple(atom))
+                new_atom = atoms[i].copy()
+                new_atom['coords'] = rigid['tensor7'][4:]
+                atom_data.append(tuple(new_atom.tolist()))
                 atom_idx += 1
+
 
     struct = Structure(
         atoms=np.array(atom_data, dtype=Atom),

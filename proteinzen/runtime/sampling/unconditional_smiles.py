@@ -69,7 +69,7 @@ class UnconditionalSamplingFromSMILES(SamplingTask):
     def sample_data(self):
         struct = smiles_to_struct(self.smiles)
         for _ in range(self.num_samples):
-            token_data, rigid_data, token_bonds = sample_noise_from_struct_template(
+            token_data, rigid_data, token_bonds, _ = sample_noise_from_struct_template(
                 struct,
             )
             data = Tokenized(
