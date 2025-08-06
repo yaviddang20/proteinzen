@@ -356,6 +356,10 @@ def sample_noise_from_struct_template(  # noqa: C901, PLR0915
                         noise_rigid = _noise_rigid[dummy_rigid_idx[j]]
                     _noise_rigid.append(noise_rigid)
 
+                    noise_rigid_trans = np.random.randn(3) * trans_std
+                    noise_rigid_quat = Rotation.random().as_quat(canonical=True)
+                    noise_rigid_tensor7 = np.concatenate([noise_rigid_quat, noise_rigid_trans], axis=-1)
+
                     rigid = RigidData(
                         rigid_idx=rigid_idx,
                         token_idx=token_idx,
@@ -363,8 +367,8 @@ def sample_noise_from_struct_template(  # noqa: C901, PLR0915
                         is_atomized=False,
                         element=-1,
                         charge=0,
-                        tensor7=rigid_tensor7[j],
-                        is_present=rigid_mask[j],
+                        tensor7=noise_rigid_tensor7 if noise_rigid else rigid_tensor7[j],
+                        is_present=True if noise_rigid else rigid_mask[j],
                         rigids_noising_mask=bool(noise_rigid)
                     )
                     rigid_data.append(astuple(rigid))
@@ -529,6 +533,7 @@ def construct_atoms(
             else:
                 res_type = residue['res_type']
                 res_name = residue['name']
+            # print(residue, token['res_type'], const.tokens[token['res_type']], residue['res_type'], residue['name'], token['seq_noising_mask'])
             atom_num = len(rc.residue_atoms[res_name])
 
 

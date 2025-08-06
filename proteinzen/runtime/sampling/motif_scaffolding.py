@@ -326,6 +326,7 @@ class MotifScaffoldingTask(SamplingTask):
         for chain_id, resid in motif_residues:
             chain = self.structure[0][chain_id]
             residue = chain[resid]
+            redesign_seq = resid in self.redesign_contigs[chain_id] if chain_id in self.redesign_contigs else False
             if self.motif_res_is_unindexed[motif_idx]:
                 output_res_idx = unindexed_res_idx
                 unindexed_res_idx += 1
@@ -334,13 +335,13 @@ class MotifScaffoldingTask(SamplingTask):
             res_data, atom_data, _atom_noising_mask, new_atom_idx = biopython_to_boltz(
                 residue, output_res_idx, curr_atom_idx,
                 noise_bb=False,
-                noise_tip=False,
-                noise_sidechain=False
+                noise_tip=redesign_seq,
+                noise_sidechain=redesign_seq
             )
             residues.append(res_data)
             atoms.extend(atom_data)
             atom_noising_mask.extend(_atom_noising_mask)
-            redesign.append(resid in self.redesign_contigs[chain_id] if chain_id in self.redesign_contigs else False)
+            redesign.append(redesign_seq)
 
             if chain_id in chain_ids:
                 chain_data[chain_id]['res_num'] = chain_data[chain_id]['res_num'] + 1
@@ -458,6 +459,7 @@ class MotifScaffoldingTask(SamplingTask):
                 task_masks=task_data
             )
             struct.atoms['coords'] -= fixed_rigids_com[None]
+            # print(struct)
 
             data = Tokenized(
                 tokens=token_data,

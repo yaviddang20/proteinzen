@@ -467,7 +467,7 @@ class BiomoleculeModule(L.LightningModule):
                 dim=0
             )
 
-            print("grad norm", total_norm)
+            # print("grad norm", total_norm)
 
         self.log(
             "grad_norm",
