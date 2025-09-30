@@ -199,7 +199,9 @@ class MultiSE3Interpolant:
                  use_euclidean_for_rots=False,
                  rot_sfm=False,
                  unconditional_guidance_alpha=0.0,
-                 dynamic_cfg=False
+                 dynamic_cfg=False,
+                 rot_g_t_fn="fn1",
+                 trans_g_t_fn="fn1"
     ):
         self._igso3 = None
 
@@ -243,6 +245,11 @@ class MultiSE3Interpolant:
 
         self.unconditional_guidance_alpha = unconditional_guidance_alpha
         self.dynamic_cfg = dynamic_cfg
+
+        assert rot_g_t_fn in ['fn1', 'fn2', 'fn3', 'fn4', 'fn5', 'fn6'] or rot_g_t_fn.startswith("poly") or rot_g_t_fn.startswith("tan")
+        assert trans_g_t_fn in ['fn1', 'fn2', 'fn3', 'fn4', 'fn5', 'fn6'] or trans_g_t_fn.startswith("poly") or trans_g_t_fn.startswith("tan")
+        self._rot_g_t_fn = rot_g_t_fn
+        self._trans_g_t_fn = trans_g_t_fn
 
 
     @property
@@ -638,10 +645,47 @@ class MultiSE3Interpolant:
 
         return batch
 
-    def g_t(self, t):
-        return (1 - t) / (t + 0.1) ** 2
+    def g_t(self, t, g_t_fn):
+        if g_t_fn == 'fn1':
+            return (1 - t) / (t + 0.1) ** 2
+        elif g_t_fn == 'fn2':
+            return (1 - t) / (t + 0.01)
+        elif g_t_fn == 'fn3':
+            return 1 / (t + 0.01)
+        elif g_t_fn == 'fn4':
+            pi_div_2 = torch.pi / 2
+            return pi_div_2 * torch.tan((0.99-t) * pi_div_2)
+        elif g_t_fn == 'fn5':
+            pi_div_2 = torch.pi / 2
+            scale = pi_div_2 * torch.tan((np.sqrt(0.99)-t)**2 * pi_div_2)
+            ret = torch.zeros_like(scale)
+            scale[t > 0.99] = 0
+            ret[torch.isfinite(scale)] = scale
+            return ret
+        elif g_t_fn == 'fn6':
+            pi_div_2 = torch.pi / 2
+            scale = pi_div_2 * torch.tan(torch.sqrt(0.98-t) * pi_div_2)
+        elif g_t_fn.startswith("poly"):
+            exponent = float(g_t_fn[4:])
+            return (1 - t) / (
+                t + (0.01 ** (1/exponent))
+            ) ** exponent
+        elif g_t_fn.startswith("tan"):
+            exponent = float(g_t_fn[3:])
+            pi_div_2 = torch.pi / 2
+            scale = pi_div_2 * torch.tan(
+                (0.99 ** (1/exponent) - t) ** exponent
+                * pi_div_2
+            )
+            ret = torch.zeros_like(scale)
+            scale[t > 0.99] = 0
+            ret[torch.isfinite(scale)] = scale
+            return ret
+        else:
+            raise ValueError(f"we don't recogize the g_t fn specifier {g_t_fn}")
 
-    def g_t_inv(self, s):
+    def g_t_inv(self, s, g_t_fn):
+        assert g_t_fn == 'fn1'
         return (- (0.2 * s + 1) + ((0.2 * s + 1) ** 2 - 4 * s * (0.01 * s - 1)) ** 0.5) / (2 * s)
 
     def _center_trans(self, trans_t, batch, trans_noising_mask=None):
@@ -668,7 +712,7 @@ class MultiSE3Interpolant:
     def _trans_churn(self, d_t, t, trans_t, noising_mask):
         if self.sampling_noise_mode == "churn":
             if self.churn_by_sigma:
-                curr_sigma = self.g_t(t)
+                curr_sigma = self.g_t(t, self._trans_g_t_fn)
                 new_sigma = (1 + self.churn) * curr_sigma
                 t_hat = self.g_t_inv(new_sigma)
                 t_hat = torch.clamp(t_hat, min=0)
@@ -677,7 +721,7 @@ class MultiSE3Interpolant:
                 t_hat = torch.clamp(t - self.churn * d_t, min=0)
                 d_t_hat = d_t * (1 + self.churn)
             noise_scale = torch.sqrt(
-                2 * self.g_t(t_hat) * self.trans_gamma - 2 * self.g_t(t) * self.trans_gamma
+                2 * self.g_t(t_hat, self._trans_g_t_fn) * self.trans_gamma - 2 * self.g_t(t, self._trans_g_t_fn) * self.trans_gamma
             )
             trans_t_hat = trans_t + torch.randn_like(trans_t) * noise_scale * 10
             trans_t_hat = _trans_diffuse_mask(trans_t_hat, trans_t, noising_mask)
@@ -704,7 +748,7 @@ class MultiSE3Interpolant:
 
         step_size = self.trans_step_size if use_score else 1
         step_size = step_size * vf_scale
-        g_t = self.g_t(t)
+        g_t = self.g_t(t, self._trans_g_t_fn)
         gamma = self.trans_gamma
         dW_t = torch.randn_like(trans_t) * torch.sqrt(d_t) * 10
         trans_score = self._trans_score(t, trans_1, trans_t) * use_score
@@ -760,7 +804,7 @@ class MultiSE3Interpolant:
 
         step_size = self.trans_step_size if use_score else 1
         step_size = step_size * vf_scale
-        g_t = self.g_t(t)
+        g_t = self.g_t(t, self._trans_g_t_fn)
         gamma = self.trans_gamma
         dW_t = torch.randn_like(trans_t) * torch.sqrt(d_t) * 10
         trans_score_cond = self._trans_score(t, trans_1_cond, trans_t) * use_score
@@ -796,7 +840,7 @@ class MultiSE3Interpolant:
                 d_t_hat = d_t * (1 + self.churn)
 
             noise_scale = torch.sqrt(
-                2 * self.g_t(t_hat) * gamma - 2 * self.g_t(t) * gamma
+                2 * self.g_t(t_hat, self._rot_g_t_fn) * gamma - 2 * self.g_t(t, self._rot_g_t_fn) * gamma
             )
             dB_rot = torch.randn(rotmats_t.shape[:-1], device=rotmats_t.device) * noise_scale
             rotmats_t_hat = so3_utils.rot_mult(
@@ -855,7 +899,7 @@ class MultiSE3Interpolant:
         else:
             rot_score = torch.zeros_like(rot_vf)
 
-        g_t = self.g_t(t)
+        g_t = self.g_t(t, self._rot_g_t_fn)
         step_size = self.rot_step_size * vf_scale
         gamma = self.rot_gamma
         dB_rot = torch.randn_like(rot_vf) * torch.sqrt(d_t)
@@ -914,7 +958,7 @@ class MultiSE3Interpolant:
         rot_vf = rot_vf_cond * (1 - self.unconditional_guidance_alpha) + rot_vf_uncond * self.unconditional_guidance_alpha
         rot_score = rot_score_cond * (1 - self.unconditional_guidance_alpha) + rot_score_uncond * self.unconditional_guidance_alpha
 
-        g_t = self.g_t(t)
+        g_t = self.g_t(t, self._rot_g_t_fn)
         step_size = self.rot_step_size * vf_scale
         gamma = self.rot_gamma
         dB_rot = torch.randn_like(rot_vf) * torch.sqrt(d_t)

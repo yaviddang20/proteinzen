@@ -11,15 +11,20 @@ import numpy as np
 import pandas as pd
 from scipy.spatial.transform import Rotation
 import tqdm
+import p_tqdm
 from Bio.PDB.Superimposer import Superimposer
 from Bio.PDB.PDBIO import PDBIO
 import pyrosetta
 
+
 from pyrosetta.rosetta.core.simple_metrics.metrics import RMSDMetric
+from pyrosetta.rosetta.core.simple_metrics.per_residue_metrics import PerResidueRMSDMetric
+from pyrosetta.rosetta.core.scoring import superimpose_pose, rms_at_corresponding_atoms_no_super
 
 from proteinzen.openfold.utils.feats import atom14_to_atom37
 from proteinzen.openfold.utils.tensor_utils import tree_map, tensor_tree_map
 
+RMSD_PROTEIN_CA_TYPE = pyrosetta.rosetta.core.scoring.rmsd_atoms.rmsd_protein_bb_ca
 RMSD_ALL_HEAVY_TYPE = pyrosetta.rosetta.core.scoring.rmsd_atoms.rmsd_all_heavy
 RMSD_PROTEIN_BB_HEAVY_TYPE = pyrosetta.rosetta.core.scoring.rmsd_atoms.rmsd_protein_bb_heavy
 
@@ -88,6 +93,45 @@ def parse_dict_to_df(d):
     return pd.DataFrame.from_dict(pd_dict)
 
 
+# RMSDMetric spazzes out sometimes and I dont know why so here's a numpy version for C-alpha rmsd
+def calc_ca_rmsd(
+    mod_pose,
+    ref_pose,
+    residue_selector_ref,
+    residue_selector,
+    residue_selector_super_ref,
+    residue_selector_super,
+):
+    ref_residues = residue_selector_super_ref.get_residues(ref_pose)
+    mod_residues = residue_selector_super.get_residues(mod_pose)
+    mod_ca_coords = np.array([mod_pose.residue(res).atom("CA").xyz() for res in mod_residues])
+    ref_ca_coords = np.array([ref_pose.residue(res).atom("CA").xyz() for res in ref_residues])
+
+    mod_com = mod_ca_coords.mean(axis=0)
+    mod_ca_coords = mod_ca_coords - mod_com[None]
+    ref_com = ref_ca_coords.mean(axis=0)
+    ref_ca_coords = ref_ca_coords - ref_com[None]
+
+    rot, _ = Rotation.align_vectors(ref_ca_coords, mod_ca_coords)
+
+    ref_residues = residue_selector_ref.get_residues(ref_pose)
+    mod_residues = residue_selector.get_residues(mod_pose)
+    mod_ca_coords = np.array([mod_pose.residue(res).atom("CA").xyz() for res in mod_residues])
+    ref_ca_coords = np.array([ref_pose.residue(res).atom("CA").xyz() for res in ref_residues])
+
+    mod_com = mod_ca_coords.mean(axis=0)
+    mod_ca_coords = mod_ca_coords - mod_com[None]
+    ref_com = ref_ca_coords.mean(axis=0)
+    ref_ca_coords = ref_ca_coords - ref_com[None]
+
+    mod_ca_coords = rot.apply(mod_ca_coords)
+    mse = np.mean(
+        np.sum((mod_ca_coords - ref_ca_coords) ** 2, axis=-1)
+    )
+    rms = np.sqrt(mse)
+    return rms
+
+
 def compute_rmsds(
     design_path,
     folded_path,
@@ -97,6 +141,7 @@ def compute_rmsds(
     fixed_bb,
     fixed_bb_chain
 ):
+
     design_pose = pyrosetta.pose_from_pdb(design_path)
 
     all_res_selector = pyrosetta.rosetta.core.select.residue_selector.TrueResidueSelector()
@@ -160,10 +205,29 @@ def compute_rmsds(
         rmsd_metric.set_residue_selector_reference(all_res_selector)
         design_data['global_all_atom_rmsd'] = rmsd_metric.calculate(folded_pose)
 
-        rmsd_metric.set_rmsd_type(RMSD_PROTEIN_BB_HEAVY_TYPE)
+        # rand_aug(folded_pose)
+
+        # rmsd_metric.set_rmsd_type(RMSD_PROTEIN_CA_TYPE)
         if fixed_bb_selector is not None:
             rmsd_metric.set_residue_selector(esmfold_fixed_bb_selector)
             rmsd_metric.set_residue_selector_reference(fixed_bb_selector)
+        else:
+            rmsd_metric.set_residue_selector(esmfold_fixed_res_selector)
+            rmsd_metric.set_residue_selector_reference(fixed_res_selector)
+        # design_data['motif_ca_rmsd'] = rmsd_metric.calculate(folded_pose)
+
+        # rand_aug(folded_pose)
+        design_data['motif_ca_rmsd'] = calc_ca_rmsd(
+            folded_pose,
+            design_pose,
+            fixed_res_selector if fixed_bb_selector is None else fixed_bb_selector,
+            esmfold_fixed_res_selector if fixed_bb_selector is None else esmfold_fixed_bb_selector,
+            fixed_res_selector if fixed_bb_selector is None else fixed_bb_selector,
+            esmfold_fixed_res_selector if fixed_bb_selector is None else esmfold_fixed_bb_selector,
+        )
+
+
+        rmsd_metric.set_rmsd_type(RMSD_PROTEIN_BB_HEAVY_TYPE)
         design_data['motif_bb_rmsd'] = rmsd_metric.calculate(folded_pose)
         rmsd_metric.set_residue_selector(all_res_selector)
         rmsd_metric.set_residue_selector_reference(all_res_selector)
@@ -175,6 +239,7 @@ def compute_rmsds(
         design_data['motif_all_atom_rmsd'] = 10.
         design_data['global_all_atom_rmsd'] = 10.
         design_data['motif_bb_rmsd'] = 10.
+        design_data['motif_ca_rmsd'] = 10.
         design_data['global_bb_rmsd'] = 10.
 
 
@@ -191,10 +256,31 @@ def compute_rmsds(
             rmsd_metric.set_residue_selector(esmfold_fixed_res_selector)
             rmsd_metric.set_residue_selector_reference(fixed_res_selector)
             _data['motif_all_atom_rmsd'] = rmsd_metric.calculate(pmpnn_pose)
-            rmsd_metric.set_rmsd_type(RMSD_PROTEIN_BB_HEAVY_TYPE)
+
+            # rmsd_metric.set_rmsd_type(RMSD_PROTEIN_CA_TYPE)
+            # rmsd_metric.set_rmsd_type(RMSD_PROTEIN_CA_TYPE)
             if fixed_bb_selector is not None:
                 rmsd_metric.set_residue_selector(esmfold_fixed_bb_selector)
                 rmsd_metric.set_residue_selector_reference(fixed_bb_selector)
+            else:
+                rmsd_metric.set_residue_selector(esmfold_fixed_res_selector)
+                rmsd_metric.set_residue_selector_reference(fixed_res_selector)
+
+            # rand_aug(pmpnn_pose)
+
+            # # _data['motif_ca_rmsd'] = rmsd_metric.calculate(pmpnn_pose)
+            _data['motif_ca_rmsd'] = calc_ca_rmsd(
+                pmpnn_pose,
+                design_pose,
+                fixed_res_selector if fixed_bb_selector is None else fixed_bb_selector,
+                esmfold_fixed_res_selector if fixed_bb_selector is None else esmfold_fixed_bb_selector,
+                fixed_res_selector if fixed_bb_selector is None else fixed_bb_selector,
+                esmfold_fixed_res_selector if fixed_bb_selector is None else esmfold_fixed_bb_selector,
+            )
+
+            # rand_aug(pmpnn_pose)
+
+            rmsd_metric.set_rmsd_type(RMSD_PROTEIN_BB_HEAVY_TYPE)
             _data['motif_bb_rmsd'] = rmsd_metric.calculate(pmpnn_pose)
             rmsd_metric.set_residue_selector(all_res_selector)
             rmsd_metric.set_residue_selector_reference(all_res_selector)
@@ -205,6 +291,7 @@ def compute_rmsds(
             _data = {
                 'motif_all_atom_rmsd': 10.,
                 'motif_bb_rmsd': 10.,
+                'motif_ca_rmsd': 10.,
                 'global_bb_rmsd': 10.,
             }
         pmpnn_data.append(_data)
@@ -231,7 +318,10 @@ if __name__ == '__main__':
     sc_df_dict = []
     folding_df_dict = []
 
-    for name, sample_data in tqdm.tqdm(parse_dict.items()):
+    def process(parse_dict_item):
+        name, sample_data = parse_dict_item
+        ret_sc_df_dicts = []
+
         sample_path = os.path.join(
             args.samples,
             name + ".pdb"
@@ -280,7 +370,7 @@ if __name__ == '__main__':
                 }
                 folding_dict.update(_data)
                 folding_dict.update(design_rmsds)
-                folding_df_dict.append(folding_dict)
+                ret_folding_df_dict = folding_dict
             else:
                 _idx = pmpnn_paths_idx.index(i)
                 sc_dict = {
@@ -291,7 +381,76 @@ if __name__ == '__main__':
                 }
                 sc_dict.update(_data)
                 sc_dict.update(pmpnn_rmsds[_idx])
-                sc_df_dict.append(sc_dict)
+                ret_sc_df_dicts.append(sc_dict)
+
+        return ret_folding_df_dict, ret_sc_df_dicts
+
+    processed_data = p_tqdm.p_map(process, parse_dict.items(), num_cpus=16)
+    for _data in processed_data:
+        folding_df_dict.append(_data[0])
+        sc_df_dict.extend(_data[1])
+
+    # for name, sample_data in tqdm.tqdm(parse_dict.items()):
+    #     sample_path = os.path.join(
+    #         args.samples,
+    #         name + ".pdb"
+    #     )
+    #     folded_path_folder = os.path.join(
+    #         args.folded_folders,
+    #         name
+    #     )
+    #     design_folded_path = None
+    #     pmpnn_paths = []
+    #     pmpnn_paths_idx = []
+    #     for path in glob.glob(os.path.join(folded_path_folder, "*")):
+    #         if "model_name=v_48_020" in path:
+    #             design_folded_path = path
+    #         else:
+    #             sample_num = int(path.split("sample=")[-1][0])
+    #             pmpnn_paths.append(path)
+    #             pmpnn_paths_idx.append(sample_num)
+
+    #     fixed_seq_idx = samples_metadata[name]['fixed_seq_res_idx']
+    #     fixed_seq_chain = samples_metadata[name]['fixed_seq_chain']
+    #     fixed_bb_res_idx = samples_metadata[name]['fixed_bb_res_idx']
+    #     fixed_bb_chain = samples_metadata[name]['fixed_bb_chain']
+
+    #     try:
+    #         design_rmsds, pmpnn_rmsds = compute_rmsds(
+    #             sample_path,
+    #             design_folded_path,
+    #             pmpnn_paths,
+    #             fixed_seq_idx,
+    #             fixed_seq_chain,
+    #             fixed_bb_res_idx,
+    #             fixed_bb_chain,
+    #         )
+    #         print(design_rmsds)
+    #         print(pmpnn_rmsds)
+    #     except Exception as e:
+    #         print(f"Error in {name}")
+    #         raise e
+    #     for i, _data in sample_data.items():
+    #         if i == 0:
+    #             folding_dict = {
+    #                 "name": name,
+    #                 "path": os.path.abspath(sample_path),
+    #                 "task": samples_metadata[name]['name']
+    #             }
+    #             folding_dict.update(_data)
+    #             folding_dict.update(design_rmsds)
+    #             folding_df_dict.append(folding_dict)
+    #         else:
+    #             _idx = pmpnn_paths_idx.index(i)
+    #             sc_dict = {
+    #                 "name": name,
+    #                 "path": os.path.abspath(pmpnn_paths[_idx]),
+    #                 "sample": i,
+    #                 "task": samples_metadata[name]['name']
+    #             }
+    #             sc_dict.update(_data)
+    #             sc_dict.update(pmpnn_rmsds[_idx])
+    #             sc_df_dict.append(sc_dict)
 
     sc_df = pd.DataFrame(sc_df_dict)
     folding_df = pd.DataFrame(folding_df_dict)

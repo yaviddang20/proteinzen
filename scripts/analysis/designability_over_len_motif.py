@@ -104,12 +104,12 @@ g.ax_joint.set_xlim(0, 20)
 plt.savefig("designable_rmsd_dist.png")
 
 plt.clf()
-fig, axs = plt.subplots(5, 5)
+fig, axs = plt.subplots(6, 5)
 fig.set_size_inches(25, 25)
 plt.subplots_adjust(wspace=0.35, hspace=0.35)
 tasks_sorted = sorted(df['task'].unique().tolist())
 for i, task in tqdm.tqdm(enumerate(tasks_sorted)):
-    ax = axs[i // 5, i % 5]
+    ax = axs[i // 5, (i - i//5 * 5)]
     ax.set_title(task)
     g = sns.scatterplot(df[df['task'] == task], x="motif_all_atom_rmsd", y="global_bb_rmsd", hue="plddt", ax=ax, palette="viridis", legend=False)
     ax.axhline(y=2.0, color='red', linestyle='--')

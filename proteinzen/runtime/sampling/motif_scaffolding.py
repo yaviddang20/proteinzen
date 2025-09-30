@@ -180,6 +180,20 @@ class MotifScaffoldingTask(SamplingTask):
         self.pdb_contigs = pdb_contigs
         self.sample_contigs_idx_config = sample_contigs_idx_config
 
+        def get_num_motif_res():
+            contigs = [c.strip() for c in pdb_contigs.split(",")]
+            num_res = 0
+
+            for contig in contigs:
+                if contig[0] in self.chain_alphabet:
+                    if "-" in contig:
+                        motif_start, motif_end = [int(i) for i in contig[1:].split("-")]
+                        num_res += (motif_end - motif_start + 1)
+                    else:
+                        num_res += 1
+            return num_res
+        self.num_motif_res = get_num_motif_res()
+
         # try:
         #     self.motif_seq_idx, self.motif_res_is_unindexed = self._parse_idx_str(contigs_idx, pdb_contigs)
         # except Exception as e:
@@ -396,7 +410,7 @@ class MotifScaffoldingTask(SamplingTask):
                 contigs_idx = self._sample_idx_str(self.sample_contigs_idx_config)
                 print(contigs_idx, self.total_len)
 
-                max_idx = max([int(i) for i in contigs_idx.split(",")])
+                max_idx = max([int(i) for i in contigs_idx.split(",") if len(i) > 0])
                 max_len_str = str(max(self.total_len))
                 assert max_idx < max(self.total_len), (
                     "the idx contig provided " +
@@ -409,7 +423,10 @@ class MotifScaffoldingTask(SamplingTask):
                 contigs_idx = self.contigs_idx
 
             if len(self.total_len) == 2:
-                max_idx = max([int(i) for i in contigs_idx.split(",")])
+                if len(contigs_idx) > 0:
+                    max_idx = max([int(i) for i in contigs_idx.split(",")])
+                else:
+                    max_idx = self.num_motif_res
                 min_len = max(self.total_len[0], max_idx)
                 sample_length = np.random.randint(min_len, self.total_len[1] + 1)
             else:

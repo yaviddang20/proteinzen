@@ -146,6 +146,50 @@ def get_linear_warmup_schedule(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def _get_decay_lr_lambda(
+    current_step: int, *, start_step: int, decay_step: int, decay_factor: float
+):
+    if current_step < start_step:
+        return 1.0
+    else:
+        exponent = (current_step - start_step) // decay_step
+        return decay_factor ** (exponent + 1)
+
+
+def get_mult_decay_schedule(
+    optimizer: torch.optim.Optimizer, start_step: int, decay_step: int, decay_factor: float
+):
+    """
+    Create a schedule with a learning rate that decreases following the values of the cosine function between the
+    initial lr set in the optimizer to 0, with several hard restarts, after a warmup period during which it increases
+    linearly between 0 and the initial lr set in the optimizer.
+
+    Args:
+        optimizer ([`~torch.optim.Optimizer`]):
+            The optimizer for which to schedule the learning rate.
+        num_warmup_steps (`int`):
+            The number of steps for the warmup phase.
+        num_training_steps (`int`):
+            The total number of training steps.
+        num_cycles (`int`, *optional*, defaults to 1):
+            The number of hard restarts to use.
+        last_epoch (`int`, *optional*, defaults to -1):
+            The index of the last epoch when resuming training.
+
+    Return:
+        `torch.optim.lr_scheduler.LambdaLR` with the appropriate schedule.
+    """
+
+    lr_lambda = partial(
+        _get_decay_lr_lambda,
+        start_step=start_step,
+        decay_step=decay_step,
+        decay_factor=decay_factor
+    )
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+
 RES_TO_AA = {}
 for i, aa in enumerate(residue_constants.resnames):
     RES_TO_AA[const.token_ids[aa]] = i
@@ -161,6 +205,10 @@ class BiomoleculeModule(L.LightningModule):
                  cosine_total_steps=1e6,
                  use_linear_warmup=False,
                  linear_warmup_steps=0,
+                 use_lr_step_decay=False,
+                 lr_step_decay_start=0,
+                 lr_step_decay_step=1,
+                 lr_step_decay_factor=0.95,
                  use_ema=True,
                  ema_decay=0.999,
                  use_posthoc_ema=False,
@@ -182,11 +230,17 @@ class BiomoleculeModule(L.LightningModule):
         self.corrupter = corrupter
         self.optim = optim
         self.self_condition_rate = self_condition_rate
+
         self.use_cosine_lr_sched = use_cosine_lr_sched
         self.use_linear_warmup = use_linear_warmup
+        self.use_lr_step_decay = use_lr_step_decay
         self.linear_warmup_steps = linear_warmup_steps
         self.cosine_warmup_steps = cosine_warmup_steps
         self.cosine_total_steps = cosine_total_steps
+        self.lr_step_decay_start = lr_step_decay_start
+        self.lr_step_decay_step = lr_step_decay_step
+        self.lr_step_decay_factor = lr_step_decay_factor
+
         self.use_ema = use_ema
         self.use_posthoc_ema = use_posthoc_ema
         self.use_euclidean_for_rots = use_euclidean_for_rots
@@ -520,16 +574,15 @@ class BiomoleculeModule(L.LightningModule):
 
         clean_traj = []
 
-        global_shift = 0
+        global_shift = torch.zeros_like(trans_0).mean(dim=-2)
         for t_2 in tqdm.tqdm(ts[1:]):
             d_t = t_2 - t_1
             # Run model.
             trans_t_1, rotmats_t_1, _ = prot_traj[-1]
-            # trans_t_1_center = (trans_t_1 * rigids_noising_mask[..., None]).sum(dim=-2) / rigids_noising_mask[..., None].float().sum(dim=-2)
-            # # print(trans_t_1_center.shape, rigids_noising_mask.shape, trans_t_1.shape)
-            # trans_t_1 = trans_t_1 - trans_t_1_center[..., None, :] * rigids_noising_mask[..., None]
-            # # trans_t_1, center = frame_noiser._center_trans(trans_t_1, res_data.batch, rigids_noising_mask)
-            # # global_shift += center
+
+            # trans_t_1_center = trans_t_1.mean(dim=-2)
+            # trans_t_1 = trans_t_1 - trans_t_1_center[..., None, :]
+            # global_shift += trans_t_1_center
 
             t_hat, d_t_hat, trans_t_hat = corrupter._trans_churn(
                 d_t,
@@ -567,7 +620,7 @@ class BiomoleculeModule(L.LightningModule):
             pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
 
             clean_traj.append(
-                (pred_trans_1,
+                (pred_trans_1 + global_shift[..., None, :],
                  pred_rotmats_1,
                  denoiser_out["pred_seq"].detach().cpu(),
                 )
@@ -599,7 +652,7 @@ class BiomoleculeModule(L.LightningModule):
             )
 
             prot_traj.append(
-                (trans_t_2,
+                (trans_t_2 + global_shift[..., None, :],
                  rotmats_t_2,
                  denoiser_out["pred_seq"].detach().cpu(),
                 )
@@ -622,11 +675,11 @@ class BiomoleculeModule(L.LightningModule):
         t = torch.ones(num_batch, device=device)[..., None] * t_1
         batch["t"] = t
 
-        denoiser_out = model(batch, self_condition=denoiser_out)
+        denoiser_out = model(batch, self_condition=denoiser_out)#, sanitize_motif_idx=True)
 
         # Process model output.
         pred_rigids = denoiser_out['denoised_rigids']
-        pred_trans_1 = pred_rigids.get_trans()
+        pred_trans_1 = pred_rigids.get_trans() + global_shift[..., None, :]
         pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
 
         ret = []
@@ -648,6 +701,7 @@ class BiomoleculeModule(L.LightningModule):
             pred_seq = pred_seq[i, :num_tokens]
             output_data['tokens']['res_type'] = pred_seq
 
+
             # if we copy any tokens, figure out what generated residue corresponds to these fixed tokens
             # select masks
             token_data = output_data['tokens']
@@ -660,6 +714,15 @@ class BiomoleculeModule(L.LightningModule):
             fixed_seq_res_idx = motif_idx[motif_seq_fixed]
             fixed_bb_chain_idx = token_data['asym_id'][motif_select_mask]
             fixed_seq_chain_idx = token_data['asym_id'][motif_seq_fixed]
+
+            # token_is_unindexed_mask = token_data['is_unindexed']
+            # token_assign_index_mask = token_is_unindexed_mask & motif_select_mask
+            # token_data['token_idx'][token_assign_index_mask] = motif_idx.numpy(force=True)[token_assign_index_mask]
+
+            # TODO: this is kinda jenk, we're doing this to allow us to have access to both the "original unindexed index" and "new assigned index"
+            # so that we can replace the motif into the structure
+            token_data['token_idx'][motif_select_mask] = motif_idx.numpy(force=True)[motif_select_mask]
+            # print(output_data['tokens'])
 
             prot_traj_i = [(_trans[i], _rot[i], _seq[i]) for _trans, _rot, _seq in prot_traj]
             ret_prot_traj = []
@@ -707,7 +770,14 @@ class BiomoleculeModule(L.LightningModule):
     def configure_optimizers(self):
         optimizer = self.optim(self.model.parameters())
 
-        if self.use_cosine_lr_sched:
+        if self.use_lr_step_decay:
+            scheduler = get_mult_decay_schedule(
+                optimizer,
+                start_step=self.lr_step_decay_start,
+                decay_step=self.lr_step_decay_step,
+                decay_factor=self.lr_step_decay_factor
+            )
+        elif self.use_cosine_lr_sched:
             scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
                 optimizer,
                 num_warmup_steps=self.cosine_warmup_steps,

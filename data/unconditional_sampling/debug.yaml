@@ -1,13 +1,13 @@
 tasks:
 # - task: unconditional
-#   sample_length: 100
-#   num_samples: 1
+#   sample_length: 300
+#   num_samples: 10
 - task: unconditional
   sample_length: 60
   num_samples: 5
 - task: unconditional
   sample_length: 80
   num_samples: 5
-- task: unconditional
-  sample_length: 100
-  num_samples: 5
+# - task: unconditional
+#   sample_length: 100
+#   num_samples: 5

@@ -28,13 +28,13 @@ def run_easy_cluster(designable_dir, output_dir):
         '--min-seq-id',
         '0',
         '--tmscore-threshold',
-        '0.6',
+        '0.5',
         '--threads',
         '1',
         # these three are mainly for clustering small sets which can error out with the default settings
         '--single-step-clustering',
-        '-s',
-        '6'
+        # '-s',
+        # '6'
     ]
     process = subprocess.Popen(
         easy_cluster_args,
@@ -74,6 +74,9 @@ os.makedirs("pmpnn_pass_by_task/clusters", exist_ok=True)
 for _, row in tqdm.tqdm(pz_pass.iterrows()):
     entry = row['name']
     metadata = samples_metadata[entry]
+    copy_out_folder = os.path.join("pz_pass_by_task", metadata['name'])
+    if not os.path.exists(copy_out_folder):
+        os.makedirs(copy_out_folder, exist_ok=True)
     copy_out_path = os.path.join("pz_pass_by_task", metadata['name'], entry + ".pdb")
     if not os.path.exists(copy_out_path):
         shutil.copy(metadata["path"], copy_out_path)
@@ -92,6 +95,9 @@ for _, row in tqdm.tqdm(pmpnn_pass.iterrows()):
             folded_path = p
             break
     assert folded_path is not None
+    copy_out_folder = os.path.join("pmpnn_pass_by_task", metadata['name'])
+    if not os.path.exists(copy_out_folder):
+        os.makedirs(copy_out_folder, exist_ok=True)
     copy_out_path = os.path.join("pmpnn_pass_by_task", metadata['name'], entry + ".pdb")
     if not os.path.exists(copy_out_path):
         shutil.copy(folded_path, copy_out_path)

@@ -484,6 +484,7 @@ def sample_noise_from_struct_template(  # noqa: C901, PLR0915
 def construct_atoms(
     data: Tokenized,
     struct: Structure,
+    take_copy_structure: bool = True # False
 ):
     token_data = data.tokens
     rigids_data = data.rigids
@@ -499,10 +500,19 @@ def construct_atoms(
     # res_idx = 1
     atom_idx = 0
 
+    unindexed_to_motif_idx = {}
+
     for token in token_data:
         res_idx = token['res_idx']
         if token['is_copy']:
             record_dict = copy_tokens_to_residues
+
+            # TODO: we're currently placing "inferred seq pos" in the token_idx slot
+            # if the motif residue is unindexed, we need to record the which residue has been assigned to represent the residue
+            # so we can determine whether the resultant residue needs to copy the motif coords
+            if token['is_unindexed']:
+                unindexed_to_motif_idx[token['token_idx']] = res_idx
+
         else:
             record_dict = tokens_to_residues
 
@@ -511,12 +521,27 @@ def construct_atoms(
         else:
             record_dict[res_idx].append(token)
 
+    # print(unindexed_to_motif_idx)
+
     for residue in struct.residues:
         res_idx = residue['res_idx']
         if residue['is_copy']:
             token_set = copy_tokens_to_residues[res_idx]
+        elif take_copy_structure:
+            # use the copy's data instead of the denoiser's data for residues which have been copied
+            if res_idx in unindexed_to_motif_idx:
+                # we check if an unindexed motif residue to be scaffolded maps to the current residue
+                token_set = copy_tokens_to_residues[unindexed_to_motif_idx[res_idx]]
+                print(residue, token_set)
+            elif res_idx in copy_tokens_to_residues:
+                # otherwise we just assume that the mapping is indexed
+                token_set = copy_tokens_to_residues[res_idx]
+                print(residue, token_set)
+            else:
+                token_set = tokens_to_residues[res_idx]
         else:
             token_set = tokens_to_residues[res_idx]
+
 
         if len(token_set) == 1:
             token = token_set[0]
@@ -527,7 +552,15 @@ def construct_atoms(
             )
             assert token_is_standard_protein
 
-            if token['seq_noising_mask']:
+            if res_idx in unindexed_to_motif_idx:
+                copy_token = copy_tokens_to_residues[unindexed_to_motif_idx[res_idx]][0]
+                res_type = copy_token['res_type']
+                res_name = const.tokens[res_type]
+            elif res_idx in copy_tokens_to_residues:
+                copy_token = copy_tokens_to_residues[res_idx][0]
+                res_type = copy_token['res_type']
+                res_name = const.tokens[res_type]
+            elif token['seq_noising_mask']:
                 res_type = token['res_type']
                 res_name = const.tokens[res_type]
             else:

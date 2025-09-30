@@ -6,6 +6,8 @@ import torch.nn.functional as F
 import copy
 import functools as fn
 
+from scipy.optimize import linear_sum_assignment
+
 from proteinzen.boltz.data import const
 
 from proteinzen.model.modules.attention import ConditionedTransformerPairBias
@@ -39,9 +41,9 @@ def get_index_embedding(indices, embed_size, max_len=2056):
     """
     K = torch.arange(embed_size//2, device=indices.device)
     pos_embedding_sin = torch.sin(
-        indices[..., None] * math.pi / (max_len**(2*K[None]/embed_size))).to(indices.device)
+        indices[..., None] * math.pi / (max_len**(2*K[None]/embed_size)))# .to(indices.device)
     pos_embedding_cos = torch.cos(
-        indices[..., None] * math.pi / (max_len**(2*K[None]/embed_size))).to(indices.device)
+        indices[..., None] * math.pi / (max_len**(2*K[None]/embed_size)))# .to(indices.device)
     pos_embedding = torch.cat([
         pos_embedding_sin, pos_embedding_cos], axis=-1)
     return pos_embedding
@@ -1149,7 +1151,8 @@ class IpaMultiRigidDenoiser(nn.Module):
                  rot_vf_scaling=1,
                  self_conditioning=True,
                  self_folding=False,
-                 use_residue_indexing=True
+                 use_residue_indexing=True,
+                 num_registers=0
                  ):
         super().__init__()
 
@@ -1242,7 +1245,16 @@ class IpaMultiRigidDenoiser(nn.Module):
             self.trans_gamma_t = MonotonicIncreasingFn()
             # self.rot_gamma_t = lambda x: x # MonotonicIncreasingFn()
 
-    def forward(self, data, self_condition=None, self_folding=None):
+        # TODO: need to actually implement this at some point
+        self.num_registers = num_registers
+        if num_registers > 0:
+            self.registers = nn.Parameter(
+                torch.randn(self.num_registers, self.c_s) / 20.0
+            )
+        else:
+            self.registers = None
+
+    def forward(self, data, self_condition=None, self_folding=None, sanitize_motif_idx=False):
         token_data = data['token']
         rigids_data = data['rigids']
         # print(rigids_data['rigids_t'].shape, token_data['token_seq_idx'].shape)
@@ -1398,6 +1410,21 @@ class IpaMultiRigidDenoiser(nn.Module):
             closest_neighbors = torch.argsort(trans_dist)
             motif_idx = closest_neighbors[..., 0]
             ret['motif_idx'] = motif_idx
+            if sanitize_motif_idx and not self.training:
+                # there are rare cases where
+                # two motif residues will be assigned to the same residue
+                # this can sometimes happen because of a bad generated structure
+                # if prompted, we patch this out using linear sum assignment
+                # with the distance matrix as the cost matrix
+                for i, sample_motif_rigid_mask in enumerate(motif_rigid_mask):
+                    motif_assignments = motif_idx[i, sample_motif_rigid_mask]
+                    if motif_assignments.unique().numel() == motif_assignments.numel():
+                        continue
+                    # if we have duplicate motif assignments, we'll greedily resolve them
+                    cost_mat = trans_dist[i, sample_motif_rigid_mask].numpy(force=True)
+                    row_assign, col_assign = linear_sum_assignment(cost_mat)
+                    motif_idx[i, sample_motif_rigid_mask] = torch.as_tensor(col_assign, device=motif_idx.device)
+                    # print(motif_assignments, col_assign)
 
         return ret
 

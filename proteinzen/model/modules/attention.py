@@ -14,6 +14,7 @@ from proteinzen.openfold.layers.layers_v2 import LayerNorm, Transition, permute_
 from proteinzen.openfold.utils.rigid_utils import Rigid
 
 from proteinzen.openfold.utils import rigid_utils as ru
+# from proteinzen.utils.flash_attn_triton import flash_attn_func
 
 
 class FlashTransformerEncoderLayer(nn.Module):
@@ -258,11 +259,6 @@ class TransformerPairBias(nn.Module):
         return x
 
 
-
-
-
-
-
 class ConditionedTransformerPairBiasLayer(nn.Module):
     def __init__(self,
                  c_s,
@@ -347,19 +343,35 @@ class ConditionedTransformerPairBiasLayer(nn.Module):
             b += self.inf * (x_mask[..., None, :, None].float() - 1)
             b += self.inf * (x_mask[..., None, None].float() - 1)
 
-            q = q.view(*q.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
-            k = k.view(*k.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
-            v = v.view(*v.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
+            if True or self.training:
+                q = q.view(*q.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
+                k = k.view(*k.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
+                v = v.view(*v.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
+            else:
+                q = q.view(*q.shape[:2], self.no_heads, self.h_head)#.transpose(-2, -3)
+                k = k.view(*k.shape[:2], self.no_heads, self.h_head)#.transpose(-2, -3)
+                v = v.view(*v.shape[:2], self.no_heads, self.h_head)#.transpose(-2, -3)
 
             if self.use_qk_norm:
                 q = self.q_norm(q)
                 k = self.k_norm(k)
 
-            # print(q.shape, k.shape, v.shape, b.shape)
+            # if True or self.training:
+            #     update = F.scaled_dot_product_attention(
+            #         q, k, v, attn_mask=permute_final_dims(b, (2, 0, 1))
+            #     )
+            #     update = update.transpose(-2, -3).flatten(-2, -1)
+            # else:
+            #     # print(q.shape, k.shape,v.shape, b.shape)
+            #     update = flash_attn_func(
+            #         q, k, v, permute_final_dims(b, (2, 0, 1))
+            #     )
+            #     update = update.flatten(-2, -1)
             update = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=permute_final_dims(b, (2, 0, 1))
             )
             update = update.transpose(-2, -3).flatten(-2, -1)
+
         out_gate = self.out_gate(_x)
         cond_gate = self.cond_gate(cond)
         update = self.lin_out(update * torch.sigmoid(out_gate))

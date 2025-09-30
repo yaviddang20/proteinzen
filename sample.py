@@ -7,6 +7,7 @@ import io
 import os
 import glob
 from dataclasses import replace
+import shutil
 
 import hydra
 from hydra_zen import zen, load_from_yaml, instantiate
@@ -46,8 +47,11 @@ class Experiment:
         self._model: LightningModule = model
 
     def predict(self):
+        kwargs = {}
         if torch.cuda.is_available():
             devices = list(range(torch.cuda.device_count()))
+            # if len(devices) > 1:
+            #     kwargs['strategy'] = 'ddp_find_unused_parameters_true'
         else:
             devices = 1
 
@@ -58,12 +62,14 @@ class Experiment:
             enable_progress_bar=True,
             enable_model_summary=True,
             devices=devices,
+            **kwargs
         )
         ret = trainer.predict(
             model=self._model,
             datamodule=self._sampler,
             ckpt_path=self._cfg['ckpt_path']
         )
+        # print([len(i) for i in ret])
         os.chdir(self._cfg['samples_dir'])
 
         samples_metadata = {}
@@ -274,6 +280,11 @@ def main(sampler,
 
     with open(os.path.join(run_dir, zen_cfg['out_prefix'], "run.log"), 'w') as fp:
         fp.write(f"Sampling config path: {zen_cfg['sampler']['tasks_yaml']}")
+    shutil.copy(
+        zen_cfg['sampler']['tasks_yaml'],
+        os.path.join(run_dir, zen_cfg['out_prefix'], "config.yaml")
+    )
+
 
     exp = Experiment(
         model=model,

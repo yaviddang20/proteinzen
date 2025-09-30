@@ -508,7 +508,7 @@ class BlockInvariantPointAttention(nn.Module):
         o_pt = flatten_final_dims(o_pt, 3)
 
         # [*, N_block, block_Q, block_K, H, C_z // 4]
-        pair_z = self.down_z(z).to(dtype=a.dtype)
+        pair_z = self.down_z(z)#.to(dtype=a.dtype)
         # [*, N_block, block_Q, H, C_z // 4]
         o_pair = torch.einsum("bnqhk,bnqkc->bnqhc", a, pair_z)
 
@@ -520,7 +520,7 @@ class BlockInvariantPointAttention(nn.Module):
         o_feats = [o, o_pt, o_pt_norm_feats, o_pair]
         o_feats = torch.cat(
             o_feats, dim=-1
-        ).to(dtype=z.dtype)
+        )#.to(dtype=z.dtype)
 
         if self.out_gate is not None:
             gate = self.out_gate(q_in)
@@ -870,7 +870,7 @@ class ConditionedBlockInvariantPointAttention(nn.Module):
         o_pt = flatten_final_dims(o_pt, 3)
 
         # [*, N_block, block_Q, block_K, H, C_z // 4]
-        pair_z = self.down_z(z).to(dtype=a.dtype)
+        pair_z = self.down_z(z)#.to(dtype=a.dtype)
         # [*, N_block, block_Q, H, C_z // 4]
         o_pair = torch.einsum("bnqhk,bnqkc->bnqhc", a, pair_z)
 
@@ -882,7 +882,7 @@ class ConditionedBlockInvariantPointAttention(nn.Module):
         o_feats = [o, o_pt, o_pt_norm_feats, o_pair]
         o_feats = torch.cat(
             o_feats, dim=-1
-        ).to(dtype=z.dtype)
+        )#.to(dtype=z.dtype)
 
         if self.out_gate is not None:
             gate = self.out_gate(q_in)

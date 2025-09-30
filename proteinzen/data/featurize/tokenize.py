@@ -797,6 +797,13 @@ def update_structure(
     token_idx = 0
     rigid_idx = 0
 
+    res_idx_to_copy_res_mapping = {}
+    for residue in struct.residues:
+        if residue['is_copy']:
+            res_idx = residue['res_idx']
+            res_idx_to_copy_res_mapping[res_idx] = residue
+
+
     for chain in chains:
         # Get residue indices
         res_start = chain["res_idx"]
@@ -810,8 +817,13 @@ def update_structure(
         _token_idx = token_idx
         for i, res in enumerate(struct.residues[res_start:res_end]):
             if res["is_standard"] and is_protein:
+                # if res['res_idx'] in res_idx_to_copy_res_mapping:
+                #     res_idx = res['res_idx']
+                #     rigid_start = res_idx_to_copy_res_mapping[res_idx]['rigid_idx']
+                # else:
+                #     rigid_start = _rigid_idx
                 rigid_start = _rigid_idx
-                rigid_end = _rigid_idx + 3
+                rigid_end = rigid_start + 3 #_rigid_idx + 3
                 tensor7 = rigid_tensor7[rigid_start:rigid_end].copy()
                 tensor7_for_atom14.append(tensor7)
                 tensor7_idx.append(i)
@@ -868,7 +880,10 @@ def update_structure(
                 # atom14_mask = atom14_mask.bool()
                 _idx = tensor7_idx.index(i)
                 res_atom14, res_atom14_mask = atom14[_idx], atom14_mask[_idx]
-                atoms["coords"] = res_atom14[res_atom14_mask].numpy(force=True)
+                # atoms["coords"] = res_atom14[res_atom14_mask].numpy(force=True)
+                # we're only replacing the bb oxy...
+                atoms["coords"][3] = res_atom14[res_atom14_mask].numpy(force=True)[3]
+
                 atoms["is_present"] = res_atom14_mask[res_atom14_mask].numpy(force=True)
 
                 token_idx += 1

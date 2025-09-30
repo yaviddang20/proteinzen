@@ -1046,7 +1046,7 @@ class InvariantPointAttention(nn.Module):
         ################
         # [*, N_res, H, C_hidden]
         o = torch.matmul(
-            a, v.transpose(-2, -3).to(dtype=a.dtype)
+            a, v.transpose(-2, -3)#.to(dtype=a.dtype)
         ).transpose(-2, -3)
 
         # [*, N_res, H * C_hidden]
@@ -1065,7 +1065,7 @@ class InvariantPointAttention(nn.Module):
         o_pt = permute_final_dims(o_pt, (2, 0, 3, 1))
 
         # [*, N_res, H, C_z // 4]
-        pair_z = self.down_z(z).to(dtype=a.dtype)
+        pair_z = self.down_z(z)#.to(dtype=a.dtype)
         o_pair = torch.matmul(a.transpose(-2, -3), pair_z)
 
         # [*, N_res, H * C_z // 4]
@@ -1325,7 +1325,7 @@ class InvariantPointAttention(nn.Module):
                     z[0] = z[0].to(o_pt.device)
 
                 # [*, N_res, H, C_z // 4]
-                pair_z = self.down_z(z[0]).to(dtype=a.dtype)
+                pair_z = self.down_z(z[0])#.to(dtype=a.dtype)
                 o_pair = torch.matmul(a.transpose(-2, -3), pair_z)
 
                 # [*, N_res, H * C_z // 4]
@@ -1357,7 +1357,7 @@ class InvariantPointAttention(nn.Module):
                 ################
                 # [*, N_res, H, C_hidden]
                 o = torch.matmul(
-                    a, v.transpose(-2, -3).to(dtype=a.dtype)
+                    a, v.transpose(-2, -3)#.to(dtype=a.dtype)
                 ).transpose(-2, -3)
 
                 # [*, N_res, H * C_hidden]
@@ -1388,7 +1388,7 @@ class InvariantPointAttention(nn.Module):
                     z[0] = z[0].to(o_pt.device)
 
                 # [*, N_res, H, C_z // 4]
-                pair_z = self.down_z(z[0]).to(dtype=a.dtype)
+                pair_z = self.down_z(z[0])# .to(dtype=a.dtype)
                 o_pair = torch.matmul(a.transpose(-2, -3), pair_z)
 
                 # [*, N_res, H * C_z // 4]
@@ -1400,7 +1400,7 @@ class InvariantPointAttention(nn.Module):
 
         o_feats = torch.cat(
             o_feats, dim=-1
-        ).to(dtype=z[0].dtype)
+        )#.to(dtype=z[0].dtype)
         if self.out_gate is not None:
             gate = self.out_gate(s)
             o_feats = o_feats * torch.sigmoid(gate)

@@ -68,7 +68,7 @@ class UnconditionalSampling(SamplingTask):
     def sample_data(self):
         for _ in range(self.num_samples):
             chain_lens = {
-                'A': self.sample_length
+                'A': self.sample_length,
             }
             struct = generate_protein_structure_template(chain_lens)
             token_data, rigid_data, token_bonds, _ = sample_noise_from_struct_template(

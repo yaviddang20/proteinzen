@@ -7,15 +7,15 @@
 #$ -q gpu.q
 #$ -pe smp 1
 #$ -l mem_free=32G
-#$ -l h_rt=4:00:00
+#$ -l h_rt=24:00:00
 #$ -l compute_cap=61,gpu_mem=40G
 
 export CUDA_VISIBLE_DEVICES=$SGE_GPU
 echo $SGE_GPU
 echo $CUDA_VISIBLE_DEVICES
 
-SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-source $SCRIPT_DIR/../../env_vars.sh
+# SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+# source $SCRIPT_DIR/../../env_vars.sh
 
 module load Sali cuda
 REPO_ROOT="/wynton/home/kortemme/alexjli/projects/proteinzen-clone"
