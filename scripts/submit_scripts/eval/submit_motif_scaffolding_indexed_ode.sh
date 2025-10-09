@@ -44,7 +44,7 @@ python sample.py \
     model_dir=$RUN_DIR \
     out_prefix=$OUTPREFIX \
     checkpoint_idx=$CHECKPOINTIDX \
-    sampler.tasks_yaml=/wynton/home/kortemme/alexjli/projects/proteinzen-clone/configs/sampling/rfdiff_motif_scaffolding/config.yaml \
+    sampler.tasks_yaml=/wynton/home/kortemme/alexjli/projects/proteinzen-clone/configs/sampling/rfdiff_motif_scaffolding/config_indexed.yaml \
     sampler.batch_size=10 \
     corrupter.sampling_noise_mode=null \
     corrupter.trans_step_size=1 \

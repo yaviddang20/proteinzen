@@ -7,7 +7,7 @@
 #$ -q gpu.q
 #$ -pe smp 1
 #$ -l mem_free=32G
-#$ -l h_rt=16:00:00
+#$ -l h_rt=18:00:00
 #$ -l compute_cap=61,gpu_mem=40G
 
 export CUDA_VISIBLE_DEVICES=$SGE_GPU
@@ -44,7 +44,7 @@ python sample.py \
     model_dir=$RUN_DIR \
     out_prefix=$OUTPREFIX \
     checkpoint_idx=$CHECKPOINTIDX \
-    sampler.tasks_yaml=/wynton/home/kortemme/alexjli/projects/proteinzen-clone/data/rfdiff_motif_scaffolding/config.yaml \
+    sampler.tasks_yaml=/wynton/home/kortemme/alexjli/projects/proteinzen-clone/configs/sampling/rfdiff_motif_scaffolding/config.yaml \
     sampler.batch_size=10 \
 
 ## sample with ProteinMPNN
