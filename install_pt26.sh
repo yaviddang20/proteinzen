@@ -35,6 +35,8 @@ pip install \
     rdkit \
     seaborn \
     wandb \
+    mashumaro \
+    p_tqdm
     # deepspeed \
 
 
