@@ -1,6 +1,7 @@
 import copy
 from dataclasses import astuple, asdict, dataclass, replace
 from typing import Tuple, List, Optional, Union
+import functools as fn
 
 
 import numpy as np
@@ -276,6 +277,64 @@ def standard_residue_to_frames(residue, atoms):
     return np.stack(rigid_tensor7, axis=0), np.array(rigid_mask), dummy_rigid_idx
 
 
+def is_colinear(point1, point2, point3, tol=1e-2):
+    """ Check if three points are colinear"""
+    v1 = point1 - point2
+    v2 = point3 - point1
+    e1 = v1 / (np.linalg.norm(v1) + 1e-10)
+    e2 = v2 / (np.linalg.norm(v2) + 1e-10)
+    e3 = np.cross(e1, e2)
+    return np.linalg.norm(e3) < tol
+
+
+def select_axes(atom_coord, neighbors, valid_neighbors, valid_neighbor_coords):
+    np.random.shuffle(neighbors)
+    for i, neighbor1 in enumerate(neighbors[:-1]):
+        for neighbor2 in neighbors[i+1:]:
+            coord1 = valid_neighbor_coords[valid_neighbors.index(neighbor1)]
+            coord2 = valid_neighbor_coords[valid_neighbors.index(neighbor2)]
+            if not is_colinear(coord1, atom_coord, coord2):
+                return (neighbor1, neighbor2)
+    return None
+
+def gen_rand_rot_frame(trans):
+    quat = Rotation.random().as_quat(canonical=True)
+    return np.concatenate([quat, trans], axis=0), 0
+
+def gen_semirand_rot_frame(center, x_axis_point):
+    x_axis = x_axis_point - center
+    x_axis = x_axis / np.linalg.norm(x_axis + 1e-6)
+    # sample y vecs until we get one which is suitable to make an axis from
+    while True:
+        y_vec = np.random.randn(3)
+        y_vec = y_vec / np.linalg.norm(y_vec)
+        if np.dot(x_axis, y_vec) < 1 - 1e-6:
+            break
+    y_axis = y_vec - np.dot(x_axis, y_vec) * x_axis
+    y_axis = y_axis / np.linalg.norm(y_axis)
+    y_axis_point = y_axis + center
+    rot, trans = compute_frame(
+        x_axis_point,
+        center,
+        y_axis_point,
+    )
+    quat = rot_to_quat(torch.as_tensor(rot)).numpy(force=True)
+    tensor7 = np.concatenate([quat, trans], axis=-1)
+    if np.isnan(tensor7).any():
+        raise ValueError("encountered nan in computing semi-random rotation")
+    return tensor7, 1
+
+def gen_det_rot_frame(center, point1, point2):
+    rot, trans = compute_frame(
+        point1,
+        center,
+        point2,
+    )
+    quat = rot_to_quat(torch.as_tensor(rot)).numpy(force=True)
+    tensor7 = np.concatenate([quat, trans], axis=-1)
+    return tensor7, 2
+
+
 def arbitrary_atom_to_frame(
     atom,
     atom_idx,
@@ -297,54 +356,44 @@ def arbitrary_atom_to_frame(
         # print(atom, atom_name)
         neighbors = []
 
-    np.random.shuffle(neighbors)
+    _select_axes = fn.partial(select_axes, valid_neighbors=valid_neighbors, valid_neighbor_coords=valid_neighbor_coords)
 
     if len(neighbors) == 0:
         quat = Rotation.random().as_quat(canonical=True)
         trans = atom["coords"]
         return np.concatenate([quat, trans], axis=0), 0
     elif len(neighbors) == 1:
+        neighbor_idx = neighbors[0]
+        neighbor_neighbors = [n for n in neighbor_graph.neighbors(neighbor_idx) if n in valid_neighbors and n != atom_idx]
+        # print(atom, atom_idx, neighbor_idx, neighbor_neighbors, list(neighbor_graph.edges))
+        if len(neighbor_neighbors) > 0:
+            # if we can get a second hop neighbor to define the frame, use that
+            axes = _select_axes(atom["coords"], [neighbor_idx] + neighbor_neighbors)
+            if axes is not None:
+                # print(atom, 2)
+                return gen_det_rot_frame(atom['coords'], *axes)
         try:
-            neighbor_idx = neighbors[0]
             neighbor_coord = valid_neighbor_coords[valid_neighbors.index(neighbor_idx)]
-            x_axis = neighbor_coord - atom["coords"]
-            x_axis = x_axis / np.linalg.norm(x_axis + 1e-6)
-            # sample y vecs until we get one which is suitable to make an axis from
-            while True:
-                y_vec = np.random.randn(3)
-                y_vec = y_vec / np.linalg.norm(y_vec)
-                if np.dot(x_axis, y_vec) < 1 - 1e-6:
-                    break
-            y_axis = y_vec - np.dot(x_axis, y_vec) * x_axis
-            y_axis = y_axis / np.linalg.norm(y_axis)
-            point3 = y_axis + atom["coords"]
-            rot, trans = compute_frame(
-                neighbor_coord,
-                atom["coords"],
-                point3,
-            )
-            quat = rot_to_quat(torch.as_tensor(rot)).numpy(force=True)
-            tensor7 = np.concatenate([quat, trans], axis=-1)
-            if np.isnan(tensor7).any():
-                raise ValueError("encountered nan in computing semi-random rotation")
-            return tensor7, 1
+            # print(atom, 1)
+            return gen_semirand_rot_frame(atom['coords'], neighbor_coord)
         except Exception as e:
             print(f"Caught exception '{e}', replacing with random rotation")
-            quat = Rotation.random().as_quat(canonical=True)
-            trans = atom["coords"]
-            return np.concatenate([quat, trans], axis=0), 0
+            # print(atom, 0)
+            return gen_rand_rot_frame(atom['coords'])
     else:
-        neighbor1_idx, neighbor2_idx = neighbors[:2]
-        neighbor1_coord = valid_neighbor_coords[valid_neighbors.index(neighbor1_idx)]
-        neighbor2_coord = valid_neighbor_coords[valid_neighbors.index(neighbor2_idx)]
-        rot, trans = compute_frame(
-            neighbor1_coord,
-            atom["coords"],
-            neighbor2_coord,
-        )
-        quat = rot_to_quat(torch.as_tensor(rot)).numpy(force=True)
-        tensor7 = np.concatenate([quat, trans], axis=-1)
-        return tensor7, 2
+        axes = _select_axes(atom["coords"], neighbors)
+        if axes is not None:
+            return gen_det_rot_frame(atom["coords"], *axes)
+
+        for neighbor_idx in neighbors:
+            try:
+                neighbor_coord = valid_neighbor_coords[valid_neighbors.index(neighbor_idx)]
+                return gen_semirand_rot_frame(atom['coords'], neighbor_coord)
+            except Exception:
+                pass
+        print("Error in featurizing rotation, replacing with random rotation")
+        return gen_rand_rot_frame(atom['coords'])
+
 
 
 class StructureTokenizer:
