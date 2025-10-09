@@ -17,6 +17,9 @@ conda create -n proteinzen python=3.10
 then run `bash install_pt26.sh`. Alternatively, we provide an `environment.yaml` which you can install via `conda env create -f environment.yaml`.
 Then activate the environment and install ProteinZen via `pip install -e .`.
 
+Finally, update `env_vars.sh` to what is correct for your setup. `REPO_ROOT` should point to the root of this repo, and `ENV_NAME`
+should match the name of the conda environment you created (if it is `proteinzen` you won't need to change anything).
+
 ## Training
 
 ### Dataset preprocessing
