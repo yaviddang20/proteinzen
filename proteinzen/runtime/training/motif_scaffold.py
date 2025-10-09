@@ -7,7 +7,7 @@ import torch
 from proteinzen.boltz.data import const
 
 from proteinzen.data.constants import coarse_grain as cg
-from proteinzen.data.featurize.tokenize import convert_atom_name
+from proteinzen.data.featurize.tokenize import convert_atom_str_to_tuple
 
 from .task import TrainingTask
 
@@ -32,7 +32,7 @@ def rigid_noise_to_atom_noise(residue, atoms, rigid_noising_mask):
     for i, atom_groups in enumerate(frame_atom_groups):
         noise_atom = rigid_noising_mask[i]
         for atom_name in atom_groups:
-            atom_id = convert_atom_name(atom_name)
+            atom_id = convert_atom_str_to_tuple(atom_name)
             atom_noise_mapping[atom_id] = noise_atom
 
     atom_noising_mask = []

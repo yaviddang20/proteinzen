@@ -39,9 +39,9 @@ from proteinzen.openfold.data import residue_constants
 from proteinzen.data.constants import coarse_grain as cg
 from proteinzen.openfold.data import data_transforms
 from proteinzen.openfold.utils import rigid_utils as ru
-from proteinzen.data.featurize.tokenize import sample_noise_tokenized_structure, Tokenized, convert_atom_name
+from proteinzen.data.featurize.tokenize import Tokenized, convert_atom_str_to_tuple
 from proteinzen.data.featurize.sampling import generate_protein_structure_template, sample_noise_from_struct_template, ResidueData, AtomData, ChainData
-from proteinzen.data.featurize.assembler import featurize_inference_v2
+from proteinzen.data.featurize.assembler import featurize_inference
 from .task import SamplingTask
 
 
@@ -90,7 +90,7 @@ def biopython_to_boltz(residue, res_idx, atom_idx, noise_bb=True, noise_tip=True
             atom = residue[atom_name]
             element_idx = periodic_table.GetAtomicNumber(atom.element)
             atom_data = AtomData(
-                name=np.array(convert_atom_name(atom_name)),
+                name=np.array(convert_atom_str_to_tuple(atom_name)),
                 element=element_idx,
                 charge=0,  # TODO: probs should get this from a reference
                 coords=np.array(atom.coord),
@@ -111,7 +111,7 @@ def biopython_to_boltz(residue, res_idx, atom_idx, noise_bb=True, noise_tip=True
         else:
             element_idx = periodic_table.GetAtomicNumber(atom_name[0])
             atom_data = AtomData(
-                name=np.array(convert_atom_name(atom_name)),
+                name=np.array(convert_atom_str_to_tuple(atom_name)),
                 element=element_idx,
                 charge=0, # TODO: probs should get this from a reference
                 coords=np.array((0.0, 0.0, 0.0)),
@@ -497,7 +497,7 @@ class MotifScaffoldingTask(SamplingTask):
                 "copy_unindexed_token_mask": None,
             }
 
-            yield featurize_inference_v2(data, task_data, task_name=self.kwargs.get("name", self.task_name))
+            yield featurize_inference(data, task_data, task_name=self.kwargs.get("name", self.task_name))
 
     def pad_data(self, data, n_padding):
         return NotImplemented

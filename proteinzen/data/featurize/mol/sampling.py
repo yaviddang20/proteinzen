@@ -12,7 +12,7 @@ from proteinzen.boltz.data.types import (
     Residue, Atom, Chain, Structure, Bond, SamplingResidue
 )
 
-from proteinzen.data.featurize.tokenize import convert_atom_name
+from proteinzen.data.featurize.tokenize import convert_atom_str_to_tuple
 from proteinzen.data.featurize.sampling import AtomData, ResidueData, ChainData
 
 
@@ -185,7 +185,7 @@ def smiles_to_struct(
             str(mol_atom.GetChiralTag()), unk_chirality
         )
         atom = AtomData(
-            name=np.array(convert_atom_name(mol_atom.GetProp("name"))),
+            name=np.array(convert_atom_str_to_tuple(mol_atom.GetProp("name"))),
             element=mol_atom.GetAtomicNum(),
             charge=mol_atom.GetFormalCharge(),
             coords=pos,
@@ -236,7 +236,7 @@ def smiles_to_struct(
 
             # Add atom to list
             atom = AtomData(
-                name=np.array(convert_atom_name(atom_name)),
+                name=np.array(convert_atom_str_to_tuple(atom_name)),
                 element=element,
                 charge=charge,
                 coords=coords,
@@ -370,7 +370,7 @@ def mol_to_struct(
             str(mol_atom.GetChiralTag()), unk_chirality
         )
         atom = AtomData(
-            name=np.array(convert_atom_name(mol_atom.GetProp("name"))),
+            name=np.array(convert_atom_str_to_tuple(mol_atom.GetProp("name"))),
             element=mol_atom.GetAtomicNum(),
             charge=mol_atom.GetFormalCharge(),
             coords=pos,
@@ -421,7 +421,7 @@ def mol_to_struct(
 
             # Add atom to list
             atom = AtomData(
-                name=np.array(convert_atom_name(atom_name)),
+                name=np.array(convert_atom_str_to_tuple(atom_name)),
                 element=element,
                 charge=charge,
                 coords=coords,
