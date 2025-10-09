@@ -709,7 +709,7 @@ class MultiSE3Interpolant:
             ).mean(dim=-2)
         return trans_t - center[batch][..., None, :], center
 
-    def _trans_churn(self, d_t, t, trans_t, noising_mask):
+    def trans_churn(self, d_t, t, trans_t, noising_mask):
         if self.sampling_noise_mode == "churn":
             if self.churn_by_sigma:
                 curr_sigma = self.g_t(t, self._trans_g_t_fn)
@@ -733,7 +733,7 @@ class MultiSE3Interpolant:
         trans_vf = (trans_1 - trans_t) / (1 - t)
         return (t * trans_vf - trans_t) / (1-t)
 
-    def _trans_euler_step(
+    def trans_euler_step(
             self,
             d_t,
             t,
@@ -768,7 +768,7 @@ class MultiSE3Interpolant:
         return trans_next
 
 
-    def _trans_guidance_step(
+    def trans_guidance_step(
             self,
             d_t,
             t,
@@ -826,7 +826,7 @@ class MultiSE3Interpolant:
         return trans_next
 
 
-    def _rot_churn(self, d_t, t, rotmats_t, noising_mask):
+    def rot_churn(self, d_t, t, rotmats_t, noising_mask):
         if self.sampling_noise_mode == "churn":
             gamma = self.rot_gamma
             if self.churn_by_sigma:
@@ -868,7 +868,7 @@ class MultiSE3Interpolant:
         rot_score = (prefactor / omega)[..., None] * so3_utils.calc_rot_vf(rotmats_1, rotmats_t)
         return rot_score
 
-    def _rots_euler_step(
+    def rots_euler_step(
             self,
             d_t,
             t,
@@ -922,7 +922,7 @@ class MultiSE3Interpolant:
         return rotmats_next
 
 
-    def _rots_guidance_step(
+    def rots_guidance_step(
             self,
             d_t,
             t,
