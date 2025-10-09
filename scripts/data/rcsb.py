@@ -40,7 +40,7 @@ class PDB:
     path: str
 
 
-class Resource:
+class CCDResource:
     """A shared resource for processing."""
 
     def __init__(self, host: str, port: int) -> None:
@@ -140,7 +140,7 @@ def finalize(outdir: Path) -> None:
         json.dump(records, f)
 
 
-def parse(data: PDB, resource: Resource, clusters: dict) -> Target:
+def parse(data: PDB, ccd_resource: CCDResource, clusters: ClusterResource) -> Target:
     """Process a structure.
 
     Parameters
@@ -160,7 +160,7 @@ def parse(data: PDB, resource: Resource, clusters: dict) -> Target:
     pdb_id = data.id.lower()
 
     # Parse structure
-    parsed = parse_mmcif(data.path, resource, ignore_connections=True)
+    parsed = parse_mmcif(data.path, ccd_resource, ignore_connections=True)
     structure = parsed.data
     structure_info = parsed.info
 
@@ -206,10 +206,10 @@ def parse(data: PDB, resource: Resource, clusters: dict) -> Target:
 
 def process_structure(
     data: PDB,
-    get_resource: Callable[[], Resource],
+    get_ccd_resource: Callable[[], CCDResource],
     outdir: Path,
     filters: list[StaticFilter],
-    get_clusters: Callable[[], ClusterResource],
+    get_clusters_resource: Callable[[], ClusterResource],
 ) -> None:
     """Process a target.
 
@@ -224,8 +224,8 @@ def process_structure(
 
     """
 
-    resource = get_resource()
-    clusters = get_clusters()
+    ccd = get_ccd_resource()
+    clusters = get_clusters_resource()
 
     # Check if we need to process
     if "af-" in data.id:
@@ -248,7 +248,7 @@ def process_structure(
 
     try:
         # Parse the target
-        target: Target = parse(data, resource, clusters)
+        target: Target = parse(data, ccd, clusters)
         structure = target.structure
 
         # Apply the filters
@@ -312,10 +312,10 @@ def process(args) -> None:
     rdkit.Chem.SetDefaultPickleProperties(pickle_option)
 
     # Load shared data from redis
-    def get_resource() -> Resource:
-        return Resource(host=args.redis_host, port=args.redis_port)
+    def get_ccd_resource() -> CCDResource:
+        return CCDResource(host=args.ccd_redis_host, port=args.ccd_redis_port)
     def get_cluster_resource() -> ClusterResource:
-        return ClusterResource(host=args.clusters_host, port=args.clusters_port)
+        return ClusterResource(host=args.clusters_redis_host, port=args.clusters_redis_port)
 
     # Get data points
     print("Fetching data...")
@@ -332,7 +332,7 @@ def process(args) -> None:
         # Create processing function
         fn = partial(
             process_structure,
-            get_resource=get_resource,
+            get_resource=get_ccd_resource,
             outdir=args.outdir,
             get_clusters=get_cluster_resource,
             filters=filters,
@@ -343,9 +343,9 @@ def process(args) -> None:
         for item in tqdm(data):
             process_structure(
                 item,
-                get_resource=get_resource,
+                get_ccd_resource=get_ccd_resource,
                 outdir=args.outdir,
-                get_clusters=get_cluster_resource,
+                get_clusters_resource=get_cluster_resource,
                 filters=filters,
             )
 
@@ -362,13 +362,13 @@ if __name__ == "__main__":
         help="The data containing the MMCIF files.",
     )
     parser.add_argument(
-        "--clusters-host",
+        "--clusters-redis-host",
         type=str,
         default="localhost",
         help="The Redis host.",
     )
     parser.add_argument(
-        "--clusters-port",
+        "--clusters-redis-port",
         type=int,
         default=7778,
         help="The Redis port.",
@@ -386,13 +386,13 @@ if __name__ == "__main__":
         help="The number of processes.",
     )
     parser.add_argument(
-        "--redis-host",
+        "--ccd-redis-host",
         type=str,
         default="localhost",
         help="The Redis host.",
     )
     parser.add_argument(
-        "--redis-port",
+        "--ccd-redis-port",
         type=int,
         default=7777,
         help="The Redis port.",
