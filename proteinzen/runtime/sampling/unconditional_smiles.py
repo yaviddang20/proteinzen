@@ -20,7 +20,7 @@ from proteinzen.openfold.utils import rigid_utils as ru
 from proteinzen.data.featurize.mol.sampling import smiles_to_struct
 from proteinzen.data.featurize.tokenize import Tokenized
 from proteinzen.data.featurize.sampling import sample_noise_from_struct_template
-from proteinzen.data.featurize.assembler import featurize_inference_v2
+from proteinzen.data.featurize.assembler import featurize_inference
 
 
 from .task import SamplingTask
@@ -82,7 +82,7 @@ class UnconditionalSamplingFromSMILES(SamplingTask):
                 "t": np.array([1.0], dtype=float),
             }
 
-            yield featurize_inference_v2(data, task_data)
+            yield featurize_inference(data, task_data, task_name=self.kwargs.get("name", self.task_name))
 
     def pad_data(self, data, n_padding):
         return NotImplemented

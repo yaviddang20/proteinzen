@@ -1121,14 +1121,14 @@ class IpaMultiRigidDenoiser(nn.Module):
                  num_v_points=12,
                  num_blocks=12,
                  trans_preconditioning=False,
-                 rot_preconditioning=False,
+                 rot_preconditioning=True,
                  block_q=16,
                  block_k=64,
                  use_conditioned_ipa=True,
                  use_conditioned_rigid_transformer=False,
                  rigid_transformer_num_blocks=1,
                  rigid_transformer_num_heads=4,
-                 rigid_transformer_rigid_updates=False,
+                 rigid_transformer_rigid_updates=True,
                  rigid_transformer_agg_embed=True,
                  rigid_transformer_add_vanilla_transformer=False,
                  rigid_transformer_add_second_transformer=False,
@@ -1137,7 +1137,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                  rel_quat_pair_updates=False,
                  z_broadcast=True,
                  compile_ipa=False,
-                 use_ipa_gating=False,
+                 use_ipa_gating=True,
                  ablate_ipa_down_z=False,
                  ipa_row_dropout_r=0.,
                  tfmr_row_dropout_r=0.,
@@ -1420,7 +1420,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                     motif_assignments = motif_idx[i, sample_motif_rigid_mask]
                     if motif_assignments.unique().numel() == motif_assignments.numel():
                         continue
-                    # if we have duplicate motif assignments, we'll greedily resolve them
+                    # if we have duplicate motif assignments, resolve them via linear sum assignment
                     cost_mat = trans_dist[i, sample_motif_rigid_mask].numpy(force=True)
                     row_assign, col_assign = linear_sum_assignment(cost_mat)
                     motif_idx[i, sample_motif_rigid_mask] = torch.as_tensor(col_assign, device=motif_idx.device)

@@ -44,7 +44,7 @@ python sample.py \
     model_dir=$RUN_DIR \
     out_prefix=$OUTPREFIX \
     checkpoint_idx=$CHECKPOINTIDX \
-    sampler.tasks_yaml=/wynton/home/kortemme/alexjli/projects/proteinzen-clone/data/unconditional_sampling/benchmark_300.yaml \
+    sampler.tasks_yaml=/wynton/home/kortemme/alexjli/projects/proteinzen-clone/configs/sampling/unconditional_sampling/benchmark_300.yaml \
     sampler.batch_size=10 \
 
 ## sample with ProteinMPNN

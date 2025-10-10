@@ -137,8 +137,8 @@ def config_hydra_store():
     ExperimentConfig = make_config(
         debug=True,
         hydra_defaults=[
-            {"paradigm": "diffusion"},
-            {"domain": "bb"},
+            {"paradigm": "multiframefm"},
+            {"domain": "protein"},
             {"datamodule": "default"},
             {"dataset": "afdb_128"},
             {"lmodule": "${domain}"},
@@ -210,7 +210,7 @@ def config_sampling_hydra_store():
 
     SamplingConfig = make_config(
         model_dir="",
-        out_prefix="samples",
+        out_dir="samples",
         save_traj=False,
         output_motif_chains=False,
         checkpoint_idx=-1,
