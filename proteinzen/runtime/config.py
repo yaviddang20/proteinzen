@@ -184,17 +184,6 @@ def config_sampling_hydra_store():
             run=RunDir(dir="./sampling_outputs/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}")
     ))
 
-    # store(
-    #     {
-    #         "model_dir": "",
-    #         "out_prefix": "samples",
-    #         "save_traj": False,
-    #         "debug": False,
-    #         "checkpoint_idx": -1
-    #     },
-    #     name='default'
-    # )
-
     sampler_store = store(group="sampler")
     sampler_store(
         builds(

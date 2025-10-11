@@ -1,7 +1,6 @@
 """Utilities for calculating all atom representations."""
 import torch
 from proteinzen.openfold.utils import rigid_utils as ru
-from proteinzen.openfold.utils import feats
 from proteinzen.openfold.utils.tensor_utils import batched_gather
 from proteinzen.openfold.data import residue_constants
 from proteinzen.data.constants import coarse_grain

@@ -1,3 +1,7 @@
+""" Utilities for performing operations regarding SO(3)
+
+Adapted from FrameFlow, FrameDiff, QFlow/ReQFlow
+"""
 import logging
 import os
 from typing import Callable, Dict, Optional, Tuple

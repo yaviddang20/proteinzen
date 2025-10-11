@@ -10,7 +10,6 @@ from scipy.spatial.distance import cdist
 
 from proteinzen.boltz.data import const
 from proteinzen.data.featurize.tokenize import Tokenized
-# from proteinzen.boltz.data.types import Tokenized
 
 
 def pick_random_token(

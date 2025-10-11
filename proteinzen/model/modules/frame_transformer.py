@@ -5,23 +5,51 @@ import math
 import torch.nn as nn
 import torch.nn.functional as F
 import copy
-import functools as fn
-import numpy as np
 
-from torch_geometric.nn import knn_graph
-import torch_geometric.utils as pygu
-# import dgl
-# import dgl.sparse
-# from dgl.ops import u_mul_e_sum, u_dot_v, u_add_v
 
 from proteinzen.model.modules.attention import FlashTransformerEncoder
-from proteinzen.openfold.layers.layers import _deepspeed_evo_attn
 from proteinzen.openfold.layers.layers_v2 import (
     Linear, swish, ipa_point_weights_init_, permute_final_dims, flatten_final_dims, BackboneUpdate, LayerNorm,
-    AdaLN, ConditionedTransition, Transition)
+)
 from proteinzen.openfold.utils import rigid_utils as ru
 
-from proteinzen.model.modules.pair_modules import evoformer_supported
+
+# from boltz1
+def get_indexing_matrix(K, W, H, device):
+    assert W % 2 == 0
+    assert H % (W // 2) == 0
+
+    h = H // (W // 2)
+    assert h % 2 == 0
+
+    arange = torch.arange(2 * K, device=device)
+    index = ((arange.unsqueeze(0) - arange.unsqueeze(1)) + h // 2).clamp(
+        min=0, max=h + 1
+    )
+    index = index.view(K, 2, 2 * K)[:, 0, :]
+    onehot = F.one_hot(index, num_classes=h + 2)[..., 1:-1].transpose(1, 0)
+    return onehot.reshape(2 * K, h * K).float()
+
+# from boltz1
+def single_to_keys(single, indexing_matrix, W, H):
+    B, N, D = single.shape
+    K = N // W
+    single = single.view(B, 2 * K, W // 2, D)
+    return torch.einsum("b j i d, j k -> b k i d", single, indexing_matrix).reshape(
+        B, K, H, D
+    )
+
+# adapted from boltz1
+def pairs_to_framepairs(pairs, indexing_matrix, W, H):
+    B, N, _, D = pairs.shape
+    K = N // W
+    pairs = pairs.view(B, K, W, 2 * K, W // 2, D)
+    indexing_matrix = indexing_matrix.view(2 * K, K, -1)
+    ret = torch.einsum("b x y j i d, j x h -> b x y h i d", pairs, indexing_matrix)
+    ret = ret.reshape(
+        B, K, W, H, D
+    )
+    return ret
 
 
 class GatherAdaLN(nn.Module):
@@ -130,56 +158,6 @@ class ScatterUpdate(nn.Module):
         # print(out_denom)
         out = out / out_denom[..., None].clip(min=1)
         return out + node_embed
-
-
-# from boltz1
-def get_indexing_matrix(K, W, H, device):
-    assert W % 2 == 0
-    assert H % (W // 2) == 0
-
-    h = H // (W // 2)
-    assert h % 2 == 0
-
-    arange = torch.arange(2 * K, device=device)
-    index = ((arange.unsqueeze(0) - arange.unsqueeze(1)) + h // 2).clamp(
-        min=0, max=h + 1
-    )
-    index = index.view(K, 2, 2 * K)[:, 0, :]
-    onehot = F.one_hot(index, num_classes=h + 2)[..., 1:-1].transpose(1, 0)
-    return onehot.reshape(2 * K, h * K).float()
-
-# from boltz1
-def single_to_keys(single, indexing_matrix, W, H):
-    B, N, D = single.shape
-    K = N // W
-    single = single.view(B, 2 * K, W // 2, D)
-    return torch.einsum("b j i d, j k -> b k i d", single, indexing_matrix).reshape(
-        B, K, H, D
-    )
-
-# adapted from boltz1
-def pairs_to_framepairs(pairs, indexing_matrix, W, H):
-    B, N, _, D = pairs.shape
-    K = N // W
-    pairs = pairs.view(B, K, W, 2 * K, W // 2, D)
-    indexing_matrix = indexing_matrix.view(2 * K, K, -1)
-    ret = torch.einsum("b x y j i d, j x h -> b x y h i d", pairs, indexing_matrix)
-    ret = ret.reshape(
-        B, K, W, H, D
-    )
-    return ret
-
-# adapted from boltz1
-def single_to_weighted_keys(single, weight, indexing_matrix, W, H):
-    B, N, D = single.shape
-    K = N // W
-    D_out, D_in = weight.shape
-    assert D == D_in
-    single = single.view(B, 2 * K, W // 2, D_in)
-    return torch.einsum("b j i d, j k, o d -> b k i o", single, indexing_matrix, weight).reshape(
-        B, K, H, D_out
-    )
-
 
 
 class BlockInvariantPointAttention(nn.Module):
@@ -1158,52 +1136,6 @@ class ConditionedBlockTransformerPairBias(nn.Module):
         rigids_embed = rigids_embed + self.transition(rigids_embed, s, rigids_to_res_idx, rigids_mask) * rigids_mask[..., None]
 
         return rigids_embed
-
-
-def pad_and_flatten_rigids(rigids, rigids_embed, rigids_mask, rigids_noising_mask, block_q):
-    rigids_to_res_idx = torch.arange(rigids_embed.shape[1], device=rigids_embed.device)
-    n_batch, _, rigids_per_res = rigids_embed.shape[:3]
-    rigids_to_res_idx = torch.tile(rigids_to_res_idx[None, :, None], (n_batch, 1, rigids_per_res))
-    bb_rigids_mask = torch.zeros_like(rigids_to_res_idx, dtype=torch.bool)
-    bb_rigids_mask[..., 0] = True
-
-    # pad to proper input shape
-    rigids_embed_flat = rigids_embed.flatten(1, 2)
-    # rigids_mask = torch.ones(rigids_embed_flat.shape[:-1], device=rigids_embed_flat.device, dtype=torch.bool)
-    n_padding = (block_q - (rigids_embed_flat.shape[1] % block_q)) % block_q
-    rigids_embed_flat = F.pad(rigids_embed_flat, (0, 0, 0, n_padding), value=0)
-    rigids_noising_mask_flat = F.pad(rigids_noising_mask.flatten(-2, -1), (0, n_padding), value=False)
-    rigids_flat_mask = F.pad(rigids_mask.flatten(-2, -1), (0, n_padding), value=0)
-    rigids_to_res_idx = F.pad(
-        rigids_to_res_idx.view(n_batch, -1),
-        (0, n_padding),
-        value=0
-    )
-    bb_rigids_mask = F.pad(bb_rigids_mask.flatten(-2, -1), (0, n_padding), value=False)
-
-    # pad the rigids
-    rigids_flat = rigids.view(n_batch, -1)
-    rigids_padding = ru.Rigid.identity(shape=(n_batch, n_padding), device=rigids_embed.device, fmt="quat")
-    # we don't use ru.Rigid.cat cuz this automatically converts stuff to rotmats...
-    # we need to stay in quats
-    rigids_flat = ru.Rigid(
-        trans=torch.cat([rigids_flat.get_trans(), rigids_padding.get_trans()], dim=-2),
-        rots=ru.Rotation(
-            quats=torch.cat([
-                rigids_flat.get_rots().get_quats(), rigids_padding.get_rots().get_quats()
-            ], dim=-2)
-        )
-    )
-    return rigids_flat, rigids_embed_flat, rigids_to_res_idx, rigids_flat_mask, rigids_noising_mask_flat, bb_rigids_mask, n_padding
-
-
-
-def unflatten_rigids(rigids_flat, n_padding):
-    shape = (rigids_flat.shape[0], -1, 3)
-    if n_padding > 0:
-        return rigids_flat[..., :-n_padding].view(*shape)
-    else:
-        return rigids_flat.view(*shape)
 
 
 class FramepairEmbedder(nn.Module):

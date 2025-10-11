@@ -8,13 +8,12 @@ import torch_geometric.utils as pygu
 import math
 from typing import Optional, Sequence, Tuple, Union, Callable
 
-from proteinzen.openfold.layers.layers import Linear, flatten_final_dims, ipa_point_weights_init_, _deepspeed_evo_attn, Dropout
-from proteinzen.model.modules.pair_modules import DropoutRowwise, evoformer_supported
+from proteinzen.openfold.layers.layers import Linear, flatten_final_dims, ipa_point_weights_init_, Dropout
+from proteinzen.model.modules.pair_modules import DropoutRowwise
 from proteinzen.openfold.layers.layers_v2 import LayerNorm, Transition, permute_final_dims, AdaLN
 from proteinzen.openfold.utils.rigid_utils import Rigid
 
 from proteinzen.openfold.utils import rigid_utils as ru
-# from proteinzen.utils.flash_attn_triton import flash_attn_func
 
 
 class FlashTransformerEncoderLayer(nn.Module):
@@ -171,54 +170,23 @@ class TransformerPairBiasLayer(nn.Module):
         b = self.lin_b(_z)
         k, v = kv.split(self.h_head * self.no_heads, dim=-1)
 
-        if evoformer_supported:
-            # take advantage of evoformer MSA row attention kernel for efficient pair bias
-            # by processing an "MSA" of one sequence
-            q = q.view(*q.shape[:2], self.no_heads, self.h_head)[:, None]
-            k = k.view(*k.shape[:2], self.no_heads, self.h_head)[:, None]
-            v = v.view(*v.shape[:2], self.no_heads, self.h_head)[:, None]
+        b += self.inf * (x_mask[..., None, :, None].float() - 1)
+        b += self.inf * (x_mask[..., None, None].float() - 1)
 
-            if self.use_qk_norm:
-                q = self.q_norm(q)
-                k = self.k_norm(k)
+        q = q.view(*q.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
+        k = k.view(*k.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
+        v = v.view(*v.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
 
-            res_mask = x_mask[..., None, None, None, :]
-            pair_bias = permute_final_dims(b[:, None], (2, 0, 1))
-            # print(q.shape, k.shape, v.shape, res_mask.shape, pair_bias.shape)
-            # DeepSpeed attn. kernel requires inputs to be type bf16 or fp16
-            # Cast to bf16 so kernel can be used during inference
-            biases = [res_mask.to(torch.bfloat16), pair_bias]
-            orig_dtype = q.dtype
-            if orig_dtype not in [torch.bfloat16, torch.float16]:
-                o = DS4Sci_EvoformerAttention(q.to(dtype=torch.bfloat16),
-                                            k.to(dtype=torch.bfloat16),
-                                            v.to(dtype=torch.bfloat16),
-                                            [b.to(dtype=torch.bfloat16) for b in biases])
-                o = o.to(dtype=orig_dtype)
-            else:
-                o = DS4Sci_EvoformerAttention(q, k, v, biases)
-            update = o.reshape(q.shape)
-            # print(update.shape)
-            # update = _deepspeed_evo_attn(q, k, v, [res_mask, pair_bias])
-            update = update.squeeze(1)
-            update = update.flatten(-2, -1)
-        else:
-            b += self.inf * (x_mask[..., None, :, None].float() - 1)
-            b += self.inf * (x_mask[..., None, None].float() - 1)
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
-            q = q.view(*q.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
-            k = k.view(*k.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
-            v = v.view(*v.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
+        # print(q.shape, k.shape, v.shape, b.shape)
+        update = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=permute_final_dims(b, (2, 0, 1))
+        )
+        update = update.transpose(-2, -3).flatten(-2, -1)
 
-            if self.use_qk_norm:
-                q = self.q_norm(q)
-                k = self.k_norm(k)
-
-            # print(q.shape, k.shape, v.shape, b.shape)
-            update = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=permute_final_dims(b, (2, 0, 1))
-            )
-            update = update.transpose(-2, -3).flatten(-2, -1)
         out_gate = self.out_gate(_x)
         update = self.lin_out(update * torch.sigmoid(out_gate))
         x = x + self.row_dropout(self.dropout(update))
@@ -308,69 +276,26 @@ class ConditionedTransformerPairBiasLayer(nn.Module):
         b = self.lin_b(_z)
         k, v = kv.split(self.h_head * self.no_heads, dim=-1)
 
-        if evoformer_supported:
-            # take advantage of evoformer MSA row attention kernel for efficient pair bias
-            # by processing an "MSA" of one sequence
-            q = q.view(*q.shape[:2], self.no_heads, self.h_head)[:, None]
-            k = k.view(*k.shape[:2], self.no_heads, self.h_head)[:, None]
-            v = v.view(*v.shape[:2], self.no_heads, self.h_head)[:, None]
+        b += self.inf * (x_mask[..., None, :, None].float() - 1)
+        b += self.inf * (x_mask[..., None, None].float() - 1)
 
-            if self.use_qk_norm:
-                q = self.q_norm(q)
-                k = self.k_norm(k)
-
-            res_mask = x_mask[..., None, None, None, :]
-            pair_bias = permute_final_dims(b[:, None], (2, 0, 1))
-            # print(q.shape, k.shape, v.shape, res_mask.shape, pair_bias.shape)
-            # DeepSpeed attn. kernel requires inputs to be type bf16 or fp16
-            # Cast to bf16 so kernel can be used during inference
-            biases = [res_mask.to(torch.bfloat16), pair_bias]
-            orig_dtype = q.dtype
-            if orig_dtype not in [torch.bfloat16, torch.float16]:
-                o = DS4Sci_EvoformerAttention(q.to(dtype=torch.bfloat16),
-                                            k.to(dtype=torch.bfloat16),
-                                            v.to(dtype=torch.bfloat16),
-                                            [b.to(dtype=torch.bfloat16) for b in biases])
-                o = o.to(dtype=orig_dtype)
-            else:
-                o = DS4Sci_EvoformerAttention(q, k, v, biases)
-            update = o.reshape(q.shape)
-            # print(update.shape)
-            # update = _deepspeed_evo_attn(q, k, v, [res_mask, pair_bias])
-            update = update.squeeze(1)
-            update = update.flatten(-2, -1)
+        if True or self.training:
+            q = q.view(*q.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
+            k = k.view(*k.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
+            v = v.view(*v.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
         else:
-            b += self.inf * (x_mask[..., None, :, None].float() - 1)
-            b += self.inf * (x_mask[..., None, None].float() - 1)
+            q = q.view(*q.shape[:2], self.no_heads, self.h_head)#.transpose(-2, -3)
+            k = k.view(*k.shape[:2], self.no_heads, self.h_head)#.transpose(-2, -3)
+            v = v.view(*v.shape[:2], self.no_heads, self.h_head)#.transpose(-2, -3)
 
-            if True or self.training:
-                q = q.view(*q.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
-                k = k.view(*k.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
-                v = v.view(*v.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
-            else:
-                q = q.view(*q.shape[:2], self.no_heads, self.h_head)#.transpose(-2, -3)
-                k = k.view(*k.shape[:2], self.no_heads, self.h_head)#.transpose(-2, -3)
-                v = v.view(*v.shape[:2], self.no_heads, self.h_head)#.transpose(-2, -3)
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
-            if self.use_qk_norm:
-                q = self.q_norm(q)
-                k = self.k_norm(k)
-
-            # if True or self.training:
-            #     update = F.scaled_dot_product_attention(
-            #         q, k, v, attn_mask=permute_final_dims(b, (2, 0, 1))
-            #     )
-            #     update = update.transpose(-2, -3).flatten(-2, -1)
-            # else:
-            #     # print(q.shape, k.shape,v.shape, b.shape)
-            #     update = flash_attn_func(
-            #         q, k, v, permute_final_dims(b, (2, 0, 1))
-            #     )
-            #     update = update.flatten(-2, -1)
-            update = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=permute_final_dims(b, (2, 0, 1))
-            )
-            update = update.transpose(-2, -3).flatten(-2, -1)
+        update = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=permute_final_dims(b, (2, 0, 1))
+        )
+        update = update.transpose(-2, -3).flatten(-2, -1)
 
         out_gate = self.out_gate(_x)
         cond_gate = self.cond_gate(cond)

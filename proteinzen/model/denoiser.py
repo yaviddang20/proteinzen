@@ -379,7 +379,6 @@ class Embedder(nn.Module):
         rigids_token_uid,
         rigids_idx,
         rigids_is_atomized_mask,
-        # rigids_is_unindexed_mask,
     ):
         nodes_to_rigids = fn.partial(gather_helper, token_gather_idx=rigids_token_uid)
 
@@ -390,9 +389,6 @@ class Embedder(nn.Module):
         element_mask = (rigids_element != -1)
         element_embed = self.rigid_element_embed(rigids_element * element_mask) * element_mask[..., None]
         charge_embed = self.rigid_charge_embed(rigids_charge.unsqueeze(-1))
-        # print(rigids_element)
-        # print(rigids_charge)
-        # is_unindexed_embed = self.rigid_is_unindexed_embed(rigids_is_unindexed_mask[..., None].float())
 
         rigids_init = (
             rigids_init
@@ -401,7 +397,6 @@ class Embedder(nn.Module):
             + is_atomized_embed
             + element_embed
             + charge_embed
-            # + is_unindexed_embed
         )
         return rigids_init
 
@@ -461,8 +456,6 @@ class Embedder(nn.Module):
             rigids_mask,
             rigids_noising_mask,
             rigids_is_atomized_mask,
-            # rigids_is_token_rigid_mask,
-            # rigids_is_unindexed_mask,
             token_bonds,
             sc_rigids=None,
             sf_rigids=None
@@ -522,7 +515,6 @@ class Embedder(nn.Module):
             rigids_token_uid,
             rigids_idx,
             rigids_is_atomized_mask,
-            # rigids_is_unindexed_mask
         )
 
         rigids_inputs = {
@@ -532,12 +524,9 @@ class Embedder(nn.Module):
             "rigids_init": rigids_init,
             "rigids_mask": rigids_mask,
             "rigids_token_uid": rigids_token_uid,
-            # "rigids_center_mask": rigids_is_token_rigid_mask,
             "rigids_is_atomized_mask": rigids_is_atomized_mask,
-            # "rigids_is_unindexed_mask": rigids_is_unindexed_mask,
             "rigids_noising_mask": rigids_noising_mask
         }
-        # print({k: v.shape for k,v in rigids_data.items() if v is not None})
         # we need to pad this so we can use the efficient seq-local blocks
         rigids_data = self._pad_rigid_features(
             rigids_inputs,
@@ -893,13 +882,10 @@ class IpaDenoiser(nn.Module):
 
             seq_tfmr_out = self.trunk[f'tfmr_{b}'](
                 node_embed, condition_embed, edge_embed, node_mask)
-            # seq_tfmr_out = self.trunk[f'tfmr_{b}'](
-            #     node_embed, edge_embed, node_mask)
             node_embed = node_embed + self.trunk[f'post_tfmr_{b}'](seq_tfmr_out)
             node_embed = node_embed * node_mask[..., None]
 
             node_embed = node_embed + self.trunk[f'transition_{b}'](node_embed, condition_embed)
-            # node_embed = node_embed + self.trunk[f'transition_{b}'](node_embed)
             node_embed = node_embed * node_mask[..., None]
 
             rigids_embed_flat, node_embed, framepair_embed, curr_rigids = self.trunk[f'rigids_tfmr_{b}'](
@@ -923,7 +909,9 @@ class IpaDenoiser(nn.Module):
 
             if self.accumulate_rot_vf_output:
                 assert pred_rot_vf is not None
-                rot_vf_update = self.trunk[f'rot_vf_update_{b}'](rigids_embed_flat * rigids_noising_mask_flat[..., None]) * rigids_noising_mask_flat[..., None]
+                rot_vf_update = self.trunk[f'rot_vf_update_{b}'](
+                    rigids_embed_flat * rigids_noising_mask_flat[..., None]
+                ) * rigids_noising_mask_flat[..., None]
                 pred_rot_vf = pred_rot_vf + rot_vf_update
 
             if b < self.num_blocks-1:
@@ -1000,32 +988,6 @@ class IpaDenoiser(nn.Module):
             'seq_logits': seq_logits
         }
         return model_out
-
-
-def to_internal_chain_numbering(chain_idx, batch):
-    idx_out = []
-    current_chain_idx = 0
-    for i in range(batch.max().item() + 1):
-        select = (batch == i)
-        chain_idx_ = chain_idx[select]
-        _idx = torch.arange(chain_idx_.shape[0], device=chain_idx_.device)
-        chain_idx_change = (chain_idx_[:-1] != chain_idx_[1:])
-        chain_ends = _idx[:-1][chain_idx_change].tolist()
-        chain_ends.append(_idx.numel()-1)
-        chain_starts = _idx[1:][chain_idx_change].tolist()
-        chain_starts.insert(0, 0)
-
-        for start, end in zip(chain_starts, chain_ends):
-            idx_out.append(
-                torch.full(
-                    (end-start+1,),
-                    int(current_chain_idx),
-                    device=chain_idx.device
-                )
-            )
-            current_chain_idx += 1
-
-    return torch.cat(idx_out, dim=0)
 
 
 class Pairformer(nn.Module):
@@ -1240,10 +1202,8 @@ class IpaMultiRigidDenoiser(nn.Module):
         self.rot_vf_scaling = rot_vf_scaling
 
         if learnable_noise_schedule:
-            # self.trans_gamma_t = lambda x: x # MonotonicIncreasingFn()
             self.rot_gamma_t = MonotonicIncreasingFn()
             self.trans_gamma_t = MonotonicIncreasingFn()
-            # self.rot_gamma_t = lambda x: x # MonotonicIncreasingFn()
 
         # TODO: need to actually implement this at some point
         self.num_registers = num_registers
@@ -1257,9 +1217,6 @@ class IpaMultiRigidDenoiser(nn.Module):
     def forward(self, data, self_condition=None, self_folding=None, sanitize_motif_idx=False):
         token_data = data['token']
         rigids_data = data['rigids']
-        # print(rigids_data['rigids_t'].shape, token_data['token_seq_idx'].shape)
-        # print(token_data['token_is_protein_output_mask'])
-        # print(token_data['token_gather_idx'], rigids_data['rigids_token_uid'])
 
         if self_condition is not None:
             sc_rigids = self_condition['denoised_rigids']
@@ -1292,20 +1249,13 @@ class IpaMultiRigidDenoiser(nn.Module):
                 rigids_idx=rigids_data['rigids_sidechain_idx'],
                 rigids_mask=rigids_data['rigids_mask'],
                 rigids_is_atomized_mask=rigids_data['rigids_is_atom_mask'],
-                # rigids_is_token_rigid_mask=rigids_data['rigids_is_token_rigid_mask'],
-                # rigids_is_unindexed_mask=rigids_data['rigids_is_unindexed_mask'],
                 rigids_noising_mask=rigids_data['rigids_noising_mask'],
                 token_bonds=token_data['token_bonds'],
                 sc_rigids=sc_rigids,
                 sf_rigids=sf_rigids
             )
 
-            # for k, v in input_feats.items():
-            #     if isinstance(v, torch.Tensor) and v.isnan().any():
-            #         print(k, "is nan")
-
             input_feats['condition_embed'] = input_feats['time_condition_embed']
-            # input_feats['condition_embed'] = torch.ones_like(input_feats['node_embed'])
             input_feats['token_mask'] = token_data['token_mask']
             input_feats['token_gather_idx'] = token_data['token_to_rep_rigid']
             input_feats['t'] = data['t']
@@ -1323,12 +1273,10 @@ class IpaMultiRigidDenoiser(nn.Module):
             score_dict = self.ipa_denoiser(input_feats)
 
         rigids_out = score_dict['final_rigids']
-        # print(rigids_out.shape)
 
         if self.rot_preconditioning:
             t = data['t']
             def scale_rot(rot_in, rot_out):
-                # print(rot_in.shape, rot_out.shape)
                 rel_rot = rot_out.compose_q(rot_in.invert())
                 rel_rotquat = rel_rot.get_quats()
                 rel_rotvec = rotquat_to_rotvec(rel_rotquat.view(-1, 4)).view(*rel_rotquat.shape[:-1], -1)
@@ -1352,32 +1300,9 @@ class IpaMultiRigidDenoiser(nn.Module):
 
         seq_logits = score_dict['seq_logits']
 
-        # print(rigids_out.shape, rigids_data['rigids_is_atomized_mask'].sum())
-
-        # denoised_atom14_gt_seq = rigids_to_atom14(
-        #     rigids_out,
-        #     rigids_mask=rigids_data['rigids_mask'],
-        #     rigids_is_protein_output_mask=rigids_data['rigids_is_protein_output_mask'],
-        #     rigids_is_atomized_mask=rigids_data['rigids_is_atomized_mask'],
-        #     token_is_atomized_mask=token_data['token_is_atomized_mask'],
-        #     token_is_protein_output_mask=token_data['token_is_protein_output_mask'],
-        #     seq=token_data['seq'],
-        #     cg_version=self.cg_version
-        # )
-
         pred_seq = seq_logits[..., :-1].argmax(dim=-1)
         seq_noising_mask = token_data['seq_noising_mask']
         pred_seq = pred_seq * seq_noising_mask + token_data['seq'] * (~seq_noising_mask)
-        # denoised_atom14_pred_seq = rigids_to_atom14(
-        #     rigids_out,
-        #     rigids_mask=rigids_data['rigids_mask'],
-        #     rigids_is_protein_output_mask=rigids_data['rigids_is_protein_output_mask'],
-        #     rigids_is_atomized_mask=rigids_data['rigids_is_atomized_mask'],
-        #     token_is_atomized_mask=token_data['token_is_atomized_mask'],
-        #     token_is_protein_output_mask=token_data['token_is_protein_output_mask'],
-        #     seq=pred_seq,
-        #     cg_version=self.cg_version
-        # )
 
         if rigids_out.to_tensor_7().isnan().any() or pred_seq.isnan().any():
             print("caught a nan in forward")
@@ -1385,8 +1310,6 @@ class IpaMultiRigidDenoiser(nn.Module):
 
         ret = {}
         ret['denoised_rigids'] = rigids_out
-        # ret['denoised_atom14'] = denoised_atom14_pred_seq
-        # ret['denoised_atom14_gt_seq'] = denoised_atom14_gt_seq
         ret['decoded_seq_logits'] = seq_logits
         ret['pred_seq'] = pred_seq
 
@@ -1395,7 +1318,6 @@ class IpaMultiRigidDenoiser(nn.Module):
         else:
             pred_rot_vf = None
         ret['pred_rot_vf'] = pred_rot_vf
-        # print(pred_rot_vf)
 
         with torch.no_grad():
             token_rigids = gather_helper(rigids_out.to_tensor_7(), token_data['token_to_rep_rigid'])

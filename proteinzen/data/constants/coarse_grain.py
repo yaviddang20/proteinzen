@@ -40,10 +40,6 @@ from proteinzen.openfold.utils import rigid_utils
 # I'm generating these semi-manually here from openfold residue_constants, but
 # at some point I should export them
 
-
-# changes since v2
-# C frame now matches S
-
 # group 2 and 3 atoms
 coarse_grain_sidechain_groups = {
     "ALA": {2: [], 3: []},

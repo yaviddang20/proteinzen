@@ -2,20 +2,15 @@ import tqdm
 import torch
 import torch.nn.functional as F
 from scipy.spatial.transform import Rotation
-import copy
-from functools import partial
-from scipy.optimize import linear_sum_assignment, differential_evolution, Bounds, NonlinearConstraint
 
 from proteinzen.openfold.utils import rigid_utils as ru
 
 from torch_geometric.data import HeteroData, Batch
 from torch_geometric.utils import scatter
 from torch_scatter import scatter_add
-import dataclasses
 import numpy as np
 
 from . import so3_utils
-# from . import utils as du
 
 def center_zero(pos: torch.Tensor, batch_indexes: torch.LongTensor) -> torch.Tensor:
     """
@@ -420,12 +415,7 @@ class MultiSE3Interpolant:
                 dim_size=(res_data.batch.max().item() + 1),
                 reduce='mean'
             )
-        # print(center)
-
-        # center = torch.zeros_like(center)
-
         trans_1 = trans_1 - center[rigidwise_batch]
-        # print(trans_1.mean(dim=(0, 1)))
 
         # this is just so we can calculate atom14 rmsds
         res_data["atom14"] = res_data["atom14"] - center[res_data.batch][..., None,:]
@@ -435,29 +425,9 @@ class MultiSE3Interpolant:
         res_data['atom14_alt_gt_positions'] = res_data['atom14_alt_gt_positions'] - center[res_data.batch][..., None, :]
         res_data['atom14_alt_gt_positions'] *= res_data['atom14_mask'][..., None]
 
-        # if True:
-        #     from proteinzen.utils.coarse_grain import compute_atom14_from_cg_frames
-        #     _rigids = ru.Rigid(rigids_1.get_rots(), trans_1)
-        #     _atom14 = compute_atom14_from_cg_frames(
-        #         _rigids,
-        #         res_mask=res_data['res_mask'],
-        #         seq=res_data['seq'],
-        #     )
-        #     print(_atom14[res_data['atom14_mask'].bool()].mean(dim=0))
-        #     print(res_data["atom14"][res_data['atom14_mask'].bool()].mean(dim=0))
-
-        # print("input", batch.name, res_data['atom14_gt_positions'])
-
 
         if self.prealign_noise:
             # rotate each structure to align as best as possible with noise
-
-            # aligned_trans_0, _, _ = du.align_structures(
-            #     trans_0.flatten(0, 1),
-            #     torch.repeat_interleave(res_data.batch, self.rigids_per_res),
-            #     trans_1.flatten(0, 1)
-            # )
-            # trans_0 = aligned_trans_0.view(trans_0.shape)
             align_mask = res_mask[..., None] * rigids_noising_mask
             align_batch = rigidwise_batch[align_mask]
 
@@ -466,25 +436,12 @@ class MultiSE3Interpolant:
                 align_batch,
                 trans_1[align_mask]
             )
-            # num_batch = trans_0.shape[0]
-            # batch_represented_mask = scatter(
-            #     torch.ones_like(align_batch, dtype=torch.bool),
-            #     align_batch,
-            #     dim=0,
-            #     dim_size=num_batch,
-            #     reduce='any'
-            # )
-            # align_rot_mats_safe = torch.zeros((num_batch, 3, 3), device=align_rot_mats.device, dtype=align_rot_mats.dtype)
-            # align_rot_mats_safe[batch_represented_mask] = align_rot_mats
-            # print("align_rot_mats", align_rot_mats, align_rot_mats.shape)
-            # print("batch_represented_mask", batch_represented_mask, batch_represented_mask.shape)
-            # print("align_rot_mats_safe", align_rot_mats_safe, align_rot_mats_safe.shape)
             align_rot_mats_safe = align_rot_mats
             trans_0 = torch.einsum("nki,nij->nkj", trans_0, align_rot_mats_safe[res_data.batch])
 
         if self.use_stochastic_centering:
             stoch_center = torch.randn_like(center) * self.sig_perturb
-            trans_0 = trans_0 + stoch_center[rigidwise_batch] # torch.randn_like(trans_0) * self.sig_perturb
+            trans_0 = trans_0 + stoch_center[rigidwise_batch]
 
 
         trans_t = self._corrupt_trans(
@@ -572,7 +529,6 @@ class MultiSE3Interpolant:
                 align_batch,
                 trans_1[align_mask]
             )
-            # print(trans_0.shape, align_rot_mats.shape)
             num_batch = trans_0.shape[0]
 
             if align_rot_mats.shape[0] != num_batch:
@@ -582,19 +538,6 @@ class MultiSE3Interpolant:
                     align_rot_mats,
                     eye[None].expand(num_pad, -1, -1)
                 ], dim=0)
-                # batch_represented_mask = scatter(
-                #     torch.ones_like(align_batch, dtype=torch.bool),
-                #     align_batch,
-                #     dim=0,
-                #     dim_size=num_batch,
-                #     reduce='any'
-                # )
-                # align_rot_mats_safe = torch.zeros((num_batch, 3, 3), device=align_rot_mats.device, dtype=align_rot_mats.dtype)
-                # # print("align_rot_mats", align_rot_mats, align_rot_mats.shape)
-                # # print("batch_represented_mask", batch_represented_mask, batch_represented_mask.shape)
-                # # print("align_rot_mats_safe", align_rot_mats_safe, align_rot_mats_safe.shape)
-                # align_rot_mats_safe[batch_represented_mask] = align_rot_mats
-                # # print("align_rot_mats_safe", align_rot_mats_safe, align_rot_mats_safe.shape)
             else:
                 align_rot_mats_safe = align_rot_mats
 
@@ -754,7 +697,8 @@ class MultiSE3Interpolant:
         trans_score = self._trans_score(t, trans_1, trans_t) * use_score
 
         # if t > 0.99:
-        if (isinstance(t, torch.Tensor) and (t > 0.99).any()) or (not isinstance(t, torch.Tensor) and t > 0.99):  # TODO: fix hack (what happens if not all t > 0.99?)
+        # TODO: fix hack (what happens if not all t > 0.99?)
+        if (isinstance(t, torch.Tensor) and (t > 0.99).any()) or (not isinstance(t, torch.Tensor) and t > 0.99):
             trans_next = trans_t + (trans_vf * d_t) * step_size
         else:
             if add_noise:
@@ -812,7 +756,8 @@ class MultiSE3Interpolant:
         trans_score = trans_score_cond * (1 - guidance_alpha) + trans_score_uncond * guidance_alpha
 
         # if t > 0.99:
-        if (isinstance(t, torch.Tensor) and (t > 0.99).any()) or (not isinstance(t, torch.Tensor) and t > 0.99):  # TODO: fix hack (what happens if not all t > 0.99?)
+        # TODO: fix hack (what happens if not all t > 0.99?)
+        if (isinstance(t, torch.Tensor) and (t > 0.99).any()) or (not isinstance(t, torch.Tensor) and t > 0.99):
             trans_next = trans_t + (trans_vf * d_t) * step_size
         else:
             if add_noise:
@@ -904,7 +849,8 @@ class MultiSE3Interpolant:
         gamma = self.rot_gamma
         dB_rot = torch.randn_like(rot_vf) * torch.sqrt(d_t)
         # if t > 0.99:
-        if (isinstance(t, torch.Tensor) and (t > 0.99).any()) or (not isinstance(t, torch.Tensor) and t > 0.99):  # TODO: fix hack (what happens if not all t > 0.99?)
+        # TODO: fix hack (what happens if not all t > 0.99?)
+        if (isinstance(t, torch.Tensor) and (t > 0.99).any()) or (not isinstance(t, torch.Tensor) and t > 0.99):
             mat_t = so3_utils.rotvec_to_rotmat(d_t * rot_vf * step_size)
         else:
             if add_noise:
@@ -963,7 +909,8 @@ class MultiSE3Interpolant:
         gamma = self.rot_gamma
         dB_rot = torch.randn_like(rot_vf) * torch.sqrt(d_t)
         # if t > 0.99:
-        if (isinstance(t, torch.Tensor) and (t > 0.99).any()) or (not isinstance(t, torch.Tensor) and t > 0.99):  # TODO: fix hack (what happens if not all t > 0.99?)
+        # TODO: fix hack (what happens if not all t > 0.99?)
+        if (isinstance(t, torch.Tensor) and (t > 0.99).any()) or (not isinstance(t, torch.Tensor) and t > 0.99):
             mat_t = so3_utils.rotvec_to_rotmat(d_t * rot_vf * step_size)
         else:
             if add_noise:

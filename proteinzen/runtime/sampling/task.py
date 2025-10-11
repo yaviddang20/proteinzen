@@ -15,7 +15,3 @@ class SamplingTask(abc.ABC):
     @abc.abstractmethod
     def sample_data(self):
         raise NotImplementedError
-
-    @abc.abstractmethod
-    def pad_data(self, data, n_padding):
-        raise NotImplementedError

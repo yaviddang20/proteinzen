@@ -64,17 +64,6 @@ def residue_to_atom37(residue):
     return residue_37, residue_constants.resname_to_idx[aa_3lt]
 
 
-def _centered_gaussian(num_rigids):
-    noise = torch.randn(num_rigids, 3)
-    return noise - noise.mean(dim=0, keepdim=True)
-
-def _uniform_so3(num_rigids):
-    return torch.as_tensor(
-        Rotation.random(num_rigids).as_quat(),
-        dtype=torch.float32,
-    )
-
-
 def biopython_to_boltz(residue, res_idx, atom_idx, noise_bb=True, noise_tip=True, noise_sidechain=True):
     # Load periodic table for element mapping
     periodic_table = Chem.GetPeriodicTable()
@@ -194,12 +183,6 @@ class MotifScaffoldingTask(SamplingTask):
             return num_res
         self.num_motif_res = get_num_motif_res()
 
-        # try:
-        #     self.motif_seq_idx, self.motif_res_is_unindexed = self._parse_idx_str(contigs_idx, pdb_contigs)
-        # except Exception as e:
-        #     print(f"error with parsing idx contigs {contigs_idx}")
-        #     raise e
-
         self.redesign_contigs = {}
         if redesign_contigs is not None and len(redesign_contigs) > 1:
             redesign_contigs = [c.strip() for c in redesign_contigs.split(",")]
@@ -213,12 +196,6 @@ class MotifScaffoldingTask(SamplingTask):
                 else:
                     resid = int(contig[1:])
                     self.redesign_contigs[chain].add(resid)
-
-        # try:
-        #     self.condition_struct, self.atom_noising_mask, self.res_type_noising_mask = self._parse_condition_str(pdb_contigs)
-        # except Exception as e:
-        #     print(f"error with parsing contigs {pdb_contigs} from {pdb}")
-        #     raise e
 
         self.num_samples = num_samples
         self.cg_version = cg_version
@@ -476,7 +453,6 @@ class MotifScaffoldingTask(SamplingTask):
                 task_masks=task_data
             )
             struct.atoms['coords'] -= fixed_rigids_com[None]
-            # print(struct)
 
             data = Tokenized(
                 tokens=token_data,
@@ -486,7 +462,6 @@ class MotifScaffoldingTask(SamplingTask):
             )
 
             rigids_noising_mask = rigid_data['rigids_noising_mask']
-            # print(rigids_noising_mask)
             seq_noising_mask = token_data['seq_noising_mask']
 
             task_data = {
@@ -498,9 +473,3 @@ class MotifScaffoldingTask(SamplingTask):
             }
 
             yield featurize_inference(data, task_data, task_name=self.kwargs.get("name", self.task_name))
-
-    def pad_data(self, data, n_padding):
-        return NotImplemented
-
-
-

@@ -32,7 +32,6 @@ Token = [
     ("asym_id", np.dtype("i4")),
     ("entity_id", np.dtype("i4")),
     ("mol_type", np.dtype("i4")),  # the total bytes need to be divisible by 4
-    # ("rep_rigid_idx", np.dtype("i4")),
     ("resolved_mask", np.dtype("?")),
     ("center_coords", np.dtype("3f4")),
     ("is_copy", np.dtype("?")),
@@ -211,6 +210,25 @@ def get_unk_token(chain: np.ndarray) -> int:
 
 
 def standard_residue_to_frames(residue, atoms):
+    """ Generate the frame presentation for a canonical protein residue.
+
+    Parameters
+    ==========
+    residue: proteinzen.boltz.data.types.Residue
+        The residue to featurize
+    atoms: np.ndarray, dtype=proteinzen.boltz.data.types.Atom
+        The atoms in the residue to be featurized
+
+    Returns
+    =======
+    rigids_tensor7: np.ndarray
+        Stack of residue frames in tensor7 format
+    rigids_mask: np.ndarray, dtype=bool
+        Mask specifying if all the atoms needed to define each frame exists
+    dummy_rigid_idx:  list[int]
+        Specifies the source frame for any duplicate frames generated. If all frames
+        are unique, this is [0, 1, 2].
+    """
     res_name = residue['name']
     atoms = atoms[atoms['is_present']]  # only select present atoms
     dummy_rigid_idx = [0]
@@ -342,6 +360,30 @@ def arbitrary_atom_to_frame(
     valid_neighbor_coords: np.ndarray,
     neighbor_graph: nx.Graph
 ):
+    """ For an arbitrary atom, compute a frame to use for that atom. This function will try its best to
+    construct a frame from real axes given the particular input chemical graph. If it cannot, it'll either
+    construct a semi-random rotation (one axis is fixed) or sample a random rotation for the frame.
+
+    Parameters
+    ==========
+    atom: proteinzen.boltz.data.types.Atom
+        Data about the atom to featurize
+    atom_idx: int
+        The identifier of `atom` in this particular chemical subgraph.
+    valid_neighbors: list[int]
+        A list of atom ids which are valid connections to `atom` to use for frame construction.
+    valid_neighbor_coords: np.ndarray
+        The coordinates for every atom in `valid_neighbors`.
+    neighbor_graph: nx.Graph
+        A networkX graph which specifies the connectivity between atoms in this particular chemical subgraph.
+
+    Returns
+    =======
+    tensor7: np.ndarray
+        The frame for the atom, represented in tensor7 format.
+    num_real_input_axes: int
+        The number of real axes used to construct the frame. Possible values {0, 1, 2}.
+    """
     if not atom["is_present"]:
         return np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]), 0
 
@@ -841,6 +883,8 @@ def tokenize_structure(  # noqa: C901, PLR0915
     -------
     np.ndarray
         The tokenized data.
+    np.ndarray
+        The rigids data.
     np.ndarray
         The tokenized bonds.
 

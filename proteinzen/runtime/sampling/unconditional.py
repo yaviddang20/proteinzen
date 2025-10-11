@@ -94,6 +94,3 @@ class UnconditionalSampling(SamplingTask):
             }
 
             yield featurize_inference(data, task_data, task_name=self.kwargs.get("name", self.task_name))
-
-    def pad_data(self, data, n_padding):
-        return NotImplemented
