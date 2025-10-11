@@ -107,12 +107,145 @@ plt.clf()
 fig, axs = plt.subplots(6, 5)
 fig.set_size_inches(25, 30)
 plt.subplots_adjust(wspace=0.35, hspace=0.35)
+print(plt.rcParams["figure.dpi"])
 tasks_sorted = sorted(df['task'].unique().tolist())
-for i, task in tqdm.tqdm(enumerate(tasks_sorted)):
+task_order = [
+    '1BCF',
+    '1PRW',
+    '1QJG',
+    '1QJG_NAT',
+    '1YCR',
+    '2KL8',
+    '3IXT',
+    '4JHW',
+    '4ZYP',
+    '5AOU',
+    '5AOU_QUAD',
+    '5IUS',
+    '5TPN',
+    '5TRV_short',
+    '5TRV_med',
+    '5TRV_long',
+    '5WN9',
+    '5YUI',
+    '6E6R_short',
+    '6E6R_med',
+    '6E6R_long',
+    '6VW1',
+    '7K4V',
+    '7MRX_60',
+    '7MRX_85',
+    '7MRX_128',
+]
+# for i, task in tqdm.tqdm(enumerate(tasks_sorted)):
+for i, task in tqdm.tqdm(enumerate(task_order)):
     ax = axs[i // 5, (i - i//5 * 5)]
     ax.set_title(task)
-    g = sns.scatterplot(df[df['task'] == task], x="motif_all_atom_rmsd", y="global_all_atom_rmsd", hue="plddt", ax=ax, palette="viridis", legend=False)
+    # g = sns.scatterplot(df[df['task'] == task], x="motif_all_atom_rmsd", y="global_all_atom_rmsd", hue="plddt", ax=ax, palette="viridis", legend=False)
+    g = sns.scatterplot(df[df['task'] == task], x="motif_all_atom_rmsd", y="global_all_atom_rmsd", ax=ax, legend=False, alpha=0.5)
+    ax.set_xlabel("Motif heavy atom RMSD (Å)")
+    ax.set_ylabel("Global heavy atom RMSD (Å)")
+    ax.set_xlim(xmin=0)
+    ax.set_ylim(ymin=0)
+    ax.axhline(y=2.0, color='red', linestyle='--')
+    ax.axvline(x=2.0, color='red', linestyle='--')
+    # ax.axvline(x=1.5, color='orange', linestyle='--')
+plt.tight_layout()
+plt.savefig("folding_rmsd_dist_by_task.png", dpi=300)
+
+plt.clf()
+fig, axs = plt.subplots(6, 5)
+fig.set_size_inches(25, 30)
+plt.subplots_adjust(wspace=0.35, hspace=0.35)
+tasks_sorted = sorted(df['task'].unique().tolist())
+task_order = [
+    '1BCF',
+    '1PRW',
+    '1QJG',
+    '1QJG_NAT',
+    '1YCR',
+    '2KL8',
+    '3IXT',
+    '4JHW',
+    '4ZYP',
+    '5AOU',
+    '5AOU_QUAD',
+    '5IUS',
+    '5TPN',
+    '5TRV_short',
+    '5TRV_med',
+    '5TRV_long',
+    '5WN9',
+    '5YUI',
+    '6E6R_short',
+    '6E6R_med',
+    '6E6R_long',
+    '6VW1',
+    '7K4V',
+    '7MRX_60',
+    '7MRX_85',
+    '7MRX_128',
+]
+# for i, task in tqdm.tqdm(enumerate(tasks_sorted)):
+for i, task in tqdm.tqdm(enumerate(task_order)):
+    ax = axs[i // 5, (i - i//5 * 5)]
+    ax.set_title(task)
+    # g = sns.scatterplot(df[df['task'] == task], x="motif_ca_rmsd", y="global_all_atom_rmsd", hue="plddt", ax=ax, palette="viridis", legend=False)
+    g = sns.scatterplot(df[df['task'] == task], x="motif_ca_rmsd", y="global_all_atom_rmsd", ax=ax, legend=False, alpha=0.5)
+    ax.set_xlabel("Motif C-alpha RMSD (Å)")
+    ax.set_ylabel("Global heavy atom RMSD (Å)")
+    ax.set_xlim(xmin=0)
+    ax.set_ylim(ymin=0)
     ax.axhline(y=2.0, color='red', linestyle='--')
     ax.axvline(x=1.0, color='red', linestyle='--')
-    ax.axvline(x=1.5, color='orange', linestyle='--')
-plt.savefig("folding_rmsd_dist_by_task.png")
+    # ax.axvline(x=1.5, color='orange', linestyle='--')
+plt.tight_layout()
+plt.savefig("folding_rmsd_dist_by_task_ca.png", dpi=300)
+plt.clf()
+fig, axs = plt.subplots(6, 5)
+fig.set_size_inches(25, 30)
+plt.subplots_adjust(wspace=0.35, hspace=0.35)
+tasks_sorted = sorted(df['task'].unique().tolist())
+task_order = [
+    '1BCF',
+    '1PRW',
+    '1QJG',
+    '1QJG_NAT',
+    '1YCR',
+    '2KL8',
+    '3IXT',
+    '4JHW',
+    '4ZYP',
+    '5AOU',
+    '5AOU_QUAD',
+    '5IUS',
+    '5TPN',
+    '5TRV_short',
+    '5TRV_med',
+    '5TRV_long',
+    '5WN9',
+    '5YUI',
+    '6E6R_short',
+    '6E6R_med',
+    '6E6R_long',
+    '6VW1',
+    '7K4V',
+    '7MRX_60',
+    '7MRX_85',
+    '7MRX_128',
+]
+# for i, task in tqdm.tqdm(enumerate(tasks_sorted)):
+for i, task in tqdm.tqdm(enumerate(task_order)):
+    ax = axs[i // 5, (i - i//5 * 5)]
+    ax.set_title(task)
+    # g = sns.scatterplot(df[df['task'] == task], x="motif_ca_rmsd", y="motif_all_atom_rmsd", hue="plddt", ax=ax, palette="viridis", legend=False)
+    g = sns.scatterplot(df[df['task'] == task], x="motif_ca_rmsd", y="motif_all_atom_rmsd", ax=ax, legend=False, alpha=0.5)
+    ax.set_xlabel("Motif C-alpha RMSD (Å)")
+    ax.set_ylabel("Motif heavy atom RMSD (Å)")
+    ax.set_xlim(xmin=0)
+    ax.set_ylim(ymin=0)
+    ax.axhline(y=2.0, color='red', linestyle='--')
+    ax.axvline(x=1.0, color='red', linestyle='--')
+    # ax.axvline(x=1.5, color='orange', linestyle='--')
+plt.tight_layout()
+plt.savefig("folding_rmsd_dist_by_task_motif_v_ca.png", dpi=300)
