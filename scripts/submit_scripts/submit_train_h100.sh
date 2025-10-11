@@ -8,6 +8,8 @@ NUMGPU=$1
 TRAIN_DAYS=$2
 TRAIN_HOURS=$(($2*24))
 
+mkdir -p ${SCRIPT_DIR}/autogen_scripts
+
 sed -e "s|OUTFILE|${REPO_ROOT}/outputs/sge_outs/train_${SUBMIT_TIME}|g" \
     -e "s|REPOROOT|${REPO_ROOT}|g" \
     -e "s|NUMGPU|${NUMGPU}|g" \

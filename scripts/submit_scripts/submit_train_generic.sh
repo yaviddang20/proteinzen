@@ -3,6 +3,8 @@
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source $SCRIPT_DIR/../../env_vars.sh
 
+mkdir -p ${SCRIPT_DIR}/autogen_scripts
+
 SUBMIT_TIME=$(date +"%y-%m-%d_%H%M%S")
 NUMGPU=$1
 TRAIN_DAYS=$2
