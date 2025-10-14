@@ -1,8 +1,8 @@
 ProteinZen
 ==============================
 [//]: # (Badges)
-[![GitHub Actions Build Status](https://github.com/alexjli/proteinzen/workflows/CI/badge.svg)](https://github.com/alexjli/proteinzen/actions?query=workflow%3ACI)
-[![codecov](https://codecov.io/gh/alexjli/proteinzen/branch/main/graph/badge.svg)](https://codecov.io/gh/alexjli/proteinzen/branch/main)
+[//]: # [![GitHub Actions Build Status](https://github.com/alexjli/proteinzen/workflows/CI/badge.svg)](https://github.com/alexjli/proteinzen/actions?query=workflow%3ACI)
+[//]: # [![codecov](https://codecov.io/gh/alexjli/proteinzen/branch/main/graph/badge.svg)](https://codecov.io/gh/alexjli/proteinzen/branch/main)
 
 This repo contains the code for ProteinZen as described in "All-atom protein generation via SE(3) flow matching with ProteinZen".
 
@@ -11,7 +11,7 @@ This repo contains the code for ProteinZen as described in "All-atom protein gen
 
 ## Installation
 To install, first set up a fresh conda environment
-```
+```bash
 conda create -n proteinzen python=3.10
 ```
 then run `bash install_pt26.sh`. Alternatively, we provide an `environment.yaml` which you can install via `conda env create -f environment.yaml`.
@@ -45,13 +45,13 @@ To sample from ProteinZen, run
 ```bash
 python sample.py \
     model_dir=<model_dir> \
-    out_prefix=<output_folder> \
+    out_dir=<output_folder> \
     sampler.tasks_yaml=<task_yaml_path> \
     sampler.batch_size=<batch_size> \
 ```
 where
 - `model_dir` specifies the path to a model checkpoint folder
-- `out_prefix` specifies a path to the output folder
+- `out_dir` specifies a path to the output folder
 - `samples.tasks_yaml` specifies a path to a sampling task YAML file
 - `sampler.batch_size` controls the batch size used at inference.
 By default ProteinZen will use all visible GPUs. To restrict this behavior, modify `CUDA_VISIBLE_DEVICES` to specify the GPUs you'd like to use.
@@ -69,18 +69,55 @@ tasks:
 - task: <name of task n>
   # parameters for task n
 ```
-where the `task` field specifies what kind of sampling task you'd like to do. Internally, ProteinZen constructs task objects that correspond to these
+where the `task` field specifies what kind of sampling task you'd like to do. Internally, ProteinZen constructs task objects that correspond to these.
 Currently the supported tasks are
 - `motif_scaffolding` (which points to `proteinzen.runtime.sampling.motif_scaffolding.MotifScaffoldingTask`)
 - `unconditional` (which points to `proteinzen.runtime.sampling.unconditional.UnconditionalSampling`)
-To see what parameters are necessary to specify for each, please see the docstrings for these respective files.
-Example task YAML files can also be found in `configs/sampling/`.
+
+Below we briefly describe how to run each of these tasks.
+To see detailed documentation for each task, please see the docstrings for these respective files. Example task YAML files can also be found in `configs/sampling/`.
+
+#### Unconditional generation
+```yaml
+- task: unconditional
+  sample_length: <sample length, type=int>
+  num_samples: <number of samples at specified sample length, type=int>
+```
+Unconditional generation task objects have two possible parameters: `sample_length` which specifies how large of a protein to generate,
+and `num_samples` which is how many samples to generate of that length. Both will be parsed as ints.
+You can optionally specify a string in the `name` field which will be assigned in the metadata for all samples generated from that task.
+#### Motif scaffolding
+```yaml
+- task: motif_scaffolding
+  pdb_contigs: <comma separated list specifying residues to scaffold. type=str>
+  pdb: <path to source pdb file, type=str>
+  num_samples: <number of samples to generate, type=int>
+  total_length: <total length of protein to generate, type=str>
+  sample_contigs_idx_config: <an RFDiffusion-stype contigs string to sample indices from, type=str, default=None>
+  sample_chain_name: <the chain id to sample residues from. type=str, default='A'>
+  redesign_contigs: <which residues to redesign the sequence identity of. type=str, default=None>
+```
+Motif scaffolding tasks have the above set of parameters.
+- `pdb_contigs`: comma-separated list which specifies which residues to scaffold. Each entry can specify single residues (e.g. `A35`) or a range of residues (e.g. `A35-40`).
+  - Example: `A35,A40-55,A12`.
+- `pdb`: path to the motif pdb file.
+- `num_samples`: number of scaffolds to generate.
+- `total_length`: string specifying the total length of the scaffolds to generate. Can be a single length e.g `50` or a range of lengths from which the scaffold length will be uniformly sampled from e.g. `50-100`.
+- `sample_contigs_idx_config`: comma-separated list specifying how to sample the indices and spacing of the motif and scaffold. This format largely follows the RFDiffusion-style contig strings
+  where the length of spacers are specified by either a single number (e.g. `50`) or a range of numbers (e.g. `50-100`), while a motif can be specified by either a single residues (e.g. `A35`) or a range of residues (e.g. `A35-50`).
+  - Example: `"0-10,A35,10-25,A40-55,10,A12,5-20"`
+- `sample_chain_name`: chain ID of the scaffold to generate. This should match the chain ID of the motif in `pdb_contigs`. Defaults to `A`.
+- `redesign_contigs`: commay-separated list of residues to redesign the sequence of. Each entry can specify single residues (e.g. `A35`) or a range of residues (e.g. `A35-40`).
+  - Example: `A35,A40-55,A12`.
+
+Additionally, you can optionally specify a string in the `name` field which will be assigned in the metadata for all samples generated from that task.
+
 
 ## Known issues
 ### Multi-chain behavior
-The published set of weights for ProteinZen was trained on monomers only, and hence we do not expect any multi-chain behavior to function properly.
+The current published set of weights for ProteinZen were trained on monomers only, and hence we do not expect any multi-chain behavior to function properly.
 This includes scaffolding multi-chain motifs: we have observed that ProteinZen currently puts all input motif fragments in the same chain
-regardless of fragment chain assignment.
+regardless of fragment chain assignment. This will fixed once we have multichain weights.
 
 ### Motif scaffolding
 Input motifs for both indexed and unindexed motif scaffolding are given to ProteinZen
