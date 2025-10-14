@@ -1,8 +1,8 @@
 ProteinZen
 ==============================
 [//]: # (Badges)
-[//]: # [![GitHub Actions Build Status](https://github.com/alexjli/proteinzen/workflows/CI/badge.svg)](https://github.com/alexjli/proteinzen/actions?query=workflow%3ACI)
-[//]: # [![codecov](https://codecov.io/gh/alexjli/proteinzen/branch/main/graph/badge.svg)](https://codecov.io/gh/alexjli/proteinzen/branch/main)
+<!-- [![GitHub Actions Build Status](https://github.com/alexjli/proteinzen/workflows/CI/badge.svg)](https://github.com/alexjli/proteinzen/actions?query=workflow%3ACI) -->
+<!-- [//]: # [![codecov](https://codecov.io/gh/alexjli/proteinzen/branch/main/graph/badge.svg)](https://codecov.io/gh/alexjli/proteinzen/branch/main) -->
 
 This repo contains the code for ProteinZen as described in "All-atom protein generation via SE(3) flow matching with ProteinZen".
 
