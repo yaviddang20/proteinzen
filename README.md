@@ -13,12 +13,23 @@ This repo contains the code for ProteinZen as described in "All-atom protein gen
 To install, first set up a fresh conda environment
 ```bash
 conda create -n proteinzen python=3.10
+conda activate proteinzen
+bash install_pt26.sh
 ```
-then run `bash install_pt26.sh`. Alternatively, we provide an `environment.yaml` which you can install via `conda env create -f environment.yaml`.
-Then activate the environment and install ProteinZen via `pip install -e .`.
+Alternatively, we provide an `environment.yaml` which you can install via
+```bash
+conda env create -f environment.yaml
+conda activate proteinzen
+pip install -e .
+```
 
 Finally, update `env_vars.sh` to what is correct for your setup. `REPO_ROOT` should point to the root of this repo, and `ENV_NAME`
 should match the name of the conda environment you created (if it is `proteinzen` you won't need to change anything).
+
+## Pretrained weights
+
+We're still working on a more permanent home for data! For now, pretrained weights can be downloaded at
+[https://ucsf.box.com/s/nzvilhj9w8zmck5xm1c6fy4c0ztmx1ql](https://ucsf.box.com/s/nzvilhj9w8zmck5xm1c6fy4c0ztmx1ql).
 
 ## Training
 
@@ -50,13 +61,56 @@ python sample.py \
     sampler.batch_size=<batch_size> \
 ```
 where
-- `model_dir` specifies the path to a model checkpoint folder
+- `model_dir` specifies the path to a model checkpoint folder. If you extract `proteinzen_weights` to `REPO_ROOT`,
+  then this would be `${REPO_ROOT}/proteinzen_weights/unconditional_model` for unconditional sampling
+  and `${REPO_ROOT}/proteinzen_weights/motif_scaffolding_model` for motif scaffolding
 - `out_dir` specifies a path to the output folder
 - `samples.tasks_yaml` specifies a path to a sampling task YAML file
 - `sampler.batch_size` controls the batch size used at inference.
+
 By default ProteinZen will use all visible GPUs. To restrict this behavior, modify `CUDA_VISIBLE_DEVICES` to specify the GPUs you'd like to use.
-Additional flags can be found in `proteinzen/runtime/config.py` within `config_sampling_hydra_store()`.
-Example sampling scripts can be found in `scripts/submit_scripts/eval/`.
+Additional flags can be found in `proteinzen/runtime/config.py` within `config_sampling_hydra_store()`. Some potentially useful options include:
+- `save_traj=<bool, default=False>` which specifies whether to dump per-sample denoising trajectories.
+  Note that this currently significantly slows down inference!
+- `corrupter.num_timesteps=<int, default=400>` which controls the number of discritization steps to use to integrate
+- `corrupter.sampling_noise_mode=<null or "churn", default="churn">` which specifies whether to perform ODE or SDE sampling, respectively
+
+Sampling output directories will generally have the following structure:
+```
+└── <sampling_run>/
+    ├── metadata/
+    │   ├── samples_metadata_rank0_batch0.json
+    │   └── ...
+    ├── samples/
+    │   ├── len_100_protein_id0_0_0.pdb
+    │   └── ...
+    ├── traj/
+    │   ├── len_100_protein_id0_0_0_clean_traj.pdb
+    │   ├── len_100_protein_id0_0_0_prot_traj.pdb
+    │   └── ...
+    ├── config.yaml
+    ├── pmpnn_fixed_pos_dict.jsonl
+    └── samples_metadata.json
+```
+where
+- `config.yaml` is a copy of the tasks YAML file fed in as input
+- `pmpnn_fixed_pos_dict.jsonl` is a dictionary formatted for use with ProteinMPNN to specify residues to not redesign the sequence of
+- `samples_metadata.json` contains various per-sample metadata information, including
+  - `path`: path to the sample
+  - `name`: the name of the task used to generate this sample
+  - `fixed_bb_res_idx`: list of residue indices whose backbone positions were prespecified (e.g. backbone of input motif)
+  - `fixed_bb_chain`: the chain IDs associated with the residues in `fixed_bb_res_idx`
+  - `fixed_seq_res_idx`: list of residue indices whose sequence identities were prespecified (e.g. sequence of input motif)
+  - `fixed_seq_chain`: the chain IDs associated with the residues in `fixed_seq_res_idx`
+- `metadata/` stores per-batch metadata jsons
+- `samples/` stores the generated samples in .pdb format
+- `traj/` stores trajectories if `save_traj=True`
+  - `*_clean_traj.pdb` contains the denoiser predictions over the course of integration
+  - `*_prot_traj.pdb` contains the per-timestep state `x_t` over the course of integration
+
+Example sampling scripts can be found in `scripts/submit_scripts/eval/`, which include evaluation pipelines
+involving sequence redesign via ProteinMPNN, structure prediction via ESMFold, and RMSD calculations.
+
 ### Task YAML schema
 Task YAMLs generally follow the following format:
 ```yaml
@@ -64,8 +118,8 @@ tasks:
 - task: <name of task 1>
   # parameters for task 1
 - task: <name of task 2>
-  # parameters for task 2
 ...
+  # parameters for task 2
 - task: <name of task n>
   # parameters for task n
 ```
@@ -124,10 +178,9 @@ Input motifs for both indexed and unindexed motif scaffolding are given to Prote
 in the form of additional conditioning tokens, and at the end of the denoising trajectory
 the input motif is grafted back into the scaffold based on a motif assignment process.
 Although rare, we do observe that ProteinZen sometimes produces designs
-where we cannot properly graft the motif back into the structure, often either in the form of
-(a) not maintaining the chain constraint within a motif fragment, or
-(b) assigning multiple scaffold residues to the same motif residue.
-These problems occurs more often in unindexed mode
+where we cannot properly graft the motif back into the structure,
+often by assigning multiple scaffold residues to the same motif residue.
+This problem occurs more often in unindexed mode
 (~0.8% of designs when running the Protpardelle benchmark)
 than in indexed mode (~0.08% of designs when running the Protpardelle benchmark).
 While we work on reducing this error rate, we include a script
@@ -136,11 +189,14 @@ While we work on reducing this error rate, we include a script
 
 ## Acknowledgements
 We would like to thank the various open-source repos which have made this work possible!
-- FrameDiff
-- FrameFlow
-- FoldFlow
-- OpenFold
-- Boltz
+- FrameDiff: [https://github.com/jasonkyuyim/se3_diffusion](https://github.com/jasonkyuyim/se3_diffusion)
+- FrameFlow: [https://github.com/microsoft/protein-frame-flow](https://github.com/microsoft/protein-frame-flow)
+- FoldFlow: [https://github.com/DreamFold/FoldFlow](https://github.com/DreamFold/FoldFlow)
+- OpenFold: [https://github.com/aqlaboratory/openfold](https://github.com/aqlaboratory/openfold)
+- Boltz: [https://github.com/jwohlwend/boltz](https://github.com/jwohlwend/boltz)
+
+All functions adapted from the repos above should be attributed within the code, but if any attributions are
+missing please let us know and we will correct it!
 
 Project based on the
 [Computational Molecular Science Python Cookiecutter](https://github.com/molssi/cookiecutter-cms) version 1.1.
