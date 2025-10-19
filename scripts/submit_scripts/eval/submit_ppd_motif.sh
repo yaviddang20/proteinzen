@@ -19,7 +19,7 @@ module load Sali cuda
 
 # SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 # source $SCRIPT_DIR/env_vars.sh
-source /wynton/home/kortemme/alexjli/projects/proteinzen-clone/env_vars.sh
+source /wynton/home/kortemme/alexjli/projects/proteinzen/env_vars.sh
 
 ROOT_DIR=$PWD
 cd $1
@@ -42,18 +42,17 @@ conda activate ${ENV_NAME}
 
 python sample.py \
     model_dir=$RUN_DIR \
-    out_prefix=$OUTPREFIX \
+    out_dir=$OUTPREFIX \
     checkpoint_idx=$CHECKPOINTIDX \
-    sampler.tasks_yaml=/wynton/home/kortemme/alexjli/projects/proteinzen-clone/configs/sampling/protpardelle_motif_scaffolding/config.yaml \
+    sampler.tasks_yaml=${REPO_ROOT}/configs/sampling/protpardelle_motif_scaffolding/config.yaml \
     sampler.batch_size=10 \
 
 ## sample with ProteinMPNN
 cd ~/software/ProteinMPNN/scripts
 conda activate proteinmpnn
 
-folder_with_pdbs=${RUN_DIR}/$OUTPREFIX/samples
-
-output_dir=${RUN_DIR}/$OUTPREFIX
+folder_with_pdbs=$OUTPREFIX/samples
+output_dir=$OUTPREFIX
 if [ ! -d $output_dir ]
 then
     mkdir -p $output_dir

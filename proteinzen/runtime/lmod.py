@@ -1087,10 +1087,13 @@ class PDBWriter(BasePredictionWriter):
         self.output_dir = output_dir
         self.samples_dir = os.path.join(output_dir, "samples")
         self.metadata_dir = os.path.join(output_dir, "metadata")
+        self.traj_dir = os.path.join(output_dir, "traj")
         self.run_cfg = run_cfg
 
         os.makedirs(self.samples_dir, exist_ok=True)
         os.makedirs(self.metadata_dir, exist_ok=True)
+        os.makedirs(self.traj_dir, exist_ok=True)
+
 
         self.samples_metadata = {}
 
@@ -1174,8 +1177,14 @@ class PDBWriter(BasePredictionWriter):
                 clean_traj = sample_data['clean_traj']
                 prot_traj = sample_data['prot_traj']
 
-                clean_traj_name = f"len_{sample_len}_protein_id{rank}_{batch_idx}_{curr_sample_id}_clean_traj.pdb"
-                prot_traj_name = f"len_{sample_len}_protein_id{rank}_{batch_idx}_{curr_sample_id}_prot_traj.pdb"
+                clean_traj_name = os.path.join(
+                    self.traj_dir,
+                    f"len_{sample_len}_protein_id{rank}_{batch_idx}_{curr_sample_id}_clean_traj.pdb"
+                )
+                prot_traj_name = os.path.join(
+                    self.traj_dir,
+                    f"len_{sample_len}_protein_id{rank}_{batch_idx}_{curr_sample_id}_prot_traj.pdb"
+                )
                 clean_model_strs = []
                 prot_model_strs = []
 
@@ -1188,6 +1197,7 @@ class PDBWriter(BasePredictionWriter):
                         structure=traj_struct,
 
                     )
+                    traj_struct = construct_atoms(traj_output, traj_struct)
                     traj_struct = update_structure(traj_struct, traj_output.rigids['tensor7'])
                     pdb_str = to_pdb(traj_struct)
                     clean_model_strs.append(f"MODEL        {i}\n")
@@ -1206,8 +1216,8 @@ class PDBWriter(BasePredictionWriter):
                         rigids=traj_data['rigids'],
                         bonds=traj_data['bonds'],
                         structure=traj_struct,
-
                     )
+                    traj_struct = construct_atoms(traj_output, traj_struct)
                     traj_struct = update_structure(traj_struct, traj_output.rigids['tensor7'])
                     pdb_str = to_pdb(traj_struct)
                     prot_model_strs.append(f"MODEL        {i}\n")

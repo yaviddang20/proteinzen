@@ -19,7 +19,7 @@ module load Sali cuda
 
 # SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 # source $SCRIPT_DIR/env_vars.sh
-source /wynton/home/kortemme/alexjli/projects/proteinzen-clone/env_vars.sh
+source /wynton/home/kortemme/alexjli/projects/proteinzen/env_vars.sh
 
 ROOT_DIR=$PWD
 cd $1
@@ -42,9 +42,9 @@ conda activate ${ENV_NAME}
 
 python sample.py \
     model_dir=$RUN_DIR \
-    out_prefix=$OUTPREFIX \
+    out_dir=$OUTPREFIX \
     checkpoint_idx=$CHECKPOINTIDX \
-    sampler.tasks_yaml=/wynton/home/kortemme/alexjli/projects/proteinzen-clone/configs/sampling/unconditional_sampling/benchmark_128.yaml \
+    sampler.tasks_yaml=${REPO_ROOT}/configs/sampling/unconditional_sampling/benchmark_128.yaml \
     sampler.batch_size=10 \
     corrupter.sampling_noise_mode=null \
     corrupter.trans_step_size=1 \
@@ -55,14 +55,8 @@ python sample.py \
 cd ~/software/ProteinMPNN/scripts
 conda activate proteinmpnn
 
-folder_with_pdbs=${RUN_DIR}/$OUTPREFIX/samples
-
-output_dir=${RUN_DIR}/$OUTPREFIX
-if [ ! -d $output_dir ]
-then
-    mkdir -p $output_dir
-fi
-
+folder_with_pdbs=$OUTPREFIX/samples
+output_dir=$OUTPREFIX
 path_for_parsed_chains=$output_dir"/parsed_pdbs.jsonl"
 path_for_fixed_pos=$output_dir"/pmpnn_fixed_pos_dict.jsonl"
 
@@ -77,7 +71,6 @@ python ../protein_mpnn_run.py \
         --batch_size 8
 
 ## submit ESMFold
-cd $RUN_DIR
 cd $OUTPREFIX
 mkdir esmfold
 cd esmfold

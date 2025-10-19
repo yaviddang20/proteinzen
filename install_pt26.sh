@@ -14,13 +14,11 @@ pip install \
 
 conda install -y -c https://conda.rosettacommons.org \
     pyrosetta
-# conda install -y -c conda-forge cxx-compiler
 
 pip install \
     mdtraj \
     biopython \
     black \
-    boltz==2.1.1 \
     darglint \
     dill \
     dm-tree \
@@ -37,7 +35,5 @@ pip install \
     wandb \
     mashumaro \
     p_tqdm
-    # deepspeed \
-
 
 pip install -e .
