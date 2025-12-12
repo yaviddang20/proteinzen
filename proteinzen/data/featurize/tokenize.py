@@ -400,41 +400,41 @@ def arbitrary_atom_to_frame(
 
     _select_axes = fn.partial(select_axes, valid_neighbors=valid_neighbors, valid_neighbor_coords=valid_neighbor_coords)
 
-    if len(neighbors) == 0:
-        quat = Rotation.random().as_quat(canonical=True)
-        trans = atom["coords"]
-        return np.concatenate([quat, trans], axis=0), 0
-    elif len(neighbors) == 1:
-        neighbor_idx = neighbors[0]
-        neighbor_neighbors = [n for n in neighbor_graph.neighbors(neighbor_idx) if n in valid_neighbors and n != atom_idx]
-        # print(atom, atom_idx, neighbor_idx, neighbor_neighbors, list(neighbor_graph.edges))
-        if len(neighbor_neighbors) > 0:
-            # if we can get a second hop neighbor to define the frame, use that
-            axes = _select_axes(atom["coords"], [neighbor_idx] + neighbor_neighbors)
-            if axes is not None:
-                # print(atom, 2)
-                return gen_det_rot_frame(atom['coords'], *axes)
-        try:
-            neighbor_coord = valid_neighbor_coords[valid_neighbors.index(neighbor_idx)]
-            # print(atom, 1)
-            return gen_semirand_rot_frame(atom['coords'], neighbor_coord)
-        except Exception as e:
-            print(f"Caught exception '{e}', replacing with random rotation")
-            # print(atom, 0)
-            return gen_rand_rot_frame(atom['coords'])
-    else:
-        axes = _select_axes(atom["coords"], neighbors)
-        if axes is not None:
-            return gen_det_rot_frame(atom["coords"], *axes)
+    # if len(neighbors) == 0:
+    quat = Rotation.identity().as_quat(canonical=True)
+    trans = atom["coords"]
+    return np.concatenate([quat, trans], axis=0), 0
+    # elif len(neighbors) == 1:
+    #     neighbor_idx = neighbors[0]
+    #     neighbor_neighbors = [n for n in neighbor_graph.neighbors(neighbor_idx) if n in valid_neighbors and n != atom_idx]
+    #     # print(atom, atom_idx, neighbor_idx, neighbor_neighbors, list(neighbor_graph.edges))
+    #     if len(neighbor_neighbors) > 0:
+    #         # if we can get a second hop neighbor to define the frame, use that
+    #         axes = _select_axes(atom["coords"], [neighbor_idx] + neighbor_neighbors)
+    #         if axes is not None:
+    #             # print(atom, 2)
+    #             return gen_det_rot_frame(atom['coords'], *axes)
+    #     try:
+    #         neighbor_coord = valid_neighbor_coords[valid_neighbors.index(neighbor_idx)]
+    #         # print(atom, 1)
+    #         return gen_semirand_rot_frame(atom['coords'], neighbor_coord)
+    #     except Exception as e:
+    #         print(f"Caught exception '{e}', replacing with random rotation")
+    #         # print(atom, 0)
+    #         return gen_rand_rot_frame(atom['coords'])
+    # else:
+    #     axes = _select_axes(atom["coords"], neighbors)
+    #     if axes is not None:
+    #         return gen_det_rot_frame(atom["coords"], *axes)
 
-        for neighbor_idx in neighbors:
-            try:
-                neighbor_coord = valid_neighbor_coords[valid_neighbors.index(neighbor_idx)]
-                return gen_semirand_rot_frame(atom['coords'], neighbor_coord)
-            except Exception:
-                pass
-        print("Error in featurizing rotation, replacing with random rotation")
-        return gen_rand_rot_frame(atom['coords'])
+    #     for neighbor_idx in neighbors:
+    #         try:
+    #             neighbor_coord = valid_neighbor_coords[valid_neighbors.index(neighbor_idx)]
+    #             return gen_semirand_rot_frame(atom['coords'], neighbor_coord)
+    #         except Exception:
+    #             pass
+    #     print("Error in featurizing rotation, replacing with random rotation")
+    #     return gen_rand_rot_frame(atom['coords'])
 
 
 

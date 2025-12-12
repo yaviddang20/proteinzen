@@ -1246,6 +1246,8 @@ class PDBWriter(BasePredictionWriter):
                 "fixed_seq_chain": [chain_mapping[int(i)] for i in sample_data['fixed_seq_chain_idx']],
             }
             curr_sample_id += 1
+        
+        
 
         with open(os.path.join(self.metadata_dir, f"samples_metadata_rank{rank}_batch{batch_idx}.json"), 'w') as fp:
             json.dump(samples_metadata, fp)

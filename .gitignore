@@ -110,6 +110,7 @@ ENV/
 
 
 # custom
+geom_drugs_boltz
 data/cath/mmtf
 data/cath/*.json
 data/cath/*.jsonl
