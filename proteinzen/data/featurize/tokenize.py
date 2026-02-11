@@ -399,11 +399,13 @@ def arbitrary_atom_to_frame(
         neighbors = []
 
     _select_axes = fn.partial(select_axes, valid_neighbors=valid_neighbors, valid_neighbor_coords=valid_neighbor_coords)
-
-    # if len(neighbors) == 0:
     quat = Rotation.identity().as_quat(canonical=True)
     trans = atom["coords"]
     return np.concatenate([quat, trans], axis=0), 0
+    # if len(neighbors) == 0:
+    #     quat = Rotation.identity().as_quat(canonical=True)
+    #     trans = atom["coords"]
+    #     return np.concatenate([quat, trans], axis=0), 0
     # elif len(neighbors) == 1:
     #     neighbor_idx = neighbors[0]
     #     neighbor_neighbors = [n for n in neighbor_graph.neighbors(neighbor_idx) if n in valid_neighbors and n != atom_idx]

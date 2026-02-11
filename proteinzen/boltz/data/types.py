@@ -588,6 +588,20 @@ class Record(JSONSerializable):
     md: Optional[MDInfo] = None
     affinity: Optional[AffinityInfo] = None
 
+@dataclass(frozen=True)
+class ConformerRecord(JSONSerializable):
+    """ConformerRecord datatype."""
+
+    ids: list[str]
+    structures: list[StructureInfo]
+    boltzmann_weights: list[float]
+    chains: list[ChainInfo]
+    interfaces: list[InterfaceInfo]
+    inference_options: Optional[InferenceOptions] = None
+    templates: Optional[list[TemplateInfo]] = None
+    md: Optional[MDInfo] = None
+    affinity: Optional[AffinityInfo] = None
+
 
 ####################################################################################################
 # RESIDUE CONSTRAINTS
@@ -650,6 +664,17 @@ class Target:
 
     record: Record
     structure: Structure
+    sequences: Optional[dict[str, str]] = None
+    residue_constraints: Optional[ResidueConstraints] = None
+    templates: Optional[dict[str, StructureV2]] = None
+    extra_mols: Optional[dict[str, Mol]] = None
+
+@dataclass(frozen=True)
+class ConformerTarget:
+    """Target datatype."""
+
+    record: ConformerRecord
+    structures: list[Structure]
     sequences: Optional[dict[str, str]] = None
     residue_constraints: Optional[ResidueConstraints] = None
     templates: Optional[dict[str, StructureV2]] = None

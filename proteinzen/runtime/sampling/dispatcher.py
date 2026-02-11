@@ -6,6 +6,7 @@ from torch_geometric.data import Batch
 from .task import SamplingTask
 from .unconditional import UnconditionalSampling
 from .unconditional_smiles import UnconditionalSamplingFromSMILES
+from .unconditional_smiles import UnconditionalSamplingFromMol
 from .motif_scaffolding import MotifScaffoldingTask
 
 
@@ -13,7 +14,8 @@ class BiomoleculeTaskDispatcher(Dataset):
     name_to_task_class = {
         "motif_scaffolding": MotifScaffoldingTask,
         "unconditional": UnconditionalSampling,
-        "unconditional_smiles": UnconditionalSamplingFromSMILES
+        "unconditional_smiles": UnconditionalSamplingFromSMILES,
+        "unconditional_mol": UnconditionalSamplingFromMol
     }
 
     def __init__(

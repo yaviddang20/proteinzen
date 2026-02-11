@@ -310,6 +310,23 @@ def smiles_to_struct(
     )
     return struct
 
+def mol_to_smiles_to_struct(
+    mol: Mol,
+    name: str = "LIG",
+    chain_name: str = 'A',
+    chain_idx: int = 0,
+    noise_ligand: bool = False,
+    trans_noise_std: int = 16,
+) -> Structure:
+    """Parse an RDKit molecule.
+
+    Parameters
+    ----------
+    mol: Mol
+        The molecule to parse.
+    """
+    smiles = Chem.MolToSmiles(mol)
+    return mol_to_struct(smiles, name, chain_name, chain_idx, noise_ligand, trans_noise_std)
 
 def mol_to_struct(
     mol: Mol,

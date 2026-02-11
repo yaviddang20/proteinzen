@@ -21,6 +21,8 @@ from proteinzen.data.constants import coarse_grain as cg
 from proteinzen.utils import coarse_grain as cg_utils
 from proteinzen.openfold.utils import rigid_utils as ru
 
+from proteinzen.stoch_interp import so3_utils
+
 from .tokenize import Token, Rigid, TokenBond, TokenData, RigidData, Tokenized, standard_residue_to_frames
 
 @dataclass(frozen=True)
@@ -179,6 +181,7 @@ def generate_protein_structure_template(  # noqa: C901, PLR0915
 
 def sample_noise_from_struct_template(  # noqa: C901, PLR0915
     struct: Structure,
+    igso3: so3_utils.SampleIGSO3,
     task_masks: Optional[dict[str, np.ndarray]] = None,
     trans_std=16,
 ) -> Tuple[np.ndarray, np.array, np.ndarray, np.ndarray]:
@@ -402,8 +405,10 @@ def sample_noise_from_struct_template(  # noqa: C901, PLR0915
                     is_present = res["is_present"] & atom["is_present"]
                     atom_idx = atom_start + j
 
-                    atom_trans = np.random.randn(3) * trans_std
+                    atom_trans = torch.randn(3).numpy() * trans_std
                     atom_quat = Rotation.random().as_quat(canonical=True)
+                    # atom_rotmat = igso3.sample(torch.tensor([1.5]), 1).view(3, 3).numpy()
+                    # atom_quat = Rotation.from_matrix(atom_rotmat).as_quat(canonical=True)
                     atom_tensor7 = np.concatenate([atom_quat, atom_trans], axis=-1)
 
                     # Create token
@@ -473,6 +478,10 @@ def sample_noise_from_struct_template(  # noqa: C901, PLR0915
     token_bonds = np.array(token_bonds, dtype=TokenBond)
     rigid_data = np.array(rigid_data, dtype=Rigid)
 
+
+    # rigid_data_trans_center = rigid_data['tensor7'][:, 4:].mean(axis=0)
+    # rigid_data['tensor7'][:, 4:] -= rigid_data_trans_center
+
     # center the motifs on the COM of the fixed rigids
     fixed_rigids_mask = ~rigid_data['rigids_noising_mask']
     if fixed_rigids_mask.any():
@@ -484,7 +493,6 @@ def sample_noise_from_struct_template(  # noqa: C901, PLR0915
     else:
         fixed_rigids_com = np.zeros(3)
     # fixed_rigids_com = np.zeros(3)
-
     return token_data, rigid_data, token_bonds, fixed_rigids_com
 
 
@@ -551,7 +559,6 @@ def construct_atoms(
             record_dict[res_idx].append(token)
 
     # print(unindexed_to_motif_idx)
-
     for residue in struct.residues:
         res_idx = residue['res_idx']
         if residue['is_copy']:

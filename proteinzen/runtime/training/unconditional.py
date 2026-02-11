@@ -48,6 +48,9 @@ class UnconditionalGeneration(TrainingTask):
         else:
             raise ValueError(f"self.t_sched={self.t_sched} not recognized")
 
+        # david change
+        # t = torch.zeros(1, device=device).float()
+        # t = torch.full((1,), 0.5, device=device).float()
         atom_noising_mask = np.ones(atoms.shape[0], dtype=bool)
         res_type_noising_mask = np.ones(residues.shape[0], dtype=bool)
         copy_indexed_residue_mask = np.zeros_like(res_type_noising_mask)

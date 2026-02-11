@@ -1,4 +1,4 @@
-_target_: proteinzen.data.datasets.datamodule.TrainingDataset
+_target_: proteinzen.data.datasets.datamodule.TrainingValDataset
 max_crop_residues: 1 #160
 max_crop_rigids: 96 # 512
 use_cropper: false #true

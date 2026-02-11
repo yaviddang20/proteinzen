@@ -2,6 +2,7 @@ import logging
 import math
 from functools import partial
 import copy
+from typing import Any
 import warnings
 from dataclasses import replace
 import os
@@ -14,6 +15,7 @@ import torch.distributed as dist
 import tree
 import lightning as L
 from lightning.pytorch.callbacks import BasePredictionWriter
+import sys
 
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from proteinzen.boltz.data import const
@@ -24,7 +26,6 @@ from proteinzen.openfold.utils import rigid_utils as ru
 from proteinzen.boltz.data.types import Structure
 from proteinzen.data.featurize.sampling import construct_atoms, update_structure
 from proteinzen.data.featurize.tokenize import Tokenized
-from proteinzen.data.featurize.sampling import construct_atoms
 # from proteinzen.data.write.mmcif import to_mmcif
 from proteinzen.data.write.pdb import to_pdb
 
@@ -33,6 +34,7 @@ from .ema import EMAModel
 
 from .loss.multiframe import multiframe_fm_loss_dense_batch
 from .loss.common import seq_losses_dense_batch
+from proteinzen.boltz.data.types import SamplingResidue
 
 
 DEFAULT_SEQ_WEIGHT = {
@@ -327,118 +329,326 @@ class BiomoleculeModule(L.LightningModule):
 
         return pred_seq_batch
 
-    def training_step(self, batch, batch_idx):
-        # update EMA
-        if self.ema is not None and self.global_step > 0:
-            self.ema.update_parameters(self.model)
-        if self.ema_long is not None and self.global_step > 0:
-            self.ema_long.update_parameters(self.model, self.global_step-1)
-        if self.ema_short is not None and self.global_step > 0:
-            self.ema_short.update_parameters(self.model, self.global_step-1)
-
-        # corrupt data
-        corrupter = self.corrupter
-        batch['trans_t'] = batch['t']
-        batch['rot_t'] = batch['t']
-        batch = corrupter.corrupt_dense_batch(batch)
-
-        # run denoiser, with self-conditioning as necessary
-        model = self.model
-        if model.self_conditioning and np.random.uniform() < self.self_condition_rate:
-            with torch.no_grad():
-                self_conditioning = model(batch)
-
-                # run denoising with the predicted seq of the self conditioning denoising step
-                if self.apply_self_folding:
-                    pred_seq_batch = self._generate_folding_batch(batch, self_conditioning['pred_seq'])
-                    # run "folding"
-                    self_folding = model(pred_seq_batch)
-                else:
-                    self_folding = None
-
-        else:
-            self_conditioning = None
-            self_folding = None
-        outputs = model(batch, self_conditioning, self_folding)
-
-        # compute loss
-        loss_dict = self._loss_step(batch, outputs)
-
-        # log loss
+    def _log_losses(self, loss_dict, batch, stage: str):
+        # ---- global mean losses ----
         log_dict = tree.map_structure(
-            lambda x: torch.round(torch.mean(x), decimals=3) if torch.is_tensor(x) else x,
+            lambda x: torch.round(torch.mean(x), decimals=3)
+            if torch.is_tensor(x) else x,
             loss_dict
         )
 
-        loss_by_task = {}
-        for i, task in enumerate(batch['task']):
-            if task.name + "_loss" not in loss_by_task:
-                loss_by_task[task.name + "_loss"] = []
-            if task.name + "_seq_loss" not in loss_by_task:
-                loss_by_task[task.name + "_seq_loss"] = []
-            if task.name + "_frame_vf_loss" not in loss_by_task:
-                loss_by_task[task.name + "_frame_vf_loss"] = []
-            if task.name + "_frame_vf_loss_unscaled" not in loss_by_task:
-                loss_by_task[task.name + "_frame_vf_loss_unscaled"] = []
-
-            loss_by_task[task.name + "_loss"].append(loss_dict['loss_per_batch'][i])
-            loss_by_task[task.name + "_seq_loss"].append(loss_dict["seq_loss"][i])
-            loss_by_task[task.name + "_frame_vf_loss"].append(loss_dict['frame_vf_loss'][i])
-            loss_by_task[task.name + "_frame_vf_loss_unscaled"].append(loss_dict['frame_vf_loss_unscaled'][i])
-
-        loss_by_task = {
-            key: torch.stack(values)
-            for key, values in loss_by_task.items()
+        log_dict = {
+            f"{stage}/{k}": v
+            for k, v in sorted(log_dict.items(), key=lambda x: x[0])
         }
+
+        # ---- per-task aggregation ----
+        loss_by_task = {}
+        for i, task in enumerate(batch["task"]):
+            for key in [
+                "loss_per_batch",
+                "seq_loss",
+                "frame_vf_loss",
+                "frame_vf_loss_unscaled",
+                "pred_trans_mse",
+            ]:
+                name = f"{task.name}_{key}"
+                loss_by_task.setdefault(name, []).append(loss_dict[key][i])
+
+        loss_by_task = {k: torch.stack(v) for k, v in loss_by_task.items()}
+
         for key, value in loss_by_task.items():
             self.log(
-                "task/" + key,
+                f"task/{stage}/{key}",
                 value.mean(),
-                prog_bar=False,
                 logger=True,
-                on_step=None,
                 on_epoch=True,
+                prog_bar=False,
                 batch_size=value.shape[0],
-                sync_dist=False)
+                sync_dist=False,
+            )
 
-        log_dict = {
-            ("train/" + key): value
-            for key, value in
-            sorted(log_dict.items(), key = lambda x: x[0])
-        }
-        t = batch['t']
-        for loss_name, loss_list in loss_dict.items():
-            if loss_name in ['loss', 'frameflow_loss', "frame_vf_loss_unscaled", 'loss_per_batch']:
-                continue
-            if t.numel() != loss_list.numel():
-                continue
-            # if not loss_name.startswith("pt_") and not loss_name.startswith("latent_"):
-            #     continue
-            stratified_losses = t_stratified_loss(
-                t, loss_list, loss_name=loss_name)
-            stratified_losses = {
-                f"train/{k}": torch.round(torch.as_tensor(v, device=log_dict['train/loss'].device), decimals=3)
-                for k,v in stratified_losses.items()
-            }
-            self.log_dict(
-                stratified_losses,
-                prog_bar=False,
-                logger=True,
-                on_step=None,
-                on_epoch=True,
-                batch_size=t.shape[0],
-                sync_dist=False)
+        # ---- t-stratified losses (TRAIN ONLY) ----
+        if stage == "train":
+            t = batch["t"]
+            for loss_name, loss_list in loss_dict.items():
+                if loss_name in [
+                    "loss",
+                    "frameflow_loss",
+                    "frame_vf_loss_unscaled",
+                    "loss_per_batch",
+                ]:
+                    continue
+                if t.numel() != loss_list.numel():
+                    continue
 
+                stratified = t_stratified_loss(batch_t=t, batch_loss=loss_list, loss_name=loss_name)
+                stratified = {
+                    f"train/{k}": torch.round(
+                        torch.as_tensor(v, device=t.device), decimals=3
+                    )
+                    for k, v in stratified.items()
+                }
+
+                self.log_dict(
+                    stratified,
+                    logger=True,
+                    on_epoch=True,
+                    prog_bar=False,
+                    batch_size=t.shape[0],
+                    sync_dist=False,
+                )
+
+        # ---- final logging ----
         self.log_dict(
             log_dict,
-            on_step=None,
+            logger=True,
             on_epoch=True,
             prog_bar=True,
-            logger=True,
-            batch_size=t.shape[0],
-            sync_dist=True)
+            batch_size=batch["t"].shape[0],
+            sync_dist=True,
+        )
 
+    def _shared_step(self, batch):
+        # batch = batch.copy()
+
+        # stochastic corruption for BOTH train and val
+        batch["trans_t"] = batch["t"]
+        batch["rot_t"] = batch["t"]
+        batch = self.corrupter.corrupt_dense_batch(batch)
+
+        # self-conditioning (optional)
+        self_conditioning = None
+        self_folding = None
+        if (
+            self.model.self_conditioning
+            and np.random.uniform() < self.self_condition_rate
+        ):
+            with torch.no_grad():
+                self_conditioning = self.model(batch)
+                if self.apply_self_folding:
+                    pred_seq_batch = self._generate_folding_batch(
+                        batch, self_conditioning["pred_seq"]
+                    )
+                    self_folding = self.model(pred_seq_batch)
+
+        outputs = self.model(batch, self_conditioning, self_folding)
+        loss_dict = self._loss_step(batch, outputs)
         return loss_dict
+
+    
+    def training_step(self, batch, batch_idx):
+        if self.global_step > 0:
+            if self.ema is not None:
+                self.ema.update_parameters(self.model)
+            if self.ema_long is not None:
+                self.ema_long.update_parameters(self.model, self.global_step - 1)
+            if self.ema_short is not None:
+                self.ema_short.update_parameters(self.model, self.global_step - 1)
+
+        loss_dict = self._shared_step(batch)
+        self._log_losses(loss_dict, batch, stage="train")
+        return loss_dict["loss"].mean()
+
+    @torch.no_grad()
+    def validation_step(self, batch, batch_idx):
+        device = batch["t"].device
+        B = batch["t"].shape[0]
+
+        for t_val in (0.0, 0.5):
+            batch_t = batch.copy()
+            batch_t["t"] = torch.full((*batch_t["t"].shape,), t_val, device=device)
+
+            loss_dict = self._shared_step(batch_t)
+
+            # log under separate namespace
+            self._log_losses(
+                loss_dict,
+                batch_t,
+                stage=f"val/t_{t_val}",
+            )
+
+    # def training_step(self, batch, batch_idx):
+    #     # update EMA
+    #     if self.ema is not None and self.global_step > 0:
+    #         self.ema.update_parameters(self.model)
+    #     if self.ema_long is not None and self.global_step > 0:
+    #         self.ema_long.update_parameters(self.model, self.global_step-1)
+    #     if self.ema_short is not None and self.global_step > 0:
+    #         self.ema_short.update_parameters(self.model, self.global_step-1)
+
+    #     # corrupt data
+    #     corrupter = self.corrupter
+    #     batch['trans_t'] = batch['t']
+    #     batch['rot_t'] = batch['t']
+    #     batch = corrupter.corrupt_dense_batch(batch)
+
+    #     # print("rigids_data", batch['rigids'])
+    #     # print("token_data", batch['token'])
+
+    #     # torch.save(batch['rigids'], 'rigids.pt')
+    #     # torch.save(batch['token'], 'token.pt')
+    #     # torch.save(batch['input_data'], 'input_data.pt')
+
+    #     # print("token_data", batch['token'])
+    #     # print(batch)
+
+
+    #     # run denoiser, with self-conditioning as necessary
+    #     model = self.model
+    #     if model.self_conditioning and np.random.uniform() < self.self_condition_rate:
+    #         with torch.no_grad():
+    #             self_conditioning = model(batch)
+
+    #             # run denoising with the predicted seq of the self conditioning denoising step
+    #             if self.apply_self_folding:
+    #                 pred_seq_batch = self._generate_folding_batch(batch, self_conditioning['pred_seq'])
+    #                 # run "folding"
+    #                 self_folding = model(pred_seq_batch)
+    #             else:
+    #                 self_folding = None
+
+    #     else:
+    #         self_conditioning = None
+    #         self_folding = None
+    #     outputs = model(batch, self_conditioning, self_folding)
+
+    #     # post_processed_outputs = self._post_process_outputs(batch, outputs)
+
+    #     # for i, (post_processed_output, batch_item) in enumerate(zip(
+    #     #     post_processed_outputs,
+    #     #     batch['input_data']
+    #     # )):
+    #     #     input_structure = Structure(**batch_item['structure'])
+    #     #     output_data = post_processed_output['output_data']
+    #     #     output_struct = Structure(**output_data['structure'])
+    #     #     tokenized_output = Tokenized(
+    #     #         tokens=output_data['tokens'],
+    #     #         rigids=output_data['rigids'],
+    #     #         bonds=output_data['bonds'],
+    #     #         structure=output_struct
+    #     #     )
+    #     #     new_residues = []
+    #     #     for residue in output_struct.residues:
+    #     #         new_residue = (
+    #     #             residue['name'],
+    #     #             residue['res_type'],
+    #     #             residue['res_idx'],
+    #     #             residue['atom_idx'],
+    #     #             residue['atom_num'],
+    #     #             residue['atom_center'],
+    #     #             residue['atom_disto'],
+    #     #             residue['is_standard'],
+    #     #             residue['is_present'],
+    #     #             False  # is_copy
+    #     #         )
+    #     #         new_residues.append(new_residue)
+    #     #     new_residues = np.array(new_residues, dtype=SamplingResidue)
+    #     #     output_struct = replace(output_struct, residues=new_residues)
+
+    #     #     output_struct = construct_atoms(tokenized_output, output_struct)
+    #     #     output_struct = update_structure(output_struct, tokenized_output.rigids['tensor7'])
+
+    #     #     seen_asym_id = []
+    #     #     chain_mask = []
+    #     #     for chain in output_struct.chains:
+    #     #         if chain['asym_id'] not in seen_asym_id:
+    #     #             seen_asym_id.append(chain['asym_id'])
+    #     #             chain_mask.append(True)
+    #     #         else:
+    #     #             chain_mask.append(False)
+    #     #     output_struct = replace(output_struct, mask=np.array(chain_mask))
+
+    #     #     output_pdb_str = to_pdb(output_struct)
+    #     #     with open(f"output_pdb_{i}.pdb", "w") as f:
+    #     #         f.write(output_pdb_str)
+    #     #     input_pdb_str = to_pdb(input_structure)
+    #     #     with open(f"input_pdb_{i}.pdb", "w") as f:
+    #     #         f.write(input_pdb_str)
+    #     #     print("written to", os.getcwd())
+    #     # exit()
+
+    #     # compute loss
+    #     loss_dict = self._loss_step(batch, outputs)
+
+    #     # log loss
+    #     log_dict = tree.map_structure(
+    #         lambda x: torch.round(torch.mean(x), decimals=3) if torch.is_tensor(x) else x,
+    #         loss_dict
+    #     )
+
+    #     loss_by_task = {}
+    #     for i, task in enumerate(batch['task']):
+    #         if task.name + "_loss" not in loss_by_task:
+    #             loss_by_task[task.name + "_loss"] = []
+    #         if task.name + "_seq_loss" not in loss_by_task:
+    #             loss_by_task[task.name + "_seq_loss"] = []
+    #         if task.name + "_frame_vf_loss" not in loss_by_task:
+    #             loss_by_task[task.name + "_frame_vf_loss"] = []
+    #         if task.name + "_frame_vf_loss_unscaled" not in loss_by_task:
+    #             loss_by_task[task.name + "_frame_vf_loss_unscaled"] = []
+    #         if task.name + "_pred_trans_mse" not in loss_by_task:
+    #             loss_by_task[task.name + "_pred_trans_mse"] = []
+
+    #         loss_by_task[task.name + "_loss"].append(loss_dict['loss_per_batch'][i])
+    #         loss_by_task[task.name + "_seq_loss"].append(loss_dict["seq_loss"][i])
+    #         loss_by_task[task.name + "_frame_vf_loss"].append(loss_dict['frame_vf_loss'][i])
+    #         loss_by_task[task.name + "_frame_vf_loss_unscaled"].append(loss_dict['frame_vf_loss_unscaled'][i])
+    #         loss_by_task[task.name + "_pred_trans_mse"].append(loss_dict['pred_trans_mse'][i])
+
+    #     loss_by_task = {
+    #         key: torch.stack(values)
+    #         for key, values in loss_by_task.items()
+    #     }
+    #     for key, value in loss_by_task.items():
+    #         self.log(
+    #             "task/" + key,
+    #             value.mean(),
+    #             prog_bar=False,
+    #             logger=True,
+    #             on_step=None,
+    #             on_epoch=True,
+    #             batch_size=value.shape[0],
+    #             sync_dist=False)
+
+    #     log_dict = {
+    #         ("train/" + key): value
+    #         for key, value in
+    #         sorted(log_dict.items(), key = lambda x: x[0])
+    #     }
+    #     t = batch['t']
+    #     for loss_name, loss_list in loss_dict.items():
+    #         if loss_name in ['loss', 'frameflow_loss', "frame_vf_loss_unscaled", 'loss_per_batch']:
+    #             continue
+    #         if t.numel() != loss_list.numel():
+    #             continue
+    #         # if not loss_name.startswith("pt_") and not loss_name.startswith("latent_"):
+    #         #     continue
+    #         stratified_losses = t_stratified_loss(
+    #             t, loss_list, loss_name=loss_name)
+    #         stratified_losses = {
+    #             f"train/{k}": torch.round(torch.as_tensor(v, device=log_dict['train/loss'].device), decimals=3)
+    #             for k,v in stratified_losses.items()
+    #         }
+    #         self.log_dict(
+    #             stratified_losses,
+    #             prog_bar=False,
+    #             logger=True,
+    #             on_step=None,
+    #             on_epoch=True,
+    #             batch_size=t.shape[0],
+    #             sync_dist=False)
+
+    #     self.log_dict(
+    #         log_dict,
+    #         on_step=None,
+    #         on_epoch=True,
+    #         prog_bar=True,
+    #         logger=True,
+    #         batch_size=t.shape[0],
+    #         sync_dist=True)
+
+    #     return loss_dict
 
     def _loss_step(self, inputs, outputs):
         token_seq = inputs['token']['seq']
@@ -493,6 +703,8 @@ class BiomoleculeModule(L.LightningModule):
                 + 0.5 * frame_fm_loss_dict['scaled_fafe']
                 + atomic_loss
             )
+        
+        loss = loss + 1.0 * frame_fm_loss_dict['bond_angle_rmse'] + 1.0 * frame_fm_loss_dict['bond_length_rmse']
 
         loss_dict = {"loss": loss.mean(), "frame_vf_loss": frame_vf_loss, "frame_vf_loss_unscaled": unscaled_frame_vf_loss}
         loss_dict['loss_per_batch'] = loss
@@ -552,6 +764,62 @@ class BiomoleculeModule(L.LightningModule):
             sync_dist=False
         )
 
+
+    def _post_process_outputs(
+        self,
+        batch,
+        final_denoiser_out
+    ):
+        ret = []
+
+        pred_rigids = final_denoiser_out['denoised_rigids']
+        pred_tensor7 = pred_rigids.to_tensor_7().numpy(force=True)
+        pred_seq = final_denoiser_out["pred_seq"].numpy(force=True)
+
+
+        for i, input_data in enumerate(batch['input_data']):
+            # chop off any padding for pred_rigids and pred_seq
+            num_rigids = input_data['rigids']['tensor7'].shape[0]
+            output_data = copy.deepcopy(input_data)
+            # tensor7 = pred_rigids.to_tensor_7().numpy(force=True)
+            _tensor7 = pred_tensor7[i, :num_rigids]
+            output_data['rigids']['tensor7'] = _tensor7
+
+            num_tokens = input_data['tokens']['token_idx'].shape[0]
+            _seq = pred_seq[i, :num_tokens]
+            output_data['tokens']['res_type'] = _seq
+
+            # if we copy any tokens, figure out what generated residue corresponds to these fixed tokens
+            # select masks
+            token_data = output_data['tokens']
+            token_is_copy_mask = token_data['is_copy']
+            motif_idx = final_denoiser_out["motif_idx"][i, :num_tokens]
+            motif_select_mask = (token_is_copy_mask & token_data['resolved_mask'])
+            motif_seq_fixed = ~token_data['seq_noising_mask']
+            # actual idxs
+            fixed_bb_res_idx = motif_idx[motif_select_mask]
+            fixed_seq_res_idx = motif_idx[motif_seq_fixed]
+            fixed_bb_chain_idx = token_data['asym_id'][motif_select_mask]
+            fixed_seq_chain_idx = token_data['asym_id'][motif_seq_fixed]
+
+            # TODO: this is kinda jenk, we're doing this to allow us to have access to both
+            # the "original unindexed index" (which is stored in res_idx)
+            # and "new assigned index" (which is overwritten into token_idx)
+            # we currently use both to impute the copy motif into the generated structure
+            token_data['token_idx'][motif_select_mask] = motif_idx.numpy(force=True)[motif_select_mask]
+
+            ret.append({
+                "input_data": input_data,
+                "output_data": output_data,
+                "fixed_bb_res_idx": fixed_bb_res_idx,
+                "fixed_seq_res_idx": fixed_seq_res_idx,
+                "fixed_bb_chain_idx": fixed_bb_chain_idx,
+                "fixed_seq_chain_idx": fixed_seq_chain_idx,
+                "name": batch["task"][i]
+            })
+
+        return ret
+
     def predict_step(self, batch, batch_idx):
         if self.use_ema:
             model = self.ema.module
@@ -572,6 +840,7 @@ class BiomoleculeModule(L.LightningModule):
         rigids_data = batch['rigids']
         rigids_data['rigids_t'] = rigids_data['rigids_1']
         token_data = batch['token']
+
         rigids_0 = ru.Rigid.from_tensor_7(rigids_data['rigids_t'])
         trans_0 = rigids_0.get_trans()
         rotmats_0 = rigids_0.get_rots().get_rot_mats()
@@ -593,6 +862,7 @@ class BiomoleculeModule(L.LightningModule):
         clean_traj = []
 
         global_shift = torch.zeros_like(trans_0).mean(dim=-2)
+
         for t_2 in tqdm.tqdm(ts[1:]):
             d_t = t_2 - t_1
             # Run model.
@@ -633,7 +903,7 @@ class BiomoleculeModule(L.LightningModule):
             denoiser_out = model(batch, self_condition=denoiser_out, self_folding=folding_out)
 
             # Process model output.
-            pred_rigids = denoiser_out['denoised_rigids']
+            pred_rigids = denoiser_out['denoised_rigids']   
             pred_trans_1 = pred_rigids.get_trans()
             pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
 
@@ -680,6 +950,8 @@ class BiomoleculeModule(L.LightningModule):
 
             if not model.self_conditioning:
                 denoiser_out = None
+
+
 
         # We only integrated to min_t, so need to make a final step
         t_1 = ts[-1]
@@ -835,12 +1107,62 @@ class BiomoleculeSamplingModule(L.LightningModule):
         self.run_cfg = run_cfg
 
     def predict_step(self, batch, batch_idx):
+        # structure_dict = batch['input_data'][0]['structure']
+        # structure = Structure(**structure_dict)
+        # pdb_str = to_pdb(structure)
+        # with open(f"clean_data_mol_predict.pdb", "w") as f:
+        #     f.write(pdb_str)
+        # exit()
         # Set-up time
+
+        # self.corrupter.num_timesteps = 20
         ts = torch.linspace(0.0, 1.0, self.corrupter.num_timesteps)
+        # ts = torch.linspace(1.0, 0.0, self.corrupter.num_timesteps)
 
         rigids_data = batch['rigids']
         rigids_data['rigids_t'] = rigids_data['rigids_1']
         token_data = batch['token']
+        # print("rigids_data before", rigids_data['rigids_ref_element'])
+
+        rigids_data_center = rigids_data['rigids_t'][:, :, 4:].mean(dim=1)
+        rigids_data['rigids_t'][:, :, 4:] -= rigids_data_center[..., None, :]
+
+        # rigids_data['rigids_t'] = rigids_data['rigids_t'][:, :, :4]
+
+        # test_rigids_data = torch.load('outputs/geom_identityRot_frame_384/train/rigids.pt')
+        # test_token_data = torch.load('outputs/geom_identityRot_frame_384/train/token.pt')
+        # batch['input_data'] = torch.load('outputs/geom_identityRot_frame_384/train/input_data.pt')
+        # batch['rigids'] = test_rigids_data
+        # batch['token'] = test_token_data
+        # rigids_data = test_rigids_data
+        # token_data = test_token_data
+
+        # rigids_data['rigids_t'][:, :, :4] = test_rigids_data['rigids_t'][:, :32, :4]
+
+        # print("rigids_data after", rigids_data['rigids_ref_element'])
+        # print("token_data", token_data)
+        # exit()
+
+
+        for batch_item in batch['input_data']:
+            residues = batch_item['structure']['residues']
+            new_residues = []
+            for residue in residues:
+                new_residue = (
+                    residue['name'],
+                    residue['res_type'],
+                    residue['res_idx'],
+                    residue['atom_idx'],
+                    residue['atom_num'],
+                    residue['atom_center'],
+                    residue['atom_disto'],
+                    residue['is_standard'],
+                    residue['is_present'],
+                    False  # is_copy
+                )
+                new_residues.append(new_residue)
+            batch_item['structure']['residues'] =  np.array(new_residues, dtype=SamplingResidue)
+
         rigids_0 = ru.Rigid.from_tensor_7(rigids_data['rigids_t'])
         trans_0 = rigids_0.get_trans()
         rotmats_0 = rigids_0.get_rots().get_rot_mats()
@@ -853,7 +1175,11 @@ class BiomoleculeSamplingModule(L.LightningModule):
             None
         )]
 
+        # print(trans_0)
+        # exit()
+
         clean_traj = []
+        
 
         # set up initial integration conditions
         t_1 = ts[0]
@@ -869,24 +1195,37 @@ class BiomoleculeSamplingModule(L.LightningModule):
                 t_2,
                 self_conditioning=prev_denoiser_out
             )
+
+            
+
             prot_traj.append(prot_traj_point)
             clean_traj.append(clean_traj_point)
             t_1 = t_2
 
         trans_t, rotmats_t, _ = prot_traj[-1]
-        final_denoiser_out, _, _ = self._integration_step(
-            self.ema.module,
+        # final_denoiser_out, prot_traj_point, _ = self._integration_step(
+        #     self.ema.module,
+        #     batch,
+        #     trans_t,
+        #     rotmats_t,
+        #     ts[-1],
+        #     ts[-1],
+        #     self_conditioning=prev_denoiser_out,
+        #     apply_step=False
+        # )
+        final_denoiser_out = self.ema.module(
             batch,
-            trans_t,
-            rotmats_t,
-            ts[-1],
-            ts[-1],
-            self_conditioning=prev_denoiser_out,
-            apply_step=False
+            self_condition=prev_denoiser_out,
+            self_folding=None
         )
+        pred_rigids = final_denoiser_out['denoised_rigids']
+        pred_trans_1 = pred_rigids.get_trans()
+        pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
+        prot_traj_point = (pred_trans_1, pred_rotmats_1, final_denoiser_out["pred_seq"].detach().cpu())
 
         # Process model output.
-        prot_traj = prot_traj[1:]
+        # prot_traj = prot_traj[1:]
+        prot_traj[0] = (trans_0, rotmats_0, prot_traj_point[2])
 
         ret = self._post_process_outputs(
             batch,
@@ -896,6 +1235,10 @@ class BiomoleculeSamplingModule(L.LightningModule):
         )
 
         return ret
+
+    def chk(self, name, x):
+        if not torch.isfinite(x).all():
+            raise RuntimeError(f"NaN/Inf in {name}")
 
     def _integration_step(
         self,
@@ -923,6 +1266,7 @@ class BiomoleculeSamplingModule(L.LightningModule):
             trans_t_1,
             noising_mask=rigids_noising_mask,
         )
+
         _, _, rotmats_t_hat = self.corrupter.rot_churn(
             d_t,
             t_1,
@@ -930,7 +1274,7 @@ class BiomoleculeSamplingModule(L.LightningModule):
             noising_mask=rigids_noising_mask,
         )
 
-        # Run model.
+        # # Run model.
         rigids_data["trans_t"] = trans_t_hat
         rigids_data["rotmats_t"] = rotmats_t_hat
         rigids_data['rigids_t'] = ru.Rigid(
@@ -940,22 +1284,39 @@ class BiomoleculeSamplingModule(L.LightningModule):
         t = torch.ones(num_batch, device=device)[..., None] * t_hat
         batch["t"] = t
 
+
         denoiser_out = model(
             batch,
             self_condition=self_conditioning,
             self_folding=None
         )
+        
+        
+
+        # total_mask = rigids_noising_mask & rigids_data['rigids_mask']
+        # clean_rigids_1_trans = torch.stack([batch['task'][i]['clean_rigids_1'].get_trans() for i in range(num_batch)])
+        # pred_frame_trans_se = torch.square(clean_rigids_1_trans - denoiser_out['denoised_rigids'].get_trans()).sum(dim=-1)
+        # pred_frame_trans_mse = (pred_frame_trans_se * total_mask).sum(-1) / num_batch
+        # print("pred_frame_trans_mse", pred_frame_trans_mse)
+        # sys.stdout.flush()
 
         # Process model output.
         pred_rigids = denoiser_out['denoised_rigids']
         pred_trans_1 = pred_rigids.get_trans()
         pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
 
+        # print("1", pred_rotmats_1)
+
         clean_traj_point = (
             pred_trans_1,
             pred_rotmats_1,
             denoiser_out["pred_seq"].detach().cpu(),
         )
+
+        # d_t_hat  = d_t
+        # t_hat = t_1
+        # trans_t_hat = trans_t_1
+        # rotmats_t_hat = rotmats_t_1
 
         trans_d_t_hat = d_t_hat
         rot_d_t_hat = d_t_hat
@@ -991,6 +1352,7 @@ class BiomoleculeSamplingModule(L.LightningModule):
         else:
             prot_traj_point = clean_traj_point
 
+        # print("2", rotmats_t_2)
         return denoiser_out, prot_traj_point, clean_traj_point
 
     def _post_process_outputs(
@@ -1084,10 +1446,10 @@ class BiomoleculeSamplingModule(L.LightningModule):
 class PDBWriter(BasePredictionWriter):
     def __init__(self, output_dir, run_cfg):
         super().__init__(write_interval="batch_and_epoch")
-        self.output_dir = output_dir
-        self.samples_dir = os.path.join(output_dir, "samples")
-        self.metadata_dir = os.path.join(output_dir, "metadata")
-        self.traj_dir = os.path.join(output_dir, "traj")
+        self.output_dir = os.path.abspath(output_dir)
+        self.samples_dir = os.path.abspath(os.path.join(output_dir, "samples"))
+        self.metadata_dir = os.path.abspath(os.path.join(output_dir, "metadata"))
+        self.traj_dir = os.path.abspath(os.path.join(output_dir, "traj"))
         self.run_cfg = run_cfg
 
         os.makedirs(self.samples_dir, exist_ok=True)
@@ -1096,6 +1458,7 @@ class PDBWriter(BasePredictionWriter):
 
 
         self.samples_metadata = {}
+        self.task_name_counters = {}  # Track counters per task name across function calls
 
     def write_on_batch_end(self, trainer, pl_module, prediction, batch_indices, batch, batch_idx, dataloader_idx):
         pwd = os.getcwd()
@@ -1119,7 +1482,19 @@ class PDBWriter(BasePredictionWriter):
             )
             struct = construct_atoms(sample_output, struct)
             sample_len = sample_output.tokens.shape[0]
-            sample_name = f"len_{sample_len}_protein_id{rank}_{batch_idx}_{curr_sample_id}" #.pdb"
+            # Use task name from YAML if available, otherwise fall back to default naming
+            task_name = sample_data.get('name', None)
+            
+            if task_name is not None:
+                # Initialize counter for this task name if it doesn't exist
+                if task_name not in self.task_name_counters:
+                    self.task_name_counters[task_name] = 0
+                # Use current counter value and increment for next time
+                sample_name = f"{task_name}_{self.task_name_counters[task_name]}"
+                self.task_name_counters[task_name] += 1
+            else:
+                # Fall back to original naming scheme
+                sample_name = f"len_{sample_len}_protein_id{rank}_{batch_idx}_{curr_sample_id}" #.pdb"
             struct = update_structure(struct, sample_output.rigids['tensor7'])
 
             if self.run_cfg['output_motif_chains']:
@@ -1177,13 +1552,18 @@ class PDBWriter(BasePredictionWriter):
                 clean_traj = sample_data['clean_traj']
                 prot_traj = sample_data['prot_traj']
 
+                if task_name is not None:
+                    traj_base_name = f"{task_name}_{self.task_name_counters[task_name] - 1}"
+                else:
+                    traj_base_name = f"len_{sample_len}_protein_id{rank}_{batch_idx}_{curr_sample_id}"
+                
                 clean_traj_name = os.path.join(
                     self.traj_dir,
-                    f"len_{sample_len}_protein_id{rank}_{batch_idx}_{curr_sample_id}_clean_traj.pdb"
+                    f"{traj_base_name}_clean_traj.pdb"
                 )
                 prot_traj_name = os.path.join(
                     self.traj_dir,
-                    f"len_{sample_len}_protein_id{rank}_{batch_idx}_{curr_sample_id}_prot_traj.pdb"
+                    f"{traj_base_name}_prot_traj.pdb"
                 )
                 clean_model_strs = []
                 prot_model_strs = []

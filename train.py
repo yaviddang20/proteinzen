@@ -18,7 +18,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 # import wandb
 
 from proteinzen.runtime.config import config_hydra_store, remove_zen_keys
-
+import pytorch_lightning as pl
 
 # A logger for this file
 log = logging.getLogger(__name__)
@@ -100,11 +100,15 @@ def main(model,
     log.info(f"Experiment started in folder: {os.getcwd()}")
 
     # assemble task sampler
+    pl.seed_everything(42, workers=True)
     print(dataset)
-    dataset_config = omegaconf.OmegaConf.load(dataset['config'])
-    train_dataset = hydra.utils.instantiate(dataset_config)
+    train_dataset_config = omegaconf.OmegaConf.load(dataset['config'])
+    val_dataset_config = omegaconf.OmegaConf.load(dataset['val_config'])
+    train_dataset = hydra.utils.instantiate(train_dataset_config)
+    val_dataset = hydra.utils.instantiate(val_dataset_config)
     shutil.copy(dataset['config'], os.path.join(os.getcwd(), "dataset_config.yaml"))
-    datamodule_inst = datamodule(train_dataset=train_dataset)
+    shutil.copy(dataset['val_config'], os.path.join(os.getcwd(), "val_dataset_config.yaml"))
+    datamodule_inst = datamodule(train_dataset=train_dataset, val_dataset=val_dataset)
 
     # datamodule and optim are all partial'd __init__s
     # so we instantiate instances of each

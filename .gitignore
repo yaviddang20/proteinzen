@@ -111,6 +111,8 @@ ENV/
 
 # custom
 geom_drugs_boltz
+geom_*
+sampling
 data/cath/mmtf
 data/cath/*.json
 data/cath/*.jsonl
@@ -128,3 +130,14 @@ lightning_logs/
 scripts/submit_scripts/train/tmp*
 scripts/submit_scripts/test/*
 scripts/submit_scripts/debug/*
+data/rdkit/drugs
+data/rdkit/qm9
+data/scaffold/drugs
+data/scaffold/qm9
+data/scaffold_data.tar.gz
+data/drugs.tar.gz
+data/DRUGS
+data/rdkit
+opendqc_cache
+.vscode
+script_logs

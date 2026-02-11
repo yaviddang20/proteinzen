@@ -270,7 +270,8 @@ def featurize_training(
     return {
         "t": task_data['t'],
         "token": token_features,
-        "rigids": rigid_features
+        "rigids": rigid_features,
+        'input_data': data,
     }
 
 def featurize_inference(
@@ -281,6 +282,7 @@ def featurize_inference(
     max_rigids: Optional[int] = None,
     rigids_per_window_queries: int = 16,
 ):
+    max_rigids = 96
     token_features = process_token_features(
         data,
         max_tokens

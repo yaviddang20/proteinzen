@@ -18,6 +18,16 @@ from lightning.pytorch import Trainer
 from proteinzen.runtime.config import config_sampling_hydra_store
 from proteinzen.runtime.lmod import BiomoleculeSamplingModule, PDBWriter
 
+# PyTorch 2.6+ changed default weights_only=True which breaks checkpoint loading
+# SIMPLE FIX: Monkey-patch torch.load to use weights_only=False by default
+# This restores the old behavior and avoids the ridiculous safe unpickling errors
+_original_torch_load = torch.load
+def _patched_torch_load(*args, weights_only=None, **kwargs):
+    # If weights_only not explicitly set, default to False (old behavior)
+    if weights_only is None:
+        weights_only = False
+    return _original_torch_load(*args, weights_only=weights_only, **kwargs)
+torch.load = _patched_torch_load
 
 # A logger for this file
 log = logging.getLogger(__name__)
@@ -77,11 +87,13 @@ def main(sampler,
     zen_cfg = omegaconf.OmegaConf.to_container(zen_cfg)
     assert zen_cfg is not None
 
+    version_num = zen_cfg['version_num']
+
     run_dir = zen_cfg['model_dir']
     ckpt_list = list(glob.glob(
         os.path.join(
             run_dir,
-            "lightning_logs/version_0/checkpoints/*.ckpt",
+            f"lightning_logs/version_{version_num}/checkpoints/*.ckpt",
         )
     ))
     epoch_list = []

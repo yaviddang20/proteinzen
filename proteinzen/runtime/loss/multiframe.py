@@ -2,6 +2,179 @@ import torch
 
 from proteinzen.openfold.utils import rigid_utils as ru
 from proteinzen.stoch_interp import so3_utils as so3_fm_utils
+import torch.nn.functional as F
+
+
+def bond_length_rmse(inputs, denoiser_outputs):
+    rigids_data = inputs['rigids']
+    rigids_mask = rigids_data['rigids_mask']
+    rigids_noising_mask = rigids_data['rigids_noising_mask']
+    total_mask = rigids_mask * rigids_noising_mask  # [B, L_pad]
+
+    denoised_rigids = denoiser_outputs['denoised_rigids']
+    gt_rigids = ru.Rigid.from_tensor_7(rigids_data['rigids_1'])
+
+    gt_frame_trans = gt_rigids.get_trans()    # [B, L_pad, 3]
+    pred_frame_trans = denoised_rigids.get_trans()  # [B, L_pad, 3]
+    
+    B, L_pad, _ = gt_frame_trans.shape
+
+    # Compute all pairwise distances
+    gt_dists = torch.linalg.norm(
+        gt_frame_trans[:, :, None, :] - gt_frame_trans[:, None, :, :],
+        dim=-1
+    )  # [B, L_pad, L_pad]
+    pred_dists = torch.linalg.norm(
+        pred_frame_trans[:, :, None, :] - pred_frame_trans[:, None, :, :],
+        dim=-1
+    )  # [B, L_pad, L_pad]
+
+    # Build padded bond matrix
+    token_bonds = inputs['token']['token_bonds']  # [L, L] or [B, L, L]
+    
+    if token_bonds.dim() == 2:
+        token_bonds = token_bonds.unsqueeze(0).expand(B, -1, -1)
+    
+    L = token_bonds.shape[-1]
+    pad = L_pad - L
+
+    if pad > 0:
+        token_bonds = torch.nn.functional.pad(
+            token_bonds,
+            (0, pad, 0, pad),
+            value=0
+        )
+
+    token_bonds_mask = token_bonds > 0  # [B, L_pad, L_pad]
+    
+    # Only keep upper triangle to avoid double-counting
+    triu_mask = torch.triu(torch.ones(L_pad, L_pad, device=token_bonds.device, dtype=torch.bool), diagonal=1)
+    token_bonds_mask = token_bonds_mask & triu_mask[None, :, :]  # [B, L_pad, L_pad]
+    
+    # Apply position mask: both endpoints must be valid
+    pos_mask = total_mask[:, :, None] & total_mask[:, None, :]  # [B, L_pad, L_pad]
+    final_mask = token_bonds_mask & pos_mask
+    
+    # Extract valid bonds across all batches
+    gt_bonds = gt_dists[final_mask]  # [N_total_bonds]
+    pred_bonds = pred_dists[final_mask]  # [N_total_bonds]
+    
+    if gt_bonds.numel() == 0:
+        return torch.tensor(0.0, device=gt_dists.device)
+    
+    # RMSE across all bonds in all batches
+    rmse = torch.sqrt(torch.mean(torch.square(gt_bonds - pred_bonds)))
+    
+    return rmse  # scalar
+
+
+def bond_angle_rmse(inputs, denoiser_outputs, eps=1e-8):
+    rigids_data = inputs["rigids"]
+    rigids_mask = rigids_data["rigids_mask"].bool()
+    rigids_noising_mask = rigids_data["rigids_noising_mask"].bool()
+    total_mask = rigids_mask & rigids_noising_mask
+    
+    denoised_rigids = denoiser_outputs["denoised_rigids"]
+    gt_rigids = ru.Rigid.from_tensor_7(rigids_data["rigids_1"])
+    
+    gt_xyz = gt_rigids.get_trans()
+    pred_xyz = denoised_rigids.get_trans()
+    B, L_pad, _ = gt_xyz.shape
+    device = gt_xyz.device
+    
+    # Pad token_bonds
+    token_bonds = inputs["token"]["token_bonds"]
+    if token_bonds.dim() == 2:
+        token_bonds = token_bonds.unsqueeze(0).expand(B, -1, -1)
+    
+    L = token_bonds.shape[-1]
+    pad = L_pad - L
+    if pad > 0:
+        token_bonds = F.pad(token_bonds, (0, pad, 0, pad), value=0)
+    
+    bond_mask = (token_bonds > 0)
+    
+    # Remove diagonal and apply masks
+    diag = torch.eye(L_pad, device=device, dtype=torch.bool)[None, :, :]
+    bond_mask = bond_mask & ~diag
+    bond_mask = bond_mask & total_mask[:, :, None] & total_mask[:, None, :]
+    
+    # Edge list
+    b_e, i_e, j_e = torch.where(bond_mask)
+    if b_e.numel() == 0:
+        return gt_xyz.new_zeros(())
+    
+    # Group by center (b, j)
+    key = b_e * L_pad + j_e
+    perm = torch.argsort(key)
+    key = key[perm]
+    b_e = b_e[perm]
+    i_e = i_e[perm]
+    j_e = j_e[perm]
+    
+    uniq_key, counts = torch.unique_consecutive(key, return_counts=True)
+    
+    # Build triplets
+    trip_b = []
+    trip_i = []
+    trip_j = []
+    trip_k = []
+    
+    start = 0
+    counts_list = counts.tolist()  # Single CPU transfer
+    for c in counts_list:
+        end = start + c
+        if c >= 2:
+            neigh = i_e[start:end]
+            b0 = b_e[start]
+            j0 = j_e[start]
+            
+            a, b = torch.triu_indices(c, c, offset=1, device=device)
+            trip_b.append(b0.expand(a.shape[0]))
+            trip_j.append(j0.expand(a.shape[0]))
+            trip_i.append(neigh[a])
+            trip_k.append(neigh[b])
+        start = end
+    
+    if len(trip_b) == 0:
+        return gt_xyz.new_zeros(())
+    
+    b_idx = torch.cat(trip_b)
+    i_idx = torch.cat(trip_i)
+    j_idx = torch.cat(trip_j)
+    k_idx = torch.cat(trip_k)
+    
+    # Gather positions
+    gt_i = gt_xyz[b_idx, i_idx]
+    gt_j = gt_xyz[b_idx, j_idx]
+    gt_k = gt_xyz[b_idx, k_idx]
+    
+    pred_i = pred_xyz[b_idx, i_idx]
+    pred_j = pred_xyz[b_idx, j_idx]
+    pred_k = pred_xyz[b_idx, k_idx]
+    
+    # Vectors
+    gt_v1 = gt_i - gt_j
+    gt_v2 = gt_k - gt_j
+    pred_v1 = pred_i - pred_j
+    pred_v2 = pred_k - pred_j
+    
+    # Normalize
+    gt_v1 = gt_v1 / (torch.linalg.norm(gt_v1, dim=-1, keepdim=True) + eps)
+    gt_v2 = gt_v2 / (torch.linalg.norm(gt_v2, dim=-1, keepdim=True) + eps)
+    pred_v1 = pred_v1 / (torch.linalg.norm(pred_v1, dim=-1, keepdim=True) + eps)
+    pred_v2 = pred_v2 / (torch.linalg.norm(pred_v2, dim=-1, keepdim=True) + eps)
+    
+    # Angles
+    gt_cos = (gt_v1 * gt_v2).sum(dim=-1).clamp(-1 + 1e-6, 1 - 1e-6)
+    pred_cos = (pred_v1 * pred_v2).sum(dim=-1).clamp(-1 + 1e-6, 1 - 1e-6)
+    
+    gt_angle = torch.acos(gt_cos)
+    pred_angle = torch.acos(pred_cos)
+    
+    rmse = torch.sqrt(torch.mean((gt_angle - pred_angle) ** 2))
+    
+    return rmse
 
 
 def angle_axis_rot_vf_loss_dense(
@@ -81,6 +254,8 @@ def multiframe_fm_loss_dense_batch(
     ref_frame_trans_se = torch.square(gt_frame_trans - ref_frame_trans).sum(dim=-1)
     ref_frame_trans_mse = (ref_frame_trans_se * total_mask).sum(-1) / num_rigids_per_batch
 
+    
+    
     t = inputs['t']
     norm_scale = 1 - torch.min(
         t, torch.as_tensor(t_norm_clip)
@@ -182,6 +357,10 @@ def multiframe_fm_loss_dense_batch(
     unscaled_trans_vf_loss = (unscaled_trans_vf_loss * total_mask).sum(dim=-1) / num_rigids_per_batch
     unscaled_trans_vf_loss *= 0.01  # Angstroms to nm
 
+
+    bond_length_loss = bond_length_rmse(inputs, denoiser_outputs)
+    bond_angle_loss = bond_angle_rmse(inputs, denoiser_outputs)
+
     # torch.set_printoptions(threshold=1000001)
     # print(trans_1_pred, trans_1)
 
@@ -207,7 +386,9 @@ def multiframe_fm_loss_dense_batch(
         "pred_trans_mse": pred_frame_trans_mse,
         "ref_trans_mse": ref_frame_trans_mse,
         "fafe": fafe,
-        "scaled_fafe": scaled_fafe
+        "scaled_fafe": scaled_fafe,
+        "bond_length_rmse": bond_length_loss,
+        "bond_angle_rmse": bond_angle_loss,
     }
     return ret
 

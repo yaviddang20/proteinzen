@@ -200,6 +200,8 @@ class TrainingDataset(torch.utils.data.Dataset):
         )
         features['task'] = task
 
+        features['structure'] = struct
+
         return features
 
     def __len__(self) -> int:
@@ -213,10 +215,135 @@ class TrainingDataset(torch.utils.data.Dataset):
         """
         return self.samples_per_epoch
 
+class ValidationDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        datasets,
+        max_crop_residues,
+        max_crop_rigids,
+        use_cropper=True,
+        samples_per_epoch=1000,  # this is PER GPU
+        crop_min_neighbors=0,
+        crop_max_neighbors=40,
+        dataset_probs=None,
+        remove_mol_types=None,
+        mask_nonstandard=False
+    ):
+        super().__init__()
+        self.datasets = datasets
+        self.max_crop_residues = max_crop_residues
+        self.max_crop_rigids = max_crop_rigids
+        self.samples_per_epoch = samples_per_epoch
+        if dataset_probs is None:
+            self.dataset_probs = [1/len(datasets) for _ in datasets]
+        else:
+            self.dataset_probs = dataset_probs
+        self.samples = []
+        if use_cropper:
+            self.cropper = Cropper(
+                min_neighborhood=crop_min_neighbors,
+                max_neighborhood=crop_max_neighbors
+            )
+        else:
+            self.cropper = None
+
+        if remove_mol_types is None:
+            self.remove_mol_types = []
+        else:
+            print("Removing chains of types:", remove_mol_types)
+            self.remove_mol_types = [const.chain_types.index(s) for s in remove_mol_types]
+        self.mask_nonstandard = mask_nonstandard
+
+        for dataset in datasets:
+            conformer_records = dataset.manifest
+            for conformer_record in conformer_records:
+                boltzmann_weights = conformer_record.boltzmann_weights
+                conformer_index = np.argmax(boltzmann_weights)
+                conformer_id = conformer_record.ids[conformer_index]
+                structure = conformer_record.structures[conformer_index]
+                record = Record(
+                    id=conformer_id,
+                    structure=structure,
+                    chains=conformer_record.chains,
+                    interfaces=conformer_record.interfaces,
+                    inference_options=conformer_record.inference_options,
+                    templates=conformer_record.templates,
+                    md=conformer_record.md,
+                    affinity=conformer_record.affinity,
+                )
+                self.samples.append(Sample(record=record))
+
+    def __getitem__(self, idx):
+        dataset_idx = np.random.choice(
+            len(self.datasets),
+            p=self.dataset_probs,
+        )
+        dataset = self.datasets[dataset_idx]
+        task_sampler = dataset.task_sampler
+        sample = self.samples[idx]
+        task = task_sampler.sample_task()
+
+        struct = load_input(sample.record, Path(dataset.data_dir))
+        chain_mask = struct.mask
+        remove_chain_masks = [struct.chains['mol_type'] == i for i in self.remove_mol_types]
+        for remove_mask in remove_chain_masks:
+            chain_mask[remove_mask] = False
+
+        if self.mask_nonstandard:
+            struct = mask_nonstandard_residues(struct)
+
+        task_data = task.sample_t_and_mask(struct)
+
+        token_data, rigid_data, token_bonds = tokenize_structure(
+            struct,
+            task_data
+        )
+        tokenized_data = Tokenized(
+            tokens=token_data,
+            rigids=rigid_data,
+            bonds=token_bonds,
+            structure=struct
+        )
+
+        if self.cropper is not None:
+            crop_size = self.max_crop_residues - task.max_added_tokens(token_data.shape[0])
+            if len(tokenized_data.tokens) > crop_size:
+                tokenized_data = self.cropper.crop(
+                    tokenized_data,
+                    max_tokens=crop_size,
+                    random=np.random,
+                    chain_id=sample.chain_id,
+                    interface_id=sample.interface_id
+                )
+
+        features = featurize_training(
+            tokenized_data,
+            task_data,
+            max_tokens=self.max_crop_residues,
+            max_rigids=self.max_crop_rigids
+        )
+        features['task'] = task
+
+        features['structure'] = struct
+
+        return features
+
+    def __len__(self) -> int:
+        """Get the length of the dataset.
+
+        Returns
+        -------
+        int
+            The length of the dataset.
+
+        """
+        return len(self.samples)
+
 
 class BiomoleculeDataModule(L.LightningDataModule):
     def __init__(self,
                  train_dataset: TrainingDataset,
+                 val_dataset: ValidationDataset,
                  batch_size,  # this is PER GPU
                  num_workers,
                  ):
@@ -224,6 +351,7 @@ class BiomoleculeDataModule(L.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
 
     def build_dataloader(self, x, collate_fn):
         dataloader = DataLoader(
@@ -237,6 +365,9 @@ class BiomoleculeDataModule(L.LightningDataModule):
 
     def train_dataloader(self):
         return self.build_dataloader(self.train_dataset, collate)
+
+    def val_dataloader(self):
+        return self.build_dataloader(self.val_dataset, collate)
 
 
 class BiomoleculeSamplingDataModule(L.LightningDataModule):

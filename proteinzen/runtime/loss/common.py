@@ -26,9 +26,9 @@ def seq_losses_dense_batch(
     seq_loss = seq_loss.view(seq.shape)
     seq_loss = seq_loss * seq_loss_mask
 
-    if (~seq_loss_mask).all(dim=-1).any():
+    # if (~seq_loss_mask).all(dim=-1).any():
         # print("seq_loss_mask all False", batch['name'], (~seq_loss_mask).all(dim=-1))
-        print("seq_loss_mask all False", (~seq_loss_mask).all(dim=-1))
+        # print("seq_loss_mask all False", (~seq_loss_mask).all(dim=-1))
 
     seq_loss = seq_loss * seqwise_weight
     seq_loss = seq_loss.sum(dim=-1) / seq_loss_mask.sum(dim=-1).clip(min=1)

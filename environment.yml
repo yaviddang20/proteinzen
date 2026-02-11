@@ -189,7 +189,6 @@ dependencies:
       - pox==0.3.6
       - ppft==1.7.7
       - propcache==0.3.2
-      - proteinzen==1.0.0+125.gfaa9a58.dirty
       - protobuf==5.29.5
       - psutil==7.0.0
       - pydantic==2.11.7

@@ -8,7 +8,7 @@ import torch
 import torch.utils.data as data
 
 from proteinzen.boltz.data import const
-from proteinzen.boltz.data.types import Record
+from proteinzen.boltz.data.types import Record, ConformerRecord
 
 
 class MMCIFDataset(data.Dataset):
@@ -17,6 +17,7 @@ class MMCIFDataset(data.Dataset):
             data_dir,
             data_sampler,
             task_sampler,
+            mode,
             min_num_res=30,
             max_num_res=5000,
             min_percent_ordered=0.5,
@@ -39,6 +40,9 @@ class MMCIFDataset(data.Dataset):
         self.data_sampler = data_sampler
         self.overfit_num = overfit_num
         self.count_on_protein_res = count_on_protein_res
+        self.mode = mode
+        self.data_dir = f"{self.data_dir}/{self.mode}"
+        print("Initializing MMCIFDataset in mode:", mode)
         if exclude_mol_types is None:
             self.exclude_mol_types = []
         else:
@@ -58,6 +62,7 @@ class MMCIFDataset(data.Dataset):
             self.raw_manifest = json.load(fp)
 
         self.manifest = []
+        num_records = 0
         for record in self.raw_manifest:
             # remove records which contain mol types we're excluding
             _exclude_record = False
@@ -74,21 +79,26 @@ class MMCIFDataset(data.Dataset):
                 num_res = sum(chain['num_residues'] for chain in record['chains'])
             if num_res > self.max_num_res or num_res < self.min_num_res:
                 continue
-            resolution = record['structure']['resolution']
+            if 'structure' in record:
+                resolution = record['structure']['resolution']
+            elif 'structures' in record:
+                resolution = record['structures'][0]['resolution']
+            else:
+                raise ValueError(f"Record {record['id']} has no structure or structures")
             if resolution is not None and resolution > self.max_resolution:
                 continue
             if self.split is not None and record['id'] not in self.split:
                 continue
-            # if record['structure']['coil_percent'] > (1 - self.min_percent_ordered):
-            #     continue
+            self.manifest.append(ConformerRecord.from_dict(record))
+            num_records += 1
+            if self.overfit_num is not None and num_records >= self.overfit_num:
+                print(f"Overfitting on {num_records} records:\n", self.manifest)
+                break
+            # self.manifest.append(Record.from_dict(record))
 
-            record['is_af2_struct'] = record['id'].startswith("AF-")
-
-            self.manifest.append(Record.from_dict(record))
-
-        if self.overfit_num is not None:
-            self.manifest = self.manifest[-self.overfit_num:]
-            print("overfit entries:", self.manifest)
+        # if self.overfit_num is not None:
+        #     self.manifest = self.manifest[-self.overfit_num:]
+        #     print("overfit entries:", self.manifest)
 
     def __len__(self):
         return len(self.manifest)

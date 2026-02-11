@@ -1,7 +1,7 @@
 python train.py \
     domain=protein \
     paradigm=multiframefm \
-    datamodule.batch_size=8 \
+    datamodule.batch_size=16 \
     datamodule.num_workers=8 \
     model.c_s=384 \
     model.c_cond=384 \
@@ -17,17 +17,16 @@ python train.py \
     model.rot_preconditioning=true \
     model.num_blocks=8 \
     lmodule.use_ema=true \
+    lmodule.atom_rigid_upweight=false \
     corrupter.use_stochastic_centering=true \
-    corrupter.center_on_motif=false \
+    corrupter.center_on_motif=true \
     corrupter.sig_perturb=4 \
     dataset.config=/datastor1/dy4652/proteinzen/configs/train/data/geom.yaml \
     experiment.lightning.devices=1 \
     experiment.lightning.strategy=ddp_find_unused_parameters_true \
     experiment.checkpointer.train_time_interval=null \
     experiment.checkpointer.every_n_train_steps=5000 \
-    'experiment.warm_start="/datastor1/dy4652/proteinzen/outputs/geom_identityRot_frame_384/train/lightning_logs/version_3/checkpoints/last.ckpt"' \
-    hydra.run.dir="/datastor1/dy4652/proteinzen/outputs/geom_identityRot_frame_384/train" \
-    corrupter.use_uniform_rot_noise=true
+    hydra.run.dir="/datastor1/dy4652/proteinzen/outputs/geom_identityRot_frame_384_no_corrupt_correct/train"
 # python train.py \
 #     domain=protein \
 #     paradigm=multiframefm \

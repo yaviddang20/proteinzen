@@ -343,6 +343,7 @@ class TriangleMultiplicativeUpdate(nn.Module):
             )
             return x
         else:
+            #TODO: check if cuet_supported is set or if this bugged else block is used
             if mask is None:
                 mask = z.new_ones(z.shape[:-1])
 
