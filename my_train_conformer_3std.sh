@@ -26,7 +26,7 @@ python train.py \
     experiment.lightning.strategy=ddp_find_unused_parameters_true \
     experiment.checkpointer.train_time_interval=null \
     experiment.checkpointer.every_n_train_steps=500 \
-    'experiment.warm_start="/datastor1/dy4652/proteinzen/outputs/geom_identityRot_256_conformer_3std_bondlength/train/lightning_logs/version_27/checkpoints/last.ckpt"' \
+    'experiment.warm_start="/datastor1/dy4652/proteinzen/outputs/geom_identityRot_256_conformer_3std_bondlength/train/lightning_logs/version_28/checkpoints/last.ckpt"' \
     hydra.run.dir="/datastor1/dy4652/proteinzen/outputs/geom_identityRot_256_conformer_3std_bondlength/train" \
     corrupter.use_uniform_rot_noise=false \
     experiment.lightning.max_epochs=110

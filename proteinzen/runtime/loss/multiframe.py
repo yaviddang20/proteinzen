@@ -358,8 +358,8 @@ def multiframe_fm_loss_dense_batch(
     unscaled_trans_vf_loss *= 0.01  # Angstroms to nm
 
 
-    bond_length_loss = bond_length_rmse(inputs, denoiser_outputs)
-    bond_angle_loss = bond_angle_rmse(inputs, denoiser_outputs)
+    bond_length_loss = bond_length_rmse(inputs, denoiser_outputs) / (norm_scale ** 2)
+    bond_angle_loss = bond_angle_rmse(inputs, denoiser_outputs) / (norm_scale ** 2)
 
     # torch.set_printoptions(threshold=1000001)
     # print(trans_1_pred, trans_1)
