@@ -138,6 +138,6 @@ data/scaffold_data.tar.gz
 data/drugs.tar.gz
 data/DRUGS
 data/rdkit
-opendqc_cache
+openqdc_cache
 .vscode
 script_logs
