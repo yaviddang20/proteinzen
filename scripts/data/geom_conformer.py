@@ -71,7 +71,7 @@ def parse(datadir: Path, data: dict) -> ConformerTarget:
     with open(data_path, 'rb') as fp:
         data_dict = pickle.load(fp)
 
-    conformer_data = data_dict['conformers'][:20]
+    conformer_data = sorted(data_dict['conformers'], key=lambda c: c['boltzmannweight'], reverse=True)[:20]
 
     structure_info_list = []
     boltzmann_weights_list = []
@@ -133,6 +133,7 @@ def process_structure(
     data: tuple[str, dict],
     datadir: Path,
     outdir: Path,
+    overwrite: bool = True,
 ) -> Optional[tuple[str, str]]:
     """Process a target. Returns (error_type, smiles) on failure, None on success."""
     smiles = data[0]
@@ -151,7 +152,7 @@ def process_structure(
     record_path = outdir / "records" / mid / f"{data_id}.json"
     struct_path = outdir / "structures" / mid / f"{data_id}_0.npz"
 
-    if struct_path.exists() and record_path.exists():
+    if not overwrite and struct_path.exists() and record_path.exists():
         return None
 
     try:
@@ -203,7 +204,7 @@ def process(args, dataset_mode: str) -> None:
 
     # Run processing
     print("Processing data...")
-    fn = partial(process_structure, datadir=datadir, outdir=outdir)
+    fn = partial(process_structure, datadir=datadir, outdir=outdir, overwrite=args.overwrite)
     if parallel:
         results = p_umap(fn, metadata, num_cpus=num_processes)
     else:
@@ -251,6 +252,12 @@ if __name__ == "__main__":
         type=int,
         default=multiprocessing.cpu_count(),
         help="The number of processes.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Overwrite existing output files (default: True).",
     )
     args = parser.parse_args()
     assert args.dataset in ['qm9', 'drugs']

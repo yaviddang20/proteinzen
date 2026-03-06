@@ -81,44 +81,45 @@ class UnconditionalSamplingFromSMILES(SamplingTask):
         igso3 = self.igso3()
         struct = smiles_to_struct(self.smiles)
 
-        pdb_str =to_pdb(struct)
-        with open(f"clean_data.pdb", "w") as f:
-            f.write(pdb_str)
-        exit()
+        # pdb_str =to_pdb(struct)
+        # with open(f"clean_data.pdb", "w") as f:
+        #     f.write(pdb_str)
+        # exit()
         
-        clean_task_data= {}
-        atom_noising_mask = np.ones(len(struct.atoms), dtype=bool)
-        res_type_noising_mask = np.ones(len(struct.residues), dtype=bool)
-        clean_task_data["atom_noising_mask"] = atom_noising_mask
-        clean_task_data["res_type_noising_mask"] = res_type_noising_mask
-        clean_token_data, clean_rigid_data, clean_token_bonds = tokenize_structure(struct, clean_task_data)
+        # clean_task_data= {}
+        # atom_noising_mask = np.ones(len(struct.atoms), dtype=bool)
+        # res_type_noising_mask = np.ones(len(struct.residues), dtype=bool)
+        # clean_task_data["atom_noising_mask"] = atom_noising_mask
+        # clean_task_data["res_type_noising_mask"] = res_type_noising_mask
+        # clean_token_data, clean_rigid_data, clean_token_bonds = tokenize_structure(struct, clean_task_data)
         for _ in range(self.num_samples):
-            # token_data, rigid_data, token_bonds, _ = sample_noise_from_struct_template(
-            #     struct,
-            #     igso3=igso3
-            # )
-            # data = Tokenized(
-            #     tokens=token_data,
-            #     rigids=rigid_data,
-            #     bonds=token_bonds,
-            #     structure=struct
-            # )
-            task_data = {
-                "t": np.array([1.0], dtype=float),
-            }
-
-            clean_data = Tokenized(
-                tokens=clean_token_data,
-                rigids=clean_rigid_data,
-                bonds=clean_token_bonds,
+            token_data, rigid_data, token_bonds, _ = sample_noise_from_struct_template(
+                struct,
+                igso3=igso3,
+                trans_std=3
+            )
+            data = Tokenized(
+                tokens=token_data,
+                rigids=rigid_data,
+                bonds=token_bonds,
                 structure=struct
             )
+            task_data = {
+                "t": np.array([0.0], dtype=float),
+            }
+
+            # clean_data = Tokenized(
+            #     tokens=clean_token_data,
+            #     rigids=clean_rigid_data,
+            #     bonds=clean_token_bonds,
+            #     structure=struct
+            # )
 
 
             # task_data['clean_rigids_1'] = process_rigid_features(clean_data)['rigids_1'] 
 
-            yield featurize_inference(clean_data, task_data, task_name=self.kwargs.get("name", self.task_name))
-            # yield featurize_inference(data, task_data, task_name=self.kwargs.get("name", self.task_name))
+            # yield featurize_inference(clean_data, task_data, task_name=self.kwargs.get("name", self.task_name))
+            yield featurize_inference(data, task_data, task_name=self.kwargs.get("name", self.task_name))
 
 class UnconditionalSamplingFromMol(SamplingTask):
     task_name: str = "unconditional_mol"
@@ -147,12 +148,12 @@ class UnconditionalSamplingFromMol(SamplingTask):
         # with open(f"clean_data_mol.pdb", "w") as f:
         #     f.write(pdb_str)
         # exit()
-        clean_task_data= {}
-        atom_noising_mask = np.ones(len(struct.atoms), dtype=bool)
-        res_type_noising_mask = np.ones(len(struct.residues), dtype=bool)
-        clean_task_data["atom_noising_mask"] = atom_noising_mask
-        clean_task_data["res_type_noising_mask"] = res_type_noising_mask
-        clean_token_data, clean_rigid_data, clean_token_bonds = tokenize_structure(struct, clean_task_data)
+        # clean_task_data= {}
+        # atom_noising_mask = np.ones(len(struct.atoms), dtype=bool)
+        # res_type_noising_mask = np.ones(len(struct.residues), dtype=bool)
+        # clean_task_data["atom_noising_mask"] = atom_noising_mask
+        # clean_task_data["res_type_noising_mask"] = res_type_noising_mask
+        # clean_token_data, clean_rigid_data, clean_token_bonds = tokenize_structure(struct, clean_task_data)
         for _ in range(self.num_samples):
             token_data, rigid_data, token_bonds, _ = sample_noise_from_struct_template(
                 struct,
