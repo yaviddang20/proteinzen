@@ -47,6 +47,7 @@ Rigid = [
     ("is_atomized", np.dtype("?")),
     ("element", np.dtype("i1")),
     ("charge", np.dtype("i1")),
+    ("chirality", np.dtype("i1")),
     ("tensor7", np.dtype("7f4")),
     ("is_present", np.dtype("?")),
     ("rigids_noising_mask", np.dtype("?")),
@@ -145,10 +146,12 @@ class RigidData:
     is_atomized: bool
     element: int
     charge: int
+    chirality: int
     tensor7: np.ndarray
     is_present: bool
     rigids_noising_mask: bool
     num_real_input_axes: int
+
 
 
 def compute_frame(
@@ -656,6 +659,7 @@ class StructureTokenizer:
                 is_atomized=True,
                 element=atom["element"],
                 charge=atom["charge"],
+                chirality=atom["chirality"],
                 tensor7=atom_tensor7,
                 is_present=atom["is_present"],
                 rigids_noising_mask=bool(atom_noising_mask[atom_start + i]),

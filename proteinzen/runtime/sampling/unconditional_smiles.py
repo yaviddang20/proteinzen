@@ -20,7 +20,7 @@ from proteinzen.openfold.utils import rigid_utils as ru
 from proteinzen.data.featurize.mol.sampling import smiles_to_struct, mol_to_struct
 from proteinzen.data.featurize.tokenize import Tokenized
 from proteinzen.data.featurize.sampling import sample_noise_from_struct_template
-from proteinzen.data.featurize.assembler import featurize_inference
+from proteinzen.data.featurize.assembler import featurize
 
 
 from rdkit import Chem
@@ -119,7 +119,7 @@ class UnconditionalSamplingFromSMILES(SamplingTask):
             # task_data['clean_rigids_1'] = process_rigid_features(clean_data)['rigids_1'] 
 
             # yield featurize_inference(clean_data, task_data, task_name=self.kwargs.get("name", self.task_name))
-            yield featurize_inference(data, task_data, task_name=self.kwargs.get("name", self.task_name))
+            yield featurize(data, task_data, task_name=self.kwargs.get("name", self.task_name))
 
 class UnconditionalSamplingFromMol(SamplingTask):
     task_name: str = "unconditional_mol"
@@ -182,4 +182,4 @@ class UnconditionalSamplingFromMol(SamplingTask):
                 "t": np.array([0.0], dtype=float),
             }
 
-            yield featurize_inference(data, task_data, task_name=self.kwargs.get("name", self.task_name))
+            yield featurize(data, task_data, task_name=self.kwargs.get("name", self.task_name))

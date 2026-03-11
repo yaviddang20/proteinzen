@@ -375,6 +375,7 @@ class Embedder(nn.Module):
         node_init,
         rigids_element,
         rigids_charge,
+        rigids_chirality,
         t,
         rigids_token_uid,
         rigids_idx,
@@ -389,6 +390,7 @@ class Embedder(nn.Module):
         element_mask = (rigids_element != -1)
         element_embed = self.rigid_element_embed(rigids_element * element_mask) * element_mask[..., None]
         charge_embed = self.rigid_charge_embed(rigids_charge.unsqueeze(-1))
+        chirality_embed = self.rigid_chirality_embed(rigids_chirality.unsqueeze(-1)) * rigids_is_atomized_mask[..., None].float()
 
         rigids_init = (
             rigids_init
@@ -397,6 +399,7 @@ class Embedder(nn.Module):
             + is_atomized_embed
             + element_embed
             + charge_embed
+            + chirality_embed
         )
         return rigids_init
 
@@ -451,6 +454,7 @@ class Embedder(nn.Module):
             rigids,
             rigids_element,
             rigids_charge,
+            rigids_chirality,
             rigids_token_uid,
             rigids_idx,
             rigids_mask,
@@ -511,6 +515,7 @@ class Embedder(nn.Module):
             node_init,
             rigids_element,
             rigids_charge,
+            rigids_chirality,
             t,
             rigids_token_uid,
             rigids_idx,
@@ -1245,6 +1250,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                 rigids=rigids_data['rigids_t'],
                 rigids_element=rigids_data['rigids_ref_element'],
                 rigids_charge=rigids_data['rigids_ref_charge'],
+                rigids_chirality=rigids_data['rigids_ref_chirality'],
                 rigids_token_uid=rigids_data['rigids_to_token'],
                 rigids_idx=rigids_data['rigids_sidechain_idx'],
                 rigids_mask=rigids_data['rigids_mask'],
