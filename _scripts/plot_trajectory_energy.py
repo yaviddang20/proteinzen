@@ -193,7 +193,7 @@ for mol_idx, (name, traj_paths) in enumerate(sorted(name_to_trajs.items())):
         continue
 
     # t values: model i -> t = (i+1)/n_total_models
-    first_idx = int(np.ceil(T_START * n_total_models)) - 1
+    first_idx = max(int(np.ceil(T_START * n_total_models)) - 1, 0)
     model_indices = np.arange(first_idx, n_total_models)
     t_values = (model_indices + 1) / n_total_models
 

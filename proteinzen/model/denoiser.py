@@ -227,6 +227,7 @@ class Embedder(nn.Module):
         self.rigid_is_atomized_embed = Linear(1, c_frame, bias=False)
         self.rigid_element_embed = nn.Embedding(num_elements, c_frame)
         self.rigid_charge_embed = Linear(1, c_frame, bias=False)
+        self.rigid_chirality_embed = Linear(1, c_frame, bias=False)
         # self.rigid_is_unindexed_embed = Linear(1, c_frame, bias=False)
 
         self.framepair_init = FramepairEmbedder(
