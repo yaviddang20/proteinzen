@@ -19,7 +19,7 @@ from proteinzen.openfold.data import data_transforms
 from proteinzen.openfold.utils import rigid_utils as ru
 from proteinzen.data.featurize.tokenize import Tokenized
 from proteinzen.data.featurize.sampling import generate_protein_structure_template, sample_noise_from_struct_template
-from proteinzen.data.featurize.assembler import featurize_inference
+from proteinzen.data.featurize.assembler import featurize
 
 
 from .task import SamplingTask
@@ -93,4 +93,4 @@ class UnconditionalSampling(SamplingTask):
                 "copy_unindexed_token_mask": None,
             }
 
-            yield featurize_inference(data, task_data, task_name=self.kwargs.get("name", self.task_name))
+            yield featurize(data, task_data, task_name=self.kwargs.get("name", self.task_name))

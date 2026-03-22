@@ -124,7 +124,10 @@ def process_entry(item: tuple[str, dict]) -> tuple[str, str, str, int] | None:
 
 def count_stereo(args) -> None:
     datadir = Path(args.datadir)
-    outdir = Path(args.outdir)
+    if args.outdir is None:
+        outdir = Path(datadir)  
+    else:
+        outdir  = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
     summary_path = datadir / f"summary_{args.dataset}.json"
@@ -224,7 +227,22 @@ def count_stereo(args) -> None:
     out_path = outdir / f"stereo_counts_{args.dataset}.json"
     with open(out_path, "w") as f:
         json.dump(out, f, indent=2)
+    
     print(f"Wrote {total_groups} groups to {out_path}")
+
+    txt_out_path = outdir / f"stereo_counts_{args.dataset}.txt"
+    with open(txt_out_path, "w") as f:
+        f.write(f"Total groups: {total_groups}\n")
+        f.write(f"Enantiomers only: {n_enant_only}\n")
+        f.write(f"Diastereomers only: {n_diast_only}\n")
+        f.write(f"Mixed: {n_mixed}\n")
+        f.write(f"Enantiomeric pairs: {n_enant_pairs}\n")
+        f.write(f"Diastereomeric pairs: {n_diast_pairs}\n")
+        f.write(f"Unique isomer SMILES: {total_unique_isomers}\n")
+        f.write(f"Total entries: {total_entries}\n")
+        f.write(f"Within-entry stereo inconsistency: {n_within_entry}\n")
+
+    print(f"Wrote {txt_out_path}")
 
 
 if __name__ == "__main__":
@@ -234,8 +252,7 @@ if __name__ == "__main__":
     parser.add_argument("--datadir", type=Path, required=True,
                         help="Directory containing summary_{dataset}.json.")
     parser.add_argument("--dataset", type=str, default="drugs", choices=["qm9", "drugs"])
-    parser.add_argument("--outdir", type=Path, required=True,
-                        help="Directory to write stereo_counts_{dataset}.json.")
-    parser.add_argument("--num-processes", type=int, default=multiprocessing.cpu_count())
+    parser.add_argument("--outdir", type=Path, help="Directory to write stereo_counts_{dataset}.json.")
+    parser.add_argument("--num-processes", type=int, default=multiprocessing.cpu_count() // 2)
     args = parser.parse_args()
     count_stereo(args)

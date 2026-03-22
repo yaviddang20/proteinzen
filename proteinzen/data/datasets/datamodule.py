@@ -295,7 +295,7 @@ class ValidationDataset(torch.utils.data.Dataset):
 
         task_data = task.sample_t_and_mask(struct)
 
-        token_data, rigid_data, token_bonds, is_standard_data = tokenize_structure(
+        token_data, rigid_data, token_bonds = tokenize_structure(
             struct,
             task_data
         )

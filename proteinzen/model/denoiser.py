@@ -321,13 +321,6 @@ class Embedder(nn.Module):
             use_self_folding=use_self_folding
         )
 
-        self.indexing_matrix = get_indexing_matrix(
-            block_q,
-            W=block_q,
-            H=block_k,
-            device=torch.device('cuda')
-        )
-
     def _gen_node_features(
         self,
         seq,
@@ -397,8 +390,10 @@ class Embedder(nn.Module):
         is_atomized_embed = self.rigid_is_atomized_embed(rigids_is_atomized_mask[..., None].float())
         element_mask = (rigids_element != -1)
         element_embed = self.rigid_element_embed(rigids_element * element_mask) * element_mask[..., None]
-        charge_embed = self.rigid_charge_embed(rigids_charge.unsqueeze(-1))
-        chirality_embed = self.rigid_chirality_embed(rigids_chirality.unsqueeze(-1)) * rigids_is_atomized_mask[..., None].float()
+        charge_embed = self.rigid_charge_embed(rigids_charge.unsqueeze(-1).float())
+        chirality_embed = self.rigid_chirality_embed(
+            rigids_chirality.unsqueeze(-1).float()
+        ) * rigids_is_atomized_mask[..., None].float()
 
         rigids_init = (
             rigids_init
@@ -481,7 +476,8 @@ class Embedder(nn.Module):
         n_padding = (self.block_q - n_rigids % self.block_q) % self.block_q
         n_attn_blocks = (n_rigids + n_padding) // self.block_q
 
-        indexing_matrix = self.indexing_matrix
+        indexing_matrix = get_indexing_matrix(n_attn_blocks, W=self.block_q, H=self.block_k, device=rigids.device)
+        
         to_queries = lambda x: x.view(n_batch, n_attn_blocks, self.block_q, -1)
         to_keys = fn.partial(
             single_to_keys, indexing_matrix=indexing_matrix, W=self.block_q, H=self.block_k
