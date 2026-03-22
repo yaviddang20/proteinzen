@@ -1,3 +1,3 @@
 export GEOMSTATS_BACKEND="pytorch"
-export REPO_ROOT="/datastor1/dy4652/proteinzen"
+export REPO_ROOT="/mnt/scratch/user/daviyang/proteinzen"
 export ENV_NAME="proteinzen"

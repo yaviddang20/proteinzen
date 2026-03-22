@@ -1,10 +1,13 @@
-MODE=train
-MODEL_NAME=geom_identityRot_256_conformer_3std_bondlength
+dir=$(realpath "$(dirname "${BASH_SOURCE[0]}")")
+source $dir/env_vars.sh
+eval "$(micromamba shell hook --shell bash)"
+micromamba activate $ENV_NAME
+# CUDA_VISIBLE_DEVICES=0
 
-python sample.py \
-    model_dir=/datastor1/dy4652/proteinzen/outputs/${MODEL_NAME}/train \
-    out_dir=sampling/geom_conformer_${MODE}/${MODEL_NAME}_0_5_trans_vf_scale \
-    sampler.tasks_yaml=sampling/geom_conformer_${MODE}/smiles.yaml \
+python $REPO_ROOT/sample.py \
+    model_dir=${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_bondlength/train \
+    out_dir=${REPO_ROOT}/sampling/geom_conformer_train/geom_identityRot_256_conformer_3std_bondlength \
+    sampler.tasks_yaml=${REPO_ROOT}/sampling/geom_conformer_train/smiles.yaml \
     sampler.batch_size=32 \
     save_traj=true \
     +version_num=29 \

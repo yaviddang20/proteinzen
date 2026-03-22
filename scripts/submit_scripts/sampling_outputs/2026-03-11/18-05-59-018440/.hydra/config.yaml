@@ -1,0 +1,49 @@
+sampler:
+  _target_: proteinzen.data.datasets.datamodule.BiomoleculeSamplingDataModule
+  tasks_yaml: /mnt/scratch/user/daviyang/proteinzen/sampling/geom_conformer_train/smiles.yaml
+  batch_size: 32
+  batching_mode: optimal
+  use_collate_for_pad: false
+corrupter:
+  _target_: proteinzen.stoch_interp.multiframe.MultiSE3Interpolant
+  min_t: 0.01
+  separate_ot: true
+  prealign_noise: true
+  trans_preconditioning: false
+  trans_prior_std: 16
+  rigids_per_res: 3
+  lognorm_t_sched: false
+  lognorm_mu: 0.0
+  lognorm_sig: 1.0
+  mixed_beta_t_sched: false
+  beta_p1: 1.9
+  beta_p2: 1.0
+  shift_time_scale: false
+  use_diffusion_forcing: false
+  use_stochastic_centering: true
+  center_on_motif: true
+  sig_perturb: 4.0
+  use_uniform_rot_noise: false
+  use_unwrapped_rot_noise: false
+  unwrapped_rot_noise_sig: 1.5
+  trans_gamma: 0.16
+  trans_step_size: 1.5
+  rot_gamma: 0.16
+  rot_step_size: 1.5
+  rot_sample_schedule: linear
+  sampling_noise_mode: null
+  sampling_churn: 0.4
+  churn_by_sigma: false
+  num_timesteps: 400
+  use_euclidean_for_rots: false
+  rot_sfm: false
+  unconditional_guidance_alpha: 0.0
+  dynamic_cfg: false
+  rot_g_t_fn: fn1
+  trans_g_t_fn: fn1
+model_dir: /mnt/scratch/user/daviyang/proteinzen/outputs/geom_identityRot_256_conformer_3std_bondlength/train
+out_dir: /mnt/scratch/user/daviyang/proteinzen/sampling/geom_conformer_train/geom_identityRot_256_conformer_train_3std_bondlength
+save_traj: true
+output_motif_chains: false
+checkpoint_idx: -1
+version_num: 29

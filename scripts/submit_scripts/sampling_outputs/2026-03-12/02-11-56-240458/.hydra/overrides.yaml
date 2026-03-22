@@ -1,0 +1,7 @@
+- model_dir=/mnt/scratch/user/daviyang/proteinzen/outputs/geom_identityRot_256_conformer_3std_bondlength/train
+- out_dir=/mnt/scratch/user/daviyang/proteinzen/sampling/geom_conformer_train/geom_identityRot_256_conformer_3std_bondlength
+- sampler.tasks_yaml=/mnt/scratch/user/daviyang/proteinzen/sampling/geom_conformer_train/smiles.yaml
+- sampler.batch_size=32
+- save_traj=true
+- +version_num=29
+- corrupter.sampling_noise_mode=null
