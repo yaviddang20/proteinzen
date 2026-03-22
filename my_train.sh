@@ -1,3 +1,6 @@
+dir=$(realpath "$(dirname "${BASH_SOURCE[0]}")")
+source $dir/env_vars.sh
+
 python train.py \
     domain=protein \
     paradigm=multiframefm \

@@ -1088,7 +1088,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                  trans_preconditioning=False,
                  rot_preconditioning=True,
                  block_q=16,
-                 block_k=64,
+                 block_k=96,
                  use_conditioned_ipa=True,
                  use_conditioned_rigid_transformer=False,
                  rigid_transformer_num_blocks=1,

@@ -1,10 +1,14 @@
-python train.py \
+dir=$(realpath "$(dirname "${BASH_SOURCE[0]}")")
+source $dir/env_vars.sh 
+CKPT="${REPO_ROOT}/proteinzen_weights/motif_scaffolding_model/lightning_logs/version_0/checkpoints/epoch=3278-step=780000_no_opt.ckpt"
+
+python ${REPO_ROOT}/train.py \
     domain=protein \
     paradigm=multiframefm \
-    datamodule.batch_size=8 \
+    datamodule.batch_size=32 \
     datamodule.num_workers=16 \
-    model.c_s=256 \
-    model.c_cond=256 \
+    model.c_s=768 \
+    model.c_cond=768 \
     model.c_frame=256 \
     model.c_framepair=64 \
     model.z_broadcast=true \
@@ -15,20 +19,20 @@ python train.py \
     model.use_qk_norm=true \
     model.use_amp=true \
     model.rot_preconditioning=true \
-    model.num_blocks=8 \
+    model.num_blocks=12 \
     lmodule.use_ema=true \
-    corrupter.use_stochastic_centering=false \
-    corrupter.center_on_motif=false \
+    lmodule.strict_weight_loading=false \
+    corrupter.use_stochastic_centering=true \
+    corrupter.center_on_motif=true \
     corrupter.trans_prior_std=3 \
-    dataset.config=/datastor1/dy4652/proteinzen/configs/train/data/geom_conformer.yaml \
-    +dataset.val_config=/datastor1/dy4652/proteinzen/configs/train/data/geom_conformer_val.yaml \
-    experiment.lightning.devices=1 \
+    dataset.config="'${REPO_ROOT}/configs/train/data/geom_conformer.yaml'" \
+    +dataset.val_config="'${REPO_ROOT}/configs/train/data/geom_conformer_val.yaml'" \
+    experiment.lightning.devices=8 \
     experiment.lightning.strategy=ddp_find_unused_parameters_true \
     experiment.checkpointer.train_time_interval=null \
     experiment.checkpointer.every_n_train_steps=500 \
-    hydra.run.dir="/datastor1/dy4652/proteinzen/outputs/geom_identityRot_256_conformer_3std_stereo/train" \
-    corrupter.use_uniform_rot_noise=false \
-    experiment.lightning.max_epochs=1
+    experiment.warm_start="'${CKPT}'" \
+    hydra.run.dir="'${REPO_ROOT}/outputs/geom_identityRot_conformer_3std_stereo/train'"
 # python train.py \
 #     domain=protein \
 #     paradigm=multiframefm \

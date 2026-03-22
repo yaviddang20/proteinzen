@@ -7,8 +7,18 @@ import shutil
 import hydra
 from hydra_zen import zen
 import omegaconf
-import torch
-import numpy as np
+import torch          
+# from omegaconf import ListConfig, DictConfig                                                                                                                         
+# from omegaconf.base import ContainerMetadata                                                                                                                         
+# from omegaconf.nodes import ValueNode, AnyNode, IntegerNode, FloatNode, BooleanNode, StringNode, EnumNode                                                            
+# torch.serialization.add_safe_globals([                                                                                                                               
+#     ListConfig, DictConfig, ContainerMetadata,                                                                                                                       
+#     ValueNode, AnyNode, IntegerNode, FloatNode, BooleanNode, StringNode, EnumNode                                                                                    
+# ])                                                                                                                                                                   
+                                                                                                                             
+                                                                                                                                                                    
+_original_load = torch.load                                                                                                                                          
+torch.load = lambda *args, **kwargs: _original_load(*args, **{**kwargs, 'weights_only': False})
 
 from lightning import LightningDataModule, LightningModule, Trainer
 # from lightning.pytorch.loggers.wandb import WandbLogger

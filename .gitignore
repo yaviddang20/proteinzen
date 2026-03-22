@@ -137,3 +137,4 @@ ENV/
 /aligned_pairs
 /geom_drugs_conformers
 proteinzen_weights
+proteinzen/outputs/

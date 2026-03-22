@@ -165,6 +165,8 @@ class EMA(Callback):
             print("LOADING CHECKPOINT RUNNING")
             self.load_state_dict(checkpoint["ema"])
 
+            
+
     def on_save_checkpoint(
         self,
         trainer: Trainer,  # noqa: ARG002

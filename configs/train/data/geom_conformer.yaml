@@ -8,7 +8,7 @@ datasets:
     mode: train
     min_num_res: 0
     # overfit_num: 1
-    data_dir: /datastor1/dy4652/proteinzen/geom_drugs_conformers
+    data_dir: /scratch/user/daviyang/proteinzen/data/geom_drugs_conformers
     data_sampler:
       _target_: proteinzen.boltz.data.sample.random.ConformerSampler
     task_sampler:
