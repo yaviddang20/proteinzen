@@ -918,7 +918,8 @@ class BiomoleculeModule(L.LightningModule):
             rot_d_t_hat = d_t_hat
             trans_time = t_hat
             rot_time = t_hat
-            trans_vf_scale = 1
+            trans_vf_scale = 0.5
+            # trans_vf_scale = 1
             rot_vf_scale = 1
 
             trans_t_2 = corrupter.trans_euler_step(

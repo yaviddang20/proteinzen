@@ -199,6 +199,7 @@ def process_rigid_features(
     # Compute features
     ref_element = from_numpy(rigid_data["element"].copy()).long()
     ref_charge = from_numpy(rigid_data["charge"].copy())
+    ref_chirality = from_numpy(rigid_data["chirality"].copy())
     sidechain_idx = from_numpy(rigid_data["sidechain_idx"].copy())
     tensor7 = from_numpy(rigid_data["tensor7"].copy())
     resolved_mask = from_numpy(rigid_data["is_present"].copy())
@@ -222,6 +223,7 @@ def process_rigid_features(
         resolved_mask = pad_dim(resolved_mask, 0, pad_len)
         ref_element = pad_dim(ref_element, 0, pad_len)
         ref_charge = pad_dim(ref_charge, 0, pad_len)
+        ref_chirality = pad_dim(ref_chirality, 0, pad_len)
         rigid_to_token = pad_dim(rigid_to_token, 0, pad_len)
         sidechain_idx = pad_dim(sidechain_idx, 0, pad_len)
         new_rigids_noising_mask = pad_dim(new_rigids_noising_mask, 0, pad_len, value=True)
@@ -240,6 +242,7 @@ def process_rigid_features(
         "rigids_is_atom_mask": is_atom_mask,
         "rigids_ref_element": ref_element.long(),
         "rigids_ref_charge": ref_charge.float(),
+        "rigids_ref_chirality": ref_chirality.long(),
         "rigids_resolved_mask": resolved_mask.bool(),
         "rigids_pad_mask": pad_mask.bool(),
         "rigids_to_token": rigid_to_token,
@@ -249,32 +252,7 @@ def process_rigid_features(
     }
 
 
-# TODO: i should fuse this and featurize_inference
-def featurize_training(
-    data: Tokenized,
-    task_data,
-    max_tokens: Optional[int] = None,
-    max_rigids: Optional[int] = None,
-    rigids_per_window_queries: int = 16,
-):
-    token_features = process_token_features(
-        data,
-        max_tokens
-    )
-    rigid_features = process_rigid_features(
-        data,
-        rigids_per_window_queries,
-        max_rigids
-    )
-
-    return {
-        "t": task_data['t'],
-        "token": token_features,
-        "rigids": rigid_features,
-        'input_data': data,
-    }
-
-def featurize_inference(
+def featurize(
     data: Tokenized,
     task_data,
     task_name: Optional[str] = 'sample',
@@ -282,7 +260,6 @@ def featurize_inference(
     max_rigids: Optional[int] = None,
     rigids_per_window_queries: int = 16,
 ):
-    max_rigids = 96
     token_features = process_token_features(
         data,
         max_tokens
@@ -292,7 +269,6 @@ def featurize_inference(
         rigids_per_window_queries,
         max_rigids
     )
-
     return {
         "t": task_data['t'],
         "task": task_name,
@@ -300,6 +276,58 @@ def featurize_inference(
         "token": token_features,
         "rigids": rigid_features
     }
+
+# TODO: i should fuse this and featurize_inference
+# def featurize_training(
+#     data: Tokenized,
+#     task_data,
+#     max_tokens: Optional[int] = None,
+#     max_rigids: Optional[int] = None,
+#     rigids_per_window_queries: int = 16,
+# ):
+#     token_features = process_token_features(
+#         data,
+#         max_tokens
+#     )
+#     rigid_features = process_rigid_features(
+#         data,
+#         rigids_per_window_queries,
+#         max_rigids
+#     )
+
+#     return {
+#         "t": task_data['t'],
+#         "token": token_features,
+#         "rigids": rigid_features,
+#         'input_data': data,
+#     }
+
+# def featurize_inference(
+#     data: Tokenized,
+#     task_data,
+#     task_name: Optional[str] = 'sample',
+#     max_tokens: Optional[int] = None,
+#     max_rigids: Optional[int] = None,
+#     rigids_per_window_queries: int = 16,
+# ):
+#     max_rigids = 96
+#     token_features = process_token_features(
+#         data,
+#         max_tokens
+#     )
+#     rigid_features = process_rigid_features(
+#         data,
+#         rigids_per_window_queries,
+#         max_rigids
+#     )
+
+#     return {
+#         "t": task_data['t'],
+#         "task": task_name,
+#         "input_data": data,
+#         "token": token_features,
+#         "rigids": rigid_features
+#     }
 
 
 def collate(data_list):

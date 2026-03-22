@@ -21,7 +21,8 @@ from proteinzen.boltz.data.sample.sampler import Sample
 
 from proteinzen.data.featurize.cropper import Cropper
 from proteinzen.data.featurize.tokenize import tokenize_structure, Tokenized
-from proteinzen.data.featurize.assembler import featurize_training, collate
+# from proteinzen.data.featurize.assembler import featurize_training, collate
+from proteinzen.data.featurize.assembler import featurize, collate
 
 from proteinzen.runtime.sampling.dispatcher import BiomoleculeTaskDispatcher
 
@@ -192,7 +193,7 @@ class TrainingDataset(torch.utils.data.Dataset):
                     interface_id=sample.interface_id
                 )
 
-        features = featurize_training(
+        features = featurize(
             tokenized_data,
             task_data,
             max_tokens=self.max_crop_residues,
@@ -294,7 +295,7 @@ class ValidationDataset(torch.utils.data.Dataset):
 
         task_data = task.sample_t_and_mask(struct)
 
-        token_data, rigid_data, token_bonds = tokenize_structure(
+        token_data, rigid_data, token_bonds, is_standard_data = tokenize_structure(
             struct,
             task_data
         )
@@ -316,7 +317,7 @@ class ValidationDataset(torch.utils.data.Dataset):
                     interface_id=sample.interface_id
                 )
 
-        features = featurize_training(
+        features = featurize(
             tokenized_data,
             task_data,
             max_tokens=self.max_crop_residues,

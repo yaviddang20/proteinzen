@@ -227,6 +227,7 @@ class Embedder(nn.Module):
         self.rigid_is_atomized_embed = Linear(1, c_frame, bias=False)
         self.rigid_element_embed = nn.Embedding(num_elements, c_frame)
         self.rigid_charge_embed = Linear(1, c_frame, bias=False)
+        self.rigid_chirality_embed = Linear(1, c_frame, bias=False)
         # self.rigid_is_unindexed_embed = Linear(1, c_frame, bias=False)
 
         self.framepair_init = FramepairEmbedder(
@@ -320,6 +321,13 @@ class Embedder(nn.Module):
             use_self_folding=use_self_folding
         )
 
+        self.indexing_matrix = get_indexing_matrix(
+            block_q,
+            W=block_q,
+            H=block_k,
+            device=torch.device('cuda')
+        )
+
     def _gen_node_features(
         self,
         seq,
@@ -375,6 +383,7 @@ class Embedder(nn.Module):
         node_init,
         rigids_element,
         rigids_charge,
+        rigids_chirality,
         t,
         rigids_token_uid,
         rigids_idx,
@@ -389,6 +398,7 @@ class Embedder(nn.Module):
         element_mask = (rigids_element != -1)
         element_embed = self.rigid_element_embed(rigids_element * element_mask) * element_mask[..., None]
         charge_embed = self.rigid_charge_embed(rigids_charge.unsqueeze(-1))
+        chirality_embed = self.rigid_chirality_embed(rigids_chirality.unsqueeze(-1)) * rigids_is_atomized_mask[..., None].float()
 
         rigids_init = (
             rigids_init
@@ -397,6 +407,7 @@ class Embedder(nn.Module):
             + is_atomized_embed
             + element_embed
             + charge_embed
+            + chirality_embed
         )
         return rigids_init
 
@@ -406,6 +417,8 @@ class Embedder(nn.Module):
         rigids_data,
         n_padding: int
     ):
+        if n_padding == 0:
+            return rigids_data
         padded_data = {}
         for key, value in rigids_data.items():
             if key in ("rigids_t", "sc_rigids", "sf_rigids"):
@@ -451,6 +464,7 @@ class Embedder(nn.Module):
             rigids,
             rigids_element,
             rigids_charge,
+            rigids_chirality,
             rigids_token_uid,
             rigids_idx,
             rigids_mask,
@@ -467,12 +481,7 @@ class Embedder(nn.Module):
         n_padding = (self.block_q - n_rigids % self.block_q) % self.block_q
         n_attn_blocks = (n_rigids + n_padding) // self.block_q
 
-        indexing_matrix = get_indexing_matrix(
-            n_attn_blocks,
-            W=self.block_q,
-            H=self.block_k,
-            device=t.device
-        )
+        indexing_matrix = self.indexing_matrix
         to_queries = lambda x: x.view(n_batch, n_attn_blocks, self.block_q, -1)
         to_keys = fn.partial(
             single_to_keys, indexing_matrix=indexing_matrix, W=self.block_q, H=self.block_k
@@ -511,6 +520,7 @@ class Embedder(nn.Module):
             node_init,
             rigids_element,
             rigids_charge,
+            rigids_chirality,
             t,
             rigids_token_uid,
             rigids_idx,
@@ -1040,10 +1050,7 @@ class Pairformer(nn.Module):
     ):
         edge_cond = self.lin_edge_cond(s)
         num_res = s.shape[-2]
-        cond = (
-            torch.tile(edge_cond[..., None, :], (1, 1, num_res, 1))
-            + torch.tile(edge_cond[..., None, :, :], (1, num_res, 1, 1))
-        )
+        cond = edge_cond[..., None, :] + edge_cond[..., None, :, :]
         z = z + self.edge_transition(z, cond)
 
         edge_mask = node_mask[..., None] & node_mask[..., None, :]
@@ -1245,6 +1252,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                 rigids=rigids_data['rigids_t'],
                 rigids_element=rigids_data['rigids_ref_element'],
                 rigids_charge=rigids_data['rigids_ref_charge'],
+                rigids_chirality=rigids_data['rigids_ref_chirality'],
                 rigids_token_uid=rigids_data['rigids_to_token'],
                 rigids_idx=rigids_data['rigids_sidechain_idx'],
                 rigids_mask=rigids_data['rigids_mask'],
@@ -1304,9 +1312,9 @@ class IpaMultiRigidDenoiser(nn.Module):
         seq_noising_mask = token_data['seq_noising_mask']
         pred_seq = pred_seq * seq_noising_mask + token_data['seq'] * (~seq_noising_mask)
 
-        if rigids_out.to_tensor_7().isnan().any() or pred_seq.isnan().any():
-            print("caught a nan in forward")
-            exit()
+        # if rigids_out.to_tensor_7().isnan().any() or pred_seq.isnan().any():
+        #     print("caught a nan in forward")
+        #     exit()
 
         ret = {}
         ret['denoised_rigids'] = rigids_out
