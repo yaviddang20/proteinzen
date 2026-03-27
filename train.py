@@ -5,7 +5,6 @@ import os
 import shutil
 
 os.environ.setdefault("REPO_ROOT", os.path.dirname(os.path.abspath(__file__)))
-os.environ.pop("SLURM_JOB_ID", None)  # prevent Lightning from auto-detecting SLURM and limiting GPUs
 
 import hydra
 from hydra_zen import zen
@@ -25,6 +24,8 @@ _original_load = torch.load
 torch.load = lambda *args, **kwargs: _original_load(*args, **{**kwargs, 'weights_only': False})
 
 from lightning import LightningDataModule, LightningModule, Trainer
+from lightning.pytorch.strategies import DDPStrategy
+from lightning.fabric.plugins.environments import LightningEnvironment
 # from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
@@ -85,9 +86,8 @@ class Experiment:
             enable_progress_bar=True,
             enable_model_summary=True,
             devices=devices,
-
+            strategy=DDPStrategy(cluster_environment=LightningEnvironment(), find_unused_parameters=True),
             # reload_dataloaders_every_n_epochs=1,
-            # strategy='ddp_find_unused_parameters_true',
             # detect_anomaly=True
         )
         trainer_cfg = omegaconf.OmegaConf.to_container(trainer_cfg)
