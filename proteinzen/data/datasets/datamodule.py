@@ -425,7 +425,6 @@ class BiomoleculeDataModule(L.LightningDataModule):
             batch_size=self.batch_size,
             collate_fn=collate_fn,
             shuffle=False,
-            multiprocessing_context='spawn' if self.num_workers > 0 else None,
         )
         return dataloader
 
