@@ -4,6 +4,8 @@ import logging
 import os
 import shutil
 
+os.environ.setdefault("REPO_ROOT", os.path.dirname(os.path.abspath(__file__)))
+
 import hydra
 from hydra_zen import zen
 import omegaconf

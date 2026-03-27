@@ -26,7 +26,7 @@ python ${REPO_ROOT}/train.py \
     corrupter.trans_prior_std=3 \
     dataset.config="'${REPO_ROOT}/configs/train/data/geom_conformer.yaml'" \
     +dataset.val_config="'${REPO_ROOT}/configs/train/data/geom_conformer_val.yaml'" \
-    experiment.lightning.devices=4 \
+    experiment.lightning.devices=8 \
     experiment.lightning.strategy=ddp_find_unused_parameters_true \
     experiment.checkpointer.train_time_interval=null \
     experiment.checkpointer.every_n_train_steps=500 \
@@ -35,8 +35,8 @@ python ${REPO_ROOT}/train.py \
     model.use_bond_rotation=false \
     experiment.lightning.accumulate_grad_batches=2 \
     lmodule.bond_rotation_head_only=false \
-    lmodule.scale_bond_length_loss=true \
-    lmodule.scale_bond_angle_loss=true \
+    lmodule.scale_bond_length_loss=false \
+    lmodule.scale_bond_angle_loss=false \
     lmodule.scale_ring_planarity_loss=true
 # python train.py \
 #     domain=protein \
