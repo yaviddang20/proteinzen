@@ -5,7 +5,7 @@ python ${REPO_ROOT}/train.py \
     domain=protein \
     paradigm=multiframefm \
     datamodule.batch_size=32 \
-    datamodule.num_workers=16 \
+    datamodule.num_workers=8 \
     model.c_s=256 \
     model.c_cond=256 \
     model.c_frame=256 \
