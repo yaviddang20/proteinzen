@@ -31,7 +31,7 @@ python ${REPO_ROOT}/train.py \
     experiment.checkpointer.train_time_interval=null \
     experiment.checkpointer.every_n_train_steps=500 \
     hydra.run.dir="'${REPO_ROOT}/outputs/geom_identityRot_256_conformer_6std_stereo_norm_scale/train'" \
-    experiment.lightning.max_epochs=100 \
+    experiment.lightning.max_epochs=-1 \
     model.use_bond_rotation=false \
     experiment.lightning.accumulate_grad_batches=2 \
     lmodule.bond_rotation_head_only=false \
