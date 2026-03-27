@@ -35,8 +35,8 @@ python ${REPO_ROOT}/train.py \
     model.use_bond_rotation=false \
     experiment.lightning.accumulate_grad_batches=2 \
     lmodule.bond_rotation_head_only=false \
-    lmodule.scale_bond_length_loss=false \
-    lmodule.scale_bond_angle_loss=false \
+    lmodule.scale_bond_length_loss=true \
+    lmodule.scale_bond_angle_loss=true \
     lmodule.scale_ring_planarity_loss=true
 # python train.py \
 #     domain=protein \
