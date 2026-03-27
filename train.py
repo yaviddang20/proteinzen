@@ -84,6 +84,7 @@ class Experiment:
             enable_progress_bar=True,
             enable_model_summary=True,
             devices=devices,
+            plugins=[LightningEnvironment()],
             # reload_dataloaders_every_n_epochs=1,
             # strategy='ddp_find_unused_parameters_true',
             # detect_anomaly=True
@@ -92,7 +93,6 @@ class Experiment:
         trainer_cfg.update(overrides)
 
         trainer = Trainer(
-            plugins=[LightningEnvironment()],
             **trainer_cfg,
         )
         trainer.fit(
