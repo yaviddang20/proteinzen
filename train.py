@@ -8,6 +8,7 @@ import hydra
 from hydra_zen import zen
 import omegaconf
 import torch          
+from pytorch_lightning.plugins.environments import LightningEnvironment
 # from omegaconf import ListConfig, DictConfig                                                                                                                         
 # from omegaconf.base import ContainerMetadata                                                                                                                         
 # from omegaconf.nodes import ValueNode, AnyNode, IntegerNode, FloatNode, BooleanNode, StringNode, EnumNode                                                            
@@ -89,6 +90,7 @@ class Experiment:
         trainer_cfg.update(overrides)
 
         trainer = Trainer(
+            plugins=[LightningEnvironment()],
             **trainer_cfg,
         )
         trainer.fit(
