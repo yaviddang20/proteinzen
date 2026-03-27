@@ -310,6 +310,132 @@ def smiles_to_struct(
     )
     return struct
 
+def compute_ring_atom_masks(mol):
+    """Compute atom masks for aromatic rings in a molecule.
+
+    Parameters
+    ----------
+    mol : Mol
+        RDKit molecule (H will be stripped internally).
+
+    Returns
+    -------
+    ring_masks : np.ndarray, shape (R, N_heavy_atoms), dtype bool
+        One row per aromatic ring, True for atoms in that ring.
+    """
+    mol = AllChem.AddHs(mol)
+    mol_no_h = AllChem.RemoveHs(mol)
+    n = mol_no_h.GetNumAtoms()
+
+    ring_info = mol_no_h.GetRingInfo()
+    masks = []
+    for ring in ring_info.AtomRings():
+        if all(mol_no_h.GetAtomWithIdx(i).GetIsAromatic() for i in ring):
+            mask = np.zeros(n, dtype=bool)
+            mask[list(ring)] = True
+            masks.append(mask)
+
+    if not masks:
+        return np.zeros((0, n), dtype=bool)
+    return np.array(masks, dtype=bool)
+
+
+def compute_sym_groups(mol):
+    """Compute equivalence classes of symmetric (same canonical rank) heavy atoms.
+
+    Returns
+    -------
+    sym_groups : np.ndarray, shape (num_groups, max_group_size), dtype int32
+        Atom index groups, padded with -1.
+    sym_group_sizes : np.ndarray, shape (num_groups,), dtype int32
+        Number of atoms in each group.
+    """
+    from collections import defaultdict
+    from rdkit.Chem import rdmolfiles
+
+    mol_no_h = AllChem.RemoveHs(AllChem.AddHs(mol))
+    ranks = list(rdmolfiles.CanonicalRankAtoms(mol_no_h, breakTies=False))
+
+    groups = defaultdict(list)
+    for idx, rank in enumerate(ranks):
+        groups[rank].append(idx)
+
+    sym = [sorted(g) for g in groups.values() if len(g) > 1]
+
+    if not sym:
+        return np.zeros((0, 1), dtype=np.int32), np.zeros(0, dtype=np.int32)
+
+    max_size = max(len(g) for g in sym)
+    sym_groups = np.full((len(sym), max_size), -1, dtype=np.int32)
+    sym_group_sizes = np.array([len(g) for g in sym], dtype=np.int32)
+    for i, g in enumerate(sym):
+        sym_groups[i, :len(g)] = g
+
+    return sym_groups, sym_group_sizes
+
+
+def compute_rot_bond_fragments(mol):
+    """Compute rotatable (non-ring single) bond fragment masks.
+
+    For each rotatable bond (a, b):
+    - frag_a: atoms reachable from a when bond (a,b) is removed (includes a)
+    - frag_b = complement of frag_a
+
+    Parameters
+    ----------
+    mol : Mol
+        RDKit molecule (with or without hydrogens — H will be stripped).
+
+    Returns
+    -------
+    rot_bonds : np.ndarray, shape (B, 2), dtype int32
+        Atom index pairs (a, b) for each rotatable bond.
+    frag_a : np.ndarray, shape (B, N_heavy_atoms), dtype bool
+        True for atoms in fragment A (the A-side when bond is removed).
+    """
+    from collections import deque
+
+    mol = AllChem.AddHs(mol)
+    mol_no_h = AllChem.RemoveHs(mol)
+    n = mol_no_h.GetNumAtoms()
+
+    adj = [[] for _ in range(n)]
+    for bond in mol_no_h.GetBonds():
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        adj[i].append(j)
+        adj[j].append(i)
+
+    def bfs(start, excl_a, excl_b):
+        vis = np.zeros(n, dtype=bool)
+        q = deque([start])
+        vis[start] = True
+        while q:
+            v = q.popleft()
+            for w in adj[v]:
+                if (v == excl_a and w == excl_b) or (v == excl_b and w == excl_a):
+                    continue
+                if not vis[w]:
+                    vis[w] = True
+                    q.append(w)
+        return vis
+
+    bonds_out = []
+    frags_out = []
+    for bond in mol_no_h.GetBonds():
+        if bond.IsInRing():
+            continue
+        if bond.GetBondTypeAsDouble() != 1.0:  # only single bonds
+            continue
+        a, b = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        frag_a = bfs(a, a, b)
+        bonds_out.append([a, b])
+        frags_out.append(frag_a)
+
+    if not bonds_out:
+        return np.zeros((0, 2), dtype=np.int32), np.zeros((0, n), dtype=bool)
+    return np.array(bonds_out, dtype=np.int32), np.array(frags_out, dtype=bool)
+
+
 def mol_to_smiles_to_struct(
     mol: Mol,
     name: str = "LIG",

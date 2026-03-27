@@ -1,7 +1,10 @@
-python train.py \
+dir=$(realpath "$(dirname "${BASH_SOURCE[0]}")")
+source $dir/env_vars.sh 
+
+python ${REPO_ROOT}/train.py \
     domain=protein \
     paradigm=multiframefm \
-    datamodule.batch_size=24 \
+    datamodule.batch_size=32 \
     datamodule.num_workers=16 \
     model.c_s=256 \
     model.c_cond=256 \
@@ -17,21 +20,22 @@ python train.py \
     model.rot_preconditioning=true \
     model.num_blocks=8 \
     lmodule.use_ema=true \
+    lmodule.strict_weight_loading=false \
     corrupter.use_stochastic_centering=false \
     corrupter.center_on_motif=false \
     corrupter.trans_prior_std=3 \
-    dataset.config=/datastor1/dy4652/proteinzen/configs/train/data/geom_conformer.yaml \
-    +dataset.val_config=/datastor1/dy4652/proteinzen/configs/train/data/geom_conformer_val.yaml \
+    dataset.config="'${REPO_ROOT}/configs/train/data/geom_conformer.yaml'" \
+    +dataset.val_config="'${REPO_ROOT}/configs/train/data/geom_conformer_val.yaml'" \
     experiment.lightning.devices=3 \
     experiment.lightning.strategy=ddp_find_unused_parameters_true \
     experiment.checkpointer.train_time_interval=null \
     experiment.checkpointer.every_n_train_steps=500 \
-    'experiment.warm_start="/datastor1/dy4652/proteinzen/outputs/geom_identityRot_256_conformer_3std_bondlength/train/lightning_logs/version_32/checkpoints/last.ckpt"' \
-    hydra.run.dir="/datastor1/dy4652/proteinzen/outputs/geom_identityRot_256_conformer_3std_bondlength/train" \
-    corrupter.use_uniform_rot_noise=false \
-    experiment.lightning.accumulate_grad_batches=4 \
-    experiment.lightning.max_epochs=150 \
-    lmodule.strict_weight_loading=false
+    hydra.run.dir="'${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_angle/train'" \
+    'experiment.warm_start="/datastor1/dy4652/proteinzen/outputs/geom_identityRot_256_conformer_3std_stereo_angle/train/lightning_logs/version_7/checkpoints/last_no_opt.ckpt"' \
+    experiment.lightning.max_epochs=100 \
+    model.use_bond_rotation=true \
+    experiment.lightning.accumulate_grad_batches=2 \
+    lmodule.bond_rotation_head_only=false 
 # python train.py \
 #     domain=protein \
 #     paradigm=multiframefm \

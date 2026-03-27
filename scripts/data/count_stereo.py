@@ -232,15 +232,38 @@ def count_stereo(args) -> None:
 
     txt_out_path = outdir / f"stereo_counts_{args.dataset}.txt"
     with open(txt_out_path, "w") as f:
-        f.write(f"Total groups: {total_groups}\n")
-        f.write(f"Enantiomers only: {n_enant_only}\n")
-        f.write(f"Diastereomers only: {n_diast_only}\n")
-        f.write(f"Mixed: {n_mixed}\n")
-        f.write(f"Enantiomeric pairs: {n_enant_pairs}\n")
-        f.write(f"Diastereomeric pairs: {n_diast_pairs}\n")
-        f.write(f"Unique isomer SMILES: {total_unique_isomers}\n")
-        f.write(f"Total entries: {total_entries}\n")
-        f.write(f"Within-entry stereo inconsistency: {n_within_entry}\n")
+        f.write("\n")
+        f.write("=== Stereoisomer Counts ===\n")
+        f.write(
+            f"  Within-entry stereo inconsistency (conformers disagree):  {n_within_entry}\n"
+        )
+        f.write("\n")
+        f.write(
+            f"  Cross-entry stereoisomer groups (total):                   {total_groups}\n"
+        )
+        f.write(
+            f"    Enantiomers only (all pairs are mirror images):           {n_enant_only}\n"
+        )
+        f.write(
+            f"    Diastereomers only (no enantiomeric pairs):               {n_diast_only}\n"
+        )
+        f.write(
+            f"    Mixed (both enantiomeric and diastereomeric pairs):       {n_mixed}\n"
+        )
+        f.write("\n")
+        f.write(
+            f"  Unique isomer SMILES across all cross-entry groups:        {total_unique_isomers}\n"
+        )
+        f.write(
+            f"  Total entries involved in cross-entry groups:              {total_entries}\n"
+        )
+        f.write(
+            f"  Enantiomeric pairs (unique isomer pairs):                  {n_enant_pairs}\n"
+        )
+        f.write(
+            f"  Diastereomeric pairs (unique isomer pairs):                {n_diast_pairs}\n"
+        )
+        f.write("\n")
 
     print(f"Wrote {txt_out_path}")
 

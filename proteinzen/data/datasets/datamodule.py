@@ -76,7 +76,7 @@ def load_input(record: Record, data_dir):
         # Replace old chains array with new one
         chains = new_chains
 
-    structure = Structure(
+    struct = Structure(
         atoms=structure["atoms"],
         bonds=structure["bonds"],
         residues=structure["residues"],
@@ -86,7 +86,38 @@ def load_input(record: Record, data_dir):
         mask=structure["mask"],
     )
 
-    return structure
+    rot_bond_data = None
+    if 'rot_bonds' in structure:
+        n_atoms = structure['atoms'].shape[0]
+        rot_bond_data = {
+            'rot_bonds': structure['rot_bonds'],
+            'rot_frag_a': structure['rot_frag_a'],
+            'ring_masks': structure['ring_masks'] if 'ring_masks' in structure
+                          else np.zeros((0, n_atoms), dtype=bool),
+            'sym_groups': structure['sym_groups'] if 'sym_groups' in structure
+                          else np.zeros((0, 1), dtype=np.int32),
+            'sym_group_sizes': structure['sym_group_sizes'] if 'sym_group_sizes' in structure
+                               else np.zeros(0, dtype=np.int32),
+        }
+
+    return struct, rot_bond_data
+
+
+def mirror_structure(struct: Structure) -> Structure:
+    """Reflect all atom coordinates across the x-axis and swap CW/CCW chirality tags.
+
+    Produces the enantiomer of the structure. Valid augmentation since enantiomers
+    have identical energies.
+    """
+    atoms = struct.atoms.copy()
+    atoms['coords'][:, 0] *= -1
+    cw  = const.chirality_type_ids['CHI_TETRAHEDRAL_CW']
+    ccw = const.chirality_type_ids['CHI_TETRAHEDRAL_CCW']
+    cw_mask  = atoms['chirality'] == cw
+    ccw_mask = atoms['chirality'] == ccw
+    atoms['chirality'][cw_mask]  = ccw
+    atoms['chirality'][ccw_mask] = cw
+    return replace(struct, atoms=atoms)
 
 
 def mask_nonstandard_residues(struct: Structure):
@@ -160,11 +191,14 @@ class TrainingDataset(torch.utils.data.Dataset):
         sample: Sample = next(self.samples[dataset_idx])
         task = task_sampler.sample_task()
 
-        struct = load_input(sample.record, Path(dataset.data_dir))
+        struct, rot_bond_data = load_input(sample.record, Path(dataset.data_dir))
         chain_mask = struct.mask
         remove_chain_masks = [struct.chains['mol_type'] == i for i in self.remove_mol_types]
         for remove_mask in remove_chain_masks:
             chain_mask[remove_mask] = False
+
+        if np.random.random() < 0.5:
+            struct = mirror_structure(struct)
 
         if self.mask_nonstandard:
             struct = mask_nonstandard_residues(struct)
@@ -200,8 +234,23 @@ class TrainingDataset(torch.utils.data.Dataset):
             max_rigids=self.max_crop_rigids
         )
         features['task'] = task
-
         features['structure'] = struct
+
+        if rot_bond_data is not None and rot_bond_data['rot_bonds'].shape[0] > 0:
+            features['rot_bonds'] = torch.from_numpy(rot_bond_data['rot_bonds']).long()
+            features['rot_frag_a'] = torch.from_numpy(rot_bond_data['rot_frag_a'])
+        else:
+            features['rot_bonds'] = torch.zeros((0, 2), dtype=torch.long)
+            features['rot_frag_a'] = torch.zeros((0, 0), dtype=torch.bool)
+
+        if rot_bond_data is not None:
+            features['ring_masks'] = torch.from_numpy(rot_bond_data['ring_masks'])
+            features['sym_groups'] = torch.from_numpy(rot_bond_data['sym_groups']).long()
+            features['sym_group_sizes'] = torch.from_numpy(rot_bond_data['sym_group_sizes']).long()
+        else:
+            features['ring_masks'] = torch.zeros((0, 0), dtype=torch.bool)
+            features['sym_groups'] = torch.zeros((0, 1), dtype=torch.long)
+            features['sym_group_sizes'] = torch.zeros(0, dtype=torch.long)
 
         return features
 
@@ -284,7 +333,7 @@ class ValidationDataset(torch.utils.data.Dataset):
         sample = self.samples[idx]
         task = task_sampler.sample_task()
 
-        struct = load_input(sample.record, Path(dataset.data_dir))
+        struct, rot_bond_data = load_input(sample.record, Path(dataset.data_dir))
         chain_mask = struct.mask
         remove_chain_masks = [struct.chains['mol_type'] == i for i in self.remove_mol_types]
         for remove_mask in remove_chain_masks:
@@ -324,8 +373,23 @@ class ValidationDataset(torch.utils.data.Dataset):
             max_rigids=self.max_crop_rigids
         )
         features['task'] = task
-
         features['structure'] = struct
+
+        if rot_bond_data is not None and rot_bond_data['rot_bonds'].shape[0] > 0:
+            features['rot_bonds'] = torch.from_numpy(rot_bond_data['rot_bonds']).long()
+            features['rot_frag_a'] = torch.from_numpy(rot_bond_data['rot_frag_a'])
+        else:
+            features['rot_bonds'] = torch.zeros((0, 2), dtype=torch.long)
+            features['rot_frag_a'] = torch.zeros((0, 0), dtype=torch.bool)
+
+        if rot_bond_data is not None:
+            features['ring_masks'] = torch.from_numpy(rot_bond_data['ring_masks'])
+            features['sym_groups'] = torch.from_numpy(rot_bond_data['sym_groups']).long()
+            features['sym_group_sizes'] = torch.from_numpy(rot_bond_data['sym_group_sizes']).long()
+        else:
+            features['ring_masks'] = torch.zeros((0, 0), dtype=torch.bool)
+            features['sym_groups'] = torch.zeros((0, 1), dtype=torch.long)
+            features['sym_group_sizes'] = torch.zeros(0, dtype=torch.long)
 
         return features
 

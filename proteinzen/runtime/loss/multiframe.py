@@ -1,8 +1,190 @@
 import torch
+from itertools import permutations as _iperms
 
 from proteinzen.openfold.utils import rigid_utils as ru
 from proteinzen.stoch_interp import so3_utils as so3_fm_utils
 import torch.nn.functional as F
+
+
+def sym_permute_gt_rigids(pred_trans, gt_rigids, inputs):
+    """Permute GT atom rigids within each symmetry equivalence class to minimise
+    the squared distance to the predicted positions.
+
+    For each batch element and each symmetry group (e.g. two identical methyl
+    groups), we enumerate all permutations of the group's GT atom positions and
+    select the assignment whose total squared distance to the predicted positions
+    is smallest.  Both translation and rotation are swapped together so the full
+    rigid is consistently permuted.
+
+    Groups with size > 6 are skipped (>720 permutations; rare and expensive).
+
+    Parameters
+    ----------
+    pred_trans : Tensor (B, N, 3)
+    gt_rigids  : Rigid  (B, N)
+    inputs     : batch dict — must contain 'sym_groups', 'sym_group_sizes',
+                 'num_sym_groups'
+
+    Returns
+    -------
+    Rigid (B, N) with permuted translations/rotations for symmetric atoms.
+    """
+    if 'sym_groups' not in inputs or int(inputs['num_sym_groups'].max()) == 0:
+        return gt_rigids
+
+    sym_groups      = inputs['sym_groups']       # (B, max_sym, max_gsz)
+    sym_group_sizes = inputs['sym_group_sizes']  # (B, max_sym)
+    num_sym_groups  = inputs['num_sym_groups']   # (B,)
+
+    B = pred_trans.shape[0]
+
+    pred_np          = pred_trans.detach().cpu().numpy()
+    gt_trans_orig    = gt_rigids.get_trans()                         # (B, N, 3)
+    gt_rotmat_orig   = gt_rigids.get_rots().get_rot_mats()           # (B, N, 3, 3)
+    gt_trans_np      = gt_trans_orig.detach().cpu().numpy()
+    sym_groups_cpu   = sym_groups.cpu().numpy()
+    sym_gsizes_cpu   = sym_group_sizes.cpu().numpy()
+    num_sym_cpu      = num_sym_groups.cpu().numpy()
+
+    gt_trans_new   = gt_trans_orig.clone()
+    gt_rotmat_new  = gt_rotmat_orig.clone()
+
+    for b in range(B):
+        n_groups = int(num_sym_cpu[b])
+        for s in range(n_groups):
+            gsz = int(sym_gsizes_cpu[b, s])
+            if gsz < 2 or gsz > 6:
+                continue
+            atom_idxs = sym_groups_cpu[b, s, :gsz].tolist()
+
+            pred_pos = pred_np[b, atom_idxs]   # (gsz, 3)
+            gt_pos   = gt_trans_np[b, atom_idxs]  # (gsz, 3)
+
+            best_perm = list(range(gsz))
+            best_dist = float('inf')
+            for perm in _iperms(range(gsz)):
+                perm = list(perm)
+                dist = float(((pred_pos - gt_pos[perm]) ** 2).sum())
+                if dist < best_dist:
+                    best_dist = dist
+                    best_perm = perm
+
+            perm_idxs = [atom_idxs[i] for i in best_perm]
+            gt_trans_new[b, atom_idxs]  = gt_trans_orig[b, perm_idxs]
+            gt_rotmat_new[b, atom_idxs] = gt_rotmat_orig[b, perm_idxs]
+
+    new_rots = ru.Rotation(rot_mats=gt_rotmat_new)
+    return ru.Rigid(new_rots, gt_trans_new)
+
+
+def compute_gt_delta_torsion(rigids_pred, rigids_gt, bond_idx):
+      """
+      Compute GT delta torsion at each bond end:
+      the rotation needed to go from pred frame to GT frame,
+      projected onto the bond axis.
+   
+      rigids_pred: Rigid [B, N] — the x_1 prediction
+      rigids_gt:   Rigid [B, N] — the clean ground truth
+      bond_idx:    [num_bonds, 3] from BondDeltaTorsionHead
+      """
+      b, i, j = bond_idx[:, 0], bond_idx[:, 1], bond_idx[:, 2]
+
+      trans_pred = rigids_pred.get_trans()
+      bond_axis = F.normalize(trans_pred[b, j] - trans_pred[b, i], dim=-1)  # [num_bonds, 3]
+
+      rots_pred = rigids_pred.get_rots().get_rot_mats()  # [B, N, 3, 3]
+      rots_gt   = rigids_gt.get_rots().get_rot_mats()
+
+      ref = torch.tensor([1., 0., 0.], device=bond_axis.device)
+
+      def perp_projection(rots, b_idx, n_idx, axis):
+          # rotate reference vector by atom's frame, project perp to bond axis
+          local_x = (rots[b_idx, n_idx] @ ref.unsqueeze(-1)).squeeze(-1)  # [num_bonds, 3]
+          perp = local_x - (local_x * axis).sum(-1, keepdim=True) * axis
+          return F.normalize(perp + 1e-8, dim=-1)
+
+      perp_pred_i = perp_projection(rots_pred, b, i, bond_axis)
+      perp_gt_i   = perp_projection(rots_gt,   b, i, bond_axis)
+      perp_pred_j = perp_projection(rots_pred, b, j, bond_axis)
+      perp_gt_j   = perp_projection(rots_gt,   b, j, bond_axis)
+
+      # sin/cos of Δθ at each end via cross and dot product
+      sin_i = (torch.cross(perp_pred_i, perp_gt_i, dim=-1) * bond_axis).sum(-1)
+      cos_i = (perp_pred_i * perp_gt_i).sum(-1)
+      sin_j = (torch.cross(perp_pred_j, perp_gt_j, dim=-1) * bond_axis).sum(-1)
+      cos_j = (perp_pred_j * perp_gt_j).sum(-1)
+
+      gt_i = torch.stack([sin_i, cos_i], dim=-1)  # [num_bonds, 2]
+      gt_j = torch.stack([sin_j, cos_j], dim=-1)
+
+      return gt_i, gt_j
+      
+
+def delta_torsion_loss(pred_i, pred_j, gt_i, gt_j):
+      """Simple MSE on sin/cos — equivalent to 1 - cos(Δ_pred - Δ_gt)."""
+      return F.mse_loss(pred_i, gt_i) + F.mse_loss(pred_j, gt_j)
+
+
+def ring_planarity_loss(inputs, denoiser_outputs, eps=1e-8):
+    """Penalize deviation of predicted aromatic ring atoms from their best-fit plane.
+
+    Loss is the smallest eigenvalue of the centered covariance of ring atom positions,
+    normalized by ring size. Zero for a perfectly planar ring.
+    """
+    if 'ring_masks' not in inputs:
+        return torch.tensor(0.0, device=inputs['rigids']['rigids_1'].device)
+
+    ring_masks = inputs['ring_masks'].float()   # (B, R, N)
+    num_rings = inputs['num_rings']             # (B,)
+    B, R, N = ring_masks.shape
+
+    if R == 0 or num_rings.max() == 0:
+        return torch.tensor(0.0, device=ring_masks.device)
+
+    trans = denoiser_outputs['denoised_rigids'].get_trans()  # (B, N, 3)
+
+    n_atoms = ring_masks.sum(-1, keepdim=True).clamp(min=1)  # (B, R, 1)
+    centroid = (trans[:, None, :, :] * ring_masks[..., None]).sum(-2) / n_atoms  # (B, R, 3)
+    p = trans[:, None, :, :] - centroid[:, :, None, :]       # (B, R, N, 3)
+    p_masked = p * ring_masks[..., None]                      # (B, R, N, 3)
+
+    # Covariance matrix of ring atom positions
+    cov = torch.einsum('brni,brnj->brij', p_masked, p_masked)  # (B, R, 3, 3)
+
+    # Smallest eigenvalue = variance perpendicular to best-fit plane
+    eigvals = torch.linalg.eigvalsh(cov + eps * torch.eye(3, device=cov.device))  # (B, R, 3)
+    planarity_dev = eigvals[..., 0] / n_atoms.squeeze(-1)  # (B, R)
+
+    valid = (torch.arange(R, device=ring_masks.device)[None, :] < num_rings[:, None]).float()
+    loss = (planarity_dev * valid).sum(-1) / valid.sum(-1).clamp(min=1)  # (B,)
+    return loss.mean()
+
+
+def bond_rotation_pos_loss(inputs, denoiser_outputs, gt_trans=None):
+    """MSE between bond-rotation-updated positions and GT positions for atom rigids.
+
+    Parameters
+    ----------
+    gt_trans : Tensor (B, N, 3), optional
+        Pre-computed (possibly sym-permuted) GT translations.  Falls back to
+        parsing rigids_1 from inputs if not provided.
+    """
+    if 'bond_updated_trans' not in denoiser_outputs:
+        return torch.tensor(0.0, device=inputs['rigids']['rigids_1'].device)
+
+    updated_trans = denoiser_outputs['bond_updated_trans']  # (B, N, 3)
+    if gt_trans is None:
+        gt_trans = ru.Rigid.from_tensor_7(inputs['rigids']['rigids_1']).get_trans()
+
+    atom_mask = inputs['rigids']['rigids_is_atom_mask'].bool()  # (B, N)
+    valid_mask = inputs['rigids']['rigids_mask'].bool() & atom_mask
+
+    if valid_mask.sum() == 0:
+        return torch.tensor(0.0, device=updated_trans.device)
+
+    diff_sq = ((updated_trans - gt_trans) ** 2).sum(-1)  # (B, N)
+    loss = (diff_sq * valid_mask).sum(-1) / valid_mask.sum(-1).clamp(min=1)  # (B,)
+    return loss.mean()
 
 
 def bond_length_rmse(inputs, denoiser_outputs):
@@ -227,7 +409,10 @@ def multiframe_fm_loss_dense_batch(
     rot_rigidwise_weight=1,
     direct_rot_vf_loss=False,
     direct_rot_vf_loss_scale=1,
-    upweight_atomic=False
+    upweight_atomic=False,
+    scale_bond_length_loss=False,
+    scale_bond_angle_loss=False,
+    scale_ring_planarity_loss=False,
 ):
     rigids_data = inputs['rigids']
     rigids_mask = rigids_data['rigids_mask']
@@ -243,6 +428,10 @@ def multiframe_fm_loss_dense_batch(
 
     denoised_rigids = denoiser_outputs['denoised_rigids']
     gt_rigids = ru.Rigid.from_tensor_7(rigids_data['rigids_1'])
+
+    # Permute GT atom rigids within symmetry equivalence classes so the loss
+    # is not penalising arbitrary labelling of identical atoms.
+    gt_rigids = sym_permute_gt_rigids(denoised_rigids.get_trans(), gt_rigids, inputs)
 
     num_rigids_per_batch = rigids_mask.long().sum(dim=-1).clip(min=1)
 
@@ -358,8 +547,15 @@ def multiframe_fm_loss_dense_batch(
     unscaled_trans_vf_loss *= 0.01  # Angstroms to nm
 
 
-    bond_length_loss = bond_length_rmse(inputs, denoiser_outputs) / (norm_scale ** 2)
-    bond_angle_loss = bond_angle_rmse(inputs, denoiser_outputs) / (norm_scale ** 2)
+    raw_bond_length = bond_length_rmse(inputs, denoiser_outputs)
+    raw_bond_angle = bond_angle_rmse(inputs, denoiser_outputs)
+    raw_ring_plan = ring_planarity_loss(inputs, denoiser_outputs)
+    raw_bond_rot = bond_rotation_pos_loss(inputs, denoiser_outputs, gt_trans=gt_rigids.get_trans())
+
+    bond_length_loss = raw_bond_length / (norm_scale ** 2) if scale_bond_length_loss else raw_bond_length
+    bond_angle_loss = raw_bond_angle / (norm_scale ** 2) if scale_bond_angle_loss else raw_bond_angle
+    ring_plan_loss = raw_ring_plan / (norm_scale ** 2) if scale_ring_planarity_loss else raw_ring_plan
+    bond_rot_loss = raw_bond_rot / (norm_scale ** 2)
 
     # torch.set_printoptions(threshold=1000001)
     # print(trans_1_pred, trans_1)
@@ -389,6 +585,12 @@ def multiframe_fm_loss_dense_batch(
         "scaled_fafe": scaled_fafe,
         "bond_length_rmse": bond_length_loss,
         "bond_angle_rmse": bond_angle_loss,
+        "ring_planarity_loss": ring_plan_loss,
+        "bond_rot_mse": bond_rot_loss,
+        "unscaled_bond_length_rmse": raw_bond_length.detach(),
+        "unscaled_bond_angle_rmse": raw_bond_angle.detach(),
+        "unscaled_ring_planarity_loss": raw_ring_plan.detach(),
+        "unscaled_bond_rot_mse": raw_bond_rot.detach(),
     }
     return ret
 

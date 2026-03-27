@@ -408,9 +408,10 @@ def sample_noise_from_struct_template(  # noqa: C901, PLR0915
                     atom_idx = atom_start + j
 
                     atom_trans = torch.randn(3).numpy() * trans_std
-                    atom_quat = Rotation.random().as_quat(canonical=True)
+                    # atom_quat = Rotation.random().as_quat(canonical=True)
                     # atom_rotmat = igso3.sample(torch.tensor([1.5]), 1).view(3, 3).numpy()
                     # atom_quat = Rotation.from_matrix(atom_rotmat).as_quat(canonical=True)
+                    atom_quat = Rotation.identity().as_quat(canonical=True)
                     atom_tensor7 = np.concatenate([atom_quat, atom_trans], axis=-1)
 
                     # Create token

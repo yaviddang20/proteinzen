@@ -24,7 +24,7 @@ import hashlib
 
 from proteinzen.boltz.data.types import ChainInfo, StructureInfo, InterfaceInfo, Record, Target, ConformerRecord, ConformerTarget
 
-from proteinzen.data.featurize.mol.sampling import mol_to_struct
+from proteinzen.data.featurize.mol.sampling import mol_to_struct, compute_rot_bond_fragments, compute_ring_atom_masks, compute_sym_groups
 
 def hash_sequence(seq: str) -> str:
     """Hash a sequence."""
@@ -65,7 +65,7 @@ def finalize(outdir: Path) -> None:
 
 
 
-def parse(datadir: Path, data: dict) -> ConformerTarget:
+def parse(datadir: Path, data: dict):
     data_id = data['data_id']
     data_path = datadir / data['pickle_path']
     with open(data_path, 'rb') as fp:
@@ -76,10 +76,21 @@ def parse(datadir: Path, data: dict) -> ConformerTarget:
     structure_info_list = []
     boltzmann_weights_list = []
     structures = []
+    rot_bond_data_list = []
     for conformer in conformer_data:
         rd_mol = conformer['rd_mol']
 
         structure = mol_to_struct(rd_mol, noise_ligand=False)
+        rot_bonds, frag_a = compute_rot_bond_fragments(rd_mol)
+        ring_masks = compute_ring_atom_masks(rd_mol)
+        sym_groups, sym_group_sizes = compute_sym_groups(rd_mol)
+        rot_bond_data_list.append({
+            'rot_bonds': rot_bonds,
+            'rot_frag_a': frag_a,
+            'ring_masks': ring_masks,
+            'sym_groups': sym_groups,
+            'sym_group_sizes': sym_group_sizes,
+        })
 
         structure_info = StructureInfo(
             deposited=None,
@@ -127,7 +138,7 @@ def parse(datadir: Path, data: dict) -> ConformerTarget:
     )
     target = ConformerTarget(structures=structures, record=record)
 
-    return target
+    return target, rot_bond_data_list
 
 def process_structure(
     data: tuple[str, dict],
@@ -157,15 +168,21 @@ def process_structure(
 
     try:
         # Parse the target
-        target = parse(datadir, data_dict)
+        target, rot_bond_data_list = parse(datadir, data_dict)
     except Exception:  # noqa: BLE001
         traceback.print_exc()
         print(f"Failed to parse {smiles}")
         return ("parse_error", smiles)
 
-    for i, structure in enumerate(target.structures):
+    for i, (structure, rot_bond_data) in enumerate(zip(target.structures, rot_bond_data_list)):
         struct_path = outdir / "structures" / mid / f"{data_id}_{i}.npz"
-        np.savez_compressed(struct_path, **asdict(structure))
+        save_dict = asdict(structure)
+        save_dict['rot_bonds'] = rot_bond_data['rot_bonds']
+        save_dict['rot_frag_a'] = rot_bond_data['rot_frag_a']
+        save_dict['ring_masks'] = rot_bond_data['ring_masks']
+        save_dict['sym_groups'] = rot_bond_data['sym_groups']
+        save_dict['sym_group_sizes'] = rot_bond_data['sym_group_sizes']
+        np.savez_compressed(struct_path, **save_dict)
 
     record = target.record
     with record_path.open("w") as f:

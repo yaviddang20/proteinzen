@@ -392,4 +392,67 @@ def collate(data_list):
         batched_data_list['name'] = [data['name'] for data in data_list]
     if 'input_data' in data_list[0]:
         batched_data_list['input_data'] = [asdict(data['input_data']) for data in data_list]
+
+    # Handle rotatable bond data (variable-length per sample)
+    if 'rot_bonds' in data_list[0]:
+        max_bonds = max(d['rot_bonds'].shape[0] for d in data_list)
+        max_n = max(rigids_lens)
+        num_rot_bonds = torch.tensor([d['rot_bonds'].shape[0] for d in data_list], dtype=torch.long)
+        rot_bonds_padded = []
+        rot_frag_a_padded = []
+        for d in data_list:
+            b = d['rot_bonds'].shape[0]
+            if b == 0:
+                rot_bonds_padded.append(torch.zeros(max_bonds, 2, dtype=torch.long))
+                rot_frag_a_padded.append(torch.zeros(max_bonds, max_n, dtype=torch.bool))
+            else:
+                n = d['rot_frag_a'].shape[1]
+                rot_bonds_padded.append(F.pad(d['rot_bonds'], (0, 0, 0, max_bonds - b)))
+                rot_frag_a_padded.append(F.pad(d['rot_frag_a'], (0, max_n - n, 0, max_bonds - b)))
+        batched_data_list['rot_bonds'] = torch.stack(rot_bonds_padded)       # (B, max_bonds, 2)
+        batched_data_list['rot_frag_a'] = torch.stack(rot_frag_a_padded)     # (B, max_bonds, max_n)
+        batched_data_list['num_rot_bonds'] = num_rot_bonds                    # (B,)
+
+    # Handle ring planarity masks
+    if 'ring_masks' in data_list[0]:
+        max_rings = max(d['ring_masks'].shape[0] for d in data_list)
+        max_n = max(rigids_lens)
+        num_rings = torch.tensor([d['ring_masks'].shape[0] for d in data_list], dtype=torch.long)
+        ring_masks_padded = []
+        for d in data_list:
+            r = d['ring_masks'].shape[0]
+            if r == 0:
+                ring_masks_padded.append(torch.zeros(max_rings, max_n, dtype=torch.bool))
+            else:
+                n = d['ring_masks'].shape[1]
+                ring_masks_padded.append(F.pad(d['ring_masks'], (0, max_n - n, 0, max_rings - r)))
+        batched_data_list['ring_masks'] = torch.stack(ring_masks_padded)  # (B, max_rings, max_n)
+        batched_data_list['num_rings'] = num_rings                         # (B,)
+
+    # Handle symmetry groups
+    if 'sym_groups' in data_list[0]:
+        max_sym = max(d['sym_groups'].shape[0] for d in data_list)
+        max_gsz = max(d['sym_groups'].shape[1] for d in data_list)
+        num_sym_groups = torch.tensor([d['sym_groups'].shape[0] for d in data_list], dtype=torch.long)
+        sym_groups_padded = []
+        sym_group_sizes_padded = []
+        for d in data_list:
+            s = d['sym_groups'].shape[0]
+            g = d['sym_groups'].shape[1]
+            if s == 0:
+                sym_groups_padded.append(torch.full((max_sym, max_gsz), -1, dtype=torch.long))
+                sym_group_sizes_padded.append(torch.zeros(max_sym, dtype=torch.long))
+            else:
+                # pad group size dim first, then num_groups dim; fill with -1
+                sg = d['sym_groups']
+                if g < max_gsz:
+                    sg = F.pad(sg, (0, max_gsz - g), value=-1)
+                if s < max_sym:
+                    sg = F.pad(sg, (0, 0, 0, max_sym - s), value=-1)
+                sym_groups_padded.append(sg)
+                sym_group_sizes_padded.append(F.pad(d['sym_group_sizes'], (0, max_sym - s)))
+        batched_data_list['sym_groups'] = torch.stack(sym_groups_padded)            # (B, max_sym, max_gsz)
+        batched_data_list['sym_group_sizes'] = torch.stack(sym_group_sizes_padded)  # (B, max_sym)
+        batched_data_list['num_sym_groups'] = num_sym_groups                        # (B,)
+
     return batched_data_list

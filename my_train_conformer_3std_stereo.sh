@@ -1,14 +1,13 @@
 dir=$(realpath "$(dirname "${BASH_SOURCE[0]}")")
 source $dir/env_vars.sh 
-CKPT="${REPO_ROOT}/proteinzen_weights/motif_scaffolding_model/lightning_logs/version_0/checkpoints/epoch=3278-step=780000_no_opt.ckpt"
 
 python ${REPO_ROOT}/train.py \
     domain=protein \
     paradigm=multiframefm \
     datamodule.batch_size=32 \
     datamodule.num_workers=16 \
-    model.c_s=768 \
-    model.c_cond=768 \
+    model.c_s=256 \
+    model.c_cond=256 \
     model.c_frame=256 \
     model.c_framepair=64 \
     model.z_broadcast=true \
@@ -19,20 +18,26 @@ python ${REPO_ROOT}/train.py \
     model.use_qk_norm=true \
     model.use_amp=true \
     model.rot_preconditioning=true \
-    model.num_blocks=12 \
+    model.num_blocks=8 \
     lmodule.use_ema=true \
     lmodule.strict_weight_loading=false \
-    corrupter.use_stochastic_centering=true \
-    corrupter.center_on_motif=true \
+    corrupter.use_stochastic_centering=false \
+    corrupter.center_on_motif=false \
     corrupter.trans_prior_std=3 \
     dataset.config="'${REPO_ROOT}/configs/train/data/geom_conformer.yaml'" \
     +dataset.val_config="'${REPO_ROOT}/configs/train/data/geom_conformer_val.yaml'" \
-    experiment.lightning.devices=8 \
+    experiment.lightning.devices=4 \
     experiment.lightning.strategy=ddp_find_unused_parameters_true \
     experiment.checkpointer.train_time_interval=null \
     experiment.checkpointer.every_n_train_steps=500 \
-    experiment.warm_start="'${CKPT}'" \
-    hydra.run.dir="'${REPO_ROOT}/outputs/geom_identityRot_conformer_3std_stereo/train'"
+    hydra.run.dir="'${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_norm_scale/train'" \
+    experiment.lightning.max_epochs=100 \
+    model.use_bond_rotation=false \
+    experiment.lightning.accumulate_grad_batches=2 \
+    lmodule.bond_rotation_head_only=false \
+    lmodule.scale_bond_length_loss=true \
+    lmodule.scale_bond_angle_loss=true \
+    lmodule.scale_ring_planarity_loss=true
 # python train.py \
 #     domain=protein \
 #     paradigm=multiframefm \

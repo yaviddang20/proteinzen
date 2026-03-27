@@ -1071,6 +1071,112 @@ class Pairformer(nn.Module):
         return s, z
 
 
+class BondRotationHead(nn.Module):
+    """Predicts a rotation angle (sin, cos) for each precomputed rotatable bond.
+
+    For bond (a, b), the predicted angle rotates the fragment on B's side
+    around the A→B axis. Fragment masks are precomputed in the dataset.
+    """
+    def __init__(self, c_s):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            Linear(2 * c_s + 3, c_s),
+            nn.ReLU(),
+            Linear(c_s, 2),  # (sin Δθ, cos Δθ)
+        )
+        nn.init.zeros_(self.mlp[-1].weight)                                                                                                                                                                                             
+        with torch.no_grad():
+            self.mlp[-1].bias.copy_(torch.tensor([0., 1.]))
+
+    def forward(self, node_embed, rigids_out, rot_bonds, num_rot_bonds):
+        """
+        node_embed   : (B, N_tokens, c_s)
+        rigids_out   : Rigid with trans (B, N_rigids, 3)
+        rot_bonds    : (B, max_bonds, 2) — precomputed atom-index pairs (a, b)
+        num_rot_bonds: (B,) — number of valid bonds per sample
+
+        Returns
+        -------
+        angles : (B, max_bonds, 2) — (sin θ, cos θ) per bond; padding zeroed
+        """
+        B, max_bonds, _ = rot_bonds.shape
+        if max_bonds == 0:
+            return rot_bonds.new_zeros(B, 0, 2, dtype=node_embed.dtype)
+
+        trans = rigids_out.get_trans()  # (B, N, 3)
+        ba = torch.arange(B, device=node_embed.device)[:, None]
+
+        atom_a = rot_bonds[..., 0]  # (B, max_bonds)
+        atom_b = rot_bonds[..., 1]
+
+        feat_a = node_embed[ba, atom_a]  # (B, max_bonds, c_s)
+        feat_b = node_embed[ba, atom_b]
+        pos_a = trans[ba, atom_a]       # (B, max_bonds, 3)
+        pos_b = trans[ba, atom_b]
+
+        bond_vec = F.normalize(pos_b - pos_a + 1e-8, dim=-1)
+        feats = torch.cat([feat_a, feat_b, bond_vec], dim=-1)
+        out = self.mlp(feats)
+        angles = F.normalize(out + 1e-8, dim=-1)  # unit circle
+
+        valid = (torch.arange(max_bonds, device=angles.device)[None, :] < num_rot_bonds[:, None])
+        angles = angles * valid[..., None].to(angles.dtype)
+        return angles
+
+
+def apply_bond_rotations(trans, rot_bonds, frag_a, angles, num_rot_bonds):
+    """Apply sequential Rodrigues rotations to update atom translations.
+
+    For each bond (a, b), rotates B-fragment atoms around the A→B axis.
+
+    Parameters
+    ----------
+    trans        : (B, N, 3)
+    rot_bonds    : (B, max_bonds, 2)
+    frag_a       : (B, max_bonds, N) bool — True for atoms on A's side
+    angles       : (B, max_bonds, 2) — (sin θ, cos θ)
+    num_rot_bonds: (B,)
+
+    Returns
+    -------
+    updated_trans : (B, N, 3)
+    """
+    B, N, _ = trans.shape
+    max_bonds = rot_bonds.shape[1]
+    if max_bonds == 0:
+        return trans
+
+    updated = trans.clone()
+    ba_idx = torch.arange(B, device=trans.device)
+
+    for b_idx in range(max_bonds):
+        valid = (b_idx < num_rot_bonds).float()[:, None, None]
+
+        atom_a = rot_bonds[:, b_idx, 0]
+        atom_b = rot_bonds[:, b_idx, 1]
+
+        pos_a = updated[ba_idx, atom_a]  # (B, 3)
+        pos_b = updated[ba_idx, atom_b]
+        axis = F.normalize(pos_b - pos_a + 1e-8, dim=-1)
+
+        sin_t = angles[:, b_idx, 0][:, None, None]
+        cos_t = angles[:, b_idx, 1][:, None, None]
+
+        mask_b = (~frag_a[:, b_idx, :]).float()[..., None]  # (B, N, 1)
+
+        center = pos_a[:, None, :]  # (B, 1, 3)
+        p = updated - center        # (B, N, 3)
+        ax = axis[:, None, :]       # (B, 1, 3)
+        cross = torch.cross(ax.expand_as(p), p, dim=-1)
+        dot = (ax * p).sum(-1, keepdim=True)
+        p_rot = cos_t * p + sin_t * cross + (1 - cos_t) * dot * ax
+        new_pos = p_rot + center
+
+        updated = updated + (new_pos - updated) * mask_b * valid
+
+    return updated
+
+
 class IpaMultiRigidDenoiser(nn.Module):
     def __init__(self,
                  c_s=768,
@@ -1117,7 +1223,8 @@ class IpaMultiRigidDenoiser(nn.Module):
                  self_conditioning=True,
                  self_folding=False,
                  use_residue_indexing=True,
-                 num_registers=0
+                 num_registers=0,
+                 use_bond_rotation=False,
                  ):
         super().__init__()
 
@@ -1216,6 +1323,10 @@ class IpaMultiRigidDenoiser(nn.Module):
             )
         else:
             self.registers = None
+
+        self.use_bond_rotation = use_bond_rotation
+        if use_bond_rotation:
+            self.bond_rotation_head = BondRotationHead(c_s)
 
     def forward(self, data, self_condition=None, self_folding=None, sanitize_motif_idx=False):
         token_data = data['token']
@@ -1316,6 +1427,22 @@ class IpaMultiRigidDenoiser(nn.Module):
         ret['denoised_rigids'] = rigids_out
         ret['decoded_seq_logits'] = seq_logits
         ret['pred_seq'] = pred_seq
+
+        # Bond rotation refinement for atomized (small molecule) tokens
+        if self.use_bond_rotation and 'rot_bonds' in data:
+            rot_bonds = data['rot_bonds']       # (B, max_bonds, 2)
+            frag_a = data['rot_frag_a']         # (B, max_bonds, N_rigids)
+            num_rot_bonds = data['num_rot_bonds']  # (B,)
+            if rot_bonds.shape[1] > 0:
+                node_embed = score_dict['node_embed'].float()
+                angles = self.bond_rotation_head(
+                    node_embed, rigids_out, rot_bonds, num_rot_bonds
+                )
+                updated_trans = apply_bond_rotations(
+                    rigids_out.get_trans().float(), rot_bonds, frag_a.bool(), angles, num_rot_bonds
+                )
+                ret['bond_updated_trans'] = updated_trans
+                ret['bond_angles'] = angles
 
         if self.direct_rot_vf_output:
             pred_rot_vf = score_dict['pred_rot_vf'].float() * self.rot_vf_scaling

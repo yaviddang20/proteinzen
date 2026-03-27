@@ -236,7 +236,11 @@ class BiomoleculeModule(L.LightningModule):
                  atom_rigid_upweight=True,
                  compile_model=False,
                  apply_self_folding=False,
-                 strict_weight_loading=True
+                 strict_weight_loading=True,
+                 bond_rotation_head_only=False,
+                 scale_bond_length_loss=False,
+                 scale_bond_angle_loss=False,
+                 scale_ring_planarity_loss=False,
     ):
         super().__init__()
         self._log = logging.getLogger(__name__)
@@ -246,6 +250,10 @@ class BiomoleculeModule(L.LightningModule):
         self.corrupter = corrupter
         self.optim = optim
         self.self_condition_rate = self_condition_rate
+        self.bond_rotation_head_only = bond_rotation_head_only
+        self.scale_bond_length_loss = scale_bond_length_loss
+        self.scale_bond_angle_loss = scale_bond_angle_loss
+        self.scale_ring_planarity_loss = scale_ring_planarity_loss
 
         self.use_cosine_lr_sched = use_cosine_lr_sched
         self.use_linear_warmup = use_linear_warmup
@@ -288,9 +296,15 @@ class BiomoleculeModule(L.LightningModule):
         for aatype, restype in AA_TO_RES.items():
             self.aatype_to_restype_tensor[aatype] = restype
 
-        if not strict_weight_loading:
+        if not strict_weight_loading or bond_rotation_head_only:
             warnings.warn("Model weights will be loaded with strict_loading=False, be sure you know what you're doing!")
             self.strict_loading = False
+
+        if bond_rotation_head_only:
+            assert hasattr(self.model, 'bond_rotation_head'), \
+                "bond_rotation_head_only=True requires model.use_bond_rotation=True"
+            for name, param in self.model.named_parameters():
+                param.requires_grad = name.startswith('bond_rotation_head.')
 
     def _generate_folding_batch(self, batch, pred_aatype):
         pred_seq_batch = copy.deepcopy(batch)
@@ -668,7 +682,10 @@ class BiomoleculeModule(L.LightningModule):
             fafe_l2_block_mask_size=1,
             rigidwise_weight=rigidwise_weight,
             direct_rot_vf_loss=self.direct_rot_vf_loss,
-            upweight_atomic=self.atom_rigid_upweight
+            upweight_atomic=self.atom_rigid_upweight,
+            scale_bond_length_loss=self.scale_bond_length_loss,
+            scale_bond_angle_loss=self.scale_bond_angle_loss,
+            scale_ring_planarity_loss=self.scale_ring_planarity_loss,
         )
 
         frame_vf_loss = (
@@ -704,7 +721,11 @@ class BiomoleculeModule(L.LightningModule):
                 + atomic_loss
             )
         
-        loss = loss + 1.0 * frame_fm_loss_dict['bond_angle_rmse'] + 1.0 * frame_fm_loss_dict['bond_length_rmse']
+        if self.bond_rotation_head_only:
+            loss = frame_fm_loss_dict['bond_rot_mse']
+        else:
+            loss = loss + 1.0 * frame_fm_loss_dict['bond_angle_rmse'] + 1.0 * frame_fm_loss_dict['bond_length_rmse']
+            loss = loss + frame_fm_loss_dict['ring_planarity_loss'] * 1.0 + frame_fm_loss_dict['bond_rot_mse'] * 0.01
 
         loss_dict = {"loss": loss.mean(), "frame_vf_loss": frame_vf_loss, "frame_vf_loss_unscaled": unscaled_frame_vf_loss}
         loss_dict['loss_per_batch'] = loss
@@ -723,6 +744,14 @@ class BiomoleculeModule(L.LightningModule):
         # loss_dict[inputs['task'].name + "_frame_vf_loss"] = frame_vf_loss
         # loss_dict[inputs['task'].name + "_frame_vf_loss_unscaled"] = unscaled_frame_vf_loss
 
+
+        if 'bond_angles' in outputs:
+            angles = outputs['bond_angles']  # (B, max_bonds, 2) — (sin θ, cos θ)
+            num_rot_bonds = inputs['num_rot_bonds']  # (B,)
+            valid = (torch.arange(angles.shape[1], device=angles.device)[None, :] < num_rot_bonds[:, None])
+            theta_deg = torch.atan2(angles[..., 0], angles[..., 1]).abs() * (180.0 / torch.pi)
+            mean_angle_deg = (theta_deg * valid).sum() / valid.sum().clamp(min=1)
+            loss_dict['bond_rot_angle_deg'] = mean_angle_deg.detach()
 
         loss_dict.update(frame_fm_loss_dict)
         loss_dict.update(atomic_loss_dict)
@@ -752,6 +781,19 @@ class BiomoleculeModule(L.LightningModule):
             )
 
             # print("grad norm", total_norm)
+
+            if hasattr(self.model, 'bond_rotation_head'):
+                head_norms = [
+                    torch.linalg.vector_norm(p.grad.view(-1))
+                    for p in self.model.bond_rotation_head.parameters()
+                    if p.grad is not None
+                ]
+                if head_norms:
+                    self.log("bond_rot_head_grad_norm", torch.stack(head_norms).norm(),
+                             prog_bar=False, logger=True, on_step=True, on_epoch=False, batch_size=1)
+                else:
+                    self.log("bond_rot_head_grad_norm", 0.0,
+                             prog_bar=False, logger=True, on_step=True, on_epoch=False, batch_size=1)
 
         self.log(
             "grad_norm",
@@ -1059,7 +1101,11 @@ class BiomoleculeModule(L.LightningModule):
 
 
     def configure_optimizers(self):
-        optimizer = self.optim(self.model.parameters())
+        if self.bond_rotation_head_only:
+            params = self.model.bond_rotation_head.parameters()
+        else:
+            params = self.model.parameters()
+        optimizer = self.optim(params)
 
         if self.use_lr_step_decay:
             scheduler = get_mult_decay_schedule(
