@@ -2,13 +2,15 @@ dir=$(realpath "$(dirname "${BASH_SOURCE[0]}")")
 source $dir/env_vars.sh
 eval "$(micromamba shell hook --shell bash)"
 micromamba activate $ENV_NAME
+model_name=geom_identityRot_256_conformer_6std_stereo_norm_scale
+split="train"
 # CUDA_VISIBLE_DEVICES=0
 
 python $REPO_ROOT/sample.py \
-    model_dir=${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_bondlength/train \
-    out_dir=${REPO_ROOT}/sampling/geom_conformer_train/geom_identityRot_256_conformer_3std_bondlength \
-    sampler.tasks_yaml=${REPO_ROOT}/sampling/geom_conformer_train/smiles.yaml \
+    model_dir=${REPO_ROOT}/outputs/${model_name}/${split} \
+    out_dir=${REPO_ROOT}/sampling/geom_conformer_${split}/${model_name} \
+    sampler.tasks_yaml=${REPO_ROOT}/sampling/geom_conformer_${split}/smiles.yaml \
     sampler.batch_size=32 \
     save_traj=true \
-    +version_num=29 \
+    +version_num=48835 \
     corrupter.sampling_noise_mode=null

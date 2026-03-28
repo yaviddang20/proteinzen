@@ -25,7 +25,7 @@ python ${REPO_ROOT}/train.py \
     corrupter.center_on_motif=false \
     corrupter.trans_prior_std=1 \
     dataset.config="'${REPO_ROOT}/configs/train/data/geom_conformer.yaml'" \
-    +dataset.val_config="'${REPO_ROOT}/configs/train/data/geom_conformer_val.yaml'" \
+    dataset.val_config="'${REPO_ROOT}/configs/train/data/geom_conformer_val.yaml'" \
     experiment.lightning.devices=8 \
     experiment.lightning.strategy=ddp_find_unused_parameters_true \
     experiment.checkpointer.train_time_interval=null \
@@ -38,7 +38,7 @@ python ${REPO_ROOT}/train.py \
     lmodule.scale_bond_length_loss=true \
     lmodule.scale_bond_angle_loss=true \
     lmodule.scale_ring_planarity_loss=true \
-    corrupter.use_harmonic_prior=true
+    corrupter.use_harmonic_prior=true \
     corrupter.mol_harmonic_prior_std=1
 # python train.py \
 #     domain=protein \
