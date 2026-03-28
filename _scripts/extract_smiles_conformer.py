@@ -2,10 +2,12 @@ import json
 import random
 import hashlib
 import shutil
+import traceback
 import yaml
 import numpy as np
 from pathlib import Path
 from collections import Counter
+from multiprocessing import Pool, cpu_count
 from rdkit import Chem
 from rdkit.Chem.rdchem import RWMol, Conformer
 from rdkit.Geometry import Point3D
@@ -131,7 +133,19 @@ def write_geom_drugs_molecule_to_pdb(npz_paths, output_dir):
     return output_paths
 
 
-def write_conformer_pdb_paths(smiles_sample, manifest, output_dir, dataset_dir):
+def _write_conformer_worker(args):
+    """Top-level worker for multiprocessing: processes one SMILES entry."""
+    smiles, molecule_ids, output_dir, dataset_dir = args
+    npz_paths = get_npz_paths(molecule_ids, dataset_dir)
+    try:
+        return write_geom_drugs_molecule_to_pdb(npz_paths=npz_paths, output_dir=output_dir)[0]
+    except Exception:
+        print(f"Failed for {smiles[:60]}...")
+        traceback.print_exc()
+        return None
+
+
+def write_conformer_pdb_paths(smiles_sample, manifest, output_dir, dataset_dir, num_workers=None):
     smiles_to_use = sorted([str(s) for s in smiles_sample])
 
     print("Building SMILES to molecule ID mapping...")
@@ -146,28 +160,19 @@ def write_conformer_pdb_paths(smiles_sample, manifest, output_dir, dataset_dir):
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    first_conformer_output_pdb_paths = []
+    worker_args = []
     for smiles in smiles_to_use:
-        smiles = str(smiles)
-
         if smiles not in smiles_to_ids:
             print(f"SMILES not found in manifest: {smiles[:60]}...")
             continue
+        worker_args.append((smiles, smiles_to_ids[smiles], output_dir, dataset_dir))
 
-        molecule_ids = smiles_to_ids[smiles]
-        npz_paths = get_npz_paths(molecule_ids, dataset_dir)
+    n_workers = num_workers or cpu_count()
+    print(f"Processing {len(worker_args)} molecules with {n_workers} workers...")
+    with Pool(processes=n_workers) as pool:
+        results = pool.map(_write_conformer_worker, worker_args)
 
-        try:
-            first_conformer_output_pdb_paths.append(write_geom_drugs_molecule_to_pdb(
-                npz_paths=npz_paths,
-                output_dir=output_dir
-            )[0])
-        except Exception:
-            import traceback
-            print(f"Failed for {smiles[:60]}...")
-            traceback.print_exc()
-
-    return first_conformer_output_pdb_paths
+    return [p for p in results if p is not None]
 
 
 def write_mol_yaml(first_conformer_output_pdb_paths, output_yaml):
