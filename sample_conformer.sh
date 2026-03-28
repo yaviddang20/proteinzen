@@ -4,7 +4,7 @@ eval "$(micromamba shell hook --shell bash)"
 micromamba activate $ENV_NAME
 model_name=geom_identityRot_256_conformer_6std_stereo_norm_scale
 split="train"
-trans_std=3
+trans_std=1
 # CUDA_VISIBLE_DEVICES=0
 
 python $REPO_ROOT/sample.py \
