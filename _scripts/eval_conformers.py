@@ -870,9 +870,10 @@ for mode in _modes:
     no_match_mol_ids = set(mol_id for mol_id, _ in connectivity_no_match_all) | \
                        set(mol_id for mol_id, _ in stereo_no_match_all) | \
                        set(mol_id for mol_id, _ in exact_no_match_all)
-    perfect = [(mol_id, ref_mol_id_to_display_smis[mol_id][1])
+    perfect = [(mol_id, ref_mol_id_to_display_smis.get(mol_id, ('?', '?'))[1])
                for mol_id in sorted(groups.keys())
-               if mol_id not in no_match_mol_ids]
+               if mol_id not in no_match_mol_ids
+               and mol_id in ref_mol_id_to_display_smis]
     if perfect:
         print(f"\n--- Perfectly matched molecules ({len(perfect)}/{len(groups)}, all conformers exact match) ---")
         for mol_id, smi in perfect:
@@ -948,16 +949,18 @@ for mol_id in sorted(set(gen_energies) | set(ref_energies)):
 
 df = pd.DataFrame(rows)
 print(f"Perfectly matched molecules: {len(df)}/30")
-print(df.to_string(index=False))
 
-print(f"\n--- Aggregate (kcal/mol, perfectly matched only) ---")
-print(f"  Mean gen_min  energy:     {df['gen_min'].mean():.2f}")
-print(f"  Mean ref_min  energy:     {df['ref_min'].mean():.2f}")
-print(f"  Mean ref BW-mean energy:  {df['ref_bw_mean'].mean():.2f}")
-print(f"  Mean Δmin (gen-ref):      {df['Δmin (gen-ref)'].mean():.2f}")
-
-df.to_csv(OUT_STATS_DIR / f"energy_stats_{mode}.csv", index=False)
-print(f"Energy stats saved to {OUT_STATS_DIR / f'energy_stats_{mode}.csv'}")
+if df.empty:
+    print("  (no perfectly matched molecules — skipping energy aggregate)")
+else:
+    print(df.to_string(index=False))
+    print(f"\n--- Aggregate (kcal/mol, perfectly matched only) ---")
+    print(f"  Mean gen_min  energy:     {df['gen_min'].mean():.2f}")
+    print(f"  Mean ref_min  energy:     {df['ref_min'].mean():.2f}")
+    print(f"  Mean ref BW-mean energy:  {df['ref_bw_mean'].mean():.2f}")
+    print(f"  Mean Δmin (gen-ref):      {df['Δmin (gen-ref)'].mean():.2f}")
+    df.to_csv(OUT_STATS_DIR / f"energy_stats_{mode}.csv", index=False)
+    print(f"Energy stats saved to {OUT_STATS_DIR / f'energy_stats_{mode}.csv'}")
 
 # ============================================================
 # Main — min-energy aligned pairs
