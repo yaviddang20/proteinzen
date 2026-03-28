@@ -65,12 +65,14 @@ class UnconditionalSamplingFromSMILES(SamplingTask):
         self,
         smiles: str,
         num_samples: int,
+        trans_std: float = 3,
         **kwargs
     ):
         super().__init__(**kwargs)
 
         self.smiles = smiles
         self.num_samples = num_samples
+        self.trans_std = trans_std
 
     def igso3(self):
         sigma_grid = torch.linspace(0.1, 1.5, 1000)
@@ -96,7 +98,7 @@ class UnconditionalSamplingFromSMILES(SamplingTask):
             token_data, rigid_data, token_bonds, _ = sample_noise_from_struct_template(
                 struct,
                 igso3=igso3,
-                trans_std=3
+                trans_std=self.trans_std
             )
             data = Tokenized(
                 tokens=token_data,
@@ -128,12 +130,14 @@ class UnconditionalSamplingFromMol(SamplingTask):
         self,
         mol_pdb_path: str,
         num_samples: int,
+        trans_std: float = 3,
         **kwargs
     ):
         super().__init__(**kwargs)
 
         self.mol = Chem.MolFromPDBFile(mol_pdb_path)
         self.num_samples = num_samples
+        self.trans_std = trans_std
 
     def igso3(self):
         sigma_grid = torch.linspace(0.1, 1.5, 1000)
@@ -158,7 +162,7 @@ class UnconditionalSamplingFromMol(SamplingTask):
             token_data, rigid_data, token_bonds, _ = sample_noise_from_struct_template(
                 struct,
                 igso3=igso3,
-                trans_std=3
+                trans_std=self.trans_std
             )
 
             # print("token_data", token_data)
