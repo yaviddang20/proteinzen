@@ -112,6 +112,33 @@ def align_structures(
     return batch_positions_rotated, reference_positions, rotation_matrices
 
 # from eigenfold
+class MolecularHarmonicPrior:
+    """Harmonic prior for small molecules using actual bond connectivity.
+
+    Builds a graph Laplacian from the bond adjacency matrix per sample and
+    samples from the resulting Gaussian (zero-ing the translation mode).
+    Spring constant a = 1/bond_length^2 with bond_length=1.5 Å by default.
+    """
+    def __init__(self, bond_length=1.5):
+        self.a = 1.0 / (bond_length ** 2)
+
+    def sample(self, adj, std=1.0):
+        """
+        adj: [N, N] float tensor, binary bond adjacency
+        std: scalar scale factor applied to samples
+        returns: [N, 3] tensor
+        """
+        n = adj.shape[0]
+        device, dtype = adj.device, adj.dtype
+        degree = adj.sum(dim=-1)
+        J = -self.a * adj.clone()
+        J[torch.arange(n, device=device), torch.arange(n, device=device)] = self.a * degree
+        D, P = torch.linalg.eigh(J)
+        D_inv = torch.where(D > 1e-6, 1.0 / D, torch.zeros_like(D))
+        z = torch.randn(n, 3, device=device, dtype=dtype)
+        return std * (P @ (torch.sqrt(D_inv)[:, None] * z))
+
+
 class HarmonicPrior:
     def __init__(self, N = 256, a=3/(3.8**2)):
         J = torch.zeros(N, N)
@@ -197,7 +224,9 @@ class MultiSE3Interpolant:
                  unconditional_guidance_alpha=0.0,
                  dynamic_cfg=False,
                  rot_g_t_fn="fn1",
-                 trans_g_t_fn="fn1"
+                 trans_g_t_fn="fn1",
+                 use_harmonic_prior=False,
+                 mol_harmonic_prior_std=None,
     ):
         self._igso3 = None
 
@@ -246,6 +275,11 @@ class MultiSE3Interpolant:
         assert trans_g_t_fn in ['fn1', 'fn2', 'fn3', 'fn4', 'fn5', 'fn6'] or trans_g_t_fn.startswith("poly") or trans_g_t_fn.startswith("tan")
         self._rot_g_t_fn = rot_g_t_fn
         self._trans_g_t_fn = trans_g_t_fn
+
+        self.use_harmonic_prior = use_harmonic_prior
+        # default scale matches Gaussian prior std so behaviour is consistent out of the box
+        self.mol_harmonic_prior_std = mol_harmonic_prior_std if mol_harmonic_prior_std is not None else trans_prior_std
+        self._mol_harmonic_prior = MolecularHarmonicPrior() if use_harmonic_prior else None
 
 
     @property
@@ -485,6 +519,43 @@ class MultiSE3Interpolant:
         res_data["rigids_1"] = rigids_1.to_tensor_7()
         return batch
 
+    def _sample_trans_prior(self, trans_1, batch):
+        """Sample translation noise, using harmonic prior for molecule rigids if enabled."""
+        trans_0 = torch.randn_like(trans_1) * self.trans_prior_std
+        trans_0 = trans_0 - trans_0.mean(dim=1)[..., None, :]
+
+        if not self.use_harmonic_prior:
+            return trans_0
+
+        token_data = batch["token"]
+        token_bonds = token_data["token_bonds"]   # [B, N_tok, N_tok]
+        mol_type = token_data["mol_type"]          # [B, N_tok]
+        rigids_seq_idx = batch["rigids"]["rigids_seq_idx"]  # [B, N_rigids]
+        rigids_mask = batch["rigids"]["rigids_mask"].bool()  # [B, N_rigids]
+
+        for b in range(trans_1.shape[0]):
+            is_mol_token = (mol_type[b] == 3)  # NONPOLYMER
+            mol_tok_indices = is_mol_token.nonzero(as_tuple=True)[0]
+            if mol_tok_indices.numel() == 0:
+                continue
+
+            is_mol_rigid = is_mol_token[rigids_seq_idx[b]] & rigids_mask[b]
+            mol_rigid_indices = is_mol_rigid.nonzero(as_tuple=True)[0]
+            if mol_rigid_indices.numel() == 0:
+                continue
+
+            n_mol = mol_tok_indices.numel()
+            adj = (token_bonds[b][mol_tok_indices][:, mol_tok_indices] > 0).float()
+            harmonic_sample = self._mol_harmonic_prior.sample(adj, std=self.mol_harmonic_prior_std)
+
+            # map each mol rigid to its position in harmonic_sample via token index
+            tok_to_pos = torch.full((mol_type[b].shape[0],), -1, dtype=torch.long, device=trans_1.device)
+            tok_to_pos[mol_tok_indices] = torch.arange(n_mol, device=trans_1.device)
+            rigid_mol_pos = tok_to_pos[rigids_seq_idx[b, mol_rigid_indices]]
+            trans_0[b, mol_rigid_indices] = harmonic_sample[rigid_mol_pos]
+
+        return trans_0
+
     # @torch.no_grad()
     def corrupt_dense_batch(self, batch):
         rigids_data = batch["rigids"]
@@ -506,9 +577,8 @@ class MultiSE3Interpolant:
         #     device=rotmats_1.device,
         #     dtype=torch.float32
         # ).expand(*rotmats_1.shape[:-2], 3, 3)
-        
-        trans_0 = torch.randn_like(trans_1) * self.trans_prior_std
-        trans_0 = trans_0 - trans_0.mean(dim=1)[..., None, :]
+
+        trans_0 = self._sample_trans_prior(trans_1, batch)
 
         if self.center_on_motif:
             # center samples on the center of the fixed region
