@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(grep:*)",
+      "Bash(conda run:*)",
+      "Bash(ls:*)",
+      "Bash(kill 3456597:*)",
+      "Bash(kill 3473358:*)",
+      "Bash(OMP_NUM_THREADS=4 conda run:*)",
+      "Bash(conda env:*)",
+      "Bash(find /datastor1/dy4652/proteinzen -type f -name \"*.py\" -exec grep -l \"chiral_atom_index\\\\|stereo_bond_index\\\\|SetProp.*chiral\\\\|aromatic_.*_ring\" {} \\\\; 2>/dev/null | head -15)",
+      "Bash(find /datastor1/dy4652/proteinzen -name \"train.py\" -not -path \"*/node_modules/*\" 2>/dev/null | head -20)",
+      "Bash(find /datastor1/dy4652/proteinzen -name *.py -type f -exec grep -l \"torsion\\\\|chi\\\\|dihedral\" {})",
+      "Bash(2)",
+      "Bash(/tmp/structure_summary.txt:*)",
+      "Read(//tmp/**)",
+      "Bash(find /datastor1/dy4652/proteinzen/configs -name multiframefm* -o -name protein*)",
+      "Bash(find /datastor1/dy4652/proteinzen -name experiment*.yaml -o -name multiframefm*.yaml)",
+      "Bash(find /datastor1/dy4652/proteinzen -name *.yaml ! -path */configs/train/data/* ! -path */sampling/*)",
+      "Bash(xtb --version)",
+      "Bash(python:*)"
+    ]
+  }
+}
