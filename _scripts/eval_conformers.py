@@ -259,55 +259,6 @@ def mmff_energy(mol):
     return ff.CalcEnergy()
 
 
-def xtb_relax_delta(mol):
-    """Return xTB(raw) - xTB(MMFF-relaxed) in kcal/mol.
-    Uses MMFF for geometry relaxation (fast), xTB single-points for energy.
-    Positive = conformer had strain vs its MMFF local minimum.
-    NaN if either step fails."""
-    try:
-        mol = Chem.RemoveHs(mol)
-        mol = Chem.AddHs(mol, addCoords=True)
-
-        # --- xTB energy at original geometry ---
-        numbers = np.array([a.GetAtomicNum() for a in mol.GetAtoms()], dtype=np.int32)
-        conf = mol.GetConformer()
-        pos_orig = np.array([conf.GetAtomPosition(i) for i in range(mol.GetNumAtoms())],
-                            dtype=np.float64) * ANGSTROM_TO_BOHR
-
-        calc = Calculator(Param.GFN2xTB, numbers, pos_orig)
-        calc.set_verbosity(0)
-        e_before = calc.singlepoint().get_energy()
-        if not np.isfinite(e_before):
-            print(f"    [xtb_relax_delta] initial SP non-finite: {e_before}")
-            return float('nan')
-
-        # --- MMFF geometry relaxation (fast proxy for local minimum) ---
-        mol_opt = Chem.RWMol(mol)
-        props = AllChem.MMFFGetMoleculeProperties(mol_opt)
-        if props is None:
-            print(f"    [xtb_relax_delta] MMFF props failed")
-            return float('nan')
-        ff = AllChem.MMFFGetMoleculeForceField(mol_opt, props)
-        ff.Minimize(maxIts=500)
-
-        # --- xTB energy at MMFF-relaxed geometry ---
-        conf_opt = mol_opt.GetConformer()
-        pos_opt = np.array([conf_opt.GetAtomPosition(i) for i in range(mol_opt.GetNumAtoms())],
-                           dtype=np.float64) * ANGSTROM_TO_BOHR
-
-        calc2 = Calculator(Param.GFN2xTB, numbers, pos_opt)
-        calc2.set_verbosity(0)
-        e_after = calc2.singlepoint().get_energy()
-        if not np.isfinite(e_after):
-            print(f"    [xtb_relax_delta] post-MMFF SP non-finite: {e_after}")
-            return float('nan')
-
-        return (e_before - e_after) * HARTREE_TO_KCALMOL
-    except Exception as e:
-        print(f"    [xtb_relax_delta] exception: {type(e).__name__}: {e}")
-        return float('nan')
-
-
 def clash_count(mol, scale=0.75):
     conf = mol.GetConformer()
     pts = np.array([conf.GetAtomPosition(i) for i in range(mol.GetNumAtoms())])
@@ -381,10 +332,23 @@ import glob
 from pathlib import Path
 from collections import defaultdict
 import numpy as np
+import sys
 from rdkit import Chem, RDLogger
 from joblib import Parallel, delayed
 import multiprocessing as mp
 import os
+
+
+class _Tee:
+    """Write to multiple file-like objects simultaneously (e.g. stdout + log file)."""
+    def __init__(self, *files):
+        self._files = files
+    def write(self, data):
+        for f in self._files:
+            f.write(data)
+    def flush(self):
+        for f in self._files:
+            f.flush()
 
 # ============================================================
 # USER SETTINGS
@@ -490,7 +454,7 @@ def compute_reference_rmsf_mean(ref_key_to_mols):
 
 
 def make_metric_lists():
-    return {k: [] for k in ['amr_r','cov_r','amr_p','cov_p','rmsd','bl','ba','tor','clash','rmsf','relax_e']}
+    return {k: [] for k in ['amr_r','cov_r','amr_p','cov_p','rmsd','bl','ba','tor','clash','rmsf']}
 
 
 def append_metrics(agg, metrics):
@@ -596,6 +560,11 @@ for mode in _modes:
   PRED_GLOB = f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/samples/*.pdb"
   OUT_ALIGN_DIR = Path(f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/aligned_pairs")
   OUT_ALIGN_DIR.mkdir(exist_ok=True, parents=True)
+  OUT_STATS_DIR = Path(f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/eval_stats")
+  OUT_STATS_DIR.mkdir(exist_ok=True, parents=True)
+  _stats_log = open(OUT_STATS_DIR / f"eval_{mode}.txt", 'w')
+  _orig_stdout = sys.stdout
+  sys.stdout = _Tee(_orig_stdout, _stats_log)
 
   print(f"\n{'='*60}")
   print(f"  MODE: {mode.upper()}")
@@ -718,7 +687,6 @@ for mode in _modes:
       print(f"  Torsion MAE:    {mean_or_nan(agg['tor']):.4f}")
       print(f"  Clashes:        {mean_or_nan(agg['clash']):.4f}")
       print(f"  RMSF (gen):     {mean_or_nan(agg['rmsf']):.4f}")
-      print(f"  Relax ΔE (xTB): {mean_or_nan(agg['relax_e']):.4f} kcal/mol")
 
   print(f"\n  RMSF (ref):     {ref_rmsf_mean}")
 
@@ -786,6 +754,10 @@ for mode in _modes:
           print(f"  [{mol_id}]  {smi}")
   else:
       print("\n--- Perfectly matched molecules: none ---")
+
+  sys.stdout = _orig_stdout
+  _stats_log.close()
+  print(f"Eval stats saved to {OUT_STATS_DIR / f'eval_{mode}.txt'}")
 
 
 # In[5]:
@@ -944,50 +916,8 @@ print(f"  Mean ref_min  energy:     {df['ref_min'].mean():.2f}")
 print(f"  Mean ref BW-mean energy:  {df['ref_bw_mean'].mean():.2f}")
 print(f"  Mean Δmin (gen-ref):      {df['Δmin (gen-ref)'].mean():.2f}")
 
-
-# ============================================================
-# Relax ΔE — computed outside parallel block to avoid xTB fork issues.
-# Per molecule: min-energy gen vs min-energy ref conformer.
-# ============================================================
-
-print("\nComputing xTB relaxation energies (min-energy conformers per molecule)...")
-
-relax_rows = []
-for mol_id in tqdm(sorted(perfect_mol_ids)):
-    gen_ents = [(p, e) for p, e in gen_energies.get(mol_id, []) if np.isfinite(e)]
-    ref_ents = [(p, e, w) for p, e, w in ref_energies.get(mol_id, []) if np.isfinite(e)]
-    if not gen_ents or not ref_ents:
-        continue
-
-    gen_min_path, _ = min(gen_ents, key=lambda x: x[1])
-    ref_min_path, _, _ = min(ref_ents, key=lambda x: x[1])
-
-    gen_mol, *_ = load_and_prepare(gen_min_path)
-    ref_mol, *_ = load_and_prepare(ref_min_path)
-
-    if gen_mol is None:
-        print(f"    [relax] gen_mol is None for {mol_id[:16]}")
-    if ref_mol is None:
-        print(f"    [relax] ref_mol is None for {mol_id[:16]}")
-    gen_relax = xtb_relax_delta(gen_mol) if gen_mol is not None else float('nan')
-    ref_relax = xtb_relax_delta(ref_mol) if ref_mol is not None else float('nan')
-
-    relax_rows.append({
-        'mol_id':           mol_id[:16] + '…',
-        'gen_relax_e':      gen_relax,
-        'ref_relax_e':      ref_relax,
-        'Δrelax (gen-ref)': gen_relax - ref_relax,
-    })
-
-if relax_rows:
-    df_relax = pd.DataFrame(relax_rows)
-    print(df_relax.to_string(index=False))
-    print(f"\n  Mean gen relax ΔE:      {df_relax['gen_relax_e'].mean():.2f} kcal/mol")
-    print(f"  Mean ref relax ΔE:      {df_relax['ref_relax_e'].mean():.2f} kcal/mol")
-    print(f"  Mean Δrelax (gen-ref):  {df_relax['Δrelax (gen-ref)'].mean():.2f} kcal/mol")
-    agg_conn['relax_e'] = df_relax['gen_relax_e'].dropna().tolist()
-else:
-    agg_conn['relax_e'] = []
+df.to_csv(OUT_STATS_DIR / f"energy_stats_{mode}.csv", index=False)
+print(f"Energy stats saved to {OUT_STATS_DIR / f'energy_stats_{mode}.csv'}")
 
 
 # In[ ]:
