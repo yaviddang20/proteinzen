@@ -1,36 +1,76 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
+# ============================================================
+# Imports
+# ============================================================
 
-
-from pathlib import Path
+import argparse
 import glob
-import re
+import json
+import multiprocessing as mp
+import os
+import sys
+from collections import defaultdict
+from itertools import product as iproduct
+from pathlib import Path
 
-from rdkit import Chem, RDLogger
-from rdkit.Chem import AllChem, rdMolAlign, rdmolfiles
-from rdkit.Chem import rdMolTransforms
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+from joblib import Parallel, delayed
+from rdkit import Chem, RDLogger
+from rdkit.Chem import AllChem, rdMolAlign, rdmolfiles, rdMolTransforms
+from rdkit.Chem import rdchem, rdmolops
+from tqdm.auto import tqdm
+from xtb.interface import Calculator, Param
 
-# Silence RDKit logs (explicit valence errors, sanitization warnings, etc.)
 RDLogger.DisableLog('rdApp.*')
 
+# ============================================================
+# Constants
+# ============================================================
 
-# In[2]:
+ANGSTROM_TO_BOHR   = 1.8897259886
+HARTREE_TO_KCALMOL = 627.509474
+
+# ============================================================
+# I/O helpers
+# ============================================================
+
+class _Tee:
+    """Write to multiple file-like objects simultaneously (e.g. stdout + log file)."""
+    def __init__(self, *files):
+        self._files = files
+    def write(self, data):
+        for f in self._files:
+            f.write(data)
+    def flush(self):
+        for f in self._files:
+            f.flush()
 
 
-# for pdb_path in glob.glob("sampling/train_ref/*.pdb"):
-#     pdb_num = int(re.search(r'(\d+).pdb', pdb_path).group(1))
-#     mol = Chem.MolFromPDBFile(pdb_path)
-#     Chem.MolToPDBFile(mol, f"sampling/test_{pdb_num}.pdb")
+def _clean_pdb_block(block):
+    """Strip END and CONECT records from a MolToPDBBlock — keeps multi-MODEL files clean."""
+    lines = block.splitlines(keepends=True)
+    return "".join(l for l in lines if not l.startswith(("END", "CONECT")))
 
 
-# In[2]:
+def save_best_pair(m1, m2, out_path):
+    m1 = Chem.RemoveHs(m1)
+    m2 = Chem.RemoveHs(m2)
+    with open(out_path, "w") as f:
+        f.write("MODEL        1\n")
+        f.write(_clean_pdb_block(rdmolfiles.MolToPDBBlock(m1, flavor=4)))
+        f.write("ENDMDL\n")
+        f.write("MODEL        2\n")
+        f.write(_clean_pdb_block(rdmolfiles.MolToPDBBlock(m2, flavor=4)))
+        f.write("ENDMDL\n")
+        f.write("END\n")
 
-
-from rdkit.Chem import rdchem, rdmolops
-
+# ============================================================
+# Molecule key / matching
+# ============================================================
 
 def mol_to_match_key(mol, stereo=False):
     """
@@ -84,6 +124,32 @@ def load_pdb(path, perceive_stereo=False):
         Chem.AssignStereochemistry(mol, cleanIt=False, force=True)
     return mol
 
+
+def load_and_prepare(pdb_path):
+    mol = load_pdb(pdb_path, perceive_stereo=False)
+    if mol is None:
+        return None, None, None, None, None, None
+    mol = Chem.AddHs(mol)
+
+    display_smi_no_stereo = canon_smi_from_mol(mol, stereo=False)
+    match_no_stereo = mol_to_match_key(mol, stereo=False)
+
+    mol_stereo = load_pdb(pdb_path, perceive_stereo=True)
+    if mol_stereo is not None:
+        mol_stereo = Chem.AddHs(mol_stereo)
+        display_smi_stereo = canon_smi_from_mol(mol_stereo, stereo=True)
+        match_stereo = mol_to_match_key(mol_stereo, stereo=True)
+        match_exact = mol_to_exact_key(mol_stereo)
+    else:
+        display_smi_stereo = display_smi_no_stereo
+        match_stereo = match_no_stereo
+        match_exact = match_no_stereo
+
+    return mol, match_no_stereo, match_stereo, match_exact, display_smi_no_stereo, display_smi_stereo
+
+# ============================================================
+# Geometry metrics
+# ============================================================
 
 def heavy_atom_rmsd(mol_ref, mol_gen):
     ref = Chem.RemoveHs(mol_ref)
@@ -166,7 +232,6 @@ def _equiv_groups(mol, center_idx, exclude_idx):
     """Return list-of-lists: neighbors of center_idx (excluding exclude_idx)
     grouped by chemical equivalence (same atom_priority).  Each group is a
     list of atom indices that are symmetrically interchangeable."""
-    from collections import defaultdict
     nbrs = [n.GetIdx() for n in mol.GetAtomWithIdx(center_idx).GetNeighbors()
             if n.GetIdx() != exclude_idx]
     buckets = defaultdict(list)
@@ -185,7 +250,6 @@ def torsion_mae(mol_ref, mol_gen):
     correctly generating a conformation but with substituents labelled in a
     different-but-equivalent order.
     """
-    from itertools import product as iproduct
     mol_ref = Chem.RemoveHs(mol_ref)
     mol_gen = Chem.RemoveHs(mol_gen)
     conf_r = mol_ref.GetConformer()
@@ -253,12 +317,6 @@ def heavy_atom_rmsf(mol_list, align_first=True):
     return float(np.mean(rmsf_per_atom))
 
 
-def mmff_energy(mol):
-    props = AllChem.MMFFGetMoleculeProperties(mol)
-    ff = AllChem.MMFFGetMoleculeForceField(mol, props)
-    return ff.CalcEnergy()
-
-
 def clash_count(mol, scale=0.75):
     conf = mol.GetConformer()
     pts = np.array([conf.GetAtomPosition(i) for i in range(mol.GetNumAtoms())])
@@ -282,94 +340,83 @@ def clash_count(mol, scale=0.75):
                 clashes += 1
     return clashes
 
+# ============================================================
+# Energy
+# ============================================================
 
-def _clean_pdb_block(block):
-    """Strip END and CONECT records from a MolToPDBBlock — keeps multi-MODEL files clean."""
-    lines = block.splitlines(keepends=True)
-    return "".join(l for l in lines if not l.startswith(("END", "CONECT")))
+def mmff_energy(mol):
+    props = AllChem.MMFFGetMoleculeProperties(mol)
+    ff = AllChem.MMFFGetMoleculeForceField(mol, props)
+    return ff.CalcEnergy()
 
 
-def load_and_prepare(pdb_path):
-    mol = load_pdb(pdb_path, perceive_stereo=False)
+def xtb_energy(mol):
+    """Calculate GFN2-xTB single-point energy. Returns energy in kcal/mol, or NaN on failure."""
+    try:
+        mol = Chem.RemoveHs(mol)
+        mol = Chem.AddHs(mol, addCoords=True)
+
+        numbers = np.array([atom.GetAtomicNum() for atom in mol.GetAtoms()], dtype=np.int32)
+        conf = mol.GetConformer()
+        positions = np.array(
+            [conf.GetAtomPosition(i) for i in range(mol.GetNumAtoms())],
+            dtype=np.float64
+        ) * ANGSTROM_TO_BOHR  # Å → Bohr
+
+        calc = Calculator(Param.GFN2xTB, numbers, positions)
+        calc.set_verbosity(0)
+        res = calc.singlepoint()
+        return res.get_energy() * HARTREE_TO_KCALMOL
+    except Exception:
+        return float('nan')
+
+# ============================================================
+# Boltzmann weights / energy-per-path helpers
+# ============================================================
+
+def load_boltzmann_weights(mol_id):
+    """Load (conformer_id -> boltzmann_weight) from record JSON. Returns {} on failure."""
+    mid = mol_id[1:3]
+    for split in ("train", "val", "test"):
+        record_path = GEOM_DATADIR / split / "records" / mid / f"{mol_id}.json"
+        if record_path.exists():
+            with record_path.open() as f:
+                rec = json.load(f)
+            return {cid: w for cid, w in zip(rec["ids"], rec["boltzmann_weights"])}
+    return {}
+
+
+def _energy_for_path(p):
+    mol, *_ = load_and_prepare(p)
     if mol is None:
-        return None, None, None, None, None, None
-    mol = Chem.AddHs(mol)
-
-    display_smi_no_stereo = canon_smi_from_mol(mol, stereo=False)
-    match_no_stereo = mol_to_match_key(mol, stereo=False)
-
-    mol_stereo = load_pdb(pdb_path, perceive_stereo=True)
-    if mol_stereo is not None:
-        mol_stereo = Chem.AddHs(mol_stereo)
-        display_smi_stereo = canon_smi_from_mol(mol_stereo, stereo=True)
-        match_stereo = mol_to_match_key(mol_stereo, stereo=True)
-        match_exact = mol_to_exact_key(mol_stereo)
-    else:
-        display_smi_stereo = display_smi_no_stereo
-        match_stereo = match_no_stereo
-        match_exact = match_no_stereo
-
-    return mol, match_no_stereo, match_stereo, match_exact, display_smi_no_stereo, display_smi_stereo
+        return str(p), float('nan')
+    return str(p), xtb_energy(mol)
 
 
-def save_best_pair(m1, m2, out_path):
-    m1 = Chem.RemoveHs(m1)
-    m2 = Chem.RemoveHs(m2)
-    with open(out_path, "w") as f:
-        f.write("MODEL        1\n")
-        f.write(_clean_pdb_block(rdmolfiles.MolToPDBBlock(m1, flavor=4)))
-        f.write("ENDMDL\n")
-        f.write("MODEL        2\n")
-        f.write(_clean_pdb_block(rdmolfiles.MolToPDBBlock(m2, flavor=4)))
-        f.write("ENDMDL\n")
-        f.write("END\n")
+def _gen_energies_for_group(mol_id, paths):
+    return mol_id, [_energy_for_path(p) for p in sorted(paths)]
 
 
-# In[3]:
+def _ref_energies_for_group(mol_id, paths):
+    """Select top-5 conformers by Boltzmann weight, compute energies, return (path, energy, weight)."""
+    bw_map = load_boltzmann_weights(mol_id)
 
+    weighted = []
+    for p in paths:
+        cid = Path(p).stem   # ids in record are "{mol_id}_{i}"
+        w = bw_map.get(cid, 0.0)
+        weighted.append((w, p))
 
-import glob
-from pathlib import Path
-from collections import defaultdict
-import numpy as np
-import sys
-from rdkit import Chem, RDLogger
-from joblib import Parallel, delayed
-import multiprocessing as mp
-import os
+    top5 = sorted(weighted, key=lambda x: x[0], reverse=True)[:5]
 
-
-class _Tee:
-    """Write to multiple file-like objects simultaneously (e.g. stdout + log file)."""
-    def __init__(self, *files):
-        self._files = files
-    def write(self, data):
-        for f in self._files:
-            f.write(data)
-    def flush(self):
-        for f in self._files:
-            f.flush()
+    entries = []
+    for w, p in top5:
+        _, e = _energy_for_path(p)
+        entries.append((str(p), e, w))
+    return mol_id, entries
 
 # ============================================================
-# USER SETTINGS
-# ============================================================
-
-import argparse as _ap
-_parser = _ap.ArgumentParser()
-_parser.add_argument("--mode", choices=["train", "test", "val", "both"], default="both")
-_parser.add_argument("--model_name", default="geom_identityRot_256_conformer_3std_bondlength")
-_args = _parser.parse_args()
-
-model_name = _args.model_name
-_modes = ["train", "test"] if _args.mode == "both" else [_args.mode]
-
-DELTA = 0.75   # RMSD threshold for coverage (Å)
-N_JOBS = max(1, mp.cpu_count() // 2)
-USE_PARALLEL = True
-
-
-# ============================================================
-# Utilities
+# Coverage / aggregation helpers
 # ============================================================
 
 def pairwise_rmsd_matrix(ref_mols, gen_mols):
@@ -454,13 +501,13 @@ def compute_reference_rmsf_mean(ref_key_to_mols):
 
 
 def make_metric_lists():
-    return {k: [] for k in ['amr_r','cov_r','amr_p','cov_p','rmsd','bl','ba','tor','clash','rmsf']}
+    return {k: [] for k in ['amr_r', 'cov_r', 'amr_p', 'cov_p', 'rmsd', 'bl', 'ba', 'tor', 'clash', 'rmsf']}
 
 
 def append_metrics(agg, metrics):
     amr_r, cov_r, amr_p, cov_p, rmsd, bl, ba, tor, clash, rmsf_val = metrics
-    for key, val in [('amr_r',amr_r),('cov_r',cov_r),('amr_p',amr_p),('cov_p',cov_p),
-                     ('rmsd',rmsd),('bl',bl),('ba',ba),('tor',tor),('clash',clash)]:
+    for key, val in [('amr_r', amr_r), ('cov_r', cov_r), ('amr_p', amr_p), ('cov_p', cov_p),
+                     ('rmsd', rmsd), ('bl', bl), ('ba', ba), ('tor', tor), ('clash', clash)]:
         if np.isfinite(val):
             agg[key].append(val)
     if rmsf_val is not None:
@@ -554,420 +601,9 @@ def compute_metrics_for_group(paths, ref_key_no_stereo_to_mols, ref_key_stereo_t
             connectivity_no_match, stereo_no_match, exact_no_match,
             n_attempted, n_matched_no_stereo, n_matched_stereo, n_matched_exact)
 
-
-for mode in _modes:
-  REF_GLOB  = f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/conformer_mols/*.pdb"
-  PRED_GLOB = f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/samples/*.pdb"
-  OUT_ALIGN_DIR = Path(f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/aligned_pairs")
-  OUT_ALIGN_DIR.mkdir(exist_ok=True, parents=True)
-  OUT_STATS_DIR = Path(f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/eval_stats")
-  OUT_STATS_DIR.mkdir(exist_ok=True, parents=True)
-  _stats_log = open(OUT_STATS_DIR / f"eval_{mode}.txt", 'w')
-  _orig_stdout = sys.stdout
-  sys.stdout = _Tee(_orig_stdout, _stats_log)
-
-  print(f"\n{'='*60}")
-  print(f"  MODE: {mode.upper()}")
-  print(f"{'='*60}")
-
-  # ============================================================
-  # Load Reference Molecules
-  # ============================================================
-
-  print("Loading reference molecules...")
-
-  ref_key_no_stereo_to_mols = defaultdict(list)
-  ref_key_stereo_to_mols = defaultdict(list)
-  ref_key_exact_to_mols = defaultdict(list)
-  ref_mol_id_to_display_smis = {}
-
-  for ref_path in glob.glob(REF_GLOB):
-      mol, match_no_stereo, match_stereo, match_exact, display_smi_no_stereo, display_smi_stereo = load_and_prepare(ref_path)
-      assert mol is not None, f"Failed to load ref: {ref_path}"
-      ref_key_no_stereo_to_mols[match_no_stereo].append(mol)
-      ref_key_stereo_to_mols[match_stereo].append(mol)
-      ref_key_exact_to_mols[match_exact].append(mol)
-      mol_id = Path(ref_path).stem.rsplit("_", 1)[0]
-      if mol_id not in ref_mol_id_to_display_smis:
-          ref_mol_id_to_display_smis[mol_id] = (display_smi_no_stereo, display_smi_stereo)
-
-  print(f"Loaded {sum(len(v) for v in ref_key_no_stereo_to_mols.values())} reference conformers")
-  print(f"{len(ref_key_no_stereo_to_mols)} unique keys in reference (no stereo)")
-  print(f"{len(ref_key_stereo_to_mols)} unique keys in reference (with stereo)")
-  print(f"{len(ref_key_exact_to_mols)} unique keys in reference (exact)")
-
-  # ============================================================
-  # Collect Predicted Molecules
-  # ============================================================
-
-  print("Collecting predicted PDBs...")
-
-  pred_paths = [Path(p) for p in glob.glob(PRED_GLOB)]
-
-  groups = defaultdict(list)
-  for p in pred_paths:
-      mol_id = p.stem.rsplit("_", 1)[0]
-      groups[mol_id].append(p)
-
-  print(f"{len(groups)} molecule groups found")
-
-  # ============================================================
-  # Run Computation
-  # ============================================================
-
-  print("Running metric computation...")
-
-  if USE_PARALLEL:
-      results = Parallel(n_jobs=N_JOBS, backend="loky")(
-          delayed(compute_metrics_for_group)(paths, ref_key_no_stereo_to_mols, ref_key_stereo_to_mols, ref_key_exact_to_mols, OUT_ALIGN_DIR)
-          for paths in groups.values()
-      )
-  else:
-      results = [
-          compute_metrics_for_group(paths, ref_key_no_stereo_to_mols, ref_key_stereo_to_mols, ref_key_exact_to_mols, OUT_ALIGN_DIR)
-          for paths in groups.values()
-      ]
-
-  # ============================================================
-  # Aggregate Results
-  # ============================================================
-
-  agg_conn   = make_metric_lists()
-  agg_stereo = make_metric_lists()
-  agg_exact  = make_metric_lists()
-  connectivity_no_match_all = []
-  stereo_no_match_all = []
-  exact_no_match_all = []
-  total_attempted = 0
-  total_matched_no_stereo = 0
-  total_matched_stereo = 0
-  total_matched_exact = 0
-
-  for res in results:
-      metrics_conn, metrics_stereo, metrics_exact, conn_nm, stereo_nm, exact_nm, n_att, n_conn, n_stereo, n_exact = res
-      total_attempted += n_att
-      total_matched_no_stereo += n_conn
-      total_matched_stereo += n_stereo
-      total_matched_exact += n_exact
-      connectivity_no_match_all.extend(conn_nm)
-      stereo_no_match_all.extend(stereo_nm)
-      exact_no_match_all.extend(exact_nm)
-      if metrics_conn is not None:
-          append_metrics(agg_conn, metrics_conn)
-      if metrics_stereo is not None:
-          append_metrics(agg_stereo, metrics_stereo)
-      if metrics_exact is not None:
-          append_metrics(agg_exact, metrics_exact)
-
-  ref_rmsf_mean = compute_reference_rmsf_mean(ref_key_no_stereo_to_mols)
-
-  # ============================================================
-  # Summary
-  # ============================================================
-
-  print(f"\n--- Generated Molecules ---")
-  print(f"Correctly generated — connectivity only (no stereo):  {total_matched_no_stereo}/{total_attempted}")
-  print(f"Correctly generated — connectivity + stereo:          {total_matched_stereo}/{total_attempted}")
-  print(f"Correctly generated — exact (stereo + charges):       {total_matched_exact}/{total_attempted}")
-  print(f"No-match (wrong connectivity):                        {total_attempted - total_matched_no_stereo}/{total_attempted}")
-  print(f"No-match (correct connectivity, wrong stereo):        {total_matched_no_stereo - total_matched_stereo}/{total_attempted}")
-  print(f"No-match (correct stereo, wrong exact):               {total_matched_stereo - total_matched_exact}/{total_attempted}")
-
-  for label, agg in [("Connectivity-matched (no stereo)", agg_conn),
-                     ("Connectivity + stereo matched",    agg_stereo),
-                     ("Exact matched (stereo + charges)", agg_exact)]:
-      print(f"\n--- {label} ---")
-      print(f"  AMR-R:          {mean_or_nan(agg['amr_r']):.4f}")
-      print(f"  COV-R:          {mean_or_nan(agg['cov_r']):.4f}")
-      print(f"  AMR-P:          {mean_or_nan(agg['amr_p']):.4f}")
-      print(f"  COV-P:          {mean_or_nan(agg['cov_p']):.4f}")
-      print(f"  Best RMSD:      {mean_or_nan(agg['rmsd']):.4f}")
-      print(f"  Best BL MAE:    {mean_or_nan(agg['bl']):.4f}")
-      print(f"  Best BA MAE:    {mean_or_nan(agg['ba']):.4f}")
-      print(f"  Torsion MAE:    {mean_or_nan(agg['tor']):.4f}")
-      print(f"  Clashes:        {mean_or_nan(agg['clash']):.4f}")
-      print(f"  RMSF (gen):     {mean_or_nan(agg['rmsf']):.4f}")
-
-  print(f"\n  RMSF (ref):     {ref_rmsf_mean}")
-
-  # ---- No-match: connectivity failures ----
-  if connectivity_no_match_all:
-      print(f"\n--- No-match: wrong connectivity ({len(connectivity_no_match_all)} conformers) ---")
-      by_name = defaultdict(list)
-      for mol_id, gen_smi in connectivity_no_match_all:
-          by_name[mol_id].append(gen_smi)
-      for mol_id, gen_smis in sorted(by_name.items()):
-          ref_smis = ref_mol_id_to_display_smis.get(mol_id)
-          ref_smi = ref_smis[0] if ref_smis else None
-          print(f"  [{mol_id}]  ({len(gen_smis)} conformers)")
-          print(f"    ref: {ref_smi}")
-          for smi in sorted(set(gen_smis)):
-              print(f"    gen: {smi}")
-          print()
-  else:
-      print("\n--- No-match (connectivity): none ---")
-
-  # ---- No-match: stereo failures ----
-  if stereo_no_match_all:
-      print(f"\n--- No-match: wrong stereo, correct connectivity ({len(stereo_no_match_all)} conformers) ---")
-      by_name = defaultdict(list)
-      for mol_id, gen_smi_stereo in stereo_no_match_all:
-          by_name[mol_id].append(gen_smi_stereo)
-      for mol_id, gen_smis in sorted(by_name.items()):
-          ref_smis = ref_mol_id_to_display_smis.get(mol_id)
-          ref_smi_stereo = ref_smis[1] if ref_smis else None
-          print(f"  [{mol_id}]  ({len(gen_smis)} conformers)")
-          print(f"    ref: {ref_smi_stereo}")
-          for smi in sorted(set(gen_smis)):
-              print(f"    gen: {smi}")
-          print()
-  else:
-      print("\n--- No-match (stereo): none ---")
-
-  # ---- No-match: exact failures (stereo ok, but charges etc differ) ----
-  if exact_no_match_all:
-      print(f"\n--- No-match: correct stereo, wrong exact ({len(exact_no_match_all)} conformers) ---")
-      by_name = defaultdict(list)
-      for mol_id, gen_smi in exact_no_match_all:
-          by_name[mol_id].append(gen_smi)
-      for mol_id, gen_smis in sorted(by_name.items()):
-          ref_smis = ref_mol_id_to_display_smis.get(mol_id)
-          ref_smi = ref_smis[1] if ref_smis else None
-          print(f"  [{mol_id}]  ({len(gen_smis)} conformers)")
-          print(f"    ref: {ref_smi}")
-          for smi in sorted(set(gen_smis)):
-              print(f"    gen: {smi}")
-          print()
-  else:
-      print("\n--- No-match (exact): none ---")
-
-  # ---- Perfectly matched molecules (exact match for all conformers) ----
-  no_match_mol_ids = set(mol_id for mol_id, _ in connectivity_no_match_all) | \
-                     set(mol_id for mol_id, _ in stereo_no_match_all) | \
-                     set(mol_id for mol_id, _ in exact_no_match_all)
-  perfect = [(mol_id, ref_mol_id_to_display_smis[mol_id][1])
-             for mol_id in sorted(groups.keys())
-             if mol_id not in no_match_mol_ids]
-  if perfect:
-      print(f"\n--- Perfectly matched molecules ({len(perfect)}/{len(groups)}, all conformers exact match) ---")
-      for mol_id, smi in perfect:
-          print(f"  [{mol_id}]  {smi}")
-  else:
-      print("\n--- Perfectly matched molecules: none ---")
-
-  sys.stdout = _orig_stdout
-  _stats_log.close()
-  print(f"Eval stats saved to {OUT_STATS_DIR / f'eval_{mode}.txt'}")
-
-
-# In[5]:
-
-
-import numpy as np
-from xtb.interface import Calculator, Param
-
-ANGSTROM_TO_BOHR = 1.8897259886
-HARTREE_TO_KCALMOL = 627.509474
-
-def xtb_energy(mol):
-    """Calculate GFN2-xTB single-point energy. Returns energy in kcal/mol, or NaN on failure."""
-    try:
-        # Strip any Hs placed at origin, then re-add with proper 3D coords
-        mol = Chem.RemoveHs(mol)
-        mol = Chem.AddHs(mol, addCoords=True)
-
-        numbers = np.array([atom.GetAtomicNum() for atom in mol.GetAtoms()], dtype=np.int32)
-        conf = mol.GetConformer()
-        positions = np.array(
-            [conf.GetAtomPosition(i) for i in range(mol.GetNumAtoms())],
-            dtype=np.float64
-        ) * ANGSTROM_TO_BOHR  # Å → Bohr
-
-        calc = Calculator(Param.GFN2xTB, numbers, positions)
-        calc.set_verbosity(0)  # suppress output
-        res = calc.singlepoint()
-        return res.get_energy() * HARTREE_TO_KCALMOL
-    except Exception as e:
-        return float('nan')
-
-
-# In[ ]:
-
-
-from collections import defaultdict
-from tqdm.auto import tqdm
-from joblib import Parallel, delayed
-import json
-
-print("Computing GFN2-xTB energies for generated molecules...")
-
-GEOM_DATADIR = Path(os.environ.get("REPO_ROOT", "/datastor1/dy4652/proteinzen")) / "data" / "geom_drugs_conformers"
-
-def load_boltzmann_weights(mol_id):
-    """Load (conformer_id -> boltzmann_weight) from record JSON. Returns {} on failure."""
-    mid = mol_id[1:3]
-    for split in ("train", "val", "test"):
-        record_path = GEOM_DATADIR / split / "records" / mid / f"{mol_id}.json"
-        if record_path.exists():
-            with record_path.open() as f:
-                rec = json.load(f)
-            return {cid: w for cid, w in zip(rec["ids"], rec["boltzmann_weights"])}
-    return {}
-
-def _energy_for_path(p):
-    mol, *_ = load_and_prepare(p)
-    if mol is None:
-        return str(p), float('nan')
-    return str(p), xtb_energy(mol)
-
-def _gen_energies_for_group(mol_id, paths):
-    return mol_id, [_energy_for_path(p) for p in sorted(paths)]
-
-def _ref_energies_for_group(mol_id, paths):
-    """Select top-5 conformers by Boltzmann weight, compute energies, return (path, energy, weight)."""
-    bw_map = load_boltzmann_weights(mol_id)
-
-    # pair each path with its Boltzmann weight (default 0 if not found)
-    weighted = []
-    for p in paths:
-        stem = Path(p).stem          # e.g. {mol_id}_3
-        cid = stem                   # ids in record are "{mol_id}_{i}"
-        w = bw_map.get(cid, 0.0)
-        weighted.append((w, p))
-
-    # top-5 by weight descending
-    top5 = sorted(weighted, key=lambda x: x[0], reverse=True)[:5]
-
-    entries = []
-    for w, p in top5:
-        _, e = _energy_for_path(p)
-        entries.append((str(p), e, w))
-    return mol_id, entries
-
-# Generated molecules
-gen_results = Parallel(n_jobs=N_JOBS, backend="loky")(
-    delayed(_gen_energies_for_group)(mol_id, paths)
-    for mol_id, paths in tqdm(groups.items(), desc="gen molecules")
-)
-gen_energies = defaultdict(list)
-for mol_id, entries in gen_results:
-    gen_energies[mol_id] = entries  # list of (path, energy)
-
-# Reference molecules
-ref_id_to_paths = defaultdict(list)
-for ref_path in glob.glob(REF_GLOB):
-    mol_id = Path(ref_path).stem.rsplit("_", 1)[0]
-    ref_id_to_paths[mol_id].append(ref_path)
-
-ref_results = Parallel(n_jobs=N_JOBS, backend="loky")(
-    delayed(_ref_energies_for_group)(mol_id, paths)
-    for mol_id, paths in tqdm(ref_id_to_paths.items(), desc="ref molecules")
-)
-ref_energies = defaultdict(list)
-for mol_id, entries in ref_results:
-    ref_energies[mol_id] = entries  # list of (path, energy, boltzmann_weight)
-
-print("Done.")
-
-
-# In[ ]:
-
-
-import pandas as pd
-
-perfect_mol_ids = set(mol_id for mol_id, _ in perfect)
-
-rows = []
-for mol_id in sorted(set(gen_energies) | set(ref_energies)):
-    if mol_id not in perfect_mol_ids:
-        continue
-    gen_e = [e for _, e in gen_energies.get(mol_id, []) if np.isfinite(e)]
-    ref_entries = [(e, w) for _, e, w in ref_energies.get(mol_id, []) if np.isfinite(e)]
-    ref_e = [e for e, w in ref_entries]
-    ref_w = [w for e, w in ref_entries]
-
-    gen_min  = np.min(gen_e)  if gen_e else float('nan')
-    gen_mean = np.mean(gen_e) if gen_e else float('nan')
-    ref_min  = np.min(ref_e)  if ref_e else float('nan')
-    # Boltzmann-weighted mean energy
-    ref_bw_mean = float(np.average(ref_e, weights=ref_w)) if ref_e and sum(ref_w) > 0 else float('nan')
-
-    rows.append({
-        'mol_id':          mol_id[:16] + '…',
-        'n_gen':           len(gen_e),
-        'gen_min':         gen_min,
-        'gen_mean':        gen_mean,
-        'n_ref':           len(ref_e),
-        'ref_min':         ref_min,
-        'ref_bw_mean':     ref_bw_mean,
-        'Δmin (gen-ref)':  gen_min - ref_min,
-    })
-
-df = pd.DataFrame(rows)
-pd.set_option('display.float_format', '{:.2f}'.format)
-pd.set_option('display.max_columns', None)
-pd.set_option('display.width', 160)
-print(f"Perfectly matched molecules: {len(df)}/30")
-print(df.to_string(index=False))
-
-print(f"\n--- Aggregate (kcal/mol, perfectly matched only) ---")
-print(f"  Mean gen_min  energy:     {df['gen_min'].mean():.2f}")
-print(f"  Mean ref_min  energy:     {df['ref_min'].mean():.2f}")
-print(f"  Mean ref BW-mean energy:  {df['ref_bw_mean'].mean():.2f}")
-print(f"  Mean Δmin (gen-ref):      {df['Δmin (gen-ref)'].mean():.2f}")
-
-df.to_csv(OUT_STATS_DIR / f"energy_stats_{mode}.csv", index=False)
-print(f"Energy stats saved to {OUT_STATS_DIR / f'energy_stats_{mode}.csv'}")
-
-
-# In[ ]:
-
-
-OUT_MIN_ENERGY_DIR = Path(f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/min_energy_aligned_pairs")
-OUT_MIN_ENERGY_DIR.mkdir(exist_ok=True, parents=True)
-
-OUT_PLOTS_DIR = Path(f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/torsion_plots")
-OUT_PLOTS_DIR.mkdir(exist_ok=True, parents=True)
-
-print("Writing min-energy aligned pairs...")
-for mol_id in sorted(perfect_mol_ids):
-    gen_entries = [(p, e) for p, e in gen_energies.get(mol_id, []) if np.isfinite(e)]
-    ref_entries_w = [(p, e, w) for p, e, w in ref_energies.get(mol_id, []) if np.isfinite(e)]
-    if not gen_entries or not ref_entries_w:
-        print(f"  skipping {mol_id[:16]}… (missing energies)")
-        continue
-
-    gen_min_path, gen_min_e = min(gen_entries, key=lambda x: x[1])
-    ref_min_path, ref_min_e = min(ref_entries_w, key=lambda x: x[1])[:2]
-    delta_e = gen_min_e - ref_min_e
-
-    gen_mol, *_ = load_and_prepare(gen_min_path)
-    ref_mol, *_ = load_and_prepare(ref_min_path)
-    if gen_mol is None or ref_mol is None:
-        print(f"  skipping {mol_id[:16]}… (load failed)")
-        continue
-
-    try:
-        probe = Chem.RemoveHs(Chem.Mol(gen_mol))
-        ref_a = Chem.RemoveHs(Chem.Mol(ref_mol))
-        rmsd = rdMolAlign.AlignMol(probe, ref_a)
-        sign = "+" if delta_e >= 0 else ""
-        out_name = f"{mol_id}_dE{sign}{delta_e:.1f}_rmsd{rmsd:.3f}.pdb"
-        save_best_pair(probe, ref_a, OUT_MIN_ENERGY_DIR / out_name)
-        print(f"  {mol_id[:16]}…  ΔE={sign}{delta_e:.1f} kcal/mol  RMSD={rmsd:.3f}")
-    except Exception as ex:
-        print(f"  {mol_id[:16]}… failed: {ex}")
-
-print(f"Done. Written to {OUT_MIN_ENERGY_DIR}")
-
-
-# In[ ]:
-
-
-import matplotlib.pyplot as plt
-from collections import defaultdict
-
-# ── helpers ────────────────────────────────────────────────────────────────
+# ============================================================
+# Torsion plot helpers
+# ============================================================
 
 def assign_atom_names(mol_h):
     """Assign unique names (C1, O1, N2, …) to each heavy atom by element order."""
@@ -1031,18 +667,6 @@ def conf_torsion_angles(mol_h, quads):
     return out
 
 
-# ── per-molecule torsion-spread computation ─────────────────────────────────
-#
-# Ref spread  : mean |Δtorsion| of the other top-5 BW ref conformers
-#               vs the top-1 Boltzmann-weight conformer.
-# Gen spread  : mean |Δtorsion| of the other 4 generated conformers
-#               vs the lowest-xTB-energy generated conformer.
-# Both spreads measure internal diversity within each set, using the
-# most "canonical" member of that set as the baseline.
-#
-# Only molecules in perfect_mol_ids are included (all 5 gen conformers
-# are exact connectivity+stereo+charge matches to the reference).
-
 def circular_std(angles_deg):
     """Circular standard deviation of a list of angles in degrees.
     Returns degrees.  Uses the formula: sqrt(-2 * ln(R)) where R is the
@@ -1054,11 +678,337 @@ def circular_std(angles_deg):
     R = np.clip(R, 0.0, 1.0 - 1e-10)
     return float(np.rad2deg(np.sqrt(-2.0 * np.log(R))))
 
+# ============================================================
+# User Settings
+# ============================================================
 
+_parser = argparse.ArgumentParser()
+_parser.add_argument("--mode", choices=["train", "test", "val", "both"], default="both")
+_parser.add_argument("--model_name", default="geom_identityRot_256_conformer_3std_bondlength")
+_args = _parser.parse_args()
+
+model_name = _args.model_name
+_modes     = ["train", "test"] if _args.mode == "both" else [_args.mode]
+
+DELTA        = 0.75   # RMSD threshold for coverage (Å)
+N_JOBS       = max(1, mp.cpu_count() // 2)
+USE_PARALLEL = True
+GEOM_DATADIR = Path(os.environ.get("REPO_ROOT", "/datastor1/dy4652/proteinzen")) / "data" / "geom_drugs_conformers"
+
+# ============================================================
+# Main — geometry evaluation
+# ============================================================
+
+for mode in _modes:
+    REF_GLOB  = f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/conformer_mols/*.pdb"
+    PRED_GLOB = f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/samples/*.pdb"
+    OUT_ALIGN_DIR = Path(f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/aligned_pairs")
+    OUT_ALIGN_DIR.mkdir(exist_ok=True, parents=True)
+    OUT_STATS_DIR = Path(f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/eval_stats")
+    OUT_STATS_DIR.mkdir(exist_ok=True, parents=True)
+    _stats_log = open(OUT_STATS_DIR / f"eval_{mode}.txt", 'w')
+    _orig_stdout = sys.stdout
+    sys.stdout = _Tee(_orig_stdout, _stats_log)
+
+    print(f"\n{'='*60}")
+    print(f"  MODE: {mode.upper()}")
+    print(f"{'='*60}")
+
+    # ---- Load reference molecules ----
+    print("Loading reference molecules...")
+
+    ref_key_no_stereo_to_mols = defaultdict(list)
+    ref_key_stereo_to_mols = defaultdict(list)
+    ref_key_exact_to_mols = defaultdict(list)
+    ref_mol_id_to_display_smis = {}
+
+    for ref_path in glob.glob(REF_GLOB):
+        mol, match_no_stereo, match_stereo, match_exact, display_smi_no_stereo, display_smi_stereo = load_and_prepare(ref_path)
+        assert mol is not None, f"Failed to load ref: {ref_path}"
+        ref_key_no_stereo_to_mols[match_no_stereo].append(mol)
+        ref_key_stereo_to_mols[match_stereo].append(mol)
+        ref_key_exact_to_mols[match_exact].append(mol)
+        mol_id = Path(ref_path).stem.rsplit("_", 1)[0]
+        if mol_id not in ref_mol_id_to_display_smis:
+            ref_mol_id_to_display_smis[mol_id] = (display_smi_no_stereo, display_smi_stereo)
+
+    print(f"Loaded {sum(len(v) for v in ref_key_no_stereo_to_mols.values())} reference conformers")
+    print(f"{len(ref_key_no_stereo_to_mols)} unique keys in reference (no stereo)")
+    print(f"{len(ref_key_stereo_to_mols)} unique keys in reference (with stereo)")
+    print(f"{len(ref_key_exact_to_mols)} unique keys in reference (exact)")
+
+    # ---- Collect predicted molecules ----
+    print("Collecting predicted PDBs...")
+
+    pred_paths = [Path(p) for p in glob.glob(PRED_GLOB)]
+    groups = defaultdict(list)
+    for p in pred_paths:
+        mol_id = p.stem.rsplit("_", 1)[0]
+        groups[mol_id].append(p)
+
+    print(f"{len(groups)} molecule groups found")
+
+    # ---- Run computation ----
+    print("Running metric computation...")
+
+    if USE_PARALLEL:
+        results = Parallel(n_jobs=N_JOBS, backend="loky")(
+            delayed(compute_metrics_for_group)(paths, ref_key_no_stereo_to_mols, ref_key_stereo_to_mols, ref_key_exact_to_mols, OUT_ALIGN_DIR)
+            for paths in groups.values()
+        )
+    else:
+        results = [
+            compute_metrics_for_group(paths, ref_key_no_stereo_to_mols, ref_key_stereo_to_mols, ref_key_exact_to_mols, OUT_ALIGN_DIR)
+            for paths in groups.values()
+        ]
+
+    # ---- Aggregate ----
+    agg_conn   = make_metric_lists()
+    agg_stereo = make_metric_lists()
+    agg_exact  = make_metric_lists()
+    connectivity_no_match_all = []
+    stereo_no_match_all = []
+    exact_no_match_all = []
+    total_attempted = 0
+    total_matched_no_stereo = 0
+    total_matched_stereo = 0
+    total_matched_exact = 0
+
+    for res in results:
+        metrics_conn, metrics_stereo, metrics_exact, conn_nm, stereo_nm, exact_nm, n_att, n_conn, n_stereo, n_exact = res
+        total_attempted += n_att
+        total_matched_no_stereo += n_conn
+        total_matched_stereo += n_stereo
+        total_matched_exact += n_exact
+        connectivity_no_match_all.extend(conn_nm)
+        stereo_no_match_all.extend(stereo_nm)
+        exact_no_match_all.extend(exact_nm)
+        if metrics_conn is not None:
+            append_metrics(agg_conn, metrics_conn)
+        if metrics_stereo is not None:
+            append_metrics(agg_stereo, metrics_stereo)
+        if metrics_exact is not None:
+            append_metrics(agg_exact, metrics_exact)
+
+    ref_rmsf_mean = compute_reference_rmsf_mean(ref_key_no_stereo_to_mols)
+
+    # ---- Summary ----
+    print(f"\n--- Generated Molecules ---")
+    print(f"Correctly generated — connectivity only (no stereo):  {total_matched_no_stereo}/{total_attempted}")
+    print(f"Correctly generated — connectivity + stereo:          {total_matched_stereo}/{total_attempted}")
+    print(f"Correctly generated — exact (stereo + charges):       {total_matched_exact}/{total_attempted}")
+    print(f"No-match (wrong connectivity):                        {total_attempted - total_matched_no_stereo}/{total_attempted}")
+    print(f"No-match (correct connectivity, wrong stereo):        {total_matched_no_stereo - total_matched_stereo}/{total_attempted}")
+    print(f"No-match (correct stereo, wrong exact):               {total_matched_stereo - total_matched_exact}/{total_attempted}")
+
+    for label, agg in [("Connectivity-matched (no stereo)", agg_conn),
+                       ("Connectivity + stereo matched",    agg_stereo),
+                       ("Exact matched (stereo + charges)", agg_exact)]:
+        print(f"\n--- {label} ---")
+        print(f"  AMR-R:          {mean_or_nan(agg['amr_r']):.4f}")
+        print(f"  COV-R:          {mean_or_nan(agg['cov_r']):.4f}")
+        print(f"  AMR-P:          {mean_or_nan(agg['amr_p']):.4f}")
+        print(f"  COV-P:          {mean_or_nan(agg['cov_p']):.4f}")
+        print(f"  Best RMSD:      {mean_or_nan(agg['rmsd']):.4f}")
+        print(f"  Best BL MAE:    {mean_or_nan(agg['bl']):.4f}")
+        print(f"  Best BA MAE:    {mean_or_nan(agg['ba']):.4f}")
+        print(f"  Torsion MAE:    {mean_or_nan(agg['tor']):.4f}")
+        print(f"  Clashes:        {mean_or_nan(agg['clash']):.4f}")
+        print(f"  RMSF (gen):     {mean_or_nan(agg['rmsf']):.4f}")
+
+    print(f"\n  RMSF (ref):     {ref_rmsf_mean}")
+
+    # ---- No-match details ----
+    if connectivity_no_match_all:
+        print(f"\n--- No-match: wrong connectivity ({len(connectivity_no_match_all)} conformers) ---")
+        by_name = defaultdict(list)
+        for mol_id, gen_smi in connectivity_no_match_all:
+            by_name[mol_id].append(gen_smi)
+        for mol_id, gen_smis in sorted(by_name.items()):
+            ref_smis = ref_mol_id_to_display_smis.get(mol_id)
+            ref_smi = ref_smis[0] if ref_smis else None
+            print(f"  [{mol_id}]  ({len(gen_smis)} conformers)")
+            print(f"    ref: {ref_smi}")
+            for smi in sorted(set(gen_smis)):
+                print(f"    gen: {smi}")
+            print()
+    else:
+        print("\n--- No-match (connectivity): none ---")
+
+    if stereo_no_match_all:
+        print(f"\n--- No-match: wrong stereo, correct connectivity ({len(stereo_no_match_all)} conformers) ---")
+        by_name = defaultdict(list)
+        for mol_id, gen_smi_stereo in stereo_no_match_all:
+            by_name[mol_id].append(gen_smi_stereo)
+        for mol_id, gen_smis in sorted(by_name.items()):
+            ref_smis = ref_mol_id_to_display_smis.get(mol_id)
+            ref_smi_stereo = ref_smis[1] if ref_smis else None
+            print(f"  [{mol_id}]  ({len(gen_smis)} conformers)")
+            print(f"    ref: {ref_smi_stereo}")
+            for smi in sorted(set(gen_smis)):
+                print(f"    gen: {smi}")
+            print()
+    else:
+        print("\n--- No-match (stereo): none ---")
+
+    if exact_no_match_all:
+        print(f"\n--- No-match: correct stereo, wrong exact ({len(exact_no_match_all)} conformers) ---")
+        by_name = defaultdict(list)
+        for mol_id, gen_smi in exact_no_match_all:
+            by_name[mol_id].append(gen_smi)
+        for mol_id, gen_smis in sorted(by_name.items()):
+            ref_smis = ref_mol_id_to_display_smis.get(mol_id)
+            ref_smi = ref_smis[1] if ref_smis else None
+            print(f"  [{mol_id}]  ({len(gen_smis)} conformers)")
+            print(f"    ref: {ref_smi}")
+            for smi in sorted(set(gen_smis)):
+                print(f"    gen: {smi}")
+            print()
+    else:
+        print("\n--- No-match (exact): none ---")
+
+    no_match_mol_ids = set(mol_id for mol_id, _ in connectivity_no_match_all) | \
+                       set(mol_id for mol_id, _ in stereo_no_match_all) | \
+                       set(mol_id for mol_id, _ in exact_no_match_all)
+    perfect = [(mol_id, ref_mol_id_to_display_smis[mol_id][1])
+               for mol_id in sorted(groups.keys())
+               if mol_id not in no_match_mol_ids]
+    if perfect:
+        print(f"\n--- Perfectly matched molecules ({len(perfect)}/{len(groups)}, all conformers exact match) ---")
+        for mol_id, smi in perfect:
+            print(f"  [{mol_id}]  {smi}")
+    else:
+        print("\n--- Perfectly matched molecules: none ---")
+
+    sys.stdout = _orig_stdout
+    _stats_log.close()
+    print(f"Eval stats saved to {OUT_STATS_DIR / f'eval_{mode}.txt'}")
+
+# ============================================================
+# Main — xTB energy evaluation
+# ============================================================
+
+print("Computing GFN2-xTB energies for generated molecules...")
+
+# Generated molecules
+gen_results = Parallel(n_jobs=N_JOBS, backend="loky")(
+    delayed(_gen_energies_for_group)(mol_id, paths)
+    for mol_id, paths in tqdm(groups.items(), desc="gen molecules")
+)
+gen_energies = defaultdict(list)
+for mol_id, entries in gen_results:
+    gen_energies[mol_id] = entries  # list of (path, energy)
+
+# Reference molecules
+ref_id_to_paths = defaultdict(list)
+for ref_path in glob.glob(REF_GLOB):
+    mol_id = Path(ref_path).stem.rsplit("_", 1)[0]
+    ref_id_to_paths[mol_id].append(ref_path)
+
+ref_results = Parallel(n_jobs=N_JOBS, backend="loky")(
+    delayed(_ref_energies_for_group)(mol_id, paths)
+    for mol_id, paths in tqdm(ref_id_to_paths.items(), desc="ref molecules")
+)
+ref_energies = defaultdict(list)
+for mol_id, entries in ref_results:
+    ref_energies[mol_id] = entries  # list of (path, energy, boltzmann_weight)
+
+print("Done.")
+
+perfect_mol_ids = set(mol_id for mol_id, _ in perfect)
+
+pd.set_option('display.float_format', '{:.2f}'.format)
+pd.set_option('display.max_columns', None)
+pd.set_option('display.width', 160)
+
+rows = []
+for mol_id in sorted(set(gen_energies) | set(ref_energies)):
+    if mol_id not in perfect_mol_ids:
+        continue
+    gen_e = [e for _, e in gen_energies.get(mol_id, []) if np.isfinite(e)]
+    ref_entries = [(e, w) for _, e, w in ref_energies.get(mol_id, []) if np.isfinite(e)]
+    ref_e = [e for e, w in ref_entries]
+    ref_w = [w for e, w in ref_entries]
+
+    gen_min     = np.min(gen_e)  if gen_e else float('nan')
+    gen_mean    = np.mean(gen_e) if gen_e else float('nan')
+    ref_min     = np.min(ref_e)  if ref_e else float('nan')
+    ref_bw_mean = float(np.average(ref_e, weights=ref_w)) if ref_e and sum(ref_w) > 0 else float('nan')
+
+    rows.append({
+        'mol_id':         mol_id[:16] + '…',
+        'n_gen':          len(gen_e),
+        'gen_min':        gen_min,
+        'gen_mean':       gen_mean,
+        'n_ref':          len(ref_e),
+        'ref_min':        ref_min,
+        'ref_bw_mean':    ref_bw_mean,
+        'Δmin (gen-ref)': gen_min - ref_min,
+    })
+
+df = pd.DataFrame(rows)
+print(f"Perfectly matched molecules: {len(df)}/30")
+print(df.to_string(index=False))
+
+print(f"\n--- Aggregate (kcal/mol, perfectly matched only) ---")
+print(f"  Mean gen_min  energy:     {df['gen_min'].mean():.2f}")
+print(f"  Mean ref_min  energy:     {df['ref_min'].mean():.2f}")
+print(f"  Mean ref BW-mean energy:  {df['ref_bw_mean'].mean():.2f}")
+print(f"  Mean Δmin (gen-ref):      {df['Δmin (gen-ref)'].mean():.2f}")
+
+df.to_csv(OUT_STATS_DIR / f"energy_stats_{mode}.csv", index=False)
+print(f"Energy stats saved to {OUT_STATS_DIR / f'energy_stats_{mode}.csv'}")
+
+# ============================================================
+# Main — min-energy aligned pairs
+# ============================================================
+
+OUT_MIN_ENERGY_DIR = Path(f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/min_energy_aligned_pairs")
+OUT_MIN_ENERGY_DIR.mkdir(exist_ok=True, parents=True)
+
+print("Writing min-energy aligned pairs...")
+for mol_id in sorted(perfect_mol_ids):
+    gen_entries   = [(p, e) for p, e in gen_energies.get(mol_id, []) if np.isfinite(e)]
+    ref_entries_w = [(p, e, w) for p, e, w in ref_energies.get(mol_id, []) if np.isfinite(e)]
+    if not gen_entries or not ref_entries_w:
+        print(f"  skipping {mol_id[:16]}… (missing energies)")
+        continue
+
+    gen_min_path, gen_min_e = min(gen_entries, key=lambda x: x[1])
+    ref_min_path, ref_min_e = min(ref_entries_w, key=lambda x: x[1])[:2]
+    delta_e = gen_min_e - ref_min_e
+
+    gen_mol, *_ = load_and_prepare(gen_min_path)
+    ref_mol, *_ = load_and_prepare(ref_min_path)
+    if gen_mol is None or ref_mol is None:
+        print(f"  skipping {mol_id[:16]}… (load failed)")
+        continue
+
+    try:
+        probe = Chem.RemoveHs(Chem.Mol(gen_mol))
+        ref_a = Chem.RemoveHs(Chem.Mol(ref_mol))
+        rmsd = rdMolAlign.AlignMol(probe, ref_a)
+        sign = "+" if delta_e >= 0 else ""
+        out_name = f"{mol_id}_dE{sign}{delta_e:.1f}_rmsd{rmsd:.3f}.pdb"
+        save_best_pair(probe, ref_a, OUT_MIN_ENERGY_DIR / out_name)
+        print(f"  {mol_id[:16]}…  ΔE={sign}{delta_e:.1f} kcal/mol  RMSD={rmsd:.3f}")
+    except Exception as ex:
+        print(f"  {mol_id[:16]}… failed: {ex}")
+
+print(f"Done. Written to {OUT_MIN_ENERGY_DIR}")
+
+# ============================================================
+# Main — torsion spread + plots
+# ============================================================
+
+OUT_PLOTS_DIR = Path(f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/torsion_plots")
+OUT_PLOTS_DIR.mkdir(exist_ok=True, parents=True)
+
+# Per molecule: circular std of torsion angles across ref vs gen conformers.
+# Only perfectly-matched molecules are included.
 torsion_results = {}   # mol_id -> {torsion_name: {'ref': float, 'gen': float}}
 
 for mol_id in sorted(perfect_mol_ids):
-    # ---- get a reference mol to define torsion quads ----
     ref_ents = ref_energies.get(mol_id, [])
     if not ref_ents:
         continue
@@ -1075,7 +1025,6 @@ for mol_id in sorted(perfect_mol_ids):
     quad_name  = {(a, b, c, d): f"{atom_names[a]}-{atom_names[b]}-{atom_names[c]}-{atom_names[d]}"
                   for a, b, c, d in quads}
 
-    # ---- reference: collect angle for each quad across all ref conformers ----
     ref_angle_lists = defaultdict(list)
     for path, _, _ in ref_ents:
         mol, *_ = load_and_prepare(path)
@@ -1085,7 +1034,6 @@ for mol_id in sorted(perfect_mol_ids):
         for q, v in angs.items():
             ref_angle_lists[q].append(v)
 
-    # ---- generated: collect angle for each quad across all gen conformers ----
     gen_ents = [(p, e) for p, e in gen_energies.get(mol_id, []) if np.isfinite(e)]
     gen_angle_lists = defaultdict(list)
     for path, _ in gen_ents:
@@ -1106,9 +1054,6 @@ for mol_id in sorted(perfect_mol_ids):
     torsion_results[mol_id] = mol_data
 
 print(f"Torsion spread computed for {len(torsion_results)} perfectly-matched molecules.")
-
-
-# ── plotting ────────────────────────────────────────────────────────────────
 
 for mol_id, mol_data in sorted(torsion_results.items()):
     if not mol_data:
@@ -1145,4 +1090,3 @@ for mol_id, mol_data in sorted(torsion_results.items()):
     out_path = OUT_PLOTS_DIR / f"{mol_id}_torsion_std.png"
     plt.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
-
