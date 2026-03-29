@@ -1,6 +1,6 @@
 _target_: proteinzen.data.datasets.datamodule.TrainingDataset
 max_crop_residues: 1 #160
-max_crop_rigids: 96 # 512
+max_crop_rigids: 192 # 512
 use_cropper: false #true
 samples_per_epoch: 8000
 datasets:
