@@ -256,6 +256,7 @@ def featurize(
     data: Tokenized,
     task_data,
     task_name: Optional[str] = 'sample',
+    smiles: Optional[str] = None,
     max_tokens: Optional[int] = None,
     max_rigids: Optional[int] = None,
     rigids_per_window_queries: int = 16,
@@ -272,6 +273,7 @@ def featurize(
     return {
         "t": task_data['t'],
         "task": task_name,
+        "smiles": smiles,
         "input_data": data,
         "token": token_features,
         "rigids": rigid_features
@@ -388,6 +390,8 @@ def collate(data_list):
     ]
     batched_data_list = default_collate(padded_data_list)
     batched_data_list['task'] = [data['task'] for data in data_list]
+    if 'smiles' in data_list[0]:
+        batched_data_list['smiles'] = [data['smiles'] for data in data_list]
     if 'name' in data_list[0]:
         batched_data_list['name'] = [data['name'] for data in data_list]
     if 'input_data' in data_list[0]:

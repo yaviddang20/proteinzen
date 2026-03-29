@@ -1,13 +1,16 @@
 {
   "total_analyzed": 6670,
   "n_multiring": 5553,
-  "n_with_any_stack": 1916,
-  "frac_any_stack": 0.28725637181409297,
-  "frac_multiring_with_stack": 0.3450387178101927,
+  "n_with_any_stack": 4869,
+  "frac_any_stack": 0.7299850074962518,
+  "frac_multiring_with_stack": 0.8768233387358185,
   "type_counts": {
+    "failed_t_shaped": 2266,
+    "failed_parallel_too_far": 6090,
     "t_shaped": 2151,
     "displaced_parallel": 245,
-    "face_to_face": 182
+    "face_to_face": 182,
+    "failed_parallel_over_shifted": 85
   },
   "ring_count_distribution": {
     "2": 2574,

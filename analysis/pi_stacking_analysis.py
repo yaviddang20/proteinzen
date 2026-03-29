@@ -62,30 +62,36 @@ def analyze_file(npz_path):
         atoms = d['atoms']
         bonds = d['bonds']
         ring_masks = d['ring_masks']
-        coords = atoms['coords']  # (N, 3)
+
+        # ring_masks is indexed over heavy atoms only; build heavy-atom coords
+        # and a mapping from all-atom index → heavy-atom index for bond lookup
+        heavy_mask = atoms['element'] != 1
+        heavy_coords = atoms['coords'][heavy_mask]  # (n_heavy, 3)
+        all_to_heavy = {}
+        for heavy_idx, all_idx in enumerate(np.where(heavy_mask)[0]):
+            all_to_heavy[int(all_idx)] = heavy_idx
 
         if ring_masks.shape[0] < 2:
             return {'n_rings': ring_masks.shape[0], 'n_aromatic_rings': 0,
                     'has_pi_stack': False, 'stack_type': None,
                     'n_pairs': 0}
 
-        # Identify aromatic rings: rings whose atoms are predominantly connected
-        # by aromatic bonds (type 4)
+        # Aromatic atoms in heavy-atom index space
         aromatic_atom_set = set()
         for b in bonds:
             if b['type'] == BOND_TYPE_AROMATIC:
-                aromatic_atom_set.add(int(b['atom_1']))
-                aromatic_atom_set.add(int(b['atom_2']))
+                for a in (int(b['atom_1']), int(b['atom_2'])):
+                    if a in all_to_heavy:
+                        aromatic_atom_set.add(all_to_heavy[a])
 
         aromatic_rings = []
         for i in range(ring_masks.shape[0]):
-            ring_atom_idx = np.where(ring_masks[i])[0]
+            ring_atom_idx = np.where(ring_masks[i])[0]  # heavy-atom indices
             if len(ring_atom_idx) < 5:
                 continue
-            # Ring is aromatic if majority of atoms are in aromatic bonds
             n_aromatic = sum(1 for a in ring_atom_idx if a in aromatic_atom_set)
             if n_aromatic >= len(ring_atom_idx) * 0.6:
-                ring_coords = coords[ring_atom_idx]
+                ring_coords = heavy_coords[ring_atom_idx]
                 centroid, normal = get_ring_normal(ring_coords)
                 aromatic_rings.append((centroid, normal, len(ring_atom_idx)))
 
@@ -106,7 +112,6 @@ def analyze_file(npz_path):
                 angle = angle_between_normals(n1, n2)
 
                 if angle <= PARALLEL_ANGLE_MAX:
-                    # Decompose centroid vector into vertical (along n1) + lateral components
                     vertical = abs(np.dot(vec, n1))
                     lateral = np.sqrt(max(dist**2 - vertical**2, 0.0))
                     if VERTICAL_DIST_MIN <= vertical <= VERTICAL_DIST_MAX:
@@ -114,8 +119,15 @@ def analyze_file(npz_path):
                             stack_types.append('face_to_face')
                         elif lateral <= DP_LATERAL_MAX:
                             stack_types.append('displaced_parallel')
-                elif EF_DIST_MIN <= dist <= EF_DIST_MAX and angle >= EF_ANGLE_MIN:
-                    stack_types.append('t_shaped')
+                        else:
+                            stack_types.append('failed_parallel_over_shifted')
+                    else:
+                        stack_types.append('failed_parallel_too_far')
+                elif angle >= EF_ANGLE_MIN:
+                    if EF_DIST_MIN <= dist <= EF_DIST_MAX:
+                        stack_types.append('t_shaped')
+                    else:
+                        stack_types.append('failed_t_shaped')
 
         has_stack = len(stack_types) > 0
         primary_type = stack_types[0] if stack_types else None

@@ -79,6 +79,7 @@ def config_hydra_store():
         {
             "config": f"{os.environ.get('REPO_ROOT')}/configs/train/data/afdb_128.yaml",
             "val_config": None,
+            "include_h": False,
         },
         name="afdb_128")
 

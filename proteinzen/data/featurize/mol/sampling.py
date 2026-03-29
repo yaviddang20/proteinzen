@@ -461,6 +461,7 @@ def mol_to_struct(
     chain_idx: int = 0,
     noise_ligand: bool = False,
     trans_noise_std: int = 16,
+    include_h: bool = False,
 ) -> Structure:
     """Parse an MMCIF ligand.
 
@@ -499,6 +500,8 @@ def mol_to_struct(
 
     mol_no_h = AllChem.RemoveHs(mol)
     Chem.AssignStereochemistry(mol_no_h, cleanIt=True, force=True)
+
+    mol_iter = mol if include_h else mol_no_h
 
     residue_data = []
     atom_data = []
@@ -540,13 +543,13 @@ def mol_to_struct(
 
     else:
         # Get reference conformer coordinates
-        conformer = get_conformer(mol_no_h)
+        conformer = get_conformer(mol_iter)
 
         # Parse each atom
         atom_idx = 0
         idx_map = {}  # Used for bonds later
 
-        for i, mol_atom in enumerate(mol_no_h.GetAtoms()):
+        for i, mol_atom in enumerate(mol_iter.GetAtoms()):
             # Get atom name, charge, element and reference coordinates
             atom_name = mol_atom.GetProp("name")
             charge = mol_atom.GetFormalCharge()
@@ -578,7 +581,7 @@ def mol_to_struct(
 
         # Load bonds
         unk_bond = const.bond_type_ids[const.unk_bond_type]
-        for bond in mol_no_h.GetBonds():
+        for bond in mol_iter.GetBonds():
             idx_1 = bond.GetBeginAtomIdx()
             idx_2 = bond.GetEndAtomIdx()
 

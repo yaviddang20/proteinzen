@@ -1094,7 +1094,8 @@ class BiomoleculeModule(L.LightningModule):
                 "fixed_seq_res_idx": fixed_seq_res_idx,
                 "fixed_bb_chain_idx": fixed_bb_chain_idx,
                 "fixed_seq_chain_idx": fixed_seq_chain_idx,
-                "name": batch["task"][i]
+                "name": batch["task"][i],
+                "smiles": batch["smiles"][i],
             })
 
         return ret
@@ -1484,7 +1485,8 @@ class BiomoleculeSamplingModule(L.LightningModule):
                 "fixed_seq_res_idx": fixed_seq_res_idx,
                 "fixed_bb_chain_idx": fixed_bb_chain_idx,
                 "fixed_seq_chain_idx": fixed_seq_chain_idx,
-                "name": batch["task"][i]
+                "name": batch["task"][i],
+                "smiles": batch["smiles"][i],
             })
 
         return ret
@@ -1591,7 +1593,7 @@ class PDBWriter(BasePredictionWriter):
                 struct = replace(struct, mask=np.array(chain_mask))
                 # print(struct, chain_mask)
 
-            pdb_str = to_pdb(struct)
+            pdb_str = to_pdb(struct, smiles=sample_data.get('smiles'))
             with open(sample_name + ".pdb", 'w') as fp:
                 fp.write(pdb_str)
 

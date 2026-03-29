@@ -19,7 +19,18 @@
       "Bash(find /datastor1/dy4652/proteinzen -name experiment*.yaml -o -name multiframefm*.yaml)",
       "Bash(find /datastor1/dy4652/proteinzen -name *.yaml ! -path */configs/train/data/* ! -path */sampling/*)",
       "Bash(xtb --version)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(find /datastor1/dy4652/proteinzen/data/geom_drugs_conformers/train/records -name *.npz)",
+      "Bash(for d:*)",
+      "Bash(do echo:*)",
+      "Read(//datastor1/dy4652/proteinzen/data/geom_drugs_conformers/train/structures/**)",
+      "Bash(done)",
+      "Bash(/var/local/dy4652/miniconda3/envs/proteinzen/bin/python3 -c \"\nfrom xtb.libxtb import ffi, lib\nprint\\([m for m in dir\\(lib\\) if not m.startswith\\('_'\\)]\\)\n\" 2>&1)",
+      "Bash(/var/local/dy4652/miniconda3/envs/proteinzen/bin/python3 -c \"\nfrom xtb.interface import Calculator, Results\nimport inspect\nprint\\(inspect.signature\\(Calculator.update\\)\\)\nprint\\(inspect.signature\\(Calculator.singlepoint\\)\\)\nres_src = inspect.getsource\\(Results\\)\nprint\\(res_src[:500]\\)\n\")",
+      "Bash(/var/local/dy4652/miniconda3/envs/proteinzen/bin/python3 _scripts/sanity_xtb.py 2>&1)",
+      "Bash(kill 2950121)",
+      "Bash(/var/local/dy4652/miniconda3/envs/proteinzen/bin/python3 _scripts/sanity_xtb.py 1 2 2>&1)",
+      "Bash(kill 2960107)"
     ]
   }
 }

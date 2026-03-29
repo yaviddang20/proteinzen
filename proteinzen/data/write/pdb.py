@@ -15,7 +15,8 @@ from proteinzen.boltz.data.types import Structure
 def to_pdb(
     structure: Structure,
     plddts: Optional[Tensor] = None,
-    rename_chains: bool = False
+    rename_chains: bool = False,
+    smiles: Optional[str] = None,
 ) -> str:  # noqa: PLR0915
     """Write a structure into a PDB file.
 
@@ -31,6 +32,9 @@ def to_pdb(
 
     """
     pdb_lines = []
+
+    if smiles is not None:
+        pdb_lines.append(f"REMARK SMILES {smiles}")
 
     atom_index = 1
     atom_reindex_ter = []

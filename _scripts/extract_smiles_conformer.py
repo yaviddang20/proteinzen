@@ -1,4 +1,5 @@
 import json
+import pickle
 import random
 import hashlib
 import shutil
@@ -15,6 +16,8 @@ from rdkit.Geometry import Point3D
 # Dataset path
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_DIR = SCRIPT_DIR.parent
+
+RDKIT_DIR = PROJECT_DIR / "data" / "rdkit" / "drugs"
 
 TRAIN_DATASET_DIR = PROJECT_DIR / "data/geom_drugs_conformers/train"
 TRAIN_MANIFEST_PATH = TRAIN_DATASET_DIR / "manifest.json"
@@ -100,31 +103,49 @@ def get_npz_paths(molecule_ids, dataset_dir):
     return npz_paths
 
 
-def write_geom_drugs_molecule_to_pdb(npz_paths, output_dir):
+def _load_pickle_conformers(smiles):
+    """Return {conformer_index: rd_mol} from the rdkit pickle for this SMILES, or {} on failure."""
+    pkl_path = RDKIT_DIR / f"{smiles.replace('/', '_')}.pickle"
+    if not pkl_path.exists():
+        return {}
+    try:
+        d = pickle.load(open(str(pkl_path), "rb"))
+        return {i: c["rd_mol"] for i, c in enumerate(d["conformers"])}
+    except Exception:
+        return {}
+
+
+def write_geom_drugs_molecule_to_pdb(npz_paths, output_dir, smiles=None):
     output_paths = []
+    pkl_mols = _load_pickle_conformers(smiles) if smiles is not None else {}
 
     for npz_path in npz_paths:
-        data = np.load(npz_path)
-        atoms = data['atoms']
+        # conformer index is the last part of the stem: {hash}_{i}
+        try:
+            conf_idx = int(npz_path.stem.rsplit("_", 1)[1])
+        except (ValueError, IndexError):
+            conf_idx = -1
 
-        Z = atoms['element'].astype(int)
-        q = atoms['charge'].astype(int)
-        xyz = atoms['coords'].astype(float)
+        mol = pkl_mols.get(conf_idx)
 
-        n_atoms = len(Z)
-
-        mol = RWMol()
-        conf = Conformer(n_atoms)
-
-        for i in range(n_atoms):
-            atom = Chem.Atom(int(Z[i]))
-            atom.SetFormalCharge(int(q[i]))
-            idx = mol.AddAtom(atom)
-            conf.SetAtomPosition(idx, Point3D(*xyz[i]))
-
-        mol = mol.GetMol()
-        conf.SetId(0)
-        mol.AddConformer(conf, assignId=True)
+        if mol is None:
+            # fallback: build heavy-atom-only mol from NPZ
+            data = np.load(npz_path)
+            atoms = data['atoms']
+            Z = atoms['element'].astype(int)
+            q = atoms['charge'].astype(int)
+            xyz = atoms['coords'].astype(float)
+            n_atoms = len(Z)
+            rw = RWMol()
+            conf = Conformer(n_atoms)
+            for i in range(n_atoms):
+                atom = Chem.Atom(int(Z[i]))
+                atom.SetFormalCharge(int(q[i]))
+                idx = rw.AddAtom(atom)
+                conf.SetAtomPosition(idx, Point3D(*xyz[i]))
+            mol = rw.GetMol()
+            conf.SetId(0)
+            mol.AddConformer(conf, assignId=True)
 
         output_path = output_dir / f"{npz_path.stem}.pdb"
         output_paths.append(output_path)
@@ -138,7 +159,7 @@ def _write_conformer_worker(args):
     smiles, molecule_ids, output_dir, dataset_dir = args
     npz_paths = get_npz_paths(molecule_ids, dataset_dir)
     try:
-        return write_geom_drugs_molecule_to_pdb(npz_paths=npz_paths, output_dir=output_dir)[0]
+        return write_geom_drugs_molecule_to_pdb(npz_paths=npz_paths, output_dir=output_dir, smiles=smiles)[0]
     except Exception:
         print(f"Failed for {smiles[:60]}...")
         traceback.print_exc()

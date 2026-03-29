@@ -1,20 +1,23 @@
 {
-  "total_analyzed": 50000,
-  "n_multiring": 40088,
-  "n_with_any_stack": 13078,
-  "frac_any_stack": 0.26156,
-  "frac_multiring_with_stack": 0.3262322889642786,
+  "total_analyzed": 49949,
+  "n_multiring": 40037,
+  "n_with_any_stack": 33824,
+  "frac_any_stack": 0.677170714128411,
+  "frac_multiring_with_stack": 0.8448185428478657,
   "type_counts": {
-    "face_to_face": 2193,
-    "t_shaped": 12198,
-    "displaced_parallel": 2696
+    "failed_parallel_over_shifted": 977,
+    "failed_parallel_too_far": 35612,
+    "face_to_face": 2194,
+    "t_shaped": 12145,
+    "failed_t_shaped": 14578,
+    "displaced_parallel": 2697
   },
   "ring_count_distribution": {
-    "2": 21192,
+    "2": 21183,
     "0": 9876,
-    "4": 3848,
-    "3": 14629,
-    "5": 395,
+    "4": 3828,
+    "3": 14617,
+    "5": 385,
     "1": 36,
     "6": 22,
     "7": 2

@@ -1,0 +1,21 @@
+{
+  "total_analyzed": 2940,
+  "n_multiring": 2340,
+  "n_with_any_stack": 1810,
+  "frac_any_stack": 0.6156462585034014,
+  "frac_multiring_with_stack": 0.7735042735042735,
+  "type_counts": {
+    "failed_t_shaped": 982,
+    "failed_parallel_too_far": 1325,
+    "face_to_face": 133,
+    "displaced_parallel": 198,
+    "t_shaped": 683,
+    "failed_parallel_over_shifted": 78
+  },
+  "ring_count_distribution": {
+    "0": 600,
+    "2": 1290,
+    "3": 840,
+    "4": 210
+  }
+}

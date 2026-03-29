@@ -80,7 +80,7 @@ def parse(datadir: Path, data: dict):
     for conformer in conformer_data:
         rd_mol = conformer['rd_mol']
 
-        structure = mol_to_struct(rd_mol, noise_ligand=False)
+        structure = mol_to_struct(rd_mol, noise_ligand=False, include_h=True)
         rot_bonds, frag_a = compute_rot_bond_fragments(rd_mol)
         ring_masks = compute_ring_atom_masks(rd_mol)
         sym_groups, sym_group_sizes = compute_sym_groups(rd_mol)

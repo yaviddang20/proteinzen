@@ -74,32 +74,29 @@ def save_best_pair(m1, m2, out_path):
 
 def mol_to_match_key(mol, stereo=False):
     """
-    Canonical SMILES with all explicit Hs and formal charges removed.
-    Remove Hs first so heavy-atom valences are correct after charge zeroing.
-    stereo=False strips stereo annotations for connectivity-only matching.
+    Canonical SMILES key for matching.
+    stereo=False: strips stereo and charges — connectivity-only (loose fallback).
+    stereo=True:  preserves stereo and charges — exact match tier.
     """
     mol = Chem.RemoveHs(mol)
-    rw = Chem.RWMol(mol)
-    for atom in rw.GetAtoms():
-        atom.SetFormalCharge(0)
-    try:
-        Chem.SanitizeMol(rw)
-    except Exception:
+    if not stereo:
+        rw = Chem.RWMol(mol)
+        for atom in rw.GetAtoms():
+            atom.SetFormalCharge(0)
         try:
-            Chem.SanitizeMol(rw, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES)
+            Chem.SanitizeMol(rw)
+        except Exception:
+            try:
+                Chem.SanitizeMol(rw, Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES)
+            except Exception:
+                pass
+        mol = rw.GetMol()
+    else:
+        try:
+            Chem.SanitizeMol(mol)
         except Exception:
             pass
-    return Chem.MolToSmiles(rw.GetMol(), isomericSmiles=stereo, canonical=True)
-
-
-def mol_to_exact_key(mol):
-    """Canonical SMILES preserving charges and stereo — strictest match."""
-    mol = Chem.RemoveHs(mol)
-    try:
-        Chem.SanitizeMol(mol)
-    except Exception:
-        pass
-    return Chem.MolToSmiles(mol, isomericSmiles=True, canonical=True)
+    return Chem.MolToSmiles(mol, isomericSmiles=stereo, canonical=True)
 
 
 def canon_smi_from_mol(mol, stereo=True):
@@ -125,27 +122,61 @@ def load_pdb(path, perceive_stereo=False):
     return mol
 
 
+def _parse_remark_smiles(pdb_path):
+    """Return the SMILES string from a REMARK SMILES line, or None if absent."""
+    with open(pdb_path) as f:
+        for line in f:
+            if line.startswith("REMARK SMILES "):
+                return line.split("REMARK SMILES ", 1)[1].strip()
+            if line.startswith("ATOM") or line.startswith("HETATM"):
+                break  # no REMARK before coordinate records
+    return None
+
+
+def _apply_smiles_template(mol, smiles):
+    """Use AssignBondOrdersFromTemplate to transfer bond orders and formal
+    charges from the SMILES template onto the PDB-loaded mol.
+    Returns the fixed mol, or the original mol on failure."""
+    try:
+        template = AllChem.MolFromSmiles(smiles)
+        if template is None:
+            return mol
+        template = Chem.RemoveHs(template)
+        mol_noH = Chem.RemoveHs(mol)
+        fixed = AllChem.AssignBondOrdersFromTemplate(template, mol_noH)
+        fixed = Chem.AddHs(fixed, addCoords=True)
+        return fixed
+    except Exception:
+        return mol
+
+
 def load_and_prepare(pdb_path):
+    smiles = _parse_remark_smiles(pdb_path)
+
     mol = load_pdb(pdb_path, perceive_stereo=False)
     if mol is None:
-        return None, None, None, None, None, None
-    mol = Chem.AddHs(mol)
+        return None, None, None, None, None
+    if smiles is not None:
+        mol = _apply_smiles_template(mol, smiles)
+    else:
+        mol = Chem.AddHs(mol)
 
     display_smi_no_stereo = canon_smi_from_mol(mol, stereo=False)
     match_no_stereo = mol_to_match_key(mol, stereo=False)
 
     mol_stereo = load_pdb(pdb_path, perceive_stereo=True)
     if mol_stereo is not None:
-        mol_stereo = Chem.AddHs(mol_stereo)
+        if smiles is not None:
+            mol_stereo = _apply_smiles_template(mol_stereo, smiles)
+        else:
+            mol_stereo = Chem.AddHs(mol_stereo)
         display_smi_stereo = canon_smi_from_mol(mol_stereo, stereo=True)
         match_stereo = mol_to_match_key(mol_stereo, stereo=True)
-        match_exact = mol_to_exact_key(mol_stereo)
     else:
         display_smi_stereo = display_smi_no_stereo
         match_stereo = match_no_stereo
-        match_exact = match_no_stereo
 
-    return mol, match_no_stereo, match_stereo, match_exact, display_smi_no_stereo, display_smi_stereo
+    return mol, match_no_stereo, match_stereo, display_smi_no_stereo, display_smi_stereo
 
 # ============================================================
 # Geometry metrics
@@ -518,23 +549,21 @@ def mean_or_nan(lst):
     return float(np.mean(lst)) if lst else float('nan')
 
 
-def compute_metrics_for_group(paths, ref_key_no_stereo_to_mols, ref_key_stereo_to_mols, ref_key_exact_to_mols, out_align_dir):
+def compute_metrics_for_group(paths, ref_key_no_stereo_to_mols, ref_key_stereo_to_mols, out_align_dir):
     RDLogger.DisableLog('rdApp.*')
 
-    gen_mols, gen_paths, gen_stereo_flags, gen_exact_flags = [], [], [], []
+    gen_mols, gen_paths, gen_stereo_flags = [], [], []
     ref_mols_for_group = None
     mol_id = paths[0].stem.rsplit("_", 1)[0] if paths else None
 
     connectivity_no_match = []
     stereo_no_match = []
-    exact_no_match = []
     n_attempted = 0
     n_matched_no_stereo = 0
     n_matched_stereo = 0
-    n_matched_exact = 0
 
     for p in sorted(paths):
-        mol, match_no_stereo, match_stereo, match_exact, display_smi_no_stereo, display_smi_stereo = load_and_prepare(p)
+        mol, match_no_stereo, match_stereo, display_smi_no_stereo, display_smi_stereo = load_and_prepare(p)
         if mol is None:
             continue
 
@@ -546,24 +575,18 @@ def compute_metrics_for_group(paths, ref_key_no_stereo_to_mols, ref_key_stereo_t
 
         n_matched_no_stereo += 1
         stereo_ok = ref_key_stereo_to_mols.get(match_stereo) is not None
-        exact_ok = ref_key_exact_to_mols.get(match_exact) is not None
         if stereo_ok:
             n_matched_stereo += 1
         else:
             stereo_no_match.append((mol_id, display_smi_stereo))
-        if exact_ok:
-            n_matched_exact += 1
-        elif stereo_ok:
-            exact_no_match.append((mol_id, display_smi_stereo))
 
         gen_mols.append(mol)
         gen_paths.append(p)
         gen_stereo_flags.append(stereo_ok)
-        gen_exact_flags.append(exact_ok)
         ref_mols_for_group = ref_mols
 
-    empty = (None, None, None, connectivity_no_match, stereo_no_match, exact_no_match,
-             n_attempted, n_matched_no_stereo, n_matched_stereo, n_matched_exact)
+    empty = (None, None, connectivity_no_match, stereo_no_match,
+             n_attempted, n_matched_no_stereo, n_matched_stereo)
     if not gen_mols or ref_mols_for_group is None:
         return empty
 
@@ -586,20 +609,9 @@ def compute_metrics_for_group(paths, ref_key_no_stereo_to_mols, ref_key_stereo_t
     else:
         metrics_stereo = None
 
-    exact_idx = [j for j, ok in enumerate(gen_exact_flags) if ok]
-    if exact_idx:
-        D_exact = D[:, exact_idx]
-        gen_mols_e = [gen_mols[j] for j in exact_idx]
-        gen_paths_e = [gen_paths[j] for j in exact_idx]
-        amr_r_e, cov_r_e, amr_p_e, cov_p_e = compute_coverage_amr(D_exact, DELTA)
-        geom_exact = compute_geometry_stats(ref_mols_for_group, gen_mols_e, gen_paths_e, D_exact, None)
-        metrics_exact = (amr_r_e, cov_r_e, amr_p_e, cov_p_e) + (geom_exact if geom_exact else (float('nan'),) * 6)
-    else:
-        metrics_exact = None
-
-    return (metrics_conn, metrics_stereo, metrics_exact,
-            connectivity_no_match, stereo_no_match, exact_no_match,
-            n_attempted, n_matched_no_stereo, n_matched_stereo, n_matched_exact)
+    return (metrics_conn, metrics_stereo,
+            connectivity_no_match, stereo_no_match,
+            n_attempted, n_matched_no_stereo, n_matched_stereo)
 
 # ============================================================
 # Torsion plot helpers
@@ -719,15 +731,13 @@ for mode in _modes:
 
     ref_key_no_stereo_to_mols = defaultdict(list)
     ref_key_stereo_to_mols = defaultdict(list)
-    ref_key_exact_to_mols = defaultdict(list)
     ref_mol_id_to_display_smis = {}
 
     for ref_path in glob.glob(REF_GLOB):
-        mol, match_no_stereo, match_stereo, match_exact, display_smi_no_stereo, display_smi_stereo = load_and_prepare(ref_path)
+        mol, match_no_stereo, match_stereo, display_smi_no_stereo, display_smi_stereo = load_and_prepare(ref_path)
         assert mol is not None, f"Failed to load ref: {ref_path}"
         ref_key_no_stereo_to_mols[match_no_stereo].append(mol)
         ref_key_stereo_to_mols[match_stereo].append(mol)
-        ref_key_exact_to_mols[match_exact].append(mol)
         mol_id = Path(ref_path).stem.rsplit("_", 1)[0]
         if mol_id not in ref_mol_id_to_display_smis:
             ref_mol_id_to_display_smis[mol_id] = (display_smi_no_stereo, display_smi_stereo)
@@ -735,7 +745,6 @@ for mode in _modes:
     print(f"Loaded {sum(len(v) for v in ref_key_no_stereo_to_mols.values())} reference conformers")
     print(f"{len(ref_key_no_stereo_to_mols)} unique keys in reference (no stereo)")
     print(f"{len(ref_key_stereo_to_mols)} unique keys in reference (with stereo)")
-    print(f"{len(ref_key_exact_to_mols)} unique keys in reference (exact)")
 
     # ---- Collect predicted molecules ----
     print("Collecting predicted PDBs...")
@@ -753,57 +762,47 @@ for mode in _modes:
 
     if USE_PARALLEL:
         results = Parallel(n_jobs=N_JOBS, backend="loky")(
-            delayed(compute_metrics_for_group)(paths, ref_key_no_stereo_to_mols, ref_key_stereo_to_mols, ref_key_exact_to_mols, OUT_ALIGN_DIR)
+            delayed(compute_metrics_for_group)(paths, ref_key_no_stereo_to_mols, ref_key_stereo_to_mols, OUT_ALIGN_DIR)
             for paths in groups.values()
         )
     else:
         results = [
-            compute_metrics_for_group(paths, ref_key_no_stereo_to_mols, ref_key_stereo_to_mols, ref_key_exact_to_mols, OUT_ALIGN_DIR)
+            compute_metrics_for_group(paths, ref_key_no_stereo_to_mols, ref_key_stereo_to_mols, OUT_ALIGN_DIR)
             for paths in groups.values()
         ]
 
     # ---- Aggregate ----
     agg_conn   = make_metric_lists()
     agg_stereo = make_metric_lists()
-    agg_exact  = make_metric_lists()
     connectivity_no_match_all = []
     stereo_no_match_all = []
-    exact_no_match_all = []
     total_attempted = 0
     total_matched_no_stereo = 0
     total_matched_stereo = 0
-    total_matched_exact = 0
 
     for res in results:
-        metrics_conn, metrics_stereo, metrics_exact, conn_nm, stereo_nm, exact_nm, n_att, n_conn, n_stereo, n_exact = res
+        metrics_conn, metrics_stereo, conn_nm, stereo_nm, n_att, n_conn, n_stereo = res
         total_attempted += n_att
         total_matched_no_stereo += n_conn
         total_matched_stereo += n_stereo
-        total_matched_exact += n_exact
         connectivity_no_match_all.extend(conn_nm)
         stereo_no_match_all.extend(stereo_nm)
-        exact_no_match_all.extend(exact_nm)
         if metrics_conn is not None:
             append_metrics(agg_conn, metrics_conn)
         if metrics_stereo is not None:
             append_metrics(agg_stereo, metrics_stereo)
-        if metrics_exact is not None:
-            append_metrics(agg_exact, metrics_exact)
 
     ref_rmsf_mean = compute_reference_rmsf_mean(ref_key_no_stereo_to_mols)
 
     # ---- Summary ----
     print(f"\n--- Generated Molecules ---")
     print(f"Correctly generated — connectivity only (no stereo):  {total_matched_no_stereo}/{total_attempted}")
-    print(f"Correctly generated — connectivity + stereo:          {total_matched_stereo}/{total_attempted}")
-    print(f"Correctly generated — exact (stereo + charges):       {total_matched_exact}/{total_attempted}")
+    print(f"Correctly generated — connectivity + stereo (exact):  {total_matched_stereo}/{total_attempted}")
     print(f"No-match (wrong connectivity):                        {total_attempted - total_matched_no_stereo}/{total_attempted}")
     print(f"No-match (correct connectivity, wrong stereo):        {total_matched_no_stereo - total_matched_stereo}/{total_attempted}")
-    print(f"No-match (correct stereo, wrong exact):               {total_matched_stereo - total_matched_exact}/{total_attempted}")
 
     for label, agg in [("Connectivity-matched (no stereo)", agg_conn),
-                       ("Connectivity + stereo matched",    agg_stereo),
-                       ("Exact matched (stereo + charges)", agg_exact)]:
+                       ("Stereo-matched / exact",           agg_stereo)]:
         print(f"\n--- {label} ---")
         print(f"  AMR-R:          {mean_or_nan(agg['amr_r']):.4f}")
         print(f"  COV-R:          {mean_or_nan(agg['cov_r']):.4f}")
@@ -851,31 +850,14 @@ for mode in _modes:
     else:
         print("\n--- No-match (stereo): none ---")
 
-    if exact_no_match_all:
-        print(f"\n--- No-match: correct stereo, wrong exact ({len(exact_no_match_all)} conformers) ---")
-        by_name = defaultdict(list)
-        for mol_id, gen_smi in exact_no_match_all:
-            by_name[mol_id].append(gen_smi)
-        for mol_id, gen_smis in sorted(by_name.items()):
-            ref_smis = ref_mol_id_to_display_smis.get(mol_id)
-            ref_smi = ref_smis[1] if ref_smis else None
-            print(f"  [{mol_id}]  ({len(gen_smis)} conformers)")
-            print(f"    ref: {ref_smi}")
-            for smi in sorted(set(gen_smis)):
-                print(f"    gen: {smi}")
-            print()
-    else:
-        print("\n--- No-match (exact): none ---")
-
     no_match_mol_ids = set(mol_id for mol_id, _ in connectivity_no_match_all) | \
-                       set(mol_id for mol_id, _ in stereo_no_match_all) | \
-                       set(mol_id for mol_id, _ in exact_no_match_all)
+                       set(mol_id for mol_id, _ in stereo_no_match_all)
     perfect = [(mol_id, ref_mol_id_to_display_smis.get(mol_id, ('?', '?'))[1])
                for mol_id in sorted(groups.keys())
                if mol_id not in no_match_mol_ids
                and mol_id in ref_mol_id_to_display_smis]
     if perfect:
-        print(f"\n--- Perfectly matched molecules ({len(perfect)}/{len(groups)}, all conformers exact match) ---")
+        print(f"\n--- Perfectly matched molecules ({len(perfect)}/{len(groups)}, all conformers stereo-matched) ---")
         for mol_id, smi in perfect:
             print(f"  [{mol_id}]  {smi}")
     else:

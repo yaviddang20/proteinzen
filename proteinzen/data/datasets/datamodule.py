@@ -27,7 +27,45 @@ from proteinzen.data.featurize.assembler import featurize, collate
 from proteinzen.runtime.sampling.dispatcher import BiomoleculeTaskDispatcher
 
 
-def load_input(record: Record, data_dir):
+def strip_h_from_structure(struct: Structure) -> Structure:
+    """Remove hydrogen atoms (element=1) from a structure, reindexing bonds/residues/chains."""
+    atoms = struct.atoms
+    heavy_mask = atoms['element'] != 1
+    heavy_indices = np.where(heavy_mask)[0]
+    old_to_new = np.full(len(atoms), -1, dtype=np.int32)
+    old_to_new[heavy_indices] = np.arange(len(heavy_indices), dtype=np.int32)
+
+    new_atoms = atoms[heavy_mask]
+
+    bonds = struct.bonds
+    if len(bonds) > 0:
+        bond_heavy = (old_to_new[bonds['atom_1']] >= 0) & (old_to_new[bonds['atom_2']] >= 0)
+        new_bonds = bonds[bond_heavy].copy()
+        new_bonds['atom_1'] = old_to_new[new_bonds['atom_1']]
+        new_bonds['atom_2'] = old_to_new[new_bonds['atom_2']]
+    else:
+        new_bonds = bonds.copy()
+
+    cumulative_heavy = np.concatenate([[0], np.cumsum(heavy_mask)])
+
+    new_residues = struct.residues.copy()
+    for i, res in enumerate(new_residues):
+        start = res['atom_idx']
+        end = start + res['atom_num']
+        new_residues[i]['atom_idx'] = cumulative_heavy[start]
+        new_residues[i]['atom_num'] = cumulative_heavy[end] - cumulative_heavy[start]
+
+    new_chains = struct.chains.copy()
+    for i, chain in enumerate(new_chains):
+        start = chain['atom_idx']
+        end = start + chain['atom_num']
+        new_chains[i]['atom_idx'] = cumulative_heavy[start]
+        new_chains[i]['atom_num'] = cumulative_heavy[end] - cumulative_heavy[start]
+
+    return replace(struct, atoms=new_atoms, bonds=new_bonds, residues=new_residues, chains=new_chains)
+
+
+def load_input(record: Record, data_dir, include_h: bool = False):
     """Load the given input data.
 
     Parameters
@@ -86,9 +124,12 @@ def load_input(record: Record, data_dir):
         mask=structure["mask"],
     )
 
+    if not include_h:
+        struct = strip_h_from_structure(struct)
+
     rot_bond_data = None
     if 'rot_bonds' in structure:
-        n_atoms = structure['atoms'].shape[0]
+        n_atoms = struct.atoms.shape[0]
         rot_bond_data = {
             'rot_bonds': structure['rot_bonds'],
             'rot_frag_a': structure['rot_frag_a'],
@@ -149,7 +190,8 @@ class TrainingDataset(torch.utils.data.Dataset):
         crop_max_neighbors=40,
         dataset_probs=None,
         remove_mol_types=None,
-        mask_nonstandard=False
+        mask_nonstandard=False,
+        include_h=False,
     ):
         super().__init__()
         self.datasets = datasets
@@ -175,6 +217,7 @@ class TrainingDataset(torch.utils.data.Dataset):
             print("Removing chains of types:", remove_mol_types)
             self.remove_mol_types = [const.chain_types.index(s) for s in remove_mol_types]
         self.mask_nonstandard = mask_nonstandard
+        self.include_h = include_h
 
         for dataset in datasets:
             records = dataset.manifest
@@ -191,7 +234,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         sample: Sample = next(self.samples[dataset_idx])
         task = task_sampler.sample_task()
 
-        struct, rot_bond_data = load_input(sample.record, Path(dataset.data_dir))
+        struct, rot_bond_data = load_input(sample.record, Path(dataset.data_dir), include_h=self.include_h)
         chain_mask = struct.mask
         remove_chain_masks = [struct.chains['mol_type'] == i for i in self.remove_mol_types]
         for remove_mask in remove_chain_masks:
@@ -277,7 +320,8 @@ class ValidationDataset(torch.utils.data.Dataset):
         crop_max_neighbors=40,
         dataset_probs=None,
         remove_mol_types=None,
-        mask_nonstandard=False
+        mask_nonstandard=False,
+        include_h=False,
     ):
         super().__init__()
         self.datasets = datasets
@@ -303,6 +347,7 @@ class ValidationDataset(torch.utils.data.Dataset):
             print("Removing chains of types:", remove_mol_types)
             self.remove_mol_types = [const.chain_types.index(s) for s in remove_mol_types]
         self.mask_nonstandard = mask_nonstandard
+        self.include_h = include_h
 
         for dataset in datasets:
             conformer_records = dataset.manifest
@@ -333,7 +378,7 @@ class ValidationDataset(torch.utils.data.Dataset):
         sample = self.samples[idx]
         task = task_sampler.sample_task()
 
-        struct, rot_bond_data = load_input(sample.record, Path(dataset.data_dir))
+        struct, rot_bond_data = load_input(sample.record, Path(dataset.data_dir), include_h=self.include_h)
         chain_mask = struct.mask
         remove_chain_masks = [struct.chains['mol_type'] == i for i in self.remove_mol_types]
         for remove_mask in remove_chain_masks:

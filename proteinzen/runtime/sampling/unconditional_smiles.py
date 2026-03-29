@@ -121,7 +121,7 @@ class UnconditionalSamplingFromSMILES(SamplingTask):
             # task_data['clean_rigids_1'] = process_rigid_features(clean_data)['rigids_1'] 
 
             # yield featurize_inference(clean_data, task_data, task_name=self.kwargs.get("name", self.task_name))
-            yield featurize(data, task_data, task_name=self.kwargs.get("name", self.task_name))
+            yield featurize(data, task_data, task_name=self.kwargs.get("name", self.task_name), smiles=self.smiles)
 
 class UnconditionalSamplingFromMol(SamplingTask):
     task_name: str = "unconditional_mol"
@@ -186,4 +186,4 @@ class UnconditionalSamplingFromMol(SamplingTask):
                 "t": np.array([0.0], dtype=float),
             }
 
-            yield featurize(data, task_data, task_name=self.kwargs.get("name", self.task_name))
+            yield featurize(data, task_data, task_name=self.kwargs.get("name", self.task_name), smiles=Chem.MolToSmiles(self.mol))
