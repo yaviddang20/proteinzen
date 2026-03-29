@@ -31,8 +31,8 @@ conformer_test_dir = PROJECT_DIR / "sampling/geom_conformer_test"
 conformer_train_dir.mkdir(parents=True, exist_ok=True)
 conformer_test_dir.mkdir(parents=True, exist_ok=True)
 
-NUM_TEST = 100
-NUM_GEN_SAMPLES = 30
+NUM_TEST = 50
+NUM_GEN_SAMPLES = 20
 
 
 def extract_smiles_from_manifest(manifest):
