@@ -1,4 +1,4 @@
-!/bin/bash
+#!/bin/bash
 #SBATCH --job-name=gen_geom_conformer
 #SBATCH --output=output_%j.log
 #SBATCH --error=error_%j.log
