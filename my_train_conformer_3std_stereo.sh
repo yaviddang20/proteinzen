@@ -30,15 +30,14 @@ python ${REPO_ROOT}/train.py \
     experiment.lightning.strategy=ddp_find_unused_parameters_true \
     experiment.checkpointer.train_time_interval=null \
     experiment.checkpointer.every_n_train_steps=500 \
-    hydra.run.dir="'${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_norm_scale/train'" \
-    "experiment.warm_start=${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_norm_scale/train/lightning_logs/version_46424/checkpoints/last.ckpt" \
+    hydra.run.dir="'${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo/train'" \
     experiment.lightning.max_epochs=-1 \
     model.use_bond_rotation=false \
     experiment.lightning.accumulate_grad_batches=2 \
     lmodule.bond_rotation_head_only=false \
-    lmodule.scale_bond_length_loss=true \
-    lmodule.scale_bond_angle_loss=true \
-    lmodule.scale_ring_planarity_loss=true
+    lmodule.scale_bond_length_loss=false \
+    lmodule.scale_bond_angle_loss=false \
+    lmodule.scale_ring_planarity_loss=false
 # python train.py \
 #     domain=protein \
 #     paradigm=multiframefm \
