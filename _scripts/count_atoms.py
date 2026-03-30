@@ -76,8 +76,9 @@ def save_pdb_with_h(smiles, out_path):
     from rdkit import Chem
     fname = smiles.replace('/', '_') + '.pickle'
     if len(fname) > 255:
-        prefix = fname[:100]
-        matches = list(RDKIT_DIR.glob(f"{prefix}*.pickle"))
+        import glob as _glob
+        prefix = fname[:100].replace('[', '[[]').replace(']', '[]]')
+        matches = [Path(p) for p in _glob.glob(str(RDKIT_DIR / f"{prefix}*.pickle"))]
         if not matches:
             return False
         pkl_path = matches[0]
