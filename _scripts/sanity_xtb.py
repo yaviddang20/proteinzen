@@ -108,7 +108,7 @@ def load_pdb_mol(pdb_path):
             mol = AllChem.AssignBondOrdersFromTemplate(template, Chem.RemoveHs(mol))
         except Exception:
             pass
-    return Chem.AddHs(mol, addCoords=True)
+    return Chem.AddHs(Chem.RemoveHs(mol), addCoords=True)
 
 
 # ============================================================

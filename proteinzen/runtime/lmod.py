@@ -224,6 +224,9 @@ class BiomoleculeModule(L.LightningModule):
                  lr_step_decay_start=0,
                  lr_step_decay_step=1,
                  lr_step_decay_factor=0.95,
+                 use_cosine_annealing=False,
+                 cosine_annealing_T_max=100,
+                 cosine_annealing_epoch_offset=None,
                  use_ema=True,
                  ema_decay=0.999,
                  use_posthoc_ema=False,
@@ -264,6 +267,9 @@ class BiomoleculeModule(L.LightningModule):
         self.lr_step_decay_start = lr_step_decay_start
         self.lr_step_decay_step = lr_step_decay_step
         self.lr_step_decay_factor = lr_step_decay_factor
+        self.use_cosine_annealing = use_cosine_annealing
+        self.cosine_annealing_T_max = cosine_annealing_T_max
+        self.cosine_annealing_epoch_offset = cosine_annealing_epoch_offset
 
         self.use_ema = use_ema
         self.use_posthoc_ema = use_posthoc_ema
@@ -1108,7 +1114,19 @@ class BiomoleculeModule(L.LightningModule):
             params = self.model.parameters()
         optimizer = self.optim(params)
 
-        if self.use_lr_step_decay:
+        if self.use_cosine_annealing:
+            last_epoch = self.cosine_annealing_epoch_offset if self.cosine_annealing_epoch_offset is not None else self.current_epoch
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=self.cosine_annealing_T_max,
+                last_epoch=last_epoch - 1,
+            )
+            return {
+                'optimizer': optimizer,
+                'lr_scheduler': {'scheduler': scheduler, 'interval': 'epoch'},
+            }
+
+        elif self.use_lr_step_decay:
             scheduler = get_mult_decay_schedule(
                 optimizer,
                 start_step=self.lr_step_decay_start,
