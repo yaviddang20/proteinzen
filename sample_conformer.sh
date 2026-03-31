@@ -15,4 +15,5 @@ python $REPO_ROOT/sample.py \
     sampler.trans_std=${trans_std} \
     save_traj=true \
     +version_num=48835 \
-    corrupter.sampling_noise_mode=null
+    corrupter.sampling_noise_mode=null \
+    sampler.include_h=true

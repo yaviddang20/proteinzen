@@ -189,7 +189,8 @@ def config_sampling_hydra_store():
     sampler_store = store(group="sampler")
     sampler_store(
         builds(
-            BiomoleculeSamplingDataModule
+            BiomoleculeSamplingDataModule,
+            include_h=False,
         ),
         name="default"
     )

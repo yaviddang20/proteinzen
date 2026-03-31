@@ -128,6 +128,7 @@ def smiles_to_struct(
     chain_idx: int = 0,
     noise_ligand: bool = True,
     trans_noise_std: int = 16,
+    include_h: bool = False,
 ) -> Structure:
     """Parse an MMCIF ligand.
 
@@ -172,15 +173,17 @@ def smiles_to_struct(
     mol_no_h = AllChem.RemoveHs(mol)
     Chem.AssignStereochemistry(mol_no_h, cleanIt=True, force=True)
 
+    mol_iter = mol if include_h else mol_no_h
+
     residue_data = []
     atom_data = []
     bond_data = []
     res_idx = 0
 
     # Check if this is a single atom CCD residue
-    if mol_no_h.GetNumAtoms() == 1:
+    if mol_iter.GetNumAtoms() == 1:
         pos = np.array((0, 0, 0))
-        mol_atom = mol_no_h.GetAtoms()[0]
+        mol_atom = mol_iter.GetAtoms()[0]
         chirality_type = const.chirality_type_ids.get(
             str(mol_atom.GetChiralTag()), unk_chirality
         )
@@ -212,13 +215,13 @@ def smiles_to_struct(
 
     else:
         # Get reference conformer coordinates
-        conformer = get_conformer(mol_no_h)
+        conformer = get_conformer(mol_iter)
 
         # Parse each atom
         atom_idx = 0
         idx_map = {}  # Used for bonds later
 
-        for i, mol_atom in enumerate(mol_no_h.GetAtoms()):
+        for i, mol_atom in enumerate(mol_iter.GetAtoms()):
             # Get atom name, charge, element and reference coordinates
             atom_name = mol_atom.GetProp("name")
             charge = mol_atom.GetFormalCharge()
@@ -250,7 +253,7 @@ def smiles_to_struct(
 
         # Load bonds
         unk_bond = const.bond_type_ids[const.unk_bond_type]
-        for bond in mol_no_h.GetBonds():
+        for bond in mol_iter.GetBonds():
             idx_1 = bond.GetBeginAtomIdx()
             idx_2 = bond.GetEndAtomIdx()
 

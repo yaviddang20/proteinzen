@@ -66,6 +66,7 @@ class UnconditionalSamplingFromSMILES(SamplingTask):
         smiles: str,
         num_samples: int,
         trans_std: float = 3,
+        include_h: bool = False,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -73,6 +74,7 @@ class UnconditionalSamplingFromSMILES(SamplingTask):
         self.smiles = smiles
         self.num_samples = num_samples
         self.trans_std = trans_std
+        self.include_h = include_h
 
     def igso3(self):
         sigma_grid = torch.linspace(0.1, 1.5, 1000)
@@ -81,7 +83,7 @@ class UnconditionalSamplingFromSMILES(SamplingTask):
 
     def sample_data(self):
         igso3 = self.igso3()
-        struct = smiles_to_struct(self.smiles)
+        struct = smiles_to_struct(self.smiles, include_h=self.include_h)
 
         # pdb_str =to_pdb(struct)
         # with open(f"clean_data.pdb", "w") as f:
@@ -131,6 +133,7 @@ class UnconditionalSamplingFromMol(SamplingTask):
         mol_pdb_path: str,
         num_samples: int,
         trans_std: float = 3,
+        include_h: bool = False,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -138,6 +141,7 @@ class UnconditionalSamplingFromMol(SamplingTask):
         self.mol = Chem.MolFromPDBFile(mol_pdb_path)
         self.num_samples = num_samples
         self.trans_std = trans_std
+        self.include_h = include_h
 
     def igso3(self):
         sigma_grid = torch.linspace(0.1, 1.5, 1000)
@@ -146,7 +150,7 @@ class UnconditionalSamplingFromMol(SamplingTask):
 
     def sample_data(self):
         igso3 = self.igso3()
-        struct = mol_to_struct(self.mol)
+        struct = mol_to_struct(self.mol, include_h=self.include_h)
 
         # pdb_str = to_pdb(struct)
         # with open(f"clean_data_mol.pdb", "w") as f:

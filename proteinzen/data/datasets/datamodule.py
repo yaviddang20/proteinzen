@@ -487,6 +487,7 @@ class BiomoleculeSamplingDataModule(L.LightningDataModule):
                  batching_mode="optimal",
                  use_collate_for_pad=False,
                  trans_std: float = 3,
+                 include_h: bool = False,
     ):
         super().__init__()
         self.batching_mode = batching_mode
@@ -498,6 +499,7 @@ class BiomoleculeSamplingDataModule(L.LightningDataModule):
             batching_mode,
             use_collate_for_pad,
             trans_std=trans_std,
+            include_h=include_h,
         )
 
     def predict_dataloader(self):

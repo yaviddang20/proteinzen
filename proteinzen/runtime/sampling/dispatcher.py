@@ -25,6 +25,7 @@ class BiomoleculeTaskDispatcher(Dataset):
         batching_mode="optimal",
         use_collate_for_pad=False,
         trans_std: float = 3,
+        include_h: bool = False,
     ):
         super().__init__()
         assert batching_mode in ["lazy", "optimal"]
@@ -38,7 +39,7 @@ class BiomoleculeTaskDispatcher(Dataset):
 
         for task_dict in self.config['tasks']:
             task_class = self.name_to_task_class[task_dict['task']]
-            task = task_class(trans_std=trans_std, **task_dict)
+            task = task_class(trans_std=trans_std, include_h=include_h, **task_dict)
             self.task_objs.append((task_dict, task))
 
         self.batches = self._optimal_batching()

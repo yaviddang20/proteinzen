@@ -35,19 +35,37 @@ NUM_TEST = 50
 NUM_GEN_SAMPLES = 20
 
 
+def _canonicalize_smiles_with_stereo(smiles):
+    """Round-trip through RDKit to get a canonical SMILES with explicit stereochemistry.
+    Returns None if the SMILES cannot be parsed."""
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
+    return Chem.MolToSmiles(mol, isomericSmiles=True)
+
+
 def extract_smiles_from_manifest(manifest):
     smiles_list = []
     failed = 0
+    stereo_failed = 0
     for entry in manifest:
         try:
             method = entry.get('structures', [])[0].get('method', '')
             if method.startswith('QM9:'):
-                smiles = method[4:]
+                raw_smiles = method[4:]
+                smiles = _canonicalize_smiles_with_stereo(raw_smiles)
+                if smiles is None:
+                    stereo_failed += 1
+                    failed += 1
+                    continue
                 smiles_list.append(smiles)
             else:
                 failed += 1
         except Exception:
             failed += 1
+    if stereo_failed:
+        print(f"  Warning: {stereo_failed} SMILES failed RDKit canonicalization and were skipped")
     print(f"Extracted {len(smiles_list)} SMILES strings")
     print(f"Failed to extract: {failed} entries")
     print(f"\nFirst 5 SMILES:")
