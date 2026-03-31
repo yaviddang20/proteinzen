@@ -384,7 +384,7 @@ def mmff_energy(mol):
 def xtb_energy(mol):
     """Calculate GFN2-xTB single-point energy. Returns energy in kcal/mol, or NaN on failure."""
     try:
-        mol = Chem.RemoveHs(mol)
+        # mol = Chem.RemoveHs(mol)
         mol = Chem.AddHs(mol, addCoords=True)
 
         numbers = np.array([atom.GetAtomicNum() for atom in mol.GetAtoms()], dtype=np.int32)
