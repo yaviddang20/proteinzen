@@ -5,6 +5,7 @@ micromamba activate $ENV_NAME
 model_name=geom_identityRot_256_conformer_6std_stereo_norm_scale
 split="train"
 trans_std=1
+version_num=48835
 # CUDA_VISIBLE_DEVICES=0
 
 python $REPO_ROOT/sample.py \
@@ -14,6 +15,6 @@ python $REPO_ROOT/sample.py \
     sampler.batch_size=32 \
     sampler.trans_std=${trans_std} \
     save_traj=true \
-    +version_num=48835 \
+    +version_num=${version_num} \
     corrupter.sampling_noise_mode=null \
     sampler.include_h=true
