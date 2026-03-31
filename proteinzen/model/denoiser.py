@@ -193,6 +193,7 @@ class Embedder(nn.Module):
                  use_qk_norm=False,
                  restype_dict=const.token_ids,
                  num_elements=const.num_elements,
+                 patch_unit_vec_bug=False,
     ):
         super().__init__()
         self.c_s = c_s
@@ -318,7 +319,8 @@ class Embedder(nn.Module):
             c_hidden,
             no_blocks=n_pair_embed_blocks,
             use_qk_norm=use_qk_norm,
-            use_self_folding=use_self_folding
+            use_self_folding=use_self_folding,
+            patch_unit_vec_bug=patch_unit_vec_bug,
         )
 
     def _gen_node_features(
@@ -1225,6 +1227,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                  use_residue_indexing=True,
                  num_registers=0,
                  use_bond_rotation=False,
+                 patch_unit_vec_bug=False,
                  ):
         super().__init__()
 
@@ -1292,7 +1295,8 @@ class IpaMultiRigidDenoiser(nn.Module):
             use_ipa_gating=use_ipa_gating,
             ablate_ipa_down_z=ablate_ipa_down_z,
             use_qk_norm=use_qk_norm,
-            use_self_folding=self_folding
+            use_self_folding=self_folding,
+            patch_unit_vec_bug=patch_unit_vec_bug,
         )
 
         if use_pairformer:

@@ -395,6 +395,7 @@ class ConditionedPairUpdate(nn.Module):
             rbf_max=50.75,
             inf=1e8,
             include_rel_quat=False,
+            patch_unit_vec_bug=False,
             use_qk_norm=False
         ):
         super().__init__()
@@ -405,6 +406,7 @@ class ConditionedPairUpdate(nn.Module):
         self.D_min = rbf_min / self.NM_TO_ANG_SCALE
         self.D_max = rbf_max / self.NM_TO_ANG_SCALE
         self.inf = inf
+        self.patch_unit_vec_bug = patch_unit_vec_bug
         self.include_rel_quat = include_rel_quat
         if c_cond is None:
             self.c_cond = c_s // 4
@@ -572,6 +574,9 @@ class MultiRigidPairEmbedder(nn.Module):
         )
         edge_dist_vec = X_ca[..., None, :] - X_ca[..., None, : ,:]
         unit_edge_dist_vecs = F.normalize(edge_dist_vec, dim=-1)
+        if self.patch_unit_vec_bug:
+            rots = rigids.get_rots()
+            unit_edge_dist_vecs = rots[..., None].invert_apply(unit_edge_dist_vecs)
 
         edge_dist = torch.linalg.vector_norm(edge_dist_vec, dim=-1)
         if distogram:
