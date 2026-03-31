@@ -742,12 +742,12 @@ for mode in _modes:
         if mol_id not in ref_mol_id_to_display_smis:
             ref_mol_id_to_display_smis[mol_id] = (display_smi_no_stereo, display_smi_stereo)
 
-    print(f"Loaded {sum(len(v) for v in ref_key_no_stereo_to_mols.values())} reference conformers")
-    print(f"{len(ref_key_no_stereo_to_mols)} unique keys in reference (no stereo)")
-    print(f"{len(ref_key_stereo_to_mols)} unique keys in reference (with stereo)")
+    print(f"  Ref: {sum(len(v) for v in ref_key_no_stereo_to_mols.values())} conformers across {len(ref_mol_id_to_display_smis)} molecules")
+    print(f"  Ref unique connectivity keys (no stereo): {len(ref_key_no_stereo_to_mols)}")
+    print(f"  Ref unique stereo keys:                   {len(ref_key_stereo_to_mols)}")
 
-    # ---- Collect predicted molecules ----
-    print("Collecting predicted PDBs...")
+    # ---- Collect generated molecules ----
+    print("Collecting generated PDBs...")
 
     pred_paths = [Path(p) for p in glob.glob(PRED_GLOB)]
     groups = defaultdict(list)
@@ -755,10 +755,10 @@ for mode in _modes:
         mol_id = p.stem.rsplit("_", 1)[0]
         groups[mol_id].append(p)
 
-    print(f"{len(groups)} molecule groups found")
+    print(f"  Gen: {sum(len(v) for v in groups.values())} conformers across {len(groups)} molecules")
 
     # ---- Run computation ----
-    print("Running metric computation...")
+    print("Running metric computation (gen vs. ref)...")
 
     if USE_PARALLEL:
         results = Parallel(n_jobs=N_JOBS, backend="loky")(
@@ -795,14 +795,14 @@ for mode in _modes:
     ref_rmsf_mean = compute_reference_rmsf_mean(ref_key_no_stereo_to_mols)
 
     # ---- Summary ----
-    print(f"\n--- Generated Molecules ---")
-    print(f"Correctly generated — connectivity only (no stereo):  {total_matched_no_stereo}/{total_attempted}")
-    print(f"Correctly generated — connectivity + stereo (exact):  {total_matched_stereo}/{total_attempted}")
-    print(f"No-match (wrong connectivity):                        {total_attempted - total_matched_no_stereo}/{total_attempted}")
-    print(f"No-match (correct connectivity, wrong stereo):        {total_matched_no_stereo - total_matched_stereo}/{total_attempted}")
+    print(f"\n--- Gen vs. Ref: Conformer Match Summary ({total_attempted} gen conformers, {sum(len(v) for v in ref_key_no_stereo_to_mols.values())} ref conformers) ---")
+    print(f"  Gen matched ref — connectivity only (no stereo):  {total_matched_no_stereo}/{total_attempted}")
+    print(f"  Gen matched ref — connectivity + stereo (exact):  {total_matched_stereo}/{total_attempted}")
+    print(f"  Gen no-match — wrong connectivity:                {total_attempted - total_matched_no_stereo}/{total_attempted}")
+    print(f"  Gen no-match — correct connectivity, wrong stereo:{total_matched_no_stereo - total_matched_stereo}/{total_attempted}")
 
-    for label, agg in [("Connectivity-matched (no stereo)", agg_conn),
-                       ("Stereo-matched / exact",           agg_stereo)]:
+    for label, agg in [("Gen/Ref metrics — connectivity-matched (no stereo)", agg_conn),
+                       ("Gen/Ref metrics — stereo-matched (exact)",           agg_stereo)]:
         print(f"\n--- {label} ---")
         print(f"  AMR-R:          {mean_or_nan(agg['amr_r']):.4f}")
         print(f"  COV-R:          {mean_or_nan(agg['cov_r']):.4f}")
@@ -815,7 +815,7 @@ for mode in _modes:
         print(f"  Clashes:        {mean_or_nan(agg['clash']):.4f}")
         print(f"  RMSF (gen):     {mean_or_nan(agg['rmsf']):.4f}")
 
-    print(f"\n  RMSF (ref):     {ref_rmsf_mean}")
+    print(f"\n  RMSF (ref conformers, all):  {ref_rmsf_mean}")
 
     # ---- No-match details ----
     if connectivity_no_match_all:
@@ -930,7 +930,7 @@ for mol_id in sorted(set(gen_energies) | set(ref_energies)):
     })
 
 df = pd.DataFrame(rows)
-print(f"Perfectly matched molecules: {len(df)}/30")
+print(f"Perfectly matched molecules: {len(df)}/{len(groups)}")
 
 if df.empty:
     print("  (no perfectly matched molecules — skipping energy aggregate)")
