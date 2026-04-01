@@ -468,6 +468,8 @@ class BiomoleculeModule(L.LightningModule):
 
         loss_dict = self._shared_step(batch)
         self._log_losses(loss_dict, batch, stage="train")
+        lr = self.optimizers().param_groups[0]['lr']
+        self.log("lr", lr, prog_bar=True, logger=True, on_step=True, on_epoch=False, batch_size=1)
         return loss_dict["loss"].mean()
 
     @torch.no_grad()
