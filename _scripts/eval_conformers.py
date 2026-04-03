@@ -191,23 +191,27 @@ def heavy_atom_rmsd(mol_ref, mol_gen):
         return float('inf')
 
 
-def bond_length_mae(mol_ref, mol_gen):
+def get_atom_map(mol_ref, mol_gen):
+    """Substructure match mol_ref onto mol_gen.
+    Returns a tuple t where t[mol_ref_atom_idx] = mol_gen_atom_idx, or None if no match."""
+    ref_noH = Chem.RemoveHs(mol_ref)
+    gen_noH = Chem.RemoveHs(mol_gen)
+    matches = gen_noH.GetSubstructMatches(ref_noH, uniquify=False)
+    return matches[0] if matches else None
+
+
+def bond_length_mae(mol_ref, mol_gen, atom_map):
+    """atom_map[mol_ref_idx] = mol_gen_idx"""
     mol_ref = Chem.RemoveHs(mol_ref)
     mol_gen = Chem.RemoveHs(mol_gen)
     conf_r = mol_ref.GetConformer()
     conf_g = mol_gen.GetConformer()
 
-    assert mol_ref.GetNumAtoms() == mol_gen.GetNumAtoms()
-    assert mol_ref.GetNumBonds() == mol_gen.GetNumBonds()
-    for b in mol_ref.GetBonds():
-        i, j = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
-        assert mol_gen.GetBondBetweenAtoms(i, j) is not None
-
     errs = []
     for b in mol_ref.GetBonds():
         i, j = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
         d_r = conf_r.GetAtomPosition(i).Distance(conf_r.GetAtomPosition(j))
-        d_g = conf_g.GetAtomPosition(i).Distance(conf_g.GetAtomPosition(j))
+        d_g = conf_g.GetAtomPosition(atom_map[i]).Distance(conf_g.GetAtomPosition(atom_map[j]))
         errs.append(abs(d_r - d_g))
 
     return float(np.mean(errs))
@@ -224,7 +228,8 @@ def angle(a, b, c):
     return np.degrees(np.arccos(cos_angle))
 
 
-def bond_angle_mae(mol_ref, mol_gen):
+def bond_angle_mae(mol_ref, mol_gen, atom_map):
+    """atom_map[mol_ref_idx] = mol_gen_idx"""
     mol_ref = Chem.RemoveHs(mol_ref)
     mol_gen = Chem.RemoveHs(mol_gen)
     conf_r = mol_ref.GetConformer()
@@ -239,7 +244,7 @@ def bond_angle_mae(mol_ref, mol_gen):
             for j in range(i + 1, len(nbrs)):
                 a, b, c = nbrs[i], atom.GetIdx(), nbrs[j]
                 ar = angle(conf_r.GetAtomPosition(a), conf_r.GetAtomPosition(b), conf_r.GetAtomPosition(c))
-                ag = angle(conf_g.GetAtomPosition(a), conf_g.GetAtomPosition(b), conf_g.GetAtomPosition(c))
+                ag = angle(conf_g.GetAtomPosition(atom_map[a]), conf_g.GetAtomPosition(atom_map[b]), conf_g.GetAtomPosition(atom_map[c]))
                 errs.append(abs(ar - ag))
     return float(np.mean(errs))
 
@@ -271,7 +276,7 @@ def _equiv_groups(mol, center_idx, exclude_idx):
     return list(buckets.values())
 
 
-def torsion_mae(mol_ref, mol_gen):
+def torsion_mae(mol_ref, mol_gen, atom_map):
     """Torsion MAE over rotatable bonds.
 
     For each bond i-j, we pick one representative atom from each set of
@@ -280,6 +285,8 @@ def torsion_mae(mol_ref, mol_gen):
     and take the minimum torsion error — avoiding penalising the model for
     correctly generating a conformation but with substituents labelled in a
     different-but-equivalent order.
+
+    atom_map[mol_ref_idx] = mol_gen_idx
     """
     mol_ref = Chem.RemoveHs(mol_ref)
     mol_gen = Chem.RemoveHs(mol_gen)
@@ -308,7 +315,7 @@ def torsion_mae(mol_ref, mol_gen):
         best_diff = float('inf')
         for a, d in iproduct(best_group_i, best_group_j):
             tr = rdMolTransforms.GetDihedralDeg(conf_r, a, i, j, d)
-            tg = rdMolTransforms.GetDihedralDeg(conf_g, a, i, j, d)
+            tg = rdMolTransforms.GetDihedralDeg(conf_g, atom_map[a], atom_map[i], atom_map[j], atom_map[d])
             diff = abs(tr - tg) % 360
             best_diff = min(best_diff, min(diff, 360 - diff))
 
@@ -486,12 +493,14 @@ def compute_geometry_stats(ref_mols, gen_mols, gen_paths, D, out_align_dir):
         ref = ref_mols[i]
 
         per_rmsd.append(D[i, j])
-        try:
-            per_bl.append(bond_length_mae(gen, ref))
-            per_ba.append(bond_angle_mae(gen, ref))
-            per_tor.append(torsion_mae(gen, ref))
-        except Exception:
-            pass
+        atom_map = get_atom_map(gen, ref)
+        if atom_map is not None:
+            try:
+                per_bl.append(bond_length_mae(gen, ref, atom_map))
+                per_ba.append(bond_angle_mae(gen, ref, atom_map))
+                per_tor.append(torsion_mae(gen, ref, atom_map))
+            except Exception:
+                pass
         per_clash.append(clash_count(gen))
 
         if out_align_dir is not None:
