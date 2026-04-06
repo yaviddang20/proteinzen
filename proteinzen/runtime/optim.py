@@ -4,6 +4,7 @@ Currently only includes the Noam optimizer,
 based on https://github.com/jingraham/neurips19-graph-protein-design
 """
 
+import re
 import torch
 
 class NoamOpt:
@@ -61,9 +62,39 @@ class NoamOpt:
         return getattr(self.optimizer, name)
 
 
-def get_std_opt(parameters, d_model, state=None):
+def make_adam(model, lr=1e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0):
+    return torch.optim.Adam(model.parameters(), lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+
+
+def get_std_opt(model, d_model, state=None):
     optim = NoamOpt(d_model, 2, 4000,
-                    torch.optim.Adam(parameters, lr=0, betas=(0.9, 0.98), eps=1e-9))
+                    torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
     if state is not None:
         optim.load_state_dict(state)
     return optim
+
+
+# nn.Embedding tables — must go to Adam, not Muon
+_EMBEDDING_RE = re.compile(r'rigid_idx_embed|rigid_element_embed|lin_token_bonds')
+
+
+def make_muon(model, lr_muon=0.02, lr_adam=1e-4,
+              wd_muon=0.1, wd_adam=0.0,
+              momentum=0.95, nesterov=True,
+              betas_adam=(0.9, 0.999), eps_adam=1e-8):
+    from gram_newton_schulz.muon import Muon
+    muon_params, adam_params = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim >= 2 and not _EMBEDDING_RE.search(name):
+            muon_params.append(p)
+        else:
+            adam_params.append(p)
+
+    scalar_opt = torch.optim.Adam(adam_params, lr=lr_adam,
+                                  betas=betas_adam, eps=eps_adam,
+                                  weight_decay=wd_adam)
+    return Muon(muon_params, lr=lr_muon, weight_decay=wd_muon,
+                momentum=momentum, nesterov=nesterov,
+                scalar_optimizer=scalar_opt)
