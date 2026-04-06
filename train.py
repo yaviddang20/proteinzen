@@ -70,6 +70,15 @@ class Experiment:
         # Model checkpoints
         callbacks.append(self._checkpointer)
 
+        best_checkpointer = ModelCheckpoint(
+            filename="best",
+            monitor="val/composite_pred_trans_mse",
+            mode="min",
+            save_top_k=1,
+            save_last=False,
+        )
+        callbacks.append(best_checkpointer)
+
         if torch.cuda.is_available():
             devices = list(range(torch.cuda.device_count()))
         else:

@@ -490,6 +490,22 @@ class BiomoleculeModule(L.LightningModule):
                 stage=f"val/t_{t_val}",
             )
 
+    def on_validation_epoch_end(self):
+        metrics = self.trainer.callback_metrics
+        # Training epoch average: Lightning appends _epoch when on_step=True and on_epoch=True
+        train_mse = metrics.get("train/pred_trans_mse_epoch", metrics.get("train/pred_trans_mse"))
+        val_t05_mse = metrics.get("val/t_0.5/pred_trans_mse")
+        val_t0_mse = metrics.get("val/t_0.0/pred_trans_mse")
+
+        if train_mse is not None and val_t05_mse is not None and val_t0_mse is not None:
+            composite = 0.4 * train_mse + 0.4 * val_t05_mse + 0.2 * val_t0_mse
+            self.log(
+                "val/composite_pred_trans_mse",
+                composite,
+                prog_bar=True,
+                sync_dist=True,
+            )
+
     # def training_step(self, batch, batch_idx):
     #     # update EMA
     #     if self.ema is not None and self.global_step > 0:
