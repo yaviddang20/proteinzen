@@ -118,7 +118,7 @@ def config_hydra_store():
     optim_store = exp_store(group="experiment/optim")
     optim_store(pbuilds(make_adam, lr=1e-4), name="adam")
     optim_store(pbuilds(get_std_opt, d_model=128), name="noam")
-    optim_store(pbuilds(make_muon, lr_muon=0.02, lr_adam=1e-4), name="muon")
+    optim_store(pbuilds(make_muon, lr_muon=1e-3, lr_adam=1e-4), name="muon")
 
     exp_store(
         ModelCheckpoint,

@@ -78,7 +78,7 @@ def get_std_opt(model, d_model, state=None):
 _EMBEDDING_RE = re.compile(r'rigid_idx_embed|rigid_element_embed|lin_token_bonds')
 
 
-def make_muon(model, lr_muon=0.02, lr_adam=1e-4,
+def make_muon(model, lr_muon=1e-3, lr_adam=1e-4,
               wd_muon=0.1, wd_adam=0.0,
               momentum=0.95, nesterov=True,
               betas_adam=(0.9, 0.999), eps_adam=1e-8):
