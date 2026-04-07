@@ -78,11 +78,36 @@ def get_std_opt(model, d_model, state=None):
 _EMBEDDING_RE = re.compile(r'rigid_idx_embed|rigid_element_embed|lin_token_bonds')
 
 
+class MuonWithAdam:
+    def __init__(self, muon_params, adam_params, lr_muon=1e-3, lr_adam=1e-4,
+                 wd_muon=0.1, wd_adam=0.0, momentum=0.95, nesterov=True,
+                 betas_adam=(0.9, 0.999), eps_adam=1e-8):
+        self.muon = torch.optim.Muon(muon_params, lr=lr_muon, weight_decay=wd_muon,
+                                     momentum=momentum, nesterov=nesterov)
+        self.adam = torch.optim.Adam(adam_params, lr=lr_adam, betas=betas_adam,
+                                     eps=eps_adam, weight_decay=wd_adam)
+        self.param_groups = self.muon.param_groups + self.adam.param_groups
+
+    def step(self, closure=None):
+        self.muon.step(closure)
+        self.adam.step(closure)
+
+    def zero_grad(self, set_to_none=True):
+        self.muon.zero_grad(set_to_none=set_to_none)
+        self.adam.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self):
+        return {'muon': self.muon.state_dict(), 'adam': self.adam.state_dict()}
+
+    def load_state_dict(self, state_dict):
+        self.muon.load_state_dict(state_dict['muon'])
+        self.adam.load_state_dict(state_dict['adam'])
+
+
 def make_muon(model, lr_muon=1e-3, lr_adam=1e-4,
               wd_muon=0.1, wd_adam=0.0,
               momentum=0.95, nesterov=True,
               betas_adam=(0.9, 0.999), eps_adam=1e-8):
-    from gram_newton_schulz.muon import Muon
     muon_params, adam_params = [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
@@ -92,9 +117,6 @@ def make_muon(model, lr_muon=1e-3, lr_adam=1e-4,
         else:
             adam_params.append(p)
 
-    scalar_opt = torch.optim.Adam(adam_params, lr=lr_adam,
-                                  betas=betas_adam, eps=eps_adam,
-                                  weight_decay=wd_adam)
-    return Muon(muon_params, lr=lr_muon, weight_decay=wd_muon,
-                momentum=momentum, nesterov=nesterov,
-                scalar_optimizer=scalar_opt)
+    return MuonWithAdam(muon_params, adam_params, lr_muon=lr_muon, lr_adam=lr_adam,
+                        wd_muon=wd_muon, wd_adam=wd_adam, momentum=momentum,
+                        nesterov=nesterov, betas_adam=betas_adam, eps_adam=eps_adam)
