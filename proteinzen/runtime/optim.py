@@ -78,7 +78,7 @@ def get_std_opt(model, d_model, state=None):
 _EMBEDDING_RE = re.compile(r'rigid_idx_embed|rigid_element_embed|lin_token_bonds')
 
 
-class MuonWithAdam:
+class MuonWithAdam(torch.optim.Optimizer):
     def __init__(self, muon_params, adam_params, lr_muon=1e-3, lr_adam=1e-4,
                  wd_muon=0.1, wd_adam=0.0, momentum=0.95, nesterov=True,
                  betas_adam=(0.9, 0.999), eps_adam=1e-8):
@@ -86,6 +86,9 @@ class MuonWithAdam:
                                      momentum=momentum, nesterov=nesterov)
         self.adam = torch.optim.Adam(adam_params, lr=lr_adam, betas=betas_adam,
                                      eps=eps_adam, weight_decay=wd_adam)
+        # bypass Optimizer.__init__ and set required attributes directly
+        self.defaults = {}
+        self.state = {}
         self.param_groups = self.muon.param_groups + self.adam.param_groups
 
     def step(self, closure=None):
