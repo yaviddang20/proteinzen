@@ -10,6 +10,8 @@ import glob
 import json
 import multiprocessing as mp
 import os
+import subprocess
+import tempfile
 import sys
 from collections import defaultdict
 from itertools import product as iproduct
@@ -33,6 +35,8 @@ RDLogger.DisableLog('rdApp.*')
 
 ANGSTROM_TO_BOHR   = 1.8897259886
 HARTREE_TO_KCALMOL = 627.509474
+HARTREE_TO_EV      = 27.2114
+XTB_BIN            = "xtb"
 
 # ============================================================
 # I/O helpers
@@ -408,6 +412,99 @@ def xtb_energy(mol):
     except Exception:
         return float('nan')
 
+
+def xtb_homo_lumo(mol):
+    """Unrelaxed GFN2-xTB HOMO, LUMO, and gap (eV). Returns (homo, lumo, gap) or (nan, nan, nan)."""
+    try:
+        mol = Chem.AddHs(mol, addCoords=True)
+        numbers = np.array([atom.GetAtomicNum() for atom in mol.GetAtoms()], dtype=np.int32)
+        conf = mol.GetConformer()
+        positions = np.array(
+            [conf.GetAtomPosition(i) for i in range(mol.GetNumAtoms())],
+            dtype=np.float64
+        ) * ANGSTROM_TO_BOHR
+        calc = Calculator(Param.GFN2xTB, numbers, positions)
+        calc.set_verbosity(0)
+        res = calc.singlepoint()
+        eigs = res.get_orbital_eigenvalues()
+        occs = res.get_orbital_occupations()
+        homo_idx = int(np.where(occs > 0)[0][-1])
+        homo = float(eigs[homo_idx]) * HARTREE_TO_EV
+        lumo = float(eigs[homo_idx + 1]) * HARTREE_TO_EV
+        return homo, lumo, lumo - homo
+    except Exception:
+        return float('nan'), float('nan'), float('nan')
+
+
+def _mol_to_xyz_string(mol):
+    """Write mol (with Hs) to an xyz-format string."""
+    n = mol.GetNumAtoms()
+    conf = mol.GetConformer()
+    lines = [str(n), ""]
+    for i, atom in enumerate(mol.GetAtoms()):
+        p = conf.GetAtomPosition(i)
+        lines.append("%s %.8f %.8f %.8f" % (atom.GetSymbol(), p.x, p.y, p.z))
+    return "\n".join(lines)
+
+
+def xtb_relax(mol):
+    """Relax mol with GFN2-xTB binary (--opt).
+
+    Returns (relaxed_mol, strain_kcal, homo_eV, lumo_eV, gap_eV).
+    relaxed_mol has updated conformer coordinates.
+    strain_kcal = E(unrelaxed) - E(relaxed) in kcal/mol.
+    HOMO/LUMO/gap are from the relaxed geometry.
+    Returns (None, nan, nan, nan, nan) on failure.
+    """
+    nan5 = (None, float('nan'), float('nan'), float('nan'), float('nan'))
+    try:
+        mol = Chem.AddHs(mol, addCoords=True)
+        e_unrelaxed = xtb_energy(mol)  # kcal/mol
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            xyz_path = os.path.join(tmpdir, "mol.xyz")
+            with open(xyz_path, "w") as f:
+                f.write(_mol_to_xyz_string(mol))
+
+            result = subprocess.run(
+                [XTB_BIN, "mol.xyz", "--gfn", "2", "--opt", "--json"],
+                cwd=tmpdir, capture_output=True, text=True, timeout=300
+            )
+            if result.returncode != 0:
+                return nan5
+
+            with open(os.path.join(tmpdir, "xtbout.json")) as f:
+                data = json.load(f)
+            e_relaxed_kcal = data["total energy"] * HARTREE_TO_KCALMOL
+            strain_kcal = e_unrelaxed - e_relaxed_kcal
+
+            homo_eV = float('nan')
+            lumo_eV = float('nan')
+            gap_eV  = data.get("HOMO-LUMO gap / eV", float('nan'))
+            orb = data.get("orbital energies / eV", [])
+            occ = data.get("fractional occupation", [])
+            if orb and occ:
+                occupied = [i for i, o in enumerate(occ) if o > 0]
+                if occupied:
+                    hi = occupied[-1]
+                    homo_eV = float(orb[hi])
+                    if hi + 1 < len(orb):
+                        lumo_eV = float(orb[hi + 1])
+
+            # update conformer from xtbopt.xyz
+            with open(os.path.join(tmpdir, "xtbopt.xyz")) as f:
+                opt_lines = f.readlines()
+            relaxed_mol = Chem.RWMol(mol)
+            conf = relaxed_mol.GetConformer()
+            for i in range(mol.GetNumAtoms()):
+                parts = opt_lines[2 + i].split()
+                conf.SetAtomPosition(i, (float(parts[1]), float(parts[2]), float(parts[3])))
+
+            return relaxed_mol.GetMol(), strain_kcal, homo_eV, lumo_eV, gap_eV
+
+    except Exception:
+        return nan5
+
 # ============================================================
 # Boltzmann weights / energy-per-path helpers
 # ============================================================
@@ -481,8 +578,8 @@ def compute_coverage_amr(D, delta):
 
 
 def compute_geometry_stats(ref_mols, gen_mols, gen_paths, D, out_align_dir):
-    """Per-conformer geometry metrics; returns (best_rmsd, best_bl, best_ba, mean_tor, mean_clash, rmsf)."""
-    per_rmsd, per_bl, per_ba, per_tor, per_clash = [], [], [], [], []
+    """Per-conformer geometry metrics; returns (best_rmsd, best_bl, best_ba, mean_tor, mean_clash, mean_strain, rmsf)."""
+    per_rmsd, per_bl, per_ba, per_tor, per_clash, per_strain = [], [], [], [], [], []
 
     for j, (gen, p) in enumerate(zip(gen_mols, gen_paths)):
         col = D[:, j]
@@ -502,6 +599,9 @@ def compute_geometry_stats(ref_mols, gen_mols, gen_paths, D, out_align_dir):
             except Exception:
                 pass
         per_clash.append(clash_count(gen))
+        _, strain, _, _, _ = xtb_relax(gen)
+        if np.isfinite(strain):
+            per_strain.append(strain)
 
         if out_align_dir is not None:
             try:
@@ -518,10 +618,11 @@ def compute_geometry_stats(ref_mols, gen_mols, gen_paths, D, out_align_dir):
     rmsf_val = heavy_atom_rmsf(gen_mols, align_first=True) if len(gen_mols) >= 2 else None
     return (
         float(np.min(per_rmsd)),
-        float(np.min(per_bl))   if per_bl  else float('nan'),
-        float(np.min(per_ba))   if per_ba  else float('nan'),
-        float(np.mean(per_tor)) if per_tor else float('nan'),
+        float(np.min(per_bl))     if per_bl     else float('nan'),
+        float(np.min(per_ba))     if per_ba     else float('nan'),
+        float(np.mean(per_tor))   if per_tor    else float('nan'),
         float(np.mean(per_clash)),
+        float(np.mean(per_strain)) if per_strain else float('nan'),
         rmsf_val,
     )
 
@@ -541,13 +642,13 @@ def compute_reference_rmsf_mean(ref_key_to_mols):
 
 
 def make_metric_lists():
-    return {k: [] for k in ['amr_r', 'cov_r', 'amr_p', 'cov_p', 'rmsd', 'bl', 'ba', 'tor', 'clash', 'rmsf']}
+    return {k: [] for k in ['amr_r', 'cov_r', 'amr_p', 'cov_p', 'rmsd', 'bl', 'ba', 'tor', 'clash', 'strain', 'rmsf']}
 
 
 def append_metrics(agg, metrics):
-    amr_r, cov_r, amr_p, cov_p, rmsd, bl, ba, tor, clash, rmsf_val = metrics
+    amr_r, cov_r, amr_p, cov_p, rmsd, bl, ba, tor, clash, strain, rmsf_val = metrics
     for key, val in [('amr_r', amr_r), ('cov_r', cov_r), ('amr_p', amr_p), ('cov_p', cov_p),
-                     ('rmsd', rmsd), ('bl', bl), ('ba', ba), ('tor', tor), ('clash', clash)]:
+                     ('rmsd', rmsd), ('bl', bl), ('ba', ba), ('tor', tor), ('clash', clash), ('strain', strain)]:
         if np.isfinite(val):
             agg[key].append(val)
     if rmsf_val is not None:
@@ -614,7 +715,7 @@ def compute_metrics_for_group(paths, ref_key_no_stereo_to_mols, ref_key_stereo_t
         gen_paths_s = [gen_paths[j] for j in stereo_idx]
         amr_r_s, cov_r_s, amr_p_s, cov_p_s = compute_coverage_amr(D_stereo, DELTA)
         geom_stereo = compute_geometry_stats(ref_mols_for_group, gen_mols_s, gen_paths_s, D_stereo, None)
-        metrics_stereo = (amr_r_s, cov_r_s, amr_p_s, cov_p_s) + (geom_stereo if geom_stereo else (float('nan'),) * 6)
+        metrics_stereo = (amr_r_s, cov_r_s, amr_p_s, cov_p_s) + (geom_stereo if geom_stereo else (float('nan'),) * 7)
     else:
         metrics_stereo = None
 
@@ -822,6 +923,7 @@ for mode in _modes:
         print(f"  Best BA MAE:    {mean_or_nan(agg['ba']):.4f}")
         print(f"  Torsion MAE:    {mean_or_nan(agg['tor']):.4f}")
         print(f"  Clashes:        {mean_or_nan(agg['clash']):.4f}")
+        print(f"  Strain (kcal):  {mean_or_nan(agg['strain']):.4f}")
         print(f"  RMSF (gen):     {mean_or_nan(agg['rmsf']):.4f}")
 
     print(f"\n  RMSF (ref conformers, all):  {ref_rmsf_mean}")

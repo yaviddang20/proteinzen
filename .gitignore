@@ -139,3 +139,6 @@ ENV/
 proteinzen_weights
 proteinzen/outputs/
 gram-newton-schulz
+xtb*
+.xtb*
+.claude*

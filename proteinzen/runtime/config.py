@@ -17,7 +17,7 @@ from proteinzen.model.denoiser import IpaMultiRigidDenoiser
 
 
 from proteinzen.runtime.lmod import BiomoleculeModule
-from proteinzen.runtime.optim import get_std_opt, make_adam, make_muon
+from proteinzen.runtime.optim import get_std_opt
 
 if os.environ.get("REPO_ROOT") is None:
     print("Didn't find REPO_ROOT as an env var, so let's try to load it from the repo")
@@ -116,9 +116,8 @@ def config_hydra_store():
         ), name="default")
 
     optim_store = exp_store(group="experiment/optim")
-    optim_store(pbuilds(make_adam, lr=1e-4), name="adam")
+    optim_store(pbuilds(torch.optim.Adam, lr=1e-4), name="adam")
     optim_store(pbuilds(get_std_opt, d_model=128), name="noam")
-    optim_store(pbuilds(make_muon, lr_muon=1e-3, lr_adam=1e-4), name="muon")
 
     exp_store(
         ModelCheckpoint,

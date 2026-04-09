@@ -1126,8 +1126,11 @@ class BiomoleculeModule(L.LightningModule):
 
 
     def configure_optimizers(self):
-        model = self.model.bond_rotation_head if self.bond_rotation_head_only else self.model
-        optimizer = self.optim(model)
+        if self.bond_rotation_head_only:
+            params = self.model.bond_rotation_head.parameters()
+        else:
+            params = self.model.parameters()
+        optimizer = self.optim(params)
 
         if self.use_cosine_annealing:
             last_epoch = self.cosine_annealing_epoch_offset if self.cosine_annealing_epoch_offset is not None else self.current_epoch
