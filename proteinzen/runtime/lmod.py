@@ -1129,9 +1129,10 @@ class BiomoleculeModule(L.LightningModule):
         if self.use_cosine_annealing:
             last_epoch = self.cosine_annealing_epoch_offset if self.cosine_annealing_epoch_offset is not None else self.current_epoch
             scheduler = self.lr_schedulers()
+            scheduler.T_max = self.cosine_annealing_T_max
             scheduler.last_epoch = last_epoch
             scheduler._step_count = last_epoch + 1
-            print(f"Cosine annealing scheduler with T_max={scheduler.T_max} and last_epoch={scheduler.last_epoch}", self.cosine_annealing_T_max, last_epoch)
+            print(f"Cosine annealing scheduler with T_max={scheduler.T_max} and last_epoch={scheduler.last_epoch}")
 
     def configure_optimizers(self):
         if self.bond_rotation_head_only:
