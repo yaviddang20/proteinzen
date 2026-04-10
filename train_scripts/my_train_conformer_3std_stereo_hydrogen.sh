@@ -38,7 +38,9 @@ python ${REPO_ROOT}/train.py \
     lmodule.scale_bond_length_loss=false \
     lmodule.scale_bond_angle_loss=false \
     lmodule.scale_ring_planarity_loss=false \
-    dataset.include_h=true
+    dataset.include_h=true \
+    lmodule.use_cosine_annealing=true \
+    lmodule.cosine_annealing_T_max=500
 # python train.py \
 #     domain=protein \
 #     paradigm=multiframefm \

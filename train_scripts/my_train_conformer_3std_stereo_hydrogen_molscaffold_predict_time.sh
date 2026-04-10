@@ -40,7 +40,9 @@ python ${REPO_ROOT}/train.py \
     lmodule.scale_ring_planarity_loss=false \
     dataset.include_h=true \
     model.patch_unit_vec_bug=true \
-    model.predict_time=true
+    model.predict_time=true \
+    lmodule.use_cosine_annealing=true \
+    lmodule.cosine_annealing_T_max=500
 # python train.py \
 #     domain=protein \
 #     paradigm=multiframefm \

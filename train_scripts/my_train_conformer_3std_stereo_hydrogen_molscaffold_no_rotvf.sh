@@ -42,6 +42,8 @@ python ${REPO_ROOT}/train.py \
     model.patch_unit_vec_bug=true \
     lmodule.identity_rot_noise=true \
     lmodule.use_rot_vf_loss=false \
+    lmodule.use_cosine_annealing=true \
+    lmodule.cosine_annealing_T_max=500
 # python train.py \
 #     domain=protein \
 #     paradigm=multiframefm \

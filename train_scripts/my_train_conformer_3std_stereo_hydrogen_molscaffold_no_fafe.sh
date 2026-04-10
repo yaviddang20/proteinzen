@@ -41,6 +41,8 @@ python ${REPO_ROOT}/train.py \
     dataset.include_h=true \
     model.patch_unit_vec_bug=true \
     lmodule.use_fafe_loss=false \
+    lmodule.use_cosine_annealing=true \
+    lmodule.cosine_annealing_T_max=500
 # python train.py \
 #     domain=protein \
 #     paradigm=multiframefm \
