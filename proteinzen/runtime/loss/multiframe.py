@@ -455,6 +455,16 @@ def multiframe_fm_loss_dense_batch(
     rots_1_pred = denoised_rigids.get_rots().get_rot_mats()
     rots_1 = gt_rigids.get_rots().get_rot_mats()
 
+    trans_1_pred = denoised_rigids.get_trans()
+    trans_1 = gt_rigids.get_trans()
+    trans_vf_loss = torch.square(trans_1_pred - trans_1).sum(dim=-1) / (norm_scale ** 2)
+    unscaled_trans_vf_loss = trans_vf_loss
+    trans_vf_loss = trans_vf_loss * rigidwise_weight * trans_rigidwise_weight
+    trans_vf_loss = (trans_vf_loss * total_mask).sum(dim=-1) / num_rigids_per_batch
+    trans_vf_loss *= 0.01  # Angstroms to nm
+    unscaled_trans_vf_loss = (unscaled_trans_vf_loss * total_mask).sum(dim=-1) / num_rigids_per_batch
+    unscaled_trans_vf_loss *= 0.01  # Angstroms to nm
+
     if use_rot_vf_loss:
         if use_euclidean_for_rots:
             def geodesic_dist(rots1, rots2):
@@ -541,16 +551,6 @@ def multiframe_fm_loss_dense_batch(
     else:
         rot_vf_loss = torch.zeros_like(trans_vf_loss)
         unscaled_rot_vf_loss = torch.zeros_like(trans_vf_loss)
-
-    trans_1_pred = denoised_rigids.get_trans()
-    trans_1 = gt_rigids.get_trans()
-    trans_vf_loss = torch.square(trans_1_pred - trans_1).sum(dim=-1) / (norm_scale ** 2)
-    unscaled_trans_vf_loss = trans_vf_loss
-    trans_vf_loss = trans_vf_loss * rigidwise_weight * trans_rigidwise_weight
-    trans_vf_loss = (trans_vf_loss * total_mask).sum(dim=-1) / num_rigids_per_batch
-    trans_vf_loss *= 0.01  # Angstroms to nm
-    unscaled_trans_vf_loss = (unscaled_trans_vf_loss * total_mask).sum(dim=-1) / num_rigids_per_batch
-    unscaled_trans_vf_loss *= 0.01  # Angstroms to nm
 
 
     raw_bond_length = bond_length_rmse(inputs, denoiser_outputs)
