@@ -244,6 +244,9 @@ class BiomoleculeModule(L.LightningModule):
                  scale_bond_length_loss=False,
                  scale_bond_angle_loss=False,
                  scale_ring_planarity_loss=False,
+                 use_fafe_loss=True,
+                 use_rot_vf_loss=True,
+                 identity_rot_noise=False,
     ):
         super().__init__()
         self._log = logging.getLogger(__name__)
@@ -296,6 +299,11 @@ class BiomoleculeModule(L.LightningModule):
         else:
             self.ema_long = None
             self.ema_short = None
+
+        
+        self.use_fafe_loss = use_fafe_loss
+        self.use_rot_vf_loss = use_rot_vf_loss
+        self.identity_rot_noise = identity_rot_noise
 
 
         self.aatype_to_restype_tensor = torch.zeros(const.num_tokens)
@@ -435,7 +443,7 @@ class BiomoleculeModule(L.LightningModule):
         # stochastic corruption for BOTH train and val
         batch["trans_t"] = batch["t"]
         batch["rot_t"] = batch["t"]
-        batch = self.corrupter.corrupt_dense_batch(batch)
+        batch = self.corrupter.corrupt_dense_batch(batch, self.identity_rot_noise)
 
         # self-conditioning (optional)
         self_conditioning = None
@@ -519,7 +527,7 @@ class BiomoleculeModule(L.LightningModule):
     #     corrupter = self.corrupter
     #     batch['trans_t'] = batch['t']
     #     batch['rot_t'] = batch['t']
-    #     batch = corrupter.corrupt_dense_batch(batch)
+    #     batch = corrupter.corrupt_dense_batch(batch, self.identity_rot_noise)
 
     #     # print("rigids_data", batch['rigids'])
     #     # print("token_data", batch['token'])
@@ -710,6 +718,8 @@ class BiomoleculeModule(L.LightningModule):
             scale_bond_length_loss=self.scale_bond_length_loss,
             scale_bond_angle_loss=self.scale_bond_angle_loss,
             scale_ring_planarity_loss=self.scale_ring_planarity_loss,
+            use_fafe_loss=self.use_fafe_loss,
+            use_rot_vf_loss=self.use_rot_vf_loss,
         )
 
         frame_vf_loss = (
@@ -750,6 +760,9 @@ class BiomoleculeModule(L.LightningModule):
         else:
             loss = loss + 1.0 * frame_fm_loss_dict['bond_angle_rmse'] + 1.0 * frame_fm_loss_dict['bond_length_rmse']
             loss = loss + frame_fm_loss_dict['ring_planarity_loss'] * 1.0 + frame_fm_loss_dict['bond_rot_mse'] * 0.01
+
+        if outputs.get('time_pred_val') is not None:
+            loss = loss + 1.0 * (outputs['time_pred_val'] - inputs['t'].squeeze(-1)).abs().mean()
 
         loss_dict = {"loss": loss.mean(), "frame_vf_loss": frame_vf_loss, "frame_vf_loss_unscaled": unscaled_frame_vf_loss}
         loss_dict['loss_per_batch'] = loss

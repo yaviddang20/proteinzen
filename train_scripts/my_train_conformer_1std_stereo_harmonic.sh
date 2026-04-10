@@ -1,5 +1,5 @@
 dir=$(realpath "$(dirname "${BASH_SOURCE[0]}")")
-source $dir/env_vars.sh 
+source $dir/../env_vars.sh 
 
 python ${REPO_ROOT}/train.py \
     domain=protein \

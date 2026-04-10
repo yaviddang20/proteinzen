@@ -1,6 +1,6 @@
 #!/bin/bash
 dir=$(realpath "$(dirname "${BASH_SOURCE[0]}")")
-source $dir/env_vars.sh
+source $dir/../env_vars.sh
 
 run() {
     local gpu=$1

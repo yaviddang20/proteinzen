@@ -417,7 +417,7 @@ class MultiSE3Interpolant:
         rigidwise_t = batch['rigidwise_t']
         if self.shift_time_scale:
             rigidwise_t = self.time_shift(rigidwise_t, (res_data.batch == 0).float().sum().item())
-
+        
         rotmats_0 = self._sample_rotmats_0(rotmats_1)
 
         # B = res_data.batch.shape[0]
@@ -557,7 +557,7 @@ class MultiSE3Interpolant:
         return trans_0
 
     # @torch.no_grad()
-    def corrupt_dense_batch(self, batch):
+    def corrupt_dense_batch(self, batch, identity_rot_noise=False):
         rigids_data = batch["rigids"]
 
         rigids_1 = ru.Rigid.from_tensor_7(rigids_data["rigids_1"])
@@ -570,13 +570,14 @@ class MultiSE3Interpolant:
         rigids_mask = rigids_data["rigids_mask"]
         rigids_noising_mask = rigids_data["rigids_noising_mask"]
 
-        rotmats_0 = self._sample_rotmats_0(rotmats_1)
-
-        # rotmats_0 = torch.eye(
-        #     3,
-        #     device=rotmats_1.device,
-        #     dtype=torch.float32
-        # ).expand(*rotmats_1.shape[:-2], 3, 3)
+        if identity_rot_noise:
+            rotmats_0 = torch.eye(
+                3,
+                device=rotmats_1.device,
+                dtype=torch.float32
+            ).expand(*rotmats_1.shape[:-2], 3, 3)
+        else:
+            rotmats_0 = self._sample_rotmats_0(rotmats_1)
 
         trans_0 = self._sample_trans_prior(trans_1, batch)
 
