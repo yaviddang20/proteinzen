@@ -42,7 +42,8 @@ python ${REPO_ROOT}/train.py \
     model.patch_unit_vec_bug=true \
     model.predict_time=true \
     lmodule.use_cosine_annealing=true \
-    lmodule.cosine_annealing_T_max=500
+    lmodule.cosine_annealing_T_max=500 \
+    experiment.warm_start="'${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_molscaffold_predict_time/train/lightning_logs/version_62672/checkpoints/best.ckpt'"
 # python train.py \
 #     domain=protein \
 #     paradigm=multiframefm \

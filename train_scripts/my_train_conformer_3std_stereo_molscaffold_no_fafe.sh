@@ -41,7 +41,9 @@ python ${REPO_ROOT}/train.py \
     dataset.include_h=false \
     model.patch_unit_vec_bug=true \
     lmodule.use_fafe_loss=false \
-    lmodule.cosine_annealing_T_max=500
+    lmodule.use_cosine_annealing=true \
+    lmodule.cosine_annealing_T_max=500 \
+    experiment.warm_start="'${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_molscaffold_no_fafe/train/lightning_logs/version_62672/checkpoints/best.ckpt'"
 # python train.py \
 #     domain=protein \
 #     paradigm=multiframefm \

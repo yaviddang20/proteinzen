@@ -43,7 +43,8 @@ python ${REPO_ROOT}/train.py \
     lmodule.identity_rot_noise=true \
     lmodule.use_rot_vf_loss=false \
     lmodule.use_cosine_annealing=true \
-    lmodule.cosine_annealing_T_max=500
+    lmodule.cosine_annealing_T_max=500 \
+    experiment.warm_start="'${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_hydrogen_molscaffold_IdentityNoise/train/lightning_logs/version_62672/checkpoints/best.ckpt'"
 # python train.py \
 #     domain=protein \
 #     paradigm=multiframefm \
