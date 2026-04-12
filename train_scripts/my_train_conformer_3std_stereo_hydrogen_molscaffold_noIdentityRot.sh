@@ -45,7 +45,7 @@ python ${REPO_ROOT}/train.py \
     lmodule.use_cosine_annealing=true \
     lmodule.cosine_annealing_T_max=500 \
     lmodule.use_mse_loss=true \
-    dataset.use_identity_rot=false \
+    +dataset.use_identity_rot=false \
 # python train.py \
 #     domain=protein \
 #     paradigm=multiframefm \

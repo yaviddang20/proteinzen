@@ -77,7 +77,7 @@ run 3 hydrogen_noIdentityRot \
     model.num_blocks=8 \
     lmodule.identity_rot_noise=false \
     lmodule.use_rot_vf_loss=true \
-    dataset.use_identity_rot=false \
+    +dataset.use_identity_rot=false \
     "hydra.run.dir='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_hydrogen_molscaffold_noIdentityRot/train'"
 
 # --- hydrogen=false ---
@@ -109,7 +109,7 @@ run 7 noIdentityRot \
     model.num_blocks=8 \
     lmodule.identity_rot_noise=false \
     lmodule.use_rot_vf_loss=true \
-    dataset.use_identity_rot=false \
+    +dataset.use_identity_rot=false \
     "hydra.run.dir='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_molscaffold_noIdentityRot/train'"
 
 wait
