@@ -139,6 +139,10 @@ def main(sampler,
         shutil.rmtree(zen_cfg['samples_dir'])
     os.makedirs(zen_cfg['samples_dir'])
 
+    traj_dir = os.path.join(zen_cfg['out_dir'], "traj")
+    if os.path.isdir(traj_dir):
+        shutil.rmtree(traj_dir)
+
     with open(os.path.join(zen_cfg['out_dir'], "run.log"), 'w') as fp:
         fp.write(f"Sampling config path: {zen_cfg['sampler']['tasks_yaml']}")
     shutil.copy(
