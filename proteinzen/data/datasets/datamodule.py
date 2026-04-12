@@ -192,6 +192,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         remove_mol_types=None,
         mask_nonstandard=False,
         include_h=False,
+        use_identity_rot=True,
     ):
         super().__init__()
         self.datasets = datasets
@@ -218,6 +219,7 @@ class TrainingDataset(torch.utils.data.Dataset):
             self.remove_mol_types = [const.chain_types.index(s) for s in remove_mol_types]
         self.mask_nonstandard = mask_nonstandard
         self.include_h = include_h
+        self.use_identity_rot = use_identity_rot
 
         for dataset in datasets:
             records = dataset.manifest
@@ -250,7 +252,8 @@ class TrainingDataset(torch.utils.data.Dataset):
 
         token_data, rigid_data, token_bonds = tokenize_structure(
             struct,
-            task_data
+            task_data,
+            use_identity_rot=self.use_identity_rot,
         )
         tokenized_data = Tokenized(
             tokens=token_data,
@@ -322,6 +325,7 @@ class ValidationDataset(torch.utils.data.Dataset):
         remove_mol_types=None,
         mask_nonstandard=False,
         include_h=False,
+        use_identity_rot=True,
     ):
         super().__init__()
         self.datasets = datasets
@@ -348,6 +352,7 @@ class ValidationDataset(torch.utils.data.Dataset):
             self.remove_mol_types = [const.chain_types.index(s) for s in remove_mol_types]
         self.mask_nonstandard = mask_nonstandard
         self.include_h = include_h
+        self.use_identity_rot = use_identity_rot
 
         for dataset in datasets:
             conformer_records = dataset.manifest
@@ -391,7 +396,8 @@ class ValidationDataset(torch.utils.data.Dataset):
 
         token_data, rigid_data, token_bonds = tokenize_structure(
             struct,
-            task_data
+            task_data,
+            use_identity_rot=self.use_identity_rot,
         )
         tokenized_data = Tokenized(
             tokens=token_data,

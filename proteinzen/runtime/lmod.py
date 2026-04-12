@@ -288,6 +288,7 @@ class BiomoleculeModule(L.LightningModule):
                  use_fafe_loss=True,
                  use_rot_vf_loss=True,
                  identity_rot_noise=False,
+                 use_trans_mse_loss=False,
     ):
         super().__init__()
         self._log = logging.getLogger(__name__)
@@ -345,6 +346,7 @@ class BiomoleculeModule(L.LightningModule):
         self.use_fafe_loss = use_fafe_loss
         self.use_rot_vf_loss = use_rot_vf_loss
         self.identity_rot_noise = identity_rot_noise
+        self.use_trans_mse_loss = use_trans_mse_loss
 
 
         self.aatype_to_restype_tensor = torch.zeros(const.num_tokens)
@@ -801,6 +803,9 @@ class BiomoleculeModule(L.LightningModule):
         else:
             loss = loss + 1.0 * frame_fm_loss_dict['bond_angle_rmse'] + 1.0 * frame_fm_loss_dict['bond_length_rmse']
             loss = loss + frame_fm_loss_dict['ring_planarity_loss'] * 1.0 + frame_fm_loss_dict['bond_rot_mse'] * 0.01
+
+        if self.use_trans_mse_loss:
+            loss = loss + 1.0 * frame_fm_loss_dict['pred_trans_mse'].mean()
 
         if outputs.get('time_pred_val') is not None:
             loss = loss + 1.0 * (outputs['time_pred_val'] - inputs['t'].squeeze(-1)).abs().mean()

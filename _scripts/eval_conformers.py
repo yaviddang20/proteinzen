@@ -578,7 +578,7 @@ def compute_coverage_amr(D, delta):
     return amr_r, cov_r, amr_p, cov_p
 
 
-def compute_geometry_stats(ref_mols, gen_mols, gen_paths, D, out_align_dir):
+def compute_geometry_stats(ref_mols, gen_mols, gen_paths, D, out_align_dir, out_relax_dir=None):
     """Per-conformer geometry metrics; returns (best_rmsd, best_bl, best_ba, mean_tor, mean_clash, mean_strain, rmsf)."""
     per_rmsd, per_bl, per_ba, per_tor, per_clash, per_strain = [], [], [], [], [], []
 
@@ -600,7 +600,7 @@ def compute_geometry_stats(ref_mols, gen_mols, gen_paths, D, out_align_dir):
             except Exception:
                 pass
         per_clash.append(clash_count(gen))
-        _, strain, _, _, _ = xtb_relax(gen)
+        relaxed_mol, strain, _, _, _ = xtb_relax(gen)
         if np.isfinite(strain):
             per_strain.append(strain)
 
@@ -611,6 +611,16 @@ def compute_geometry_stats(ref_mols, gen_mols, gen_paths, D, out_align_dir):
                 rdMolAlign.AlignMol(probe, ref_a)
                 out_name = f"{p.stem}_BEST_rmsd{D[i, j]:.3f}.pdb"
                 save_best_pair(probe, ref_a, out_align_dir / out_name)
+            except Exception:
+                pass
+
+        if out_relax_dir is not None and relaxed_mol is not None and np.isfinite(strain):
+            try:
+                unrelaxed = Chem.RemoveHs(Chem.Mol(gen))
+                relaxed = Chem.RemoveHs(Chem.Mol(relaxed_mol))
+                rdMolAlign.AlignMol(relaxed, unrelaxed)
+                out_name = f"{p.stem}_strain{strain:.2f}kcal.pdb"
+                save_best_pair(unrelaxed, relaxed, out_relax_dir / out_name)
             except Exception:
                 pass
 
@@ -660,7 +670,7 @@ def mean_or_nan(lst):
     return float(np.mean(lst)) if lst else float('nan')
 
 
-def compute_metrics_for_group(paths, ref_key_no_stereo_to_mols, ref_key_stereo_to_mols, out_align_dir):
+def compute_metrics_for_group(paths, ref_key_no_stereo_to_mols, ref_key_stereo_to_mols, out_align_dir, out_relax_dir=None):
     RDLogger.DisableLog('rdApp.*')
 
     gen_mols, gen_paths, gen_stereo_flags = [], [], []
@@ -704,7 +714,7 @@ def compute_metrics_for_group(paths, ref_key_no_stereo_to_mols, ref_key_stereo_t
     D = pairwise_rmsd_matrix(ref_mols_for_group, gen_mols)
 
     amr_r, cov_r, amr_p, cov_p = compute_coverage_amr(D, DELTA)
-    geom_conn = compute_geometry_stats(ref_mols_for_group, gen_mols, gen_paths, D, out_align_dir)
+    geom_conn = compute_geometry_stats(ref_mols_for_group, gen_mols, gen_paths, D, out_align_dir, out_relax_dir)
     if geom_conn is None:
         return empty
     metrics_conn = (amr_r, cov_r, amr_p, cov_p) + geom_conn
@@ -829,6 +839,10 @@ for mode in _modes:
     if OUT_ALIGN_DIR.exists():
         shutil.rmtree(OUT_ALIGN_DIR)
     OUT_ALIGN_DIR.mkdir(parents=True)
+    OUT_RELAX_DIR = Path(f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/relaxed_pairs")
+    if OUT_RELAX_DIR.exists():
+        shutil.rmtree(OUT_RELAX_DIR)
+    OUT_RELAX_DIR.mkdir(parents=True)
     OUT_STATS_DIR = Path(f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/eval_stats")
     if OUT_STATS_DIR.exists():
         shutil.rmtree(OUT_STATS_DIR)
@@ -877,12 +891,12 @@ for mode in _modes:
 
     if USE_PARALLEL:
         results = Parallel(n_jobs=N_JOBS, backend="loky")(
-            delayed(compute_metrics_for_group)(paths, ref_key_no_stereo_to_mols, ref_key_stereo_to_mols, OUT_ALIGN_DIR)
+            delayed(compute_metrics_for_group)(paths, ref_key_no_stereo_to_mols, ref_key_stereo_to_mols, OUT_ALIGN_DIR, OUT_RELAX_DIR)
             for paths in groups.values()
         )
     else:
         results = [
-            compute_metrics_for_group(paths, ref_key_no_stereo_to_mols, ref_key_stereo_to_mols, OUT_ALIGN_DIR)
+            compute_metrics_for_group(paths, ref_key_no_stereo_to_mols, ref_key_stereo_to_mols, OUT_ALIGN_DIR, OUT_RELAX_DIR)
             for paths in groups.values()
         ]
 

@@ -361,7 +361,8 @@ def arbitrary_atom_to_frame(
     atom_idx,
     valid_neighbors: list[int],
     valid_neighbor_coords: np.ndarray,
-    neighbor_graph: nx.Graph
+    neighbor_graph: nx.Graph,
+    use_identity_rot: bool = True,
 ):
     """ For an arbitrary atom, compute a frame to use for that atom. This function will try its best to
     construct a frame from real axes given the particular input chemical graph. If it cannot, it'll either
@@ -402,44 +403,41 @@ def arbitrary_atom_to_frame(
         neighbors = []
 
     _select_axes = fn.partial(select_axes, valid_neighbors=valid_neighbors, valid_neighbor_coords=valid_neighbor_coords)
-    quat = Rotation.identity().as_quat(canonical=True)
-    trans = atom["coords"]
-    return np.concatenate([quat, trans], axis=0), 0
-    # if len(neighbors) == 0:
-    #     quat = Rotation.identity().as_quat(canonical=True)
-    #     trans = atom["coords"]
-    #     return np.concatenate([quat, trans], axis=0), 0
-    # elif len(neighbors) == 1:
-    #     neighbor_idx = neighbors[0]
-    #     neighbor_neighbors = [n for n in neighbor_graph.neighbors(neighbor_idx) if n in valid_neighbors and n != atom_idx]
-    #     # print(atom, atom_idx, neighbor_idx, neighbor_neighbors, list(neighbor_graph.edges))
-    #     if len(neighbor_neighbors) > 0:
-    #         # if we can get a second hop neighbor to define the frame, use that
-    #         axes = _select_axes(atom["coords"], [neighbor_idx] + neighbor_neighbors)
-    #         if axes is not None:
-    #             # print(atom, 2)
-    #             return gen_det_rot_frame(atom['coords'], *axes)
-    #     try:
-    #         neighbor_coord = valid_neighbor_coords[valid_neighbors.index(neighbor_idx)]
-    #         # print(atom, 1)
-    #         return gen_semirand_rot_frame(atom['coords'], neighbor_coord)
-    #     except Exception as e:
-    #         print(f"Caught exception '{e}', replacing with random rotation")
-    #         # print(atom, 0)
-    #         return gen_rand_rot_frame(atom['coords'])
-    # else:
-    #     axes = _select_axes(atom["coords"], neighbors)
-    #     if axes is not None:
-    #         return gen_det_rot_frame(atom["coords"], *axes)
+    if use_identity_rot:
+        quat = Rotation.identity().as_quat(canonical=True)
+        trans = atom["coords"]
+        return np.concatenate([quat, trans], axis=0), 0
+    else:
+        if len(neighbors) == 0:
+            quat = Rotation.identity().as_quat(canonical=True)
+            trans = atom["coords"]
+            return np.concatenate([quat, trans], axis=0), 0
+        elif len(neighbors) == 1:
+            neighbor_idx = neighbors[0]
+            neighbor_neighbors = [n for n in neighbor_graph.neighbors(neighbor_idx) if n in valid_neighbors and n != atom_idx]
+            if len(neighbor_neighbors) > 0:
+                axes = _select_axes(atom["coords"], [neighbor_idx] + neighbor_neighbors)
+                if axes is not None:
+                    return gen_det_rot_frame(atom['coords'], *axes)
+            try:
+                neighbor_coord = valid_neighbor_coords[valid_neighbors.index(neighbor_idx)]
+                return gen_semirand_rot_frame(atom['coords'], neighbor_coord)
+            except Exception as e:
+                print(f"Caught exception '{e}', replacing with random rotation")
+                return gen_rand_rot_frame(atom['coords'])
+        else:
+            axes = _select_axes(atom["coords"], neighbors)
+            if axes is not None:
+                return gen_det_rot_frame(atom["coords"], *axes)
 
-    #     for neighbor_idx in neighbors:
-    #         try:
-    #             neighbor_coord = valid_neighbor_coords[valid_neighbors.index(neighbor_idx)]
-    #             return gen_semirand_rot_frame(atom['coords'], neighbor_coord)
-    #         except Exception:
-    #             pass
-    #     print("Error in featurizing rotation, replacing with random rotation")
-    #     return gen_rand_rot_frame(atom['coords'])
+            for neighbor_idx in neighbors:
+                try:
+                    neighbor_coord = valid_neighbor_coords[valid_neighbors.index(neighbor_idx)]
+                    return gen_semirand_rot_frame(atom['coords'], neighbor_coord)
+                except Exception:
+                    pass
+            print("Error in featurizing rotation, replacing with random rotation")
+            return gen_rand_rot_frame(atom['coords'])
 
 
 
@@ -450,12 +448,14 @@ class StructureTokenizer:
         struct: Structure,
         task_data: dict[str, np.ndarray],
         shuffle_chains: bool = False,
-        shuffle_copied_fragments: bool = True
+        shuffle_copied_fragments: bool = True,
+        use_identity_rot: bool = True,
     ):
         self.struct = struct
         self.task_data = task_data
         self.shuffle_chains = shuffle_chains
         self.shuffle_copied_fragments = shuffle_copied_fragments
+        self.use_identity_rot = use_identity_rot
         self.bond_graph = nx.Graph([(bond["atom_1"], bond["atom_2"]) for bond in struct.bonds])
 
         self.token_idx = 0
@@ -626,7 +626,8 @@ class StructureTokenizer:
                 atom_idx if not process_isolated else i,
                 valid_neighbors,
                 valid_neighbor_coords,
-                bond_graph_override
+                bond_graph_override,
+                use_identity_rot=self.use_identity_rot,
             )
 
             # Create token
@@ -876,7 +877,8 @@ def tokenize_structure(  # noqa: C901, PLR0915
     struct: Structure,
     task_data: dict[str, np.ndarray],
     shuffle_chains: bool = False,
-    shuffle_copied_fragments: bool = True
+    shuffle_copied_fragments: bool = True,
+    use_identity_rot: bool = True,
 ) -> Tuple[np.ndarray, np.array, np.ndarray]:
     """Tokenize a structure.
 
@@ -900,7 +902,8 @@ def tokenize_structure(  # noqa: C901, PLR0915
         struct,
         task_data,
         shuffle_chains,
-        shuffle_copied_fragments
+        shuffle_copied_fragments,
+        use_identity_rot=use_identity_rot,
     )
     return tokenizer.tokenize()
 

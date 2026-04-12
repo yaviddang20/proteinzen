@@ -77,30 +77,29 @@ run 3 hydrogen_predict_time \
     "hydra.run.dir='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_hydrogen_molscaffold_predict_time/train'"
 
 # --- hydrogen=false ---
-run 4 noh_IdentityNoise \
+run 4 IdentityNoise \
     dataset.include_h=false \
     lmodule.identity_rot_noise=true \
     lmodule.use_rot_vf_loss=false \
     "experiment.warm_start='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_molscaffold_IdentityNoise/train/lightning_logs/version_62672/checkpoints/best.ckpt'" \
     "hydra.run.dir='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_molscaffold_IdentityNoise/train'"
 
-run 5 noh_no_fafe \
+run 5 no_fafe \
     dataset.include_h=false \
     lmodule.use_fafe_loss=false \
     "experiment.warm_start='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_molscaffold_no_fafe/train/lightning_logs/version_62672/checkpoints/best.ckpt'" \
     "hydra.run.dir='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_molscaffold_no_fafe/train'"
 
-run 6 noh_no_rotvf \
+run 6 no_rotvf \
     dataset.include_h=false \
     lmodule.identity_rot_noise=true \
     lmodule.use_rot_vf_loss=false \
     "experiment.warm_start='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_molscaffold_no_rotvf/train/lightning_logs/version_62672/checkpoints/best.ckpt'" \
     "hydra.run.dir='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_molscaffold_no_rotvf/train'"
 
-run 7 noh_predict_time \
+run 7 predict_time \
     dataset.include_h=false \
     model.predict_time=true \
-    "experiment.warm_start='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_molscaffold_predict_time/train/lightning_logs/version_62672/checkpoints/best.ckpt'" \
     "hydra.run.dir='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_molscaffold_predict_time/train'"
 
 wait
