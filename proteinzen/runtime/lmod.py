@@ -8,6 +8,8 @@ from dataclasses import replace
 import os
 import json
 
+from xtb.interface import Calculator, Param
+
 import numpy as np
 import tqdm
 import torch
@@ -209,6 +211,45 @@ RES_TO_AA = {}
 for i, aa in enumerate(residue_constants.resnames):
     RES_TO_AA[const.token_ids[aa]] = i
 AA_TO_RES = {j: i for i, j in RES_TO_AA.items()}
+
+ANGSTROM_TO_BOHR = 1.8897259886
+HARTREE_TO_KCALMOL = 627.509474
+
+
+def compute_xtb_energies(elements, positions, mask):
+    """
+    Compute GFN2-xTB single-point energies for a batch of molecules.
+
+    Args:
+        elements: [B, R] int tensor of atomic numbers
+        positions: [B, R, 3] float tensor of atom positions in Angstroms
+        mask: [B, R] bool tensor of valid atoms
+
+    Returns:
+        energies: [B] float tensor of energies in kcal/mol,
+                  nan for samples where xTB fails
+    """
+    B = elements.shape[0]
+    energies = []
+    elements_np = elements.cpu().numpy()
+    positions_np = positions.cpu().float().numpy()
+    mask_np = mask.cpu().numpy()
+
+    for b in range(B):
+        m = mask_np[b]
+        nums = elements_np[b][m].astype(np.int32)
+        pos = positions_np[b][m].astype(np.float64) * ANGSTROM_TO_BOHR
+        try:
+            calc = Calculator(Param.GFN2xTB, nums, pos)
+            calc.set_verbosity(0)
+            res = calc.singlepoint()
+            e = res.get_energy() * HARTREE_TO_KCALMOL
+        except Exception:
+            e = float('nan')
+        energies.append(e)
+
+    return torch.tensor(energies, dtype=torch.float32, device=elements.device)
+
 
 class BiomoleculeModule(L.LightningModule):
     def __init__(self,
@@ -763,6 +804,20 @@ class BiomoleculeModule(L.LightningModule):
 
         if outputs.get('time_pred_val') is not None:
             loss = loss + 1.0 * (outputs['time_pred_val'] - inputs['t'].squeeze(-1)).abs().mean()
+
+        if outputs.get('energy_pred_val') is not None:
+            with torch.no_grad():
+                e_gen = compute_xtb_energies(
+                    inputs['rigids']['rigids_ref_element'],
+                    outputs['denoised_rigids'].get_trans(),
+                    inputs['rigids']['rigids_mask'],
+                )
+                delta_e = e_gen - inputs['e_min'].to(e_gen.device)
+                valid = ~torch.isnan(delta_e)
+            if valid.any():
+                pred = outputs['energy_pred_val'][valid]
+                target = delta_e[valid]
+                loss = loss + 1.0 * (pred - target).abs().mean()
 
         loss_dict = {"loss": loss.mean(), "frame_vf_loss": frame_vf_loss, "frame_vf_loss_unscaled": unscaled_frame_vf_loss}
         loss_dict['loss_per_batch'] = loss

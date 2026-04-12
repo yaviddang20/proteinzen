@@ -100,14 +100,15 @@ def main(sampler,
     has_best = False
     best_ckpt_path = None
     for ckpt_path in ckpt_list:
-        if ckpt_path.split("/")[-1] == "last.ckpt":
+        fname = ckpt_path.split("/")[-1]
+        if fname == "best.ckpt":
+            has_best = True
+            best_ckpt_path = ckpt_path
+        elif fname == "last.ckpt":
             epoch_list.append((ckpt_path, 1e6))
         else:
             epoch = ckpt_path.split("=")[1].split("-")[0]
             epoch_list.append((ckpt_path, int(epoch)))
-        if ckpt_path.split("/")[-1] == "best.ckpt":
-            has_best = True
-            best_ckpt_path = ckpt_path
 
     epoch_list = sorted(epoch_list, key=lambda x: x[1])
     epoch_list, _ = zip(*epoch_list)
@@ -133,7 +134,9 @@ def main(sampler,
     zen_cfg['samples_dir'] = os.path.join(
         zen_cfg['out_dir'], "samples"
     )
-    os.makedirs(zen_cfg['samples_dir'], exist_ok=True)
+    if os.path.isdir(zen_cfg['samples_dir']):
+        shutil.rmtree(zen_cfg['samples_dir'])
+    os.makedirs(zen_cfg['samples_dir'])
 
     with open(os.path.join(zen_cfg['out_dir'], "run.log"), 'w') as fp:
         fp.write(f"Sampling config path: {zen_cfg['sampler']['tasks_yaml']}")

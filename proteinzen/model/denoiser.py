@@ -168,20 +168,30 @@ class SeqPredictor(nn.Module):
         )
         return self.out(seq_embed)
 
-class TimePredictor(nn.Module):                                                                                                                                                                                                                 
-        def __init__(self, c_frame):                                                                                                                                                                                                                
-            super().__init__()                                                                                                                                                                                                                      
-            self.ln = LayerNorm(c_frame)
-            self.out = Linear(c_frame, 1, bias=True)                                                                                                                                                                                                
-    
-        def forward(self, rigids_embed_flat, rigids_mask):                                                                                                                                                                                          
-            # [B, R', c_frame]
-            x = self.ln(rigids_embed_flat)                                                                                                                                                                                                          
-            # masked mean over rigids -> [B, c_frame]
-            mask = rigids_mask[..., None].float()                                                                                                                                                                                                   
-            x = (x * mask).sum(dim=-2) / mask.sum(dim=-2).clip(min=1)
-            # [B, 1]                                                                                                                                                                                                                                
-            return self.out(x).squeeze(-1) 
+class TimePredictor(nn.Module):
+    def __init__(self, c_frame):
+        super().__init__()
+        self.ln = LayerNorm(c_frame)
+        self.out = Linear(c_frame, 1, bias=True)
+
+    def forward(self, rigids_embed_flat, rigids_mask):
+        x = self.ln(rigids_embed_flat)
+        mask = rigids_mask[..., None].float()
+        x = (x * mask).sum(dim=-2) / mask.sum(dim=-2).clip(min=1)
+        return self.out(x).squeeze(-1)
+
+
+class EnergyPredictor(nn.Module):
+    def __init__(self, c_frame):
+        super().__init__()
+        self.ln = LayerNorm(c_frame)
+        self.out = Linear(c_frame, 1, bias=True)
+
+    def forward(self, rigids_embed_flat, rigids_mask):
+        x = self.ln(rigids_embed_flat)
+        mask = rigids_mask[..., None].float()
+        x = (x * mask).sum(dim=-2) / mask.sum(dim=-2).clip(min=1)
+        return self.out(x).squeeze(-1)
 
 
 class Embedder(nn.Module):
@@ -711,6 +721,7 @@ class IpaDenoiser(nn.Module):
                  num_aa=21,
                  accumulate_rot_vf_output=False,
                  predict_time=False,
+                 predict_energy=False,
                  ):
         super().__init__()
         # self.diffuser = diffuser
@@ -732,6 +743,7 @@ class IpaDenoiser(nn.Module):
         self.accumulate_rot_vf_output = accumulate_rot_vf_output
 
         self.predict_time = predict_time
+        self.predict_energy = predict_energy
 
         for b in range(num_blocks):
             if use_conditioned_ipa:
@@ -843,6 +855,7 @@ class IpaDenoiser(nn.Module):
         self.torsion_pred = TorsionAngles(c_s, 1)
         self.seq_pred = SeqPredictor(c_s, c_frame, n_aa=num_aa)
         self.time_pred = TimePredictor(c_frame)
+        self.energy_pred = EnergyPredictor(c_frame)
         self.detach_grad_pre_seq_pred = detach_grad_pre_seq_pred
 
         if predict_final_rot and not accumulate_rot_vf_output:
@@ -1019,6 +1032,7 @@ class IpaDenoiser(nn.Module):
             'node_embed': node_embed,
             'seq_logits': seq_logits,
             'time_pred_val': self.time_pred(rigids_embed_flat, rigids_mask_flat) if self.predict_time else None,
+            'energy_pred_val': self.energy_pred(rigids_embed_flat, rigids_mask_flat) if self.predict_energy else None,
         }
         return model_out
 
@@ -1254,6 +1268,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                  use_bond_rotation=False,
                  patch_unit_vec_bug=False,
                  predict_time=False,
+                 predict_energy=False,
                  ):
         super().__init__()
 
@@ -1269,6 +1284,7 @@ class IpaMultiRigidDenoiser(nn.Module):
         self.use_residue_indexing = use_residue_indexing
 
         self.predict_time = predict_time
+        self.predict_energy = predict_energy
 
         self.ipa_denoiser = IpaDenoiser(
             c_s=c_s,
@@ -1307,6 +1323,7 @@ class IpaMultiRigidDenoiser(nn.Module):
             detach_grad_pre_seq_pred=learnable_noise_schedule,
             num_aa=len(const.tokens),
             predict_time=predict_time,
+            predict_energy=predict_energy,
         )
 
         self.embedder = Embedder(
@@ -1464,6 +1481,9 @@ class IpaMultiRigidDenoiser(nn.Module):
 
         if self.predict_time:
             ret['time_pred_val'] = score_dict['time_pred_val']
+
+        if self.predict_energy:
+            ret['energy_pred_val'] = score_dict['energy_pred_val']
 
         # Bond rotation refinement for atomized (small molecule) tokens
         if self.use_bond_rotation and 'rot_bonds' in data:

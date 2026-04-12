@@ -10,6 +10,7 @@ import glob
 import json
 import multiprocessing as mp
 import os
+import shutil
 import subprocess
 import tempfile
 import sys
@@ -825,9 +826,13 @@ for mode in _modes:
     REF_GLOB  = f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/conformer_mols/*.pdb"
     PRED_GLOB = f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/samples/*.pdb"
     OUT_ALIGN_DIR = Path(f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/aligned_pairs")
-    OUT_ALIGN_DIR.mkdir(exist_ok=True, parents=True)
+    if OUT_ALIGN_DIR.exists():
+        shutil.rmtree(OUT_ALIGN_DIR)
+    OUT_ALIGN_DIR.mkdir(parents=True)
     OUT_STATS_DIR = Path(f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/eval_stats")
-    OUT_STATS_DIR.mkdir(exist_ok=True, parents=True)
+    if OUT_STATS_DIR.exists():
+        shutil.rmtree(OUT_STATS_DIR)
+    OUT_STATS_DIR.mkdir(parents=True)
     _stats_log = open(OUT_STATS_DIR / f"eval_{mode}.txt", 'w')
     _orig_stdout = sys.stdout
     sys.stdout = _Tee(_orig_stdout, _stats_log)
@@ -1060,7 +1065,9 @@ else:
 # ============================================================
 
 OUT_MIN_ENERGY_DIR = Path(f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/min_energy_aligned_pairs")
-OUT_MIN_ENERGY_DIR.mkdir(exist_ok=True, parents=True)
+if OUT_MIN_ENERGY_DIR.exists():
+    shutil.rmtree(OUT_MIN_ENERGY_DIR)
+OUT_MIN_ENERGY_DIR.mkdir(parents=True)
 
 print("Writing min-energy aligned pairs...")
 for mol_id in sorted(perfect_mol_ids):
@@ -1098,7 +1105,9 @@ print(f"Done. Written to {OUT_MIN_ENERGY_DIR}")
 # ============================================================
 
 OUT_PLOTS_DIR = Path(f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/torsion_plots")
-OUT_PLOTS_DIR.mkdir(exist_ok=True, parents=True)
+if OUT_PLOTS_DIR.exists():
+    shutil.rmtree(OUT_PLOTS_DIR)
+OUT_PLOTS_DIR.mkdir(parents=True)
 
 # Per molecule: circular std of torsion angles across ref vs gen conformers.
 # Only perfectly-matched molecules are included.
