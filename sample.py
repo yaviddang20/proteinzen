@@ -129,6 +129,7 @@ def main(sampler,
 
     # model = lmodule_init(model, corrupter, None)
     model = BiomoleculeSamplingModule(model, corrupter, zen_cfg)
+    model.strict_loading = False
 
     os.makedirs(zen_cfg['out_dir'], exist_ok=True)
     zen_cfg['samples_dir'] = os.path.join(
