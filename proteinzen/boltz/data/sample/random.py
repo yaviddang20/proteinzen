@@ -95,4 +95,4 @@ class ConformerSampler(Sampler):
             interfaces = [i for i in record.interfaces if i.valid]
             record = replace(record, chains=chains, interfaces=interfaces)
 
-            yield Sample(record=record)
+            yield Sample(record=record, e_min=conformer_record.e_min)

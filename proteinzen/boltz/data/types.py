@@ -601,6 +601,7 @@ class ConformerRecord(JSONSerializable):
     templates: Optional[list[TemplateInfo]] = None
     md: Optional[MDInfo] = None
     affinity: Optional[AffinityInfo] = None
+    e_min: Optional[float] = None
 
 
 ####################################################################################################

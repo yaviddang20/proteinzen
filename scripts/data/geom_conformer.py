@@ -21,6 +21,27 @@ from p_tqdm import p_umap
 from redis import Redis
 from tqdm import tqdm
 import hashlib
+from xtb.interface import Calculator, Param
+
+ANGSTROM_TO_BOHR = 1.8897259886
+HARTREE_TO_KCALMOL = 627.509474
+
+
+def compute_xtb_energy_from_mol(rd_mol):
+    """Compute GFN2-xTB single-point energy in kcal/mol for an RDKit mol."""
+    conf = rd_mol.GetConformer()
+    numbers = np.array([a.GetAtomicNum() for a in rd_mol.GetAtoms()], dtype=np.int32)
+    positions = np.array(
+        [conf.GetAtomPosition(i) for i in range(rd_mol.GetNumAtoms())],
+        dtype=np.float64,
+    ) * ANGSTROM_TO_BOHR
+    try:
+        calc = Calculator(Param.GFN2xTB, numbers, positions)
+        calc.set_verbosity(0)
+        res = calc.singlepoint()
+        return res.get_energy() * HARTREE_TO_KCALMOL
+    except Exception:
+        return None
 
 from proteinzen.boltz.data.types import ChainInfo, StructureInfo, InterfaceInfo, Record, Target, ConformerRecord, ConformerTarget
 
@@ -109,6 +130,9 @@ def parse(datadir: Path, data: dict):
     total_weight = sum(boltzmann_weights_list)
     boltzmann_weights_list = [w / total_weight for w in boltzmann_weights_list]
 
+    # Compute xTB energy for the minimum energy conformer (index 0, highest boltzmann weight)
+    e_min = compute_xtb_energy_from_mol(conformer_data[0]['rd_mol'])
+
     # Create chain metadata
     chain_info = []
     for i, chain in enumerate(structure.chains):
@@ -135,6 +159,7 @@ def parse(datadir: Path, data: dict):
         chains=chain_info,
         interfaces=interface_info,
         boltzmann_weights=boltzmann_weights_list,
+        e_min=e_min,
     )
     target = ConformerTarget(structures=structures, record=record)
 

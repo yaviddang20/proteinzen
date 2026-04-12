@@ -24,6 +24,7 @@ class Sample:
     record: Record
     chain_id: Optional[int] = None
     interface_id: Optional[int] = None
+    e_min: Optional[float] = None
 
 
 class Sampler(ABC):

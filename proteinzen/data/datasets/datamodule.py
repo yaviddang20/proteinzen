@@ -298,6 +298,9 @@ class TrainingDataset(torch.utils.data.Dataset):
             features['sym_groups'] = torch.zeros((0, 1), dtype=torch.long)
             features['sym_group_sizes'] = torch.zeros(0, dtype=torch.long)
 
+        e_min = sample.e_min
+        features['e_min'] = torch.tensor(e_min, dtype=torch.float32) if e_min is not None else torch.tensor(float('nan'), dtype=torch.float32)
+
         return features
 
     def __len__(self) -> int:
@@ -371,7 +374,7 @@ class ValidationDataset(torch.utils.data.Dataset):
                     md=conformer_record.md,
                     affinity=conformer_record.affinity,
                 )
-                self.samples.append(Sample(record=record))
+                self.samples.append(Sample(record=record, e_min=conformer_record.e_min))
 
     def __getitem__(self, idx):
         dataset_idx = np.random.choice(
@@ -441,6 +444,9 @@ class ValidationDataset(torch.utils.data.Dataset):
             features['ring_masks'] = torch.zeros((0, 0), dtype=torch.bool)
             features['sym_groups'] = torch.zeros((0, 1), dtype=torch.long)
             features['sym_group_sizes'] = torch.zeros(0, dtype=torch.long)
+
+        e_min = sample.e_min
+        features['e_min'] = torch.tensor(e_min, dtype=torch.float32) if e_min is not None else torch.tensor(float('nan'), dtype=torch.float32)
 
         return features
 
