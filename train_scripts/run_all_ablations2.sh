@@ -54,6 +54,7 @@ run 0 hydrogen_no_rotvf_4blocks \
     model.num_blocks=4 \
     lmodule.identity_rot_noise=true \
     lmodule.use_rot_vf_loss=false \
+    "experiment.warm_start='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_hydrogen_molscaffold_no_rotvf_4blocks/train/lightning_logs/version_64743/checkpoints/last.ckpt'" \
     "hydra.run.dir='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_hydrogen_molscaffold_no_rotvf_4blocks/train'"
 
 run 1 hydrogen_no_rotvf_energy \
@@ -70,6 +71,7 @@ run 2 hydrogen_no_rotvf_mse \
     lmodule.identity_rot_noise=true \
     lmodule.use_rot_vf_loss=false \
     lmodule.use_trans_mse_loss=true \
+    "experiment.warm_start='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_hydrogen_molscaffold_no_rotvf_mse/train/lightning_logs/version_64743/checkpoints/last.ckpt'" \
     "hydra.run.dir='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_hydrogen_molscaffold_no_rotvf_mse/train'"
 
 run 3 hydrogen_noIdentityRot \
@@ -78,6 +80,7 @@ run 3 hydrogen_noIdentityRot \
     lmodule.identity_rot_noise=false \
     lmodule.use_rot_vf_loss=true \
     +dataset.use_identity_rot=false \
+    "experiment.warm_start='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_hydrogen_molscaffold_noIdentityRot/train/lightning_logs/version_64743/checkpoints/last.ckpt'" \
     "hydra.run.dir='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_hydrogen_molscaffold_noIdentityRot/train'"
 
 # --- hydrogen=false ---
@@ -86,6 +89,7 @@ run 4 no_rotvf_4blocks \
     model.num_blocks=4 \
     lmodule.identity_rot_noise=true \
     lmodule.use_rot_vf_loss=false \
+    "experiment.warm_start='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_molscaffold_no_rotvf_4blocks/train/lightning_logs/version_64743/checkpoints/last.ckpt'" \
     "hydra.run.dir='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_molscaffold_no_rotvf_4blocks/train'"
 
 run 5 no_rotvf_energy \
@@ -102,6 +106,7 @@ run 6 no_rotvf_mse \
     lmodule.identity_rot_noise=true \
     lmodule.use_rot_vf_loss=false \
     lmodule.use_trans_mse_loss=true \
+    "experiment.warm_start='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_molscaffold_no_rotvf_mse/train/lightning_logs/version_64743/checkpoints/last.ckpt'" \
     "hydra.run.dir='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_molscaffold_no_rotvf_mse/train'"
 
 run 7 noIdentityRot \
@@ -110,6 +115,7 @@ run 7 noIdentityRot \
     lmodule.identity_rot_noise=false \
     lmodule.use_rot_vf_loss=true \
     +dataset.use_identity_rot=false \
+    "experiment.warm_start='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_molscaffold_noIdentityRot/train/lightning_logs/version_64743/checkpoints/last.ckpt'" \
     "hydra.run.dir='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_molscaffold_noIdentityRot/train'"
 
 wait

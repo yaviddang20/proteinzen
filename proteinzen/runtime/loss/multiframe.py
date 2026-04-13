@@ -445,6 +445,12 @@ def multiframe_fm_loss_dense_batch(
     ref_frame_trans_se = torch.square(gt_frame_trans - ref_frame_trans).sum(dim=-1)
     ref_frame_trans_mse = (ref_frame_trans_se * total_mask).sum(-1) / num_rigids_per_batch
 
+    # Heavy-atom-only pred MSE (element != 1, i.e. not hydrogen)
+    is_heavy = (inputs['rigids']['rigids_ref_element'] != 1).float()
+    heavy_mask = total_mask * is_heavy
+    num_heavy_per_batch = heavy_mask.sum(dim=-1).clip(min=1)
+    pred_heavy_trans_mse = (pred_frame_trans_se * heavy_mask).sum(-1) / num_heavy_per_batch
+
     
     
     t = inputs['t']
@@ -591,6 +597,7 @@ def multiframe_fm_loss_dense_batch(
         "unscaled_rot_vf_loss": unscaled_rot_vf_loss,
         "unscaled_trans_vf_loss": unscaled_trans_vf_loss,
         "pred_trans_mse": pred_frame_trans_mse,
+        "pred_heavy_atoms_trans_mse": pred_heavy_trans_mse,
         "ref_trans_mse": ref_frame_trans_mse,
         "fafe": fafe,
         "scaled_fafe": scaled_fafe,
