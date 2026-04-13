@@ -339,6 +339,8 @@ def collate(data_list):
             'token': {},
             'rigids': {},
         }
+        if 'e_min' in data:
+            padded_data['e_min'] = data['e_min']
         ## pad token data
         for key, value in data['token'].items():
             pad_len = token_max_len - value.shape[0]

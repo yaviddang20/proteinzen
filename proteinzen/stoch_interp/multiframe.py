@@ -640,7 +640,6 @@ class MultiSE3Interpolant:
         trans_time = batch['trans_t']
         rot_time = batch['rot_t']
 
-
         trans_t = self._corrupt_trans(
             trans_1,
             trans_0,
