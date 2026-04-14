@@ -327,7 +327,7 @@ class BiomoleculeModule(L.LightningModule):
         self.rot_angle_weight = rot_angle_weight
         self.atom_rigid_upweight = atom_rigid_upweight
         self.apply_self_folding = apply_self_folding
-        self.automatic_optimization = False
+        self.automatic_optimization = True
 
         seq_weight_tensor = torch.as_tensor([seq_weight[c] for c in const.tokens])
         self.seq_weight = seq_weight_tensor
@@ -538,30 +538,16 @@ class BiomoleculeModule(L.LightningModule):
             if self.ema_short is not None:
                 self.ema_short.update_parameters(self.model, self.global_step - 1)
 
-        optimizer = self.optimizers()
-        accum = self.accumulate_grad_batches
-
-        if batch_idx % accum == 0:
-            optimizer.zero_grad()
-
         has_sequential = batch.get('rigids', {}).get('group1_rigid_mask', torch.tensor(False)).any()
 
         if not has_sequential:
             loss_dict = self._shared_step(batch)
-            self._log_losses(loss_dict, batch, stage="train")
-            self.manual_backward(loss_dict["loss"].mean() / accum)
         else:
-            loss_dict = self._sequential_step(batch, grad_scale=1.0 / accum)
-            self._log_losses(loss_dict, batch, stage="train")
+            loss_dict = self._sequential_step(batch)
 
-        if (batch_idx + 1) % accum == 0:
-            optimizer.step()
-            # Step step-based LR schedulers (epoch-based ones are stepped in on_train_epoch_end)
-            if not self.use_cosine_annealing:
-                sch = self.lr_schedulers()
-                if sch is not None:
-                    sch.step()
+        self._log_losses(loss_dict, batch, stage="train")
 
+        optimizer = self.optimizers()
         lr = optimizer.param_groups[0]['lr']
         self.log("lr", lr, prog_bar=True, logger=True, on_step=True, on_epoch=False, batch_size=1)
         return loss_dict["loss"].mean()
@@ -612,13 +598,14 @@ class BiomoleculeModule(L.LightningModule):
         batch["rot_t"] = batch["t"]
         return self.corrupter.corrupt_dense_batch(batch, self.identity_rot_noise)
 
-    def _sequential_step(self, batch, grad_scale=1.0):
+    def _sequential_step(self, batch):
         """Two-pass training for MolSequentialScaffolding.
 
-        Pass 1: both groups noised, loss on group 1, backward (frees graph).
-        Pass 2: group 1 fixed at denoised positions from pass 1, group 2 still
-                noised, loss on group 2, backward.
-        grad_scale: divide loss before backward for gradient accumulation (1/accum).
+        Pass 1: both groups noised, loss on group 1.
+        Pass 2: group 1 fixed at detached denoised positions from pass 1,
+                group 2 still noised, loss on group 2.
+        Both graphs held simultaneously; Lightning does a single backward on
+        the combined loss.
         """
         group1_mask = batch['rigids']['group1_rigid_mask']  # [B, R]
 
@@ -629,32 +616,24 @@ class BiomoleculeModule(L.LightningModule):
 
         outputs1 = self.model(batch1)
 
-        # Restrict loss to group 1 rigids
         noising_mask_orig = batch1['rigids']['rigids_noising_mask'].clone()
         batch1['rigids']['rigids_noising_mask'] = noising_mask_orig & group1_mask
         loss_dict1 = self._loss_step(batch1, outputs1)
 
-        self.manual_backward(loss_dict1["loss"].mean() * grad_scale)  # frees pass 1 graph
-
         denoised_trans1 = outputs1['denoised_rigids'].get_trans().detach()  # [B, R, 3]
-        del outputs1
 
         # --- Pass 2 ---
         batch2 = batch.copy()
         batch2['rigids'] = {k: v for k, v in batch['rigids'].items() if k != 'group1_rigid_mask'}
         batch2 = self._corrupt_batch(batch2)
 
-        # Fix group 1 positions at denoised output from pass 1
         rigids_t = batch2['rigids']['rigids_t'].clone()
-        rigids_t[group1_mask, 4:] = denoised_trans1[group1_mask]  # overwrite translations
+        rigids_t[group1_mask, 4:] = denoised_trans1[group1_mask]
         batch2['rigids']['rigids_t'] = rigids_t
-
-        # Loss only on group 2
         batch2['rigids']['rigids_noising_mask'] = noising_mask_orig & ~group1_mask
 
         outputs2 = self.model(batch2)
         loss_dict2 = self._loss_step(batch2, outputs2)
-        self.manual_backward(loss_dict2["loss"].mean() * grad_scale)
 
         # Merge loss dicts for logging (average the scalar losses)
         loss_dict = {k: (loss_dict1[k] + loss_dict2[k]) / 2
@@ -662,7 +641,7 @@ class BiomoleculeModule(L.LightningModule):
                      else loss_dict1.get(k, loss_dict2.get(k))
                      for k in set(loss_dict1) | set(loss_dict2)}
 
-        # Ensure min_conformer keys exist for _log_losses (sequential task never runs refinement)
+        # Ensure min_conformer keys exist for _log_losses
         zeros = torch.zeros_like(loss_dict['pred_trans_mse'])
         loss_dict.setdefault('min_conformer_trans_mse', zeros)
         loss_dict.setdefault('min_conformer_heavy_trans_mse', zeros.clone())
@@ -686,12 +665,6 @@ class BiomoleculeModule(L.LightningModule):
                 batch_t,
                 stage=f"val/t_{t_val}",
             )
-
-    def on_train_epoch_end(self):
-        # With manual optimization, step epoch-based LR schedulers manually
-        sch = self.lr_schedulers()
-        if sch is not None:
-            sch.step()
 
     def on_validation_epoch_end(self):
         metrics = self.trainer.callback_metrics

@@ -70,13 +70,10 @@ run 2 hydrogen_mse_scale \
     lmodule.scale_trans_mse_loss=true \
     "hydra.run.dir='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_hydrogen_molscaffold_no_rotvf_mse_scale/train'"
 
-run 3 hydrogen_noIdentityRot \
+run 3 hydrogen_mse_energy \
     dataset.include_h=true \
-    lmodule.identity_rot_noise=false \
-    lmodule.use_rot_vf_loss=true \
-    lmodule.use_trans_mse_loss=true \
-    +dataset.use_identity_rot=false \
-    "hydra.run.dir='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_hydrogen_molscaffold_noIdentityRot/train'"
+    model.predict_energy=true \
+    "hydra.run.dir='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_hydrogen_molscaffold_no_rotvf_mse_energy/train'"
 
 # --- hydrogen=false ---
 run 4 min_conformer \
@@ -97,13 +94,10 @@ run 6 mse_scale \
     lmodule.scale_trans_mse_loss=true \
     "hydra.run.dir='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_molscaffold_no_rotvf_mse_scale/train'"
 
-run 7 noIdentityRot \
+run 7 mse_energy \
     dataset.include_h=false \
-    lmodule.identity_rot_noise=false \
-    lmodule.use_rot_vf_loss=true \
-    lmodule.use_trans_mse_loss=true \
-    +dataset.use_identity_rot=false \
-    "hydra.run.dir='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_molscaffold_noIdentityRot/train'"
+    model.predict_energy=true \
+    "hydra.run.dir='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_molscaffold_no_rotvf_mse_energy/train'"
 
 wait
 echo "All ablations3 finished."

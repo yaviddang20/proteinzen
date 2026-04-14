@@ -100,10 +100,6 @@ class Experiment:
             # detect_anomaly=True
         )
         trainer_cfg = omegaconf.OmegaConf.to_container(trainer_cfg)
-        # accumulate_grad_batches is not supported by Lightning with manual optimization.
-        # Extract it here and pass it to the module, which implements it manually.
-        accum = trainer_cfg.pop('accumulate_grad_batches', 1)
-        self._model.accumulate_grad_batches = accum
         trainer_cfg.update(overrides)
 
         trainer = Trainer(
