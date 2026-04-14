@@ -215,6 +215,25 @@ AA_TO_RES = {j: i for i, j in RES_TO_AA.items()}
 ANGSTROM_TO_BOHR = 1.8897259886
 HARTREE_TO_KCALMOL = 627.509474
 
+# Module-level thread pool for parallel xTB single-points (GIL released in C ext).
+# Sized to batch size; can be overridden before training via set_xtb_executor().
+_xtb_executor = None
+
+
+def set_xtb_executor(max_workers: int):
+    global _xtb_executor
+    _xtb_executor = __import__('concurrent.futures', fromlist=['ThreadPoolExecutor']).ThreadPoolExecutor(max_workers=max_workers)
+
+
+def _xtb_single(nums, pos):
+    try:
+        calc = Calculator(Param.GFN2xTB, nums, pos)
+        calc.set_verbosity(0)
+        res = calc.singlepoint()
+        return res.get_energy() * HARTREE_TO_KCALMOL
+    except Exception:
+        return float('nan')
+
 
 def compute_xtb_energies(elements, positions, mask):
     """
@@ -229,24 +248,25 @@ def compute_xtb_energies(elements, positions, mask):
         energies: [B] float tensor of energies in kcal/mol,
                   nan for samples where xTB fails
     """
-    B = elements.shape[0]
-    energies = []
     elements_np = elements.cpu().numpy()
     positions_np = positions.cpu().float().numpy()
     mask_np = mask.cpu().numpy()
 
-    for b in range(B):
+    def _make_args(b):
         m = mask_np[b]
         nums = elements_np[b][m].astype(np.int32)
         pos = positions_np[b][m].astype(np.float64) * ANGSTROM_TO_BOHR
-        try:
-            calc = Calculator(Param.GFN2xTB, nums, pos)
-            calc.set_verbosity(0)
-            res = calc.singlepoint()
-            e = res.get_energy() * HARTREE_TO_KCALMOL
-        except Exception:
-            e = float('nan')
-        energies.append(e)
+        return nums, pos
+
+    B = elements_np.shape[0]
+    args = [_make_args(b) for b in range(B)]
+
+    executor = _xtb_executor
+    if executor is not None:
+        futures = [executor.submit(_xtb_single, n, p) for n, p in args]
+        energies = [f.result() for f in futures]
+    else:
+        energies = [_xtb_single(n, p) for n, p in args]
 
     return torch.tensor(energies, dtype=torch.float32, device=elements.device)
 
@@ -574,9 +594,11 @@ class BiomoleculeModule(L.LightningModule):
         batch2 = self._corrupt_batch(batch2)
 
         rigids_t = batch2['rigids']['rigids_t'].clone()
-        rigids_t[group1_mask_r, 4:] = denoised_trans1[group1_mask_r]
+        n_r2 = rigids_t.shape[1]
+        group1_mask_r2 = group1_mask[:, :n_r2]
+        rigids_t[group1_mask_r2, 4:] = denoised_trans1[:, :n_r2][group1_mask_r2]
         batch2['rigids']['rigids_t'] = rigids_t
-        batch2['rigids']['rigids_noising_mask'] = noising_mask_orig & ~group1_mask_r
+        batch2['rigids']['rigids_noising_mask'] = noising_mask_orig[:, :n_r2] & ~group1_mask_r2
 
         outputs2 = self.model(batch2)
         loss_dict2 = self._loss_step(batch2, outputs2)
@@ -902,13 +924,17 @@ class BiomoleculeModule(L.LightningModule):
         if outputs.get('min_conformer_pred_val') is not None:
             gt_trans = ru.Rigid.from_tensor_7(inputs['rigids']['rigids_1']).get_trans()
             pred_trans_mc = outputs['min_conformer_pred_val']  # [B, R, 3]
-            rigids_mask = inputs['rigids']['rigids_mask']
-            rigids_noising_mask = inputs['rigids']['rigids_noising_mask']
+            # clamp to min rigid dim (input padding may differ from model output)
+            n_mc = min(gt_trans.shape[1], pred_trans_mc.shape[1])
+            gt_trans = gt_trans[:, :n_mc]
+            pred_trans_mc = pred_trans_mc[:, :n_mc]
+            rigids_mask = inputs['rigids']['rigids_mask'][:, :n_mc]
+            rigids_noising_mask = inputs['rigids']['rigids_noising_mask'][:, :n_mc]
             total_mask = rigids_mask * rigids_noising_mask
             num_rigids = rigids_mask.long().sum(-1).clip(min=1)
-            se_mc = torch.square(gt_trans - pred_trans_mc).sum(dim=-1)  # [B, R]
+            se_mc = torch.square(gt_trans - pred_trans_mc).sum(dim=-1)  # [B, n_mc]
             min_conformer_trans_mse = (se_mc * total_mask).sum(-1) / num_rigids
-            is_heavy = (inputs['rigids']['rigids_ref_element'] != 1).float()
+            is_heavy = (inputs['rigids']['rigids_ref_element'][:, :n_mc] != 1).float()
             heavy_mask = total_mask * is_heavy
             num_heavy = heavy_mask.sum(-1).clip(min=1)
             min_conformer_heavy_trans_mse = (se_mc * heavy_mask).sum(-1) / num_heavy

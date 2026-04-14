@@ -33,6 +33,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 # import wandb
 
 from proteinzen.runtime.config import config_hydra_store, remove_zen_keys
+from proteinzen.runtime.lmod import set_xtb_executor
 import pytorch_lightning as pl
 
 # A logger for this file
@@ -140,6 +141,12 @@ def main(model,
     # datamodule and optim are all partial'd __init__s
     # so we instantiate instances of each
     model = lmodule(model, corrupter, experiment['optim'])
+
+    # spin up thread pool for parallel xTB calls if energy prediction is enabled
+    if getattr(model, 'predict_energy', False) or getattr(model.model, 'predict_energy', False):
+        batch_size = datamodule_inst.batch_size if hasattr(datamodule_inst, 'batch_size') else 20
+        set_xtb_executor(max_workers=batch_size)
+        log.info(f"xTB thread pool initialized with {batch_size} workers")
     checkpointer = experiment['checkpointer']
 
     exp = Experiment(
