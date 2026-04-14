@@ -595,8 +595,14 @@ class BiomoleculeModule(L.LightningModule):
 
         rigids_t = batch2['rigids']['rigids_t'].clone()
         n_r2 = rigids_t.shape[1]
-        group1_mask_r2 = group1_mask[:, :n_r2]
-        rigids_t[group1_mask_r2, 4:] = denoised_trans1[:, :n_r2][group1_mask_r2]
+        group1_mask_r2 = group1_mask[:, :n_r2]                # [B, n_r2]
+        # Build src_trans [B, n_r2, 3] explicitly so mask application never sees
+        # a shorter-than-n_r2 tensor (pass-1 may have fewer rigids than pass-2)
+        src_trans = rigids_t[:, :, 4:].clone()                # [B, n_r2, 3] fallback
+        n_copy = min(n_r2, denoised_trans1.shape[1])
+        src_trans[:, :n_copy] = denoised_trans1[:, :n_copy]
+        mask_exp = group1_mask_r2.unsqueeze(-1)               # [B, n_r2, 1]
+        rigids_t[:, :, 4:] = torch.where(mask_exp, src_trans, rigids_t[:, :, 4:])
         batch2['rigids']['rigids_t'] = rigids_t
         batch2['rigids']['rigids_noising_mask'] = noising_mask_orig[:, :n_r2] & ~group1_mask_r2
 
