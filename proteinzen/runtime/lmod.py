@@ -544,7 +544,7 @@ class BiomoleculeModule(L.LightningModule):
         if batch_idx % accum == 0:
             optimizer.zero_grad()
 
-        has_sequential = 'group1_rigid_mask' in batch.get('rigids', {})
+        has_sequential = batch.get('rigids', {}).get('group1_rigid_mask', torch.tensor(False)).any()
 
         if not has_sequential:
             loss_dict = self._shared_step(batch)

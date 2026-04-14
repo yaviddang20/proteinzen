@@ -301,15 +301,15 @@ class TrainingDataset(torch.utils.data.Dataset):
         e_min = sample.e_min
         features['e_min'] = torch.tensor(e_min, dtype=torch.float32) if e_min is not None else torch.tensor(float('nan'), dtype=torch.float32)
 
-        # Sequential two-group task: store per-rigid group 1 mask
+        # Sequential two-group task: store per-rigid group 1 mask.
+        # Always present so collate sees a consistent key across all tasks.
+        n_rigids = features['rigids']['rigids_mask'].shape[0]
+        group1_rigid_mask = torch.zeros(n_rigids, dtype=torch.bool)
         if 'group1_atom_mask' in task_data:
             group1_atom_mask = task_data['group1_atom_mask']  # [n_atoms]
-            n_rigids = features['rigids']['rigids_mask'].shape[0]
-            # For atomized structures (GEOM), atom i -> rigid i in order
-            group1_rigid_mask = torch.zeros(n_rigids, dtype=torch.bool)
             n = min(len(group1_atom_mask), n_rigids)
             group1_rigid_mask[:n] = torch.from_numpy(group1_atom_mask[:n])
-            features['rigids']['group1_rigid_mask'] = group1_rigid_mask
+        features['rigids']['group1_rigid_mask'] = group1_rigid_mask
 
         return features
 
@@ -458,15 +458,15 @@ class ValidationDataset(torch.utils.data.Dataset):
         e_min = sample.e_min
         features['e_min'] = torch.tensor(e_min, dtype=torch.float32) if e_min is not None else torch.tensor(float('nan'), dtype=torch.float32)
 
-        # Sequential two-group task: store per-rigid group 1 mask
+        # Sequential two-group task: store per-rigid group 1 mask.
+        # Always present so collate sees a consistent key across all tasks.
+        n_rigids = features['rigids']['rigids_mask'].shape[0]
+        group1_rigid_mask = torch.zeros(n_rigids, dtype=torch.bool)
         if 'group1_atom_mask' in task_data:
             group1_atom_mask = task_data['group1_atom_mask']  # [n_atoms]
-            n_rigids = features['rigids']['rigids_mask'].shape[0]
-            # For atomized structures (GEOM), atom i -> rigid i in order
-            group1_rigid_mask = torch.zeros(n_rigids, dtype=torch.bool)
             n = min(len(group1_atom_mask), n_rigids)
             group1_rigid_mask[:n] = torch.from_numpy(group1_atom_mask[:n])
-            features['rigids']['group1_rigid_mask'] = group1_rigid_mask
+        features['rigids']['group1_rigid_mask'] = group1_rigid_mask
 
         return features
 
