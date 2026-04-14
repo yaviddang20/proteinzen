@@ -194,6 +194,18 @@ class EnergyPredictor(nn.Module):
         return self.out(x).squeeze(-1)
 
 
+class MinConformerPredictor(nn.Module):
+    """Per-rigid head that predicts min-energy conformer translations."""
+    def __init__(self, c_frame):
+        super().__init__()
+        self.ln = LayerNorm(c_frame)
+        self.out = Linear(c_frame, 3, bias=True)
+
+    def forward(self, rigids_embed_flat):
+        x = self.ln(rigids_embed_flat)
+        return self.out(x)  # [B, R, 3]
+
+
 class Embedder(nn.Module):
     def __init__(self,
                  c_s,
@@ -722,6 +734,7 @@ class IpaDenoiser(nn.Module):
                  accumulate_rot_vf_output=False,
                  predict_time=False,
                  predict_energy=False,
+                 predict_min_conformer=False,
                  ):
         super().__init__()
         # self.diffuser = diffuser
@@ -744,6 +757,7 @@ class IpaDenoiser(nn.Module):
 
         self.predict_time = predict_time
         self.predict_energy = predict_energy
+        self.predict_min_conformer = predict_min_conformer
 
         for b in range(num_blocks):
             if use_conditioned_ipa:
@@ -856,6 +870,7 @@ class IpaDenoiser(nn.Module):
         self.seq_pred = SeqPredictor(c_s, c_frame, n_aa=num_aa)
         self.time_pred = TimePredictor(c_frame)
         self.energy_pred = EnergyPredictor(c_frame)
+        self.min_conformer_pred = MinConformerPredictor(c_frame)
         self.detach_grad_pre_seq_pred = detach_grad_pre_seq_pred
 
         if predict_final_rot and not accumulate_rot_vf_output:
@@ -1033,6 +1048,7 @@ class IpaDenoiser(nn.Module):
             'seq_logits': seq_logits,
             'time_pred_val': self.time_pred(rigids_embed_flat, rigids_mask_flat) if self.predict_time else None,
             'energy_pred_val': self.energy_pred(rigids_embed_flat, rigids_mask_flat) if self.predict_energy else None,
+            'min_conformer_pred_val': self.min_conformer_pred(rigids_embed_flat) if self.predict_min_conformer else None,
         }
         return model_out
 
@@ -1269,6 +1285,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                  patch_unit_vec_bug=False,
                  predict_time=False,
                  predict_energy=False,
+                 predict_min_conformer=False,
                  ):
         super().__init__()
 
@@ -1285,6 +1302,7 @@ class IpaMultiRigidDenoiser(nn.Module):
 
         self.predict_time = predict_time
         self.predict_energy = predict_energy
+        self.predict_min_conformer = predict_min_conformer
 
         self.ipa_denoiser = IpaDenoiser(
             c_s=c_s,
@@ -1324,6 +1342,7 @@ class IpaMultiRigidDenoiser(nn.Module):
             num_aa=len(const.tokens),
             predict_time=predict_time,
             predict_energy=predict_energy,
+            predict_min_conformer=predict_min_conformer,
         )
 
         self.embedder = Embedder(
@@ -1484,6 +1503,9 @@ class IpaMultiRigidDenoiser(nn.Module):
 
         if self.predict_energy:
             ret['energy_pred_val'] = score_dict['energy_pred_val']
+
+        if self.predict_min_conformer:
+            ret['min_conformer_pred_val'] = score_dict['min_conformer_pred_val']
 
         # Bond rotation refinement for atomized (small molecule) tokens
         if self.use_bond_rotation and 'rot_bonds' in data:

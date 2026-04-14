@@ -55,7 +55,8 @@ run() {
 run 0 hydrogen_min_conformer \
     dataset.include_h=true \
     lmodule.use_trans_mse_loss=true \
-    lmodule.use_min_conformer_refine=true \
+    lmodule.use_min_conformer_head=true \
+    model.predict_min_conformer=true \
     "hydra.run.dir='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_hydrogen_molscaffold_no_rotvf_mse_min_conformer/train'"
 
 run 1 hydrogen_sequential_mse \
@@ -79,7 +80,8 @@ run 3 hydrogen_mse_energy \
 run 4 min_conformer \
     dataset.include_h=false \
     lmodule.use_trans_mse_loss=true \
-    lmodule.use_min_conformer_refine=true \
+    lmodule.use_min_conformer_head=true \
+    model.predict_min_conformer=true \
     "hydra.run.dir='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_molscaffold_no_rotvf_mse_min_conformer/train'"
 
 run 5 sequential_mse \
