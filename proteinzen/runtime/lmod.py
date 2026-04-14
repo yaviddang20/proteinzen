@@ -289,6 +289,9 @@ class BiomoleculeModule(L.LightningModule):
                  use_rot_vf_loss=True,
                  identity_rot_noise=False,
                  use_trans_mse_loss=False,
+                 scale_trans_mse_loss=False,
+                 use_min_conformer_refine=False,
+                 accumulate_grad_batches=1,
     ):
         super().__init__()
         self._log = logging.getLogger(__name__)
@@ -346,6 +349,9 @@ class BiomoleculeModule(L.LightningModule):
         self.use_rot_vf_loss = use_rot_vf_loss
         self.identity_rot_noise = identity_rot_noise
         self.use_trans_mse_loss = use_trans_mse_loss
+        self.scale_trans_mse_loss = scale_trans_mse_loss
+        self.use_min_conformer_refine = use_min_conformer_refine
+        self.accumulate_grad_batches = accumulate_grad_batches
 
 
         self.aatype_to_restype_tensor = torch.zeros(const.num_tokens)
@@ -421,6 +427,9 @@ class BiomoleculeModule(L.LightningModule):
                 "frame_vf_loss",
                 "frame_vf_loss_unscaled",
                 "pred_trans_mse",
+                "pred_heavy_atoms_trans_mse",
+                "min_conformer_trans_mse",
+                "min_conformer_heavy_trans_mse",
             ]:
                 name = f"{task.name}_{key}"
                 loss_by_task.setdefault(name, []).append(loss_dict[key][i])
@@ -479,7 +488,7 @@ class BiomoleculeModule(L.LightningModule):
             sync_dist=True,
         )
 
-    def _shared_step(self, batch):
+    def _shared_step(self, batch, force_refine=False):
         # batch = batch.copy()
 
         # stochastic corruption for BOTH train and val
@@ -504,6 +513,19 @@ class BiomoleculeModule(L.LightningModule):
 
         outputs = self.model(batch, self_conditioning, self_folding)
         loss_dict = self._loss_step(batch, outputs)
+
+        # Min-conformer refinement: with prob 0.5 run a second forward pass taking
+        # the denoised output as input and computing loss toward the clean conformer.
+        zeros = torch.zeros_like(loss_dict['pred_trans_mse'])
+        loss_dict['min_conformer_trans_mse'] = zeros
+        loss_dict['min_conformer_heavy_trans_mse'] = zeros.clone()
+        if self.use_min_conformer_refine and (force_refine or torch.rand(1).item() < 0.5):
+            refine_dict = self._min_conformer_refine_step(batch, outputs)
+            loss_dict['min_conformer_trans_mse'] = refine_dict['min_conformer_trans_mse']
+            loss_dict['min_conformer_heavy_trans_mse'] = refine_dict['min_conformer_heavy_trans_mse']
+            loss_dict['loss'] = loss_dict['loss'] + refine_dict['min_conformer_trans_mse'].mean()
+            loss_dict['loss_per_batch'] = loss_dict['loss_per_batch'] + refine_dict['min_conformer_trans_mse']
+
         return loss_dict
 
     
@@ -517,29 +539,72 @@ class BiomoleculeModule(L.LightningModule):
                 self.ema_short.update_parameters(self.model, self.global_step - 1)
 
         optimizer = self.optimizers()
-        optimizer.zero_grad()
+        accum = self.accumulate_grad_batches
+
+        if batch_idx % accum == 0:
+            optimizer.zero_grad()
 
         has_sequential = 'group1_rigid_mask' in batch.get('rigids', {})
 
         if not has_sequential:
             loss_dict = self._shared_step(batch)
             self._log_losses(loss_dict, batch, stage="train")
-            self.manual_backward(loss_dict["loss"].mean())
+            self.manual_backward(loss_dict["loss"].mean() / accum)
         else:
-            loss_dict = self._sequential_step(batch)
+            loss_dict = self._sequential_step(batch, grad_scale=1.0 / accum)
             self._log_losses(loss_dict, batch, stage="train")
 
-        optimizer.step()
-
-        # Step step-based LR schedulers (epoch-based ones are stepped in on_train_epoch_end)
-        if not self.use_cosine_annealing:
-            sch = self.lr_schedulers()
-            if sch is not None:
-                sch.step()
+        if (batch_idx + 1) % accum == 0:
+            optimizer.step()
+            # Step step-based LR schedulers (epoch-based ones are stepped in on_train_epoch_end)
+            if not self.use_cosine_annealing:
+                sch = self.lr_schedulers()
+                if sch is not None:
+                    sch.step()
 
         lr = optimizer.param_groups[0]['lr']
         self.log("lr", lr, prog_bar=True, logger=True, on_step=True, on_epoch=False, batch_size=1)
         return loss_dict["loss"].mean()
+
+    def _min_conformer_refine_step(self, batch, outputs):
+        """Second forward pass: denoised prediction → model → refine toward min-energy conformer.
+
+        Takes the denoised rigids from a previous forward pass as the new noisy input
+        (at t=0) and runs another forward pass. Returns per-batch MSE losses against
+        the ground-truth clean conformer.
+        """
+        denoised_tensor7 = outputs['denoised_rigids'].to_tensor_7()
+
+        batch_refine = batch.copy()
+        batch_refine['rigids'] = batch['rigids'].copy()
+        batch_refine['rigids']['rigids_t'] = denoised_tensor7
+        t_zero = torch.zeros_like(batch['t'])
+        batch_refine['t'] = t_zero
+        batch_refine['trans_t'] = t_zero
+        batch_refine['rot_t'] = t_zero
+
+        outputs_refine = self.model(batch_refine)
+
+        gt_trans = ru.Rigid.from_tensor_7(batch['rigids']['rigids_1']).get_trans()
+        pred_trans = outputs_refine['denoised_rigids'].get_trans()
+
+        rigids_mask = batch['rigids']['rigids_mask']
+        rigids_noising_mask = batch['rigids']['rigids_noising_mask']
+        total_mask = rigids_mask * rigids_noising_mask
+        num_rigids = rigids_mask.long().sum(-1).clip(min=1)
+
+        se = torch.square(gt_trans - pred_trans).sum(dim=-1)  # [B, R]
+        min_conformer_trans_mse = (se * total_mask).sum(-1) / num_rigids  # [B]
+
+        is_heavy = (batch['rigids']['rigids_ref_element'] != 1).float()
+        heavy_mask = total_mask * is_heavy
+        num_heavy = heavy_mask.sum(-1).clip(min=1)
+        min_conformer_heavy_trans_mse = (se * heavy_mask).sum(-1) / num_heavy  # [B]
+
+        return {
+            'min_conformer_trans_mse': min_conformer_trans_mse,
+            'min_conformer_heavy_trans_mse': min_conformer_heavy_trans_mse,
+        }
 
     def _corrupt_batch(self, batch):
         """Corrupt a batch in-place and return it."""
@@ -547,12 +612,13 @@ class BiomoleculeModule(L.LightningModule):
         batch["rot_t"] = batch["t"]
         return self.corrupter.corrupt_dense_batch(batch, self.identity_rot_noise)
 
-    def _sequential_step(self, batch):
+    def _sequential_step(self, batch, grad_scale=1.0):
         """Two-pass training for MolSequentialScaffolding.
 
         Pass 1: both groups noised, loss on group 1, backward (frees graph).
         Pass 2: group 1 fixed at denoised positions from pass 1, group 2 still
                 noised, loss on group 2, backward.
+        grad_scale: divide loss before backward for gradient accumulation (1/accum).
         """
         group1_mask = batch['rigids']['group1_rigid_mask']  # [B, R]
 
@@ -568,7 +634,7 @@ class BiomoleculeModule(L.LightningModule):
         batch1['rigids']['rigids_noising_mask'] = noising_mask_orig & group1_mask
         loss_dict1 = self._loss_step(batch1, outputs1)
 
-        self.manual_backward(loss_dict1["loss"].mean())  # frees pass 1 graph
+        self.manual_backward(loss_dict1["loss"].mean() * grad_scale)  # frees pass 1 graph
 
         denoised_trans1 = outputs1['denoised_rigids'].get_trans().detach()  # [B, R, 3]
         del outputs1
@@ -588,13 +654,19 @@ class BiomoleculeModule(L.LightningModule):
 
         outputs2 = self.model(batch2)
         loss_dict2 = self._loss_step(batch2, outputs2)
-        self.manual_backward(loss_dict2["loss"].mean())
+        self.manual_backward(loss_dict2["loss"].mean() * grad_scale)
 
         # Merge loss dicts for logging (average the scalar losses)
         loss_dict = {k: (loss_dict1[k] + loss_dict2[k]) / 2
                      if torch.is_tensor(loss_dict1.get(k)) and torch.is_tensor(loss_dict2.get(k))
                      else loss_dict1.get(k, loss_dict2.get(k))
                      for k in set(loss_dict1) | set(loss_dict2)}
+
+        # Ensure min_conformer keys exist for _log_losses (sequential task never runs refinement)
+        zeros = torch.zeros_like(loss_dict['pred_trans_mse'])
+        loss_dict.setdefault('min_conformer_trans_mse', zeros)
+        loss_dict.setdefault('min_conformer_heavy_trans_mse', zeros.clone())
+
         return loss_dict
 
     @torch.no_grad()
@@ -606,7 +678,7 @@ class BiomoleculeModule(L.LightningModule):
             batch_t = batch.copy()
             batch_t["t"] = torch.full((*batch_t["t"].shape,), t_val, device=device)
 
-            loss_dict = self._shared_step(batch_t)
+            loss_dict = self._shared_step(batch_t, force_refine=True)
 
             # log under separate namespace
             self._log_losses(
@@ -885,7 +957,12 @@ class BiomoleculeModule(L.LightningModule):
             loss = loss + frame_fm_loss_dict['ring_planarity_loss'] * 1.0 + frame_fm_loss_dict['bond_rot_mse'] * 0.01
 
         if self.use_trans_mse_loss:
-            loss = loss + 1.0 * frame_fm_loss_dict['pred_trans_mse'].mean()
+            trans_mse = frame_fm_loss_dict['pred_trans_mse']
+            if self.scale_trans_mse_loss:
+                t_norm_clip = 0.9
+                norm_scale = 1 - torch.min(inputs['t'], torch.full_like(inputs['t'], t_norm_clip))
+                trans_mse = trans_mse / (norm_scale.squeeze(-1) ** 2)
+            loss = loss + trans_mse.mean()
 
         if outputs.get('time_pred_val') is not None:
             loss = loss + 1.0 * (outputs['time_pred_val'] - inputs['t'].squeeze(-1)).abs().mean()
