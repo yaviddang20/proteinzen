@@ -53,33 +53,34 @@ def system_mid(system_id: str) -> str:
     return system_id[1:3]
 
 
-def load_clusters(plinder_dir: Path, metric: str = "pocket_fident_qcov", threshold: int = 30) -> dict:
+def load_clusters(
+    plinder_dir: Path,
+    algorithm: str = "communities",
+    directed: bool = False,
+    metric: str = "pocket_fident_qcov",
+    threshold: int = 50,
+) -> dict:
     """Load cluster parquet and return {system_id: cluster_label} dict.
 
-    Cluster parquet has columns: system_id, metric, cluster, directed, threshold, label
-    We filter to the requested metric/threshold and use 'cluster' as the cluster ID.
+    Clusters use Hive partitioning — directory path encodes algorithm/directed/metric/threshold.
+    Parquet files inside contain only system_id and label columns.
     """
-    cluster_dir = plinder_dir / "clusters"
-    parquet_files = list(cluster_dir.rglob("*.parquet"))
+    cluster_path = (
+        plinder_dir
+        / "clusters"
+        / f"cluster={algorithm}"
+        / f"directed={directed}"
+        / f"metric={metric}"
+        / f"threshold={threshold}"
+    )
+    parquet_files = list(cluster_path.glob("*.parquet"))
     if not parquet_files:
-        print(f"Warning: no cluster parquet files found under {cluster_dir}")
+        print(f"Warning: no cluster parquet files found at {cluster_path}")
         return {}
 
-    frames = []
-    for f in parquet_files:
-        try:
-            df = pd.read_parquet(f, columns=["system_id", "metric", "cluster", "threshold"])
-            frames.append(df)
-        except Exception:
-            continue
-
-    if not frames:
-        print("Warning: could not load any cluster parquet files")
-        return {}
-
+    frames = [pd.read_parquet(f) for f in parquet_files]
     df = pd.concat(frames, ignore_index=True)
-    df = df[(df["metric"] == metric) & (df["threshold"] == threshold)]
-    return dict(zip(df["system_id"], df["cluster"]))
+    return dict(zip(df["system_id"], df["label"]))
 
 
 def load_annotation_table(plinder_dir: Path) -> pd.DataFrame:
@@ -327,7 +328,13 @@ def process(args) -> None:
     rdkit.Chem.SetDefaultPickleProperties(pickle_option)
 
     print("Loading clusters...")
-    clusters = load_clusters(plinder_dir, metric=args.cluster_metric, threshold=args.cluster_threshold)
+    clusters = load_clusters(
+        plinder_dir,
+        algorithm=args.cluster_algorithm,
+        directed=args.cluster_directed,
+        metric=args.cluster_metric,
+        threshold=args.cluster_threshold,
+    )
     print(f"Loaded {len(clusters)} cluster assignments")
 
     print("Loading annotation table...")
@@ -375,10 +382,10 @@ if __name__ == "__main__":
                         help="Output directory for npz + manifest")
     parser.add_argument("--splits", nargs="+", default=["train", "val", "test"],
                         help="Which splits to include (default: train val test)")
-    parser.add_argument("--cluster-metric", type=str, default="pocket_fident_qcov",
-                        help="Cluster metric to use for sampling weights")
-    parser.add_argument("--cluster-threshold", type=int, default=30,
-                        help="Cluster threshold to use for sampling weights")
+    parser.add_argument("--cluster-algorithm", type=str, default="communities")
+    parser.add_argument("--cluster-directed", action="store_true", default=False)
+    parser.add_argument("--cluster-metric", type=str, default="pocket_fident_qcov")
+    parser.add_argument("--cluster-threshold", type=int, default=50)
     parser.add_argument("--num-processes", type=int, default=multiprocessing.cpu_count())
     parser.add_argument("--max-systems", type=int, default=None,
                         help="Cap number of systems (for debugging)")
