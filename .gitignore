@@ -110,6 +110,7 @@ ENV/
 
 
 # custom
+ccd.pkl
 /geom_drugs_boltz
 /sampling
 /data/cath/mmtf

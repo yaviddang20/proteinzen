@@ -17,10 +17,13 @@ Finalize step merges records into manifest.json.
 import argparse
 import json
 import multiprocessing
+import os
 import traceback
 from dataclasses import asdict, replace
 from pathlib import Path
 from functools import partial
+
+import pickle
 
 import numpy as np
 import pandas as pd
@@ -178,6 +181,7 @@ def process_system(
     outdir: Path,
     clusters: dict,
     annotation_row: dict,
+    ccd: dict,
 ) -> None:
     mid = system_mid(system_id)
     struct_path = outdir / "structures" / mid / f"{system_id}.npz"
@@ -193,7 +197,7 @@ def process_system(
 
     try:
         # Parse full complex (protein + ligand chains via CCD)
-        parsed = parse_mmcif(str(cif_path), components={}, ignore_connections=False)
+        parsed = parse_mmcif(str(cif_path), components=ccd, ignore_connections=False)
         structure = parsed.data
     except Exception:
         traceback.print_exc()
@@ -283,16 +287,28 @@ def process_system(
         json.dump(asdict(record), f)
 
 
+_ccd_cache = None
+
+def get_ccd(ccd_path: Path) -> dict:
+    global _ccd_cache
+    if _ccd_cache is None:
+        with open(ccd_path, "rb") as f:
+            _ccd_cache = pickle.load(f)
+    return _ccd_cache
+
+
 def process_system_worker(
     system_id: str,
     plinder_dir: Path,
     outdir: Path,
     clusters: dict,
     annotations: dict,
+    ccd_path: Path,
 ) -> None:
     annotation_row = annotations.get(system_id, {})
     try:
-        process_system(system_id, plinder_dir, outdir, clusters, annotation_row)
+        ccd = get_ccd(ccd_path)
+        process_system(system_id, plinder_dir, outdir, clusters, annotation_row, ccd)
     except Exception:
         traceback.print_exc()
         print(f"Unhandled error processing {system_id}")
@@ -326,6 +342,7 @@ def process(args) -> None:
     # Set rdkit pickle options
     pickle_option = rdkit.Chem.PropertyPickleOptions.AllProps
     rdkit.Chem.SetDefaultPickleProperties(pickle_option)
+
 
     print("Loading clusters...")
     clusters = load_clusters(
@@ -363,6 +380,7 @@ def process(args) -> None:
         outdir=outdir,
         clusters=clusters,
         annotations=annotations,
+        ccd_path=args.ccd_path,
     )
 
     if num_processes > 1:
@@ -376,6 +394,8 @@ def process(args) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process Plinder dataset into proteinzen npz format.")
+    parser.add_argument("--ccd-path", type=Path, default=Path(os.environ.get("REPO_ROOT", ".")) / "ccd.pkl",
+                        help="Path to ccd.pkl (default: $REPO_ROOT/ccd.pkl)")
     parser.add_argument("--plinder-dir", type=Path, required=True,
                         help="Path to plinder data root (e.g. /datastor1/dy4652/plinder/2024-06/v2)")
     parser.add_argument("--outdir", type=Path, required=True,
