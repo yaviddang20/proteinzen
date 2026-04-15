@@ -14,7 +14,8 @@ import pandas as pd
 from proteinzen.boltz.data.types import (
     Structure,
     Connection,
-    Record
+    Record,
+    ConformerRecord,
 )
 from proteinzen.boltz.data import const
 from proteinzen.boltz.data.sample.sampler import Sample
@@ -368,23 +369,23 @@ class ValidationDataset(torch.utils.data.Dataset):
         self.use_identity_rot = use_identity_rot
 
         for dataset in datasets:
-            conformer_records = dataset.manifest
-            for conformer_record in conformer_records:
-                boltzmann_weights = conformer_record.boltzmann_weights
-                conformer_index = np.argmax(boltzmann_weights)
-                conformer_id = conformer_record.ids[conformer_index]
-                structure = conformer_record.structures[conformer_index]
-                record = Record(
-                    id=conformer_id,
-                    structure=structure,
-                    chains=conformer_record.chains,
-                    interfaces=conformer_record.interfaces,
-                    inference_options=conformer_record.inference_options,
-                    templates=conformer_record.templates,
-                    md=conformer_record.md,
-                    affinity=conformer_record.affinity,
-                )
-                self.samples.append(Sample(record=record, e_min=conformer_record.e_min))
+            for entry in dataset.manifest:
+                if isinstance(entry, ConformerRecord):
+                    boltzmann_weights = entry.boltzmann_weights
+                    conformer_index = np.argmax(boltzmann_weights)
+                    record = Record(
+                        id=entry.ids[conformer_index],
+                        structure=entry.structures[conformer_index],
+                        chains=entry.chains,
+                        interfaces=entry.interfaces,
+                        inference_options=entry.inference_options,
+                        templates=entry.templates,
+                        md=entry.md,
+                        affinity=entry.affinity,
+                    )
+                    self.samples.append(Sample(record=record, e_min=entry.e_min))
+                else:
+                    self.samples.append(Sample(record=entry))
 
     def __getitem__(self, idx):
         dataset_idx = np.random.choice(

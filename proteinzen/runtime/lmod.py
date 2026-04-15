@@ -222,7 +222,15 @@ _xtb_executor = None
 
 def set_xtb_executor(max_workers: int):
     global _xtb_executor
-    _xtb_executor = __import__('concurrent.futures', fromlist=['ThreadPoolExecutor']).ThreadPoolExecutor(max_workers=max_workers)
+    from concurrent.futures import ThreadPoolExecutor
+    _xtb_executor = ThreadPoolExecutor(max_workers=max_workers, initializer=_xtb_worker_init)
+
+
+def _xtb_worker_init():
+    """Pin each executor thread to 1 OMP thread so parallelism is across molecules,
+    not within each xTB call (avoids 20 × OMP_NUM_THREADS thread explosion)."""
+    import os
+    os.environ['OMP_NUM_THREADS'] = '1'
 
 
 def _xtb_single(nums, pos):
@@ -441,16 +449,17 @@ class BiomoleculeModule(L.LightningModule):
         # ---- per-task aggregation ----
         loss_by_task = {}
         for i, task in enumerate(batch["task"]):
-            for key in [
+            per_task_keys = [
                 "loss_per_batch",
                 "seq_loss",
                 "frame_vf_loss",
                 "frame_vf_loss_unscaled",
                 "pred_trans_mse",
                 "pred_heavy_atoms_trans_mse",
-                "min_conformer_trans_mse",
-                "min_conformer_heavy_trans_mse",
-            ]:
+            ]
+            if "min_conformer_trans_mse" in loss_dict:
+                per_task_keys += ["min_conformer_trans_mse", "min_conformer_heavy_trans_mse"]
+            for key in per_task_keys:
                 name = f"{task.name}_{key}"
                 loss_by_task.setdefault(name, []).append(loss_dict[key][i])
 
@@ -542,7 +551,7 @@ class BiomoleculeModule(L.LightningModule):
             if self.ema_short is not None:
                 self.ema_short.update_parameters(self.model, self.global_step - 1)
 
-        has_sequential = batch.get('rigids', {}).get('group1_rigid_mask', torch.tensor(False)).any()
+        has_sequential = any(t.name == 'mol_sequential_scaffolding' for t in batch['task'])
 
         if not has_sequential:
             loss_dict = self._shared_step(batch)
@@ -924,10 +933,8 @@ class BiomoleculeModule(L.LightningModule):
                 loss = loss + 1.0 * (pred - target).abs().mean()
 
         # Min-conformer head: per-rigid translation prediction toward clean conformer
-        zeros = torch.zeros_like(frame_fm_loss_dict['pred_trans_mse'])
-        min_conformer_trans_mse = zeros
-        min_conformer_heavy_trans_mse = zeros.clone()
-        if outputs.get('min_conformer_pred_val') is not None:
+        min_conformer_active = outputs.get('min_conformer_pred_val') is not None
+        if min_conformer_active:
             gt_trans = ru.Rigid.from_tensor_7(inputs['rigids']['rigids_1']).get_trans()
             pred_trans_mc = outputs['min_conformer_pred_val']  # [B, R, 3]
             # clamp to min rigid dim (input padding may differ from model output)
@@ -948,8 +955,9 @@ class BiomoleculeModule(L.LightningModule):
 
         loss_dict = {"loss": loss.mean(), "frame_vf_loss": frame_vf_loss, "frame_vf_loss_unscaled": unscaled_frame_vf_loss}
         loss_dict['loss_per_batch'] = loss
-        loss_dict['min_conformer_trans_mse'] = min_conformer_trans_mse
-        loss_dict['min_conformer_heavy_trans_mse'] = min_conformer_heavy_trans_mse
+        if min_conformer_active:
+            loss_dict['min_conformer_trans_mse'] = min_conformer_trans_mse
+            loss_dict['min_conformer_heavy_trans_mse'] = min_conformer_heavy_trans_mse
 
         # TODO: for some reason this does not play well with nccl between different tasks
         # if 'motif_idx' in outputs:

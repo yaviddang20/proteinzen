@@ -1,6 +1,6 @@
 """
 Benchmark: manual grad accumulation vs Lightning auto accumulate_grad_batches.
-Runs both comparisons on single GPU and multi-GPU (DDP).
+Single GPU and multi-GPU DDP (matches proteinzen train.py DDP setup).
 
 Usage:
   python grad_accum_benchmark.py --mode single
@@ -21,6 +21,8 @@ from torch.utils.data import DataLoader, TensorDataset
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import Callback
+from pytorch_lightning.strategies import DDPStrategy
+from lightning.fabric.plugins.environments import LightningEnvironment
 
 
 # ─── Model ────────────────────────────────────────────────────────────────────
@@ -39,10 +41,6 @@ class MLP(nn.Module):
 
 
 # ─── Manual accum LightningModule ─────────────────────────────────────────────
-# Uses automatic_optimization=False; handles zero_grad/step internally.
-# Timing: start at first micro-step of each group, stop just before opt.step().
-# In DDP: uses model.no_sync() on intermediate micro-steps to skip redundant
-# all-reduces, matching what Lightning does in auto accum mode.
 
 class ManualLitModel(pl.LightningModule):
     def __init__(self, accum_steps: int, result_file: str | None = None, lr=1e-3):
@@ -58,7 +56,6 @@ class ManualLitModel(pl.LightningModule):
         self._accum_loss = 0.0
 
     def _no_sync_ctx(self, is_last: bool):
-        """Skip DDP all-reduce on non-final micro-steps."""
         strategy_model = getattr(self.trainer.strategy, "model", None)
         if strategy_model is not None and hasattr(strategy_model, "no_sync") and not is_last:
             return strategy_model.no_sync()
@@ -81,7 +78,6 @@ class ManualLitModel(pl.LightningModule):
         self._accum_loss += loss.item()
 
         if is_last:
-            # Record time before opt.step() — same span as TimingCallback on auto model
             self._step_times.append(time.perf_counter() - self._t0)
             opt.step()
             self.log("train_loss", self._accum_loss, on_step=True, prog_bar=True)
@@ -119,7 +115,7 @@ class AutoLitModel(pl.LightningModule):
         return torch.optim.AdamW(self.parameters(), lr=1e-3)
 
 
-# ─── Timing Callback (auto model) ─────────────────────────────────────────────
+# ─── Timing Callback ──────────────────────────────────────────────────────────
 
 class TimingCallback(Callback):
     def __init__(self, result_file=None):
@@ -153,35 +149,26 @@ def make_dataset(n=8192, in_dim=256, out_dim=128):
     return TensorDataset(torch.randn(n, in_dim), torch.randn(n, out_dim))
 
 
-# ─── Unified runner ───────────────────────────────────────────────────────────
+# ─── Runner ───────────────────────────────────────────────────────────────────
 
-def run(
-    is_manual: bool,
-    accum_steps: int,
-    micro_batch: int,
-    max_steps: int,
-    accelerator: str,
-    devices: int,
-    strategy: str | None,
-    result_file: str,
-) -> dict:
+def run(is_manual: bool, accum_steps: int, micro_batch: int,
+        max_steps: int, devices, strategy, result_file: str) -> dict:
     dataset = make_dataset()
-    loader = DataLoader(dataset, batch_size=micro_batch, shuffle=True, drop_last=True, num_workers=0)
+    loader = DataLoader(dataset, batch_size=micro_batch, shuffle=True,
+                        drop_last=True, num_workers=0)
 
     if is_manual:
         model = ManualLitModel(accum_steps=accum_steps, result_file=result_file)
-        trainer_accum = 1        # model manages accumulation internally
-        callbacks = []
+        callbacks, trainer_accum = [], 1
     else:
-        model = AutoLitModel()
         timing_cb = TimingCallback(result_file=result_file)
-        trainer_accum = accum_steps
-        callbacks = [timing_cb]
+        model = AutoLitModel()
+        callbacks, trainer_accum = [timing_cb], accum_steps
 
     trainer_kwargs = dict(
-        max_steps=max_steps * accum_steps,  # Lightning counts micro-steps
+        max_steps=max_steps * accum_steps,
         accumulate_grad_batches=trainer_accum,
-        accelerator=accelerator,
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=devices,
         enable_progress_bar=True,
         logger=False,
@@ -189,10 +176,14 @@ def run(
         callbacks=callbacks,
         precision="32-true",
     )
-    if strategy:
+    if strategy is not None:
         trainer_kwargs["strategy"] = strategy
 
-    Trainer(**trainer_kwargs).fit(model, loader)
+    trainer = Trainer(**trainer_kwargs)
+    trainer.fit(model, loader)
+
+    if trainer.global_rank != 0:
+        return None
 
     with open(result_file) as f:
         return json.load(f)
@@ -201,7 +192,7 @@ def run(
 # ─── Reporting ────────────────────────────────────────────────────────────────
 
 def summarize(label: str, data: dict):
-    times = data["times"][2:]  # drop 2 warm-up steps
+    times = data["times"][2:]
     if not times:
         print(f"  {label}: insufficient data")
         return
@@ -213,15 +204,13 @@ def summarize(label: str, data: dict):
     print(f"    final loss            : {data['final_loss']:.6f}")
 
 
-def report(label_manual: str, manual: dict, label_auto: str, auto: dict):
+def report(label_manual, manual, label_auto, auto):
     print(f"\n{'─'*56}")
     summarize(label_manual, manual)
     summarize(label_auto,   auto)
-    mt = manual["times"][2:]
-    at = auto["times"][2:]
+    mt, at = manual["times"][2:], auto["times"][2:]
     if mt and at:
-        ratio = statistics.mean(at) / statistics.mean(mt)
-        print(f"\n  Auto/Manual overhead: {ratio:.3f}x")
+        print(f"\n  Auto/Manual overhead: {statistics.mean(at) / statistics.mean(mt):.3f}x")
     print(f"{'─'*56}\n")
 
 
@@ -229,55 +218,48 @@ def report(label_manual: str, manual: dict, label_auto: str, auto: dict):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", default="single", choices=["single", "multi"])
-    parser.add_argument("--accum", type=int, default=8,  help="accumulation steps")
-    parser.add_argument("--batch", type=int, default=64, help="micro-batch size")
-    parser.add_argument("--steps", type=int, default=50, help="optimizer steps to time")
-    parser.add_argument("--gpus",  type=int, default=None, help="GPUs for multi mode")
+    parser.add_argument("--mode",  default="single", choices=["single", "multi"])
+    parser.add_argument("--accum", type=int, default=8)
+    parser.add_argument("--batch", type=int, default=64)
+    parser.add_argument("--steps", type=int, default=50)
+    parser.add_argument("--gpus",  type=int, default=None)
     args = parser.parse_args()
 
     print(f"Micro-batch: {args.batch} | Accum: {args.accum} | "
           f"Effective batch: {args.batch * args.accum} | Steps: {args.steps}")
 
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        mf = f.name
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        af = f.name
+
     if args.mode == "single":
-        accelerator = "gpu" if torch.cuda.is_available() else "cpu"
-        print(f"Accelerator: {accelerator}\n")
-
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
-            manual_file = f.name
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
-            auto_file = f.name
-
-        print("[1/2] Manual accum (single GPU) ...")
-        manual_data = run(True,  args.accum, args.batch, args.steps, accelerator, 1, None, manual_file)
-
+        print("\n[1/2] Manual accum (single GPU) ...")
+        manual_data = run(True,  args.accum, args.batch, args.steps, 1, None, mf)
         print("\n[2/2] Auto accum (single GPU) ...")
-        auto_data   = run(False, args.accum, args.batch, args.steps, accelerator, 1, None, auto_file)
-
+        auto_data   = run(False, args.accum, args.batch, args.steps, 1, None, af)
         report("Manual accum — single GPU", manual_data,
                "Auto accum   — single GPU", auto_data)
 
     elif args.mode == "multi":
         n_gpus = args.gpus or torch.cuda.device_count()
-        if n_gpus < 1:
-            raise RuntimeError("No CUDA GPUs found.")
-        if n_gpus < 2:
-            print(f"WARNING: only {n_gpus} GPU — DDP runs but no inter-GPU comms.")
-        print(f"GPUs: {n_gpus}\n")
+        devices = list(range(n_gpus))
+        strategy = DDPStrategy(cluster_environment=LightningEnvironment(),
+                               find_unused_parameters=False)
+        print(f"GPUs: {devices}\n")
 
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
-            manual_file = f.name
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
-            auto_file = f.name
+        print(f"[1/2] Manual accum (DDP) ...")
+        manual_data = run(True,  args.accum, args.batch, args.steps, devices, strategy, mf)
 
-        print(f"[1/2] Manual accum (DDP, {n_gpus} GPUs) ...")
-        manual_data = run(True,  args.accum, args.batch, args.steps, "gpu", n_gpus, "ddp", manual_file)
+        print(f"\n[2/2] Auto accum (DDP) ...")
+        strategy = DDPStrategy(cluster_environment=LightningEnvironment(),
+                               find_unused_parameters=False)
+        auto_data = run(False, args.accum, args.batch, args.steps, devices, strategy, af)
 
-        print(f"\n[2/2] Auto accum (DDP, {n_gpus} GPUs) ...")
-        auto_data   = run(False, args.accum, args.batch, args.steps, "gpu", n_gpus, "ddp", auto_file)
-
-        report(f"Manual accum — DDP {n_gpus} GPUs", manual_data,
-               f"Auto accum   — DDP {n_gpus} GPUs", auto_data)
+        # Only rank 0 has data; non-rank-0 processes skip reporting
+        if manual_data is not None and auto_data is not None:
+            report(f"Manual accum — DDP {n_gpus} GPUs", manual_data,
+                   f"Auto accum   — DDP {n_gpus} GPUs", auto_data)
 
 
 if __name__ == "__main__":

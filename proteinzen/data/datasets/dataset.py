@@ -26,7 +26,8 @@ class MMCIFDataset(data.Dataset):
             split=None,
             exclude_mol_types=None,
             overfit_num=None,
-            count_on_protein_res=False
+            count_on_protein_res=False,
+            use_conformer_record=True,
         ):
         self._log = logging.getLogger(__name__)
         self.data_dir = data_dir
@@ -40,6 +41,7 @@ class MMCIFDataset(data.Dataset):
         self.data_sampler = data_sampler
         self.overfit_num = overfit_num
         self.count_on_protein_res = count_on_protein_res
+        self.use_conformer_record = use_conformer_record
         self.mode = mode
         self.data_dir = f"{self.data_dir}/{self.mode}"
         print("Initializing MMCIFDataset in mode:", mode)
@@ -89,12 +91,14 @@ class MMCIFDataset(data.Dataset):
                 continue
             if self.split is not None and record['id'] not in self.split:
                 continue
-            self.manifest.append(ConformerRecord.from_dict(record))
+            if self.use_conformer_record:
+                self.manifest.append(ConformerRecord.from_dict(record))
+            else:
+                self.manifest.append(Record.from_dict(record))
             num_records += 1
             if self.overfit_num is not None and num_records >= self.overfit_num:
                 print(f"Overfitting on {num_records} records:\n", self.manifest)
                 break
-            # self.manifest.append(Record.from_dict(record))
 
         # if self.overfit_num is not None:
         #     self.manifest = self.manifest[-self.overfit_num:]
