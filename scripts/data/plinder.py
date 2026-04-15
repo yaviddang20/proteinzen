@@ -60,7 +60,7 @@ def load_clusters(
     plinder_dir: Path,
     algorithm: str = "communities",
     directed: bool = False,
-    metric: str = "pocket_fident_qcov",
+    metric: str = "pli_qcov",
     threshold: int = 50,
 ) -> dict:
     """Load cluster parquet and return {system_id: cluster_label} dict.
@@ -404,7 +404,7 @@ if __name__ == "__main__":
                         help="Which splits to include (default: train val test)")
     parser.add_argument("--cluster-algorithm", type=str, default="communities")
     parser.add_argument("--cluster-directed", action="store_true", default=False)
-    parser.add_argument("--cluster-metric", type=str, default="pocket_fident_qcov")
+    parser.add_argument("--cluster-metric", type=str, default="pli_qcov")
     parser.add_argument("--cluster-threshold", type=int, default=50)
     parser.add_argument("--num-processes", type=int, default=multiprocessing.cpu_count())
     parser.add_argument("--max-systems", type=int, default=None,
