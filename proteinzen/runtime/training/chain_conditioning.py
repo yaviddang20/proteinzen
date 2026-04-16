@@ -92,8 +92,6 @@ class _ChainConditioningBase(TrainingTask):
                 atom_num = int(res["atom_num"])
                 atom_noising_mask[atom_idx:atom_idx + atom_num] = False
             res_type_noising_mask[res_start:res_end] = False
-            # Provide as indexed context (position known)
-            copy_indexed_residue_mask[res_start:res_end] = True
 
         return {
             "t": t,
