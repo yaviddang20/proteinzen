@@ -420,5 +420,5 @@ if __name__ == "__main__":
 
     for split_name in ["train", "val", "test"]:
         print(f"\n=== Processing split: {split_name} ===")
-        split_args = argparse.Namespace(**vars(args), splits=[split_name], outdir=args.outdir / split_name)
+        split_args = argparse.Namespace(**{**vars(args), "splits": [split_name], "outdir": args.outdir / split_name})
         process(split_args, clusters, annotations, split)
