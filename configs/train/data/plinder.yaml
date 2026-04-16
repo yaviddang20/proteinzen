@@ -1,0 +1,41 @@
+_target_: proteinzen.data.datasets.datamodule.TrainingDataset
+max_crop_residues: 160
+max_crop_rigids: 512
+use_cropper: true
+datasets:
+  - _target_: proteinzen.data.datasets.dataset.MMCIFDataset
+    mode: train
+    data_dir: ${oc.env:REPO_ROOT}/plinder_processed
+    use_conformer_record: false
+    data_sampler:
+      _target_: proteinzen.boltz.data.sample.cluster.ClusterSampler
+    task_sampler:
+      _target_: proteinzen.runtime.training.task.TaskSampler
+      task_list:
+        - _target_: proteinzen.runtime.training.unconditional.UnconditionalGeneration
+          prob: 0.5
+          t_sched: lognorm
+          lognorm_mu: 0.0
+          lognorm_sig: 1.0
+          beta_p1: 1.9
+          beta_p2: 1.0
+          shift_time_scale: false
+          t_min: 0.01
+          t_max: 0.99
+        - _target_: proteinzen.runtime.training.chain_conditioning.ProteinConditioned
+          prob: 0.25
+          t_sched: lognorm
+          lognorm_mu: 0.0
+          lognorm_sig: 1.0
+          t_min: 0.01
+          t_max: 0.99
+        - _target_: proteinzen.runtime.training.chain_conditioning.LigandConditioned
+          prob: 0.25
+          t_sched: lognorm
+          lognorm_mu: 0.0
+          lognorm_sig: 1.0
+          t_min: 0.01
+          t_max: 0.99
+    exclude_mol_types:
+      - "DNA"
+      - "RNA"
