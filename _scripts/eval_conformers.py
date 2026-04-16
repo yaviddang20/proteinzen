@@ -816,12 +816,20 @@ def circular_std(angles_deg):
 # ============================================================
 
 _parser = argparse.ArgumentParser()
-_parser.add_argument("--mode", choices=["train", "test", "val", "both"], default="both")
+_parser.add_argument("--mode", choices=["train", "test", "val", "xl_processed", "all"], default="all")
 _parser.add_argument("--model_name", default="geom_identityRot_256_conformer_3std_bondlength")
 _args = _parser.parse_args()
 
 model_name = _args.model_name
-_modes     = ["train", "test"] if _args.mode == "both" else [_args.mode]
+_modes     = ["train", "test", "xl_processed"] if _args.mode == "all" else [_args.mode]
+
+
+def _sampling_base(mode):
+    """Return the base sampling directory for a given mode."""
+    repo = Path(__file__).resolve().parent.parent
+    if mode == "xl_processed":
+        return repo / "sampling" / "xl_processed"
+    return repo / "sampling" / f"geom_conformer_{mode}"
 
 DELTA        = 0.75   # RMSD threshold for coverage (Å)
 N_JOBS       = max(1, mp.cpu_count() // 2)
@@ -833,17 +841,18 @@ GEOM_DATADIR = Path(os.environ.get("REPO_ROOT", "/datastor1/dy4652/proteinzen"))
 # ============================================================
 
 for mode in _modes:
-    REF_GLOB  = f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/conformer_mols/*.pdb"
-    PRED_GLOB = f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/samples/*.pdb"
-    OUT_ALIGN_DIR = Path(f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/aligned_pairs")
+    _base = _sampling_base(mode)
+    REF_GLOB  = str(_base / "conformer_mols" / "*.pdb")
+    PRED_GLOB = str(_base / model_name / "samples" / "*.pdb")
+    OUT_ALIGN_DIR = _base / model_name / "aligned_pairs"
     if OUT_ALIGN_DIR.exists():
         shutil.rmtree(OUT_ALIGN_DIR)
     OUT_ALIGN_DIR.mkdir(parents=True)
-    OUT_RELAX_DIR = Path(f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/relaxed_pairs")
+    OUT_RELAX_DIR = _base / model_name / "relaxed_pairs"
     if OUT_RELAX_DIR.exists():
         shutil.rmtree(OUT_RELAX_DIR)
     OUT_RELAX_DIR.mkdir(parents=True)
-    OUT_STATS_DIR = Path(f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/eval_stats")
+    OUT_STATS_DIR = _base / model_name / "eval_stats"
     if OUT_STATS_DIR.exists():
         shutil.rmtree(OUT_STATS_DIR)
     OUT_STATS_DIR.mkdir(parents=True)
@@ -1078,7 +1087,7 @@ else:
 # Main — min-energy aligned pairs
 # ============================================================
 
-OUT_MIN_ENERGY_DIR = Path(f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/min_energy_aligned_pairs")
+OUT_MIN_ENERGY_DIR = _sampling_base(mode) / model_name / "min_energy_aligned_pairs"
 if OUT_MIN_ENERGY_DIR.exists():
     shutil.rmtree(OUT_MIN_ENERGY_DIR)
 OUT_MIN_ENERGY_DIR.mkdir(parents=True)
@@ -1118,7 +1127,7 @@ print(f"Done. Written to {OUT_MIN_ENERGY_DIR}")
 # Main — torsion spread + plots
 # ============================================================
 
-OUT_PLOTS_DIR = Path(f"{Path(__file__).resolve().parent.parent}/sampling/geom_conformer_{mode}/{model_name}/torsion_plots")
+OUT_PLOTS_DIR = _sampling_base(mode) / model_name / "torsion_plots"
 if OUT_PLOTS_DIR.exists():
     shutil.rmtree(OUT_PLOTS_DIR)
 OUT_PLOTS_DIR.mkdir(parents=True)

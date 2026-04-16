@@ -36,7 +36,6 @@ conformer_test_dir.mkdir(parents=True, exist_ok=True)
 conformer_xl_dir.mkdir(parents=True, exist_ok=True)
 
 NUM_TEST = 50
-NUM_GEN_SAMPLES = 20
 
 
 def _canonicalize_smiles_with_stereo(smiles):
@@ -95,15 +94,15 @@ def print_smiles_statistics(smiles_list):
         print("\nNo duplicate SMILES found (each SMILES appears exactly once)")
 
 
-def write_smiles_yaml(smiles_sample, output_yaml_path):
+def write_smiles_yaml(smiles_sample, conformer_counts, output_yaml_path):
     smiles_to_use = sorted([str(s) for s in smiles_sample])
 
     tasks = []
-    for smiles in smiles_to_use:
+    for smiles, k in zip(smiles_to_use, conformer_counts):
         tasks.append({
             "task": "unconditional_smiles",
             "smiles": smiles,
-            "num_samples": NUM_GEN_SAMPLES,
+            "num_samples": min(2 * k, 32),
             "name": hashlib.sha256(smiles.encode()).hexdigest()
         })
 
@@ -204,29 +203,33 @@ def write_conformer_pdb_paths(smiles_sample, manifest, output_dir, dataset_dir, 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     worker_args = []
+    conformer_counts = []
     for smiles in smiles_to_use:
         if smiles not in smiles_to_ids:
             print(f"SMILES not found in manifest: {smiles[:60]}...")
             continue
         worker_args.append((smiles, smiles_to_ids[smiles], output_dir, dataset_dir))
+        conformer_counts.append(len(smiles_to_ids[smiles]))
 
     n_workers = num_workers or cpu_count()
     print(f"Processing {len(worker_args)} molecules with {n_workers} workers...")
     with Pool(processes=n_workers) as pool:
         results = pool.map(_write_conformer_worker, worker_args)
 
-    return [p for p in results if p is not None]
+    pdb_paths = [p for p, _ in zip(results, conformer_counts) if p is not None]
+    counts = [c for p, c in zip(results, conformer_counts) if p is not None]
+    return pdb_paths, counts
 
 
-def write_mol_yaml(first_conformer_output_pdb_paths, output_yaml):
+def write_mol_yaml(first_conformer_output_pdb_paths, conformer_counts, output_yaml):
     tasks = []
-    for pdb_path in first_conformer_output_pdb_paths:
+    for pdb_path, k in zip(first_conformer_output_pdb_paths, conformer_counts):
         name = Path(pdb_path).stem
         name = name[:name.index("_")]
         tasks.append({
             "task": "unconditional_mol",
             "mol_pdb_path": str(pdb_path),
-            "num_samples": NUM_GEN_SAMPLES,
+            "num_samples": min(2 * k, 32),
             "name": name
         })
 
@@ -238,6 +241,94 @@ def write_mol_yaml(first_conformer_output_pdb_paths, output_yaml):
 
     print(f"Created YAML file with {len(tasks)} tasks from geom_drugs_sample")
     print(f"Saved to: {output_yaml.absolute()}")
+
+
+def _load_xl_processed_pkl(pkl_path):
+    """Load an xl_processed pkl file and return (smiles, rd_mol)."""
+    with open(pkl_path, "rb") as f:
+        d = pickle.load(f)
+    return d["smi"], d["mol"]
+
+
+def write_xl_processed_conformer_pdb(pkl_path, output_dir):
+    """Write the mol from an xl_processed pkl file to a PDB in output_dir."""
+    smiles, mol = _load_xl_processed_pkl(pkl_path)
+    stem = Path(pkl_path).stem  # {SMILES}_{conf_idx}
+    output_path = output_dir / f"{stem}.pdb"
+    Chem.MolToPDBFile(mol, str(output_path), confId=0)
+    return output_path
+
+
+def _write_xl_conformer_worker(args):
+    pkl_path, output_dir = args
+    try:
+        return write_xl_processed_conformer_pdb(pkl_path, output_dir)
+    except Exception:
+        print(f"Failed for {Path(pkl_path).name[:60]}...")
+        traceback.print_exc()
+        return None
+
+
+def process_xl_processed_dataset(xl_dir, output_dir, num_samples=None, num_workers=None):
+    """
+    Scan xl_processed pkl files, sample unique SMILES, write conformer PDBs,
+    and return (smiles_sample, pdb_paths).
+
+    Each pkl filename is {SMILES}_{conformer_index}.pkl. The embedded `mol`
+    already has 3D coordinates. One conformer (the first file found) is written
+    per unique SMILES.
+    """
+    from collections import defaultdict
+
+    pkl_files = sorted(Path(xl_dir).glob("*.pkl"))
+    print(f"Found {len(pkl_files)} pkl files in {xl_dir}")
+
+    # Group by SMILES (encoded in filename stem before last '_')
+    smiles_to_files = defaultdict(list)
+    for f in pkl_files:
+        smiles = f.stem.rsplit("_", 1)[0]
+        smiles_to_files[smiles].append(f)
+
+    unique_smiles = sorted(smiles_to_files.keys())
+    print(f"Unique SMILES: {len(unique_smiles)}")
+
+    # Canonicalize and filter
+    canonical_smiles = []
+    smiles_to_first_pkl = {}
+    smiles_to_num_conformers = {}
+    for raw_smiles in unique_smiles:
+        canon = _canonicalize_smiles_with_stereo(raw_smiles)
+        if canon is None:
+            print(f"  Warning: could not canonicalize {raw_smiles[:60]}, skipping")
+            continue
+        canonical_smiles.append(canon)
+        # pick first conformer file for this SMILES (lowest conformer index)
+        files = sorted(smiles_to_files[raw_smiles], key=lambda p: int(p.stem.rsplit("_", 1)[1]))
+        smiles_to_first_pkl[canon] = files[0]
+        smiles_to_num_conformers[canon] = len(smiles_to_files[raw_smiles])
+
+    if num_samples is not None and num_samples < len(canonical_smiles):
+        random.seed(42)
+        smiles_sample = random.sample(canonical_smiles, num_samples)
+    else:
+        smiles_sample = canonical_smiles
+
+    print(f"Using {len(smiles_sample)} SMILES")
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    worker_args = [(smiles_to_first_pkl[s], output_dir) for s in smiles_sample]
+
+    n_workers = num_workers or cpu_count()
+    print(f"Writing conformer PDBs with {n_workers} workers...")
+    with Pool(processes=n_workers) as pool:
+        results = pool.map(_write_xl_conformer_worker, worker_args)
+
+    pdb_paths = [p for p in results if p is not None]
+    conformer_counts = [smiles_to_num_conformers[s] for s in smiles_sample]
+    return smiles_sample, pdb_paths, conformer_counts
+
 
 
 def main():
@@ -267,17 +358,17 @@ def main():
     train_smiles_sample = random.sample(sorted(train_smiles_set), NUM_TEST)
     test_smiles_sample = random.sample(sorted(test_smiles_set), NUM_TEST)
 
-    # Write SMILES YAMLs
-    write_smiles_yaml(train_smiles_sample, conformer_train_dir / "smiles.yaml")
-    write_smiles_yaml(test_smiles_sample, conformer_test_dir / "smiles.yaml")
-
     # Write conformer PDBs
-    train_first_conformer_output_pdb_paths = write_conformer_pdb_paths(
+    train_first_conformer_output_pdb_paths, train_conformer_counts = write_conformer_pdb_paths(
         train_smiles_sample, train_manifest, conformer_train_dir / "conformer_mols", TRAIN_DATASET_DIR
     )
-    test_first_conformer_output_pdb_paths = write_conformer_pdb_paths(
+    test_first_conformer_output_pdb_paths, test_conformer_counts = write_conformer_pdb_paths(
         test_smiles_sample, test_manifest, conformer_test_dir / "conformer_mols", TEST_DATASET_DIR
     )
+
+    # Write SMILES YAMLs
+    write_smiles_yaml(train_smiles_sample, train_conformer_counts, conformer_train_dir / "smiles.yaml")
+    write_smiles_yaml(test_smiles_sample, test_conformer_counts, conformer_test_dir / "smiles.yaml")
 
     # Copy first conformers
     train_first_conformer_out_dir = conformer_train_dir / "first_conformer_mols"
@@ -292,8 +383,23 @@ def main():
         shutil.copy(pdb_path, test_first_conformer_out_dir / pdb_path.name)
 
     # Write mol YAMLs
-    write_mol_yaml(train_first_conformer_output_pdb_paths, conformer_train_dir / "mol.yaml")
-    write_mol_yaml(test_first_conformer_output_pdb_paths, conformer_test_dir / "mol.yaml")
+    write_mol_yaml(train_first_conformer_output_pdb_paths, train_conformer_counts, conformer_train_dir / "mol.yaml")
+    write_mol_yaml(test_first_conformer_output_pdb_paths, test_conformer_counts, conformer_test_dir / "mol.yaml")
+
+    # --- xl_processed dataset ---
+    print("\n=== Processing xl_processed dataset ===")
+    xl_smiles_sample, xl_pdb_paths, xl_conformer_counts = process_xl_processed_dataset(
+        xl_dir=XL_PROCESSED_DIR,
+        output_dir=conformer_xl_dir / "conformer_mols",
+    )
+
+    first_conformer_xl_out_dir = conformer_xl_dir / "first_conformer_mols"
+    first_conformer_xl_out_dir.mkdir(parents=True, exist_ok=True)
+    for pdb_path in xl_pdb_paths:
+        shutil.copy(pdb_path, first_conformer_xl_out_dir / Path(pdb_path).name)
+
+    write_smiles_yaml(xl_smiles_sample, xl_conformer_counts, conformer_xl_dir / "smiles.yaml")
+    write_mol_yaml(xl_pdb_paths, xl_conformer_counts, conformer_xl_dir / "mol.yaml")
 
 
 if __name__ == "__main__":

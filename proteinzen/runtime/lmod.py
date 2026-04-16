@@ -1580,6 +1580,8 @@ class BiomoleculeSamplingModule(L.LightningModule):
 
             
 
+            if self.run_cfg.get('no_rot_sampling', False):
+                prot_traj_point = (prot_traj_point[0], rotmats_0, prot_traj_point[2])
             prot_traj.append(prot_traj_point)
             clean_traj.append(clean_traj_point)
             t_1 = t_2
