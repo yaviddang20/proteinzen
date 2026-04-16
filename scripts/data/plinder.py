@@ -29,7 +29,6 @@ import numpy as np
 import pyarrow.parquet as pq
 import rdkit
 from rdkit import Chem
-from p_tqdm import p_umap
 from tqdm import tqdm
 
 from mmcif import parse_mmcif
@@ -293,28 +292,27 @@ def process_system(
         json.dump(asdict(record), f)
 
 
-_ccd_cache = None
+_worker_state = {}
 
-def get_ccd(ccd_path: Path) -> dict:
-    global _ccd_cache
-    if _ccd_cache is None:
-        with open(ccd_path, "rb") as f:
-            _ccd_cache = pickle.load(f)
-    return _ccd_cache
+def _worker_init(plinder_dir, outdir, clusters, annotations, ccd_path):
+    """Load large shared data once per worker process."""
+    global _worker_state
+    with open(ccd_path, "rb") as f:
+        ccd = pickle.load(f)
+    _worker_state = {
+        "plinder_dir": plinder_dir,
+        "outdir": outdir,
+        "clusters": clusters,
+        "annotations": annotations,
+        "ccd": ccd,
+    }
 
 
-def process_system_worker(
-    system_id: str,
-    plinder_dir: Path,
-    outdir: Path,
-    clusters: dict,
-    annotations: dict,
-    ccd_path: Path,
-) -> None:
-    annotation_row = annotations.get(system_id, {})
+def process_system_worker(system_id: str) -> None:
+    s = _worker_state
+    annotation_row = s["annotations"].get(system_id, {})
     try:
-        ccd = get_ccd(ccd_path)
-        process_system(system_id, plinder_dir, outdir, clusters, annotation_row, ccd)
+        process_system(system_id, s["plinder_dir"], s["outdir"], s["clusters"], annotation_row, s["ccd"])
     except Exception:
         traceback.print_exc()
         print(f"Unhandled error processing {system_id}")
@@ -354,20 +352,18 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> None:
 
     num_processes = min(args.num_processes, multiprocessing.cpu_count(), len(system_ids))
 
-    fn = partial(
-        process_system_worker,
-        plinder_dir=plinder_dir,
-        outdir=outdir,
-        clusters=clusters,
-        annotations=annotations,
-        ccd_path=args.ccd_path,
-    )
-
     if num_processes > 1:
-        p_umap(fn, system_ids, num_cpus=num_processes)
+        initargs = (plinder_dir, outdir, clusters, annotations, args.ccd_path)
+        with multiprocessing.Pool(
+            processes=num_processes,
+            initializer=_worker_init,
+            initargs=initargs,
+        ) as pool:
+            list(tqdm(pool.imap_unordered(process_system_worker, system_ids, chunksize=4), total=len(system_ids)))
     else:
+        _worker_init(plinder_dir, outdir, clusters, annotations, args.ccd_path)
         for sid in tqdm(system_ids):
-            fn(sid)
+            process_system_worker(sid)
 
     finalize(outdir)
 
@@ -393,11 +389,6 @@ if __name__ == "__main__":
     # Set rdkit pickle options
     pickle_option = rdkit.Chem.PropertyPickleOptions.AllProps
     rdkit.Chem.SetDefaultPickleProperties(pickle_option)
-
-    # Preload CCD in main process — workers inherit via fork copy-on-write
-    print("Loading CCD...")
-    get_ccd(args.ccd_path)
-    print("CCD loaded")
 
     # Load shared data once
     print("Loading clusters...")
