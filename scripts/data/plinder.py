@@ -196,7 +196,7 @@ def process_system(
     if struct_path.exists() and record_path.exists():
         return
 
-    system_dir = plinder_dir / "systems" / mid / system_id
+    system_dir = plinder_dir / "systems" / system_id
     cif_path = system_dir / "system.cif"
     if not cif_path.exists():
         return
