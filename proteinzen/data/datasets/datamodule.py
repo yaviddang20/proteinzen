@@ -28,6 +28,49 @@ from proteinzen.data.featurize.assembler import featurize, collate
 from proteinzen.runtime.sampling.dispatcher import BiomoleculeTaskDispatcher
 
 
+def compute_lap_pe(adj: np.ndarray, k: int) -> np.ndarray:
+    """k smallest non-trivial eigenvectors of normalized graph Laplacian.
+
+    L = I - D^{-1/2} A D^{-1/2}
+
+    Returns [n, k] float32 array. Columns are zero-padded if the graph has
+    fewer than k non-trivial eigenvectors (e.g. disconnected or tiny graphs).
+    Sign ambiguity is left to the model to handle (random flip at train time
+    is an option but not applied here).
+    """
+    n = adj.shape[0]
+    deg = adj.sum(axis=1)
+    d_inv_sqrt = np.where(deg > 0, 1.0 / np.sqrt(deg), 0.0)
+    L = np.eye(n) - d_inv_sqrt[:, None] * adj * d_inv_sqrt[None, :]
+    eigvals, eigvecs = np.linalg.eigh(L)
+    # skip the trivial eigenvector(s) — take indices 1..k
+    pe = eigvecs[:, 1:k + 1]
+    if pe.shape[1] < k:
+        pe = np.pad(pe, ((0, 0), (0, k - pe.shape[1])))
+    return pe.astype(np.float32)
+
+
+def _add_lap_pe_to_features(features: dict, k: int) -> None:
+    """Compute LapPE from token_bonds + rigid→token mapping, store in features['rigids']."""
+    rigids = features['rigids']
+    n_rigids = rigids['rigids_mask'].shape[0]
+    token_bonds = features['token']['token_bonds']  # [n_tokens, n_tokens]
+    rigid_to_token = rigids['rigids_to_token']      # [n_rigids]
+    is_atom = rigids['rigids_is_atom_mask']          # [n_rigids] bool
+
+    lap_pe = torch.zeros(n_rigids, k, dtype=torch.float32)
+    atom_idx = torch.where(is_atom)[0]
+    if len(atom_idx) > 1:
+        # sub-adjacency for atomized rigids only
+        tok_idx = rigid_to_token[atom_idx]
+        sub_bonds = token_bonds[tok_idx][:, tok_idx]  # [n_atoms, n_atoms]
+        adj = (sub_bonds > 0).float().numpy().astype(np.float32)
+        pe = compute_lap_pe(adj, k)
+        lap_pe[atom_idx] = torch.from_numpy(pe)
+
+    rigids['rigids_lap_pe'] = lap_pe
+
+
 def strip_h_from_structure(struct: Structure) -> Structure:
     """Remove hydrogen atoms (element=1) from a structure, reindexing bonds/residues/chains."""
     atoms = struct.atoms
@@ -194,6 +237,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         mask_nonstandard=False,
         include_h=False,
         use_identity_rot=True,
+        lap_pe_k=0,
     ):
         super().__init__()
         self.datasets = datasets
@@ -221,6 +265,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.mask_nonstandard = mask_nonstandard
         self.include_h = include_h
         self.use_identity_rot = use_identity_rot
+        self.lap_pe_k = lap_pe_k
 
         for dataset in datasets:
             records = dataset.manifest
@@ -312,6 +357,9 @@ class TrainingDataset(torch.utils.data.Dataset):
             group1_rigid_mask[:n] = torch.from_numpy(group1_atom_mask[:n])
         features['rigids']['group1_rigid_mask'] = group1_rigid_mask
 
+        if self.lap_pe_k > 0:
+            _add_lap_pe_to_features(features, self.lap_pe_k)
+
         return features
 
     def __len__(self) -> int:
@@ -340,6 +388,7 @@ class ValidationDataset(torch.utils.data.Dataset):
         mask_nonstandard=False,
         include_h=False,
         use_identity_rot=True,
+        lap_pe_k=0,
     ):
         super().__init__()
         self.datasets = datasets
@@ -367,6 +416,7 @@ class ValidationDataset(torch.utils.data.Dataset):
         self.mask_nonstandard = mask_nonstandard
         self.include_h = include_h
         self.use_identity_rot = use_identity_rot
+        self.lap_pe_k = lap_pe_k
 
         for dataset in datasets:
             for entry in dataset.manifest:
@@ -468,6 +518,9 @@ class ValidationDataset(torch.utils.data.Dataset):
             n = min(len(group1_atom_mask), n_rigids)
             group1_rigid_mask[:n] = torch.from_numpy(group1_atom_mask[:n])
         features['rigids']['group1_rigid_mask'] = group1_rigid_mask
+
+        if self.lap_pe_k > 0:
+            _add_lap_pe_to_features(features, self.lap_pe_k)
 
         return features
 

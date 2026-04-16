@@ -110,6 +110,7 @@ ENV/
 
 
 # custom
+/plinder
 ccd.pkl
 /geom_drugs_boltz
 /sampling

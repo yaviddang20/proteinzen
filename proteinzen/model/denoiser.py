@@ -232,6 +232,8 @@ class Embedder(nn.Module):
                  num_elements=const.num_elements,
                  patch_unit_vec_bug=False,
                  predict_time=False,
+                 use_lap_pe=False,
+                 lap_pe_k=8,
     ):
         super().__init__()
         self.c_s = c_s
@@ -239,6 +241,8 @@ class Embedder(nn.Module):
         self.c_sidechain = c_frame
         self.block_q = block_q
         self.block_k = block_k
+        self.use_lap_pe = use_lap_pe
+        self.lap_pe_k = lap_pe_k
 
         self.timestep_embedder = fn.partial(
             get_timestep_embedding_flexshape,
@@ -268,6 +272,8 @@ class Embedder(nn.Module):
         self.rigid_charge_embed = Linear(1, c_frame, bias=False)
         self.rigid_chirality_embed = Linear(1, c_frame, bias=False)
         # self.rigid_is_unindexed_embed = Linear(1, c_frame, bias=False)
+        if use_lap_pe:
+            self.rigid_lap_pe_embed = Linear(lap_pe_k, c_frame, bias=False)
 
         self.framepair_init = FramepairEmbedder(
             c_framepair
@@ -423,6 +429,7 @@ class Embedder(nn.Module):
         rigids_token_uid,
         rigids_idx,
         rigids_is_atomized_mask,
+        rigids_lap_pe=None,
     ):
         nodes_to_rigids = fn.partial(gather_helper, token_gather_idx=rigids_token_uid)
 
@@ -449,6 +456,10 @@ class Embedder(nn.Module):
             + charge_embed
             + chirality_embed
         )
+
+        if self.use_lap_pe and rigids_lap_pe is not None:
+            rigids_init = rigids_init + self.rigid_lap_pe_embed(rigids_lap_pe)
+
         return rigids_init
 
 
@@ -512,7 +523,8 @@ class Embedder(nn.Module):
             rigids_is_atomized_mask,
             token_bonds,
             sc_rigids=None,
-            sf_rigids=None
+            sf_rigids=None,
+            rigids_lap_pe=None,
         ):
 
         # build the indexing matrices
@@ -566,6 +578,7 @@ class Embedder(nn.Module):
             rigids_token_uid,
             rigids_idx,
             rigids_is_atomized_mask,
+            rigids_lap_pe=rigids_lap_pe,
         )
 
         rigids_inputs = {
@@ -735,6 +748,8 @@ class IpaDenoiser(nn.Module):
                  predict_time=False,
                  predict_energy=False,
                  predict_min_conformer=False,
+                 use_lap_pe=False,
+                 lap_pe_k=8,
                  ):
         super().__init__()
         # self.diffuser = diffuser
@@ -1286,6 +1301,8 @@ class IpaMultiRigidDenoiser(nn.Module):
                  predict_time=False,
                  predict_energy=False,
                  predict_min_conformer=False,
+                 use_lap_pe=False,
+                 lap_pe_k=8,
                  ):
         super().__init__()
 
@@ -1343,6 +1360,8 @@ class IpaMultiRigidDenoiser(nn.Module):
             predict_time=predict_time,
             predict_energy=predict_energy,
             predict_min_conformer=predict_min_conformer,
+            use_lap_pe=use_lap_pe,
+            lap_pe_k=lap_pe_k,
         )
 
         self.embedder = Embedder(
@@ -1363,6 +1382,8 @@ class IpaMultiRigidDenoiser(nn.Module):
             use_self_folding=self_folding,
             patch_unit_vec_bug=patch_unit_vec_bug,
             predict_time=predict_time,
+            use_lap_pe=use_lap_pe,
+            lap_pe_k=lap_pe_k,
         )
 
         if use_pairformer:
@@ -1437,7 +1458,8 @@ class IpaMultiRigidDenoiser(nn.Module):
                 rigids_noising_mask=rigids_data['rigids_noising_mask'],
                 token_bonds=token_data['token_bonds'],
                 sc_rigids=sc_rigids,
-                sf_rigids=sf_rigids
+                sf_rigids=sf_rigids,
+                rigids_lap_pe=rigids_data.get('rigids_lap_pe'),
             )
 
             input_feats['condition_embed'] = input_feats['time_condition_embed']

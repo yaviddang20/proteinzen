@@ -30,6 +30,8 @@ from proteinzen.data.featurize.sampling import construct_atoms, update_structure
 from proteinzen.data.featurize.tokenize import Tokenized
 # from proteinzen.data.write.mmcif import to_mmcif
 from proteinzen.data.write.pdb import to_pdb
+from rdkit import Chem
+from rdkit.Chem import AllChem, rdMolAlign, rdmolfiles
 
 from .utils import gen_pbar_str
 from .ema import EMAModel
@@ -279,6 +281,46 @@ def compute_xtb_energies(elements, positions, mask):
     return torch.tensor(energies, dtype=torch.float32, device=elements.device)
 
 
+def _mol_from_smiles_with_coords(smiles: str, coords: np.ndarray) -> Chem.Mol:
+    """Build an RDKit mol from SMILES and set atom positions from coords [N, 3]."""
+    mol = AllChem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    mol = AllChem.RemoveHs(mol)
+    if mol.GetNumAtoms() != len(coords):
+        return None
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    for i, (x, y, z) in enumerate(coords):
+        conf.SetAtomPosition(i, (float(x), float(y), float(z)))
+    mol.AddConformer(conf, assignId=True)
+    return mol
+
+
+def _clean_pdb_block(block: str) -> str:
+    lines = block.splitlines(keepends=True)
+    return "".join(l for l in lines if not l.startswith(("END", "CONECT")))
+
+
+def write_val_pdb(smiles: str, gt_coords: np.ndarray, pred_coords: np.ndarray, path: str):
+    """Write a two-MODEL PDB: MODEL 1 = GT, MODEL 2 = predicted (aligned to GT)."""
+    ref = _mol_from_smiles_with_coords(smiles, gt_coords)
+    probe = _mol_from_smiles_with_coords(smiles, pred_coords)
+    if ref is None or probe is None:
+        return
+    try:
+        rdMolAlign.AlignMol(probe, ref)
+    except Exception:
+        pass
+    with open(path, "w") as f:
+        f.write("MODEL        1\n")
+        f.write(_clean_pdb_block(rdmolfiles.MolToPDBBlock(ref, flavor=4)))
+        f.write("ENDMDL\n")
+        f.write("MODEL        2\n")
+        f.write(_clean_pdb_block(rdmolfiles.MolToPDBBlock(probe, flavor=4)))
+        f.write("ENDMDL\n")
+        f.write("END\n")
+
+
 class BiomoleculeModule(L.LightningModule):
     def __init__(self,
                  model,
@@ -517,7 +559,7 @@ class BiomoleculeModule(L.LightningModule):
             sync_dist=True,
         )
 
-    def _shared_step(self, batch):
+    def _shared_step(self, batch, return_outputs=False):
         # stochastic corruption for BOTH train and val
         batch["trans_t"] = batch["t"]
         batch["rot_t"] = batch["t"]
@@ -539,7 +581,10 @@ class BiomoleculeModule(L.LightningModule):
                     self_folding = self.model(pred_seq_batch)
 
         outputs = self.model(batch, self_conditioning, self_folding)
-        return self._loss_step(batch, outputs)
+        loss_dict = self._loss_step(batch, outputs)
+        if return_outputs:
+            return loss_dict, batch, outputs
+        return loss_dict
 
     
     def training_step(self, batch, batch_idx):
@@ -631,11 +676,21 @@ class BiomoleculeModule(L.LightningModule):
         device = batch["t"].device
         B = batch["t"].shape[0]
 
+        write_pdbs = (
+            self.trainer.current_epoch % 5 == 0
+            and self.trainer.global_rank == 0
+            and batch_idx == 0  # only first val batch
+        )
+
         for t_val in (0.0, 0.5):
             batch_t = batch.copy()
             batch_t["t"] = torch.full((*batch_t["t"].shape,), t_val, device=device)
 
-            loss_dict = self._shared_step(batch_t)
+            if write_pdbs:
+                loss_dict, batch_out, outputs = self._shared_step(batch_t, return_outputs=True)
+                self._write_val_pdbs(batch_out, outputs, t_val)
+            else:
+                loss_dict = self._shared_step(batch_t)
 
             # log under separate namespace
             self._log_losses(
@@ -643,6 +698,35 @@ class BiomoleculeModule(L.LightningModule):
                 batch_t,
                 stage=f"val/t_{t_val}",
             )
+
+    def _write_val_pdbs(self, batch, outputs, t_val: float, n_samples: int = 5):
+        """Write n_samples two-MODEL PDBs (GT + predicted) for visual inspection."""
+        smiles_list = batch.get('smiles', [])
+        if not smiles_list:
+            return
+
+        epoch = self.trainer.current_epoch
+        out_dir = os.path.join(os.getcwd(), f"val_pdbs/epoch_{epoch:04d}/t_{t_val}")
+        os.makedirs(out_dir, exist_ok=True)
+
+        B = batch["t"].shape[0]
+        rigids_mask = batch['rigids']['rigids_mask']  # [B, R]
+        gt_trans = ru.Rigid.from_tensor_7(batch['rigids']['rigids_1']).get_trans().cpu().numpy()  # [B, R, 3]
+        pred_trans = outputs['denoised_rigids'].get_trans().cpu().numpy()  # [B, R, 3]
+
+        indices = list(range(min(n_samples, B)))
+        for i in indices:
+            smiles = smiles_list[i]
+            if not smiles:
+                continue
+            mask = rigids_mask[i].cpu().numpy().astype(bool)
+            gt_coords = gt_trans[i][mask]
+            pred_coords = pred_trans[i][mask]
+            path = os.path.join(out_dir, f"sample_{i:02d}.pdb")
+            try:
+                write_val_pdb(smiles, gt_coords, pred_coords, path)
+            except Exception as e:
+                log.warning(f"val PDB write failed for sample {i}: {e}")
 
     def on_validation_epoch_end(self):
         metrics = self.trainer.callback_metrics

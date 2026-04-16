@@ -26,7 +26,7 @@ from functools import partial
 import pickle
 
 import numpy as np
-import pandas as pd
+import pyarrow.parquet as pq
 import rdkit
 from rdkit import Chem
 from p_tqdm import p_umap
@@ -63,11 +63,7 @@ def load_clusters(
     metric: str = "pli_qcov",
     threshold: int = 50,
 ) -> dict:
-    """Load cluster parquet and return {system_id: cluster_label} dict.
-
-    Clusters use Hive partitioning — directory path encodes algorithm/directed/metric/threshold.
-    Parquet files inside contain only system_id and label columns.
-    """
+    """Load cluster parquet and return {system_id: cluster_label} dict."""
     cluster_path = (
         plinder_dir
         / "clusters"
@@ -75,27 +71,37 @@ def load_clusters(
         / f"directed={directed}"
         / f"metric={metric}"
         / f"threshold={threshold}"
+        / "data.parquet"
     )
-    parquet_files = list(cluster_path.glob("*.parquet"))
-    if not parquet_files:
-        print(f"Warning: no cluster parquet files found at {cluster_path}")
+    if not cluster_path.exists():
+        print(f"Warning: cluster parquet not found at {cluster_path}")
         return {}
-
-    frames = [pd.read_parquet(f) for f in parquet_files]
-    df = pd.concat(frames, ignore_index=True)
-    return dict(zip(df["system_id"], df["label"]))
+    t = pq.ParquetFile(cluster_path).read(columns=["system_id", "label"])
+    return dict(zip(t["system_id"].to_pylist(), t["label"].to_pylist()))
 
 
-def load_annotation_table(plinder_dir: Path) -> pd.DataFrame:
-    """Load the main annotation table."""
+def load_annotation_table(plinder_dir: Path) -> dict:
+    """Load annotation table, return {system_id: row_dict} with only affinity columns."""
     path = plinder_dir / "index" / "annotation_table.parquet"
-    return pd.read_parquet(path)
+    cols = [
+        "system_id",
+        "system_has_binding_affinity",
+        "ligand_molecular_weight",
+        "system_proper_ligand_max_molecular_weight",
+    ]
+    t = pq.ParquetFile(path).read(columns=cols)
+    result = {}
+    ids = t["system_id"].to_pylist()
+    for i, sid in enumerate(ids):
+        result[sid] = {c: t[c][i].as_py() for c in cols}
+    return result
 
 
-def load_split(plinder_dir: Path) -> pd.DataFrame:
-    """Load the split definitions."""
+def load_split(plinder_dir: Path) -> dict:
+    """Load split definitions, return {system_id: split_name} dict."""
     path = plinder_dir / "splits" / "split.parquet"
-    return pd.read_parquet(path)
+    t = pq.ParquetFile(path).read(columns=["system_id", "split"])
+    return dict(zip(t["system_id"].to_pylist(), t["split"].to_pylist()))
 
 
 def get_ligand_sdfs(system_dir: Path) -> dict:
@@ -197,7 +203,7 @@ def process_system(
 
     try:
         # Parse full complex (protein + ligand chains via CCD)
-        parsed = parse_mmcif(str(cif_path), components=ccd, ignore_connections=False)
+        parsed = parse_mmcif(str(cif_path), components=ccd, ignore_connections=False, use_assembly=False)
         structure = parsed.data
     except Exception:
         traceback.print_exc()
@@ -334,38 +340,12 @@ def finalize(outdir: Path) -> None:
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
-def process(args) -> None:
+def process(args, clusters: dict, annotations: dict, split: dict) -> None:
     plinder_dir = args.plinder_dir
     outdir = args.outdir
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # Set rdkit pickle options
-    pickle_option = rdkit.Chem.PropertyPickleOptions.AllProps
-    rdkit.Chem.SetDefaultPickleProperties(pickle_option)
-
-
-    print("Loading clusters...")
-    clusters = load_clusters(
-        plinder_dir,
-        algorithm=args.cluster_algorithm,
-        directed=args.cluster_directed,
-        metric=args.cluster_metric,
-        threshold=args.cluster_threshold,
-    )
-    print(f"Loaded {len(clusters)} cluster assignments")
-
-    print("Loading annotation table...")
-    ann_df = load_annotation_table(plinder_dir)
-    annotations = {row["system_id"]: row for row in ann_df.to_dict(orient="records")}
-
-    print("Loading split...")
-    split_df = load_split(plinder_dir)
-
-    # Filter to requested splits
-    if args.splits:
-        split_df = split_df[split_df["split"].isin(args.splits)]
-
-    system_ids = split_df["system_id"].tolist()
+    system_ids = [sid for sid, s in split.items() if s in args.splits]
 
     if args.max_systems is not None:
         system_ids = system_ids[:args.max_systems]
@@ -392,22 +372,53 @@ def process(args) -> None:
     finalize(outdir)
 
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process Plinder dataset into proteinzen npz format.")
     parser.add_argument("--ccd-path", type=Path, default=Path(os.environ.get("REPO_ROOT", ".")) / "ccd.pkl",
                         help="Path to ccd.pkl (default: $REPO_ROOT/ccd.pkl)")
     parser.add_argument("--plinder-dir", type=Path, required=True,
-                        help="Path to plinder data root (e.g. /datastor1/dy4652/plinder/2024-06/v2)")
+                        help="Path to plinder data root (e.g. /mnt/scratch/.../plinder/2024-06/v2)")
     parser.add_argument("--outdir", type=Path, required=True,
-                        help="Output directory for npz + manifest")
-    parser.add_argument("--splits", nargs="+", default=["train", "val", "test"],
-                        help="Which splits to include (default: train val test)")
+                        help="Output root — one subdirectory per split (train/val/test)")
     parser.add_argument("--cluster-algorithm", type=str, default="communities")
     parser.add_argument("--cluster-directed", action="store_true", default=False)
     parser.add_argument("--cluster-metric", type=str, default="pli_qcov")
     parser.add_argument("--cluster-threshold", type=int, default=50)
     parser.add_argument("--num-processes", type=int, default=multiprocessing.cpu_count())
     parser.add_argument("--max-systems", type=int, default=None,
-                        help="Cap number of systems (for debugging)")
+                        help="Cap number of systems per split (for debugging)")
     args = parser.parse_args()
-    process(args)
+
+    # Set rdkit pickle options
+    pickle_option = rdkit.Chem.PropertyPickleOptions.AllProps
+    rdkit.Chem.SetDefaultPickleProperties(pickle_option)
+
+    # Preload CCD in main process — workers inherit via fork copy-on-write
+    print("Loading CCD...")
+    get_ccd(args.ccd_path)
+    print("CCD loaded")
+
+    # Load shared data once
+    print("Loading clusters...")
+    clusters = load_clusters(
+        args.plinder_dir,
+        algorithm=args.cluster_algorithm,
+        directed=args.cluster_directed,
+        metric=args.cluster_metric,
+        threshold=args.cluster_threshold,
+    )
+    print(f"Loaded {len(clusters)} cluster assignments")
+
+    print("Loading annotation table...")
+    annotations = load_annotation_table(args.plinder_dir)
+    print(f"Loaded {len(annotations)} annotation rows")
+
+    print("Loading split...")
+    split = load_split(args.plinder_dir)
+    print(f"Loaded {len(split)} split assignments")
+
+    for split_name in ["train", "val", "test"]:
+        print(f"\n=== Processing split: {split_name} ===")
+        split_args = argparse.Namespace(**vars(args), splits=[split_name], outdir=args.outdir / split_name)
+        process(split_args, clusters, annotations, split)
