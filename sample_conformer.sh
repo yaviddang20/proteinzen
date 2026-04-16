@@ -17,4 +17,5 @@ python $REPO_ROOT/sample.py \
     save_traj=true \
     +version_num=${version_num} \
     corrupter.sampling_noise_mode=null \
-    sampler.include_h=true
+    sampler.include_h=true \
+    +identity_rot_noise=true 

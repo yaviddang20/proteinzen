@@ -1546,6 +1546,8 @@ class BiomoleculeSamplingModule(L.LightningModule):
         rigids_0 = ru.Rigid.from_tensor_7(rigids_data['rigids_t'])
         trans_0 = rigids_0.get_trans()
         rotmats_0 = rigids_0.get_rots().get_rot_mats()
+        if self.run_cfg.get('identity_rot_noise', False):
+            rotmats_0 = torch.eye(3, device=rotmats_0.device, dtype=rotmats_0.dtype).expand_as(rotmats_0).clone()
         rigids_noising_mask = rigids_data['rigids_noising_mask']
         seq_noising_mask = token_data['seq_noising_mask']
 

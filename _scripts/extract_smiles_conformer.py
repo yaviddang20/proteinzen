@@ -25,11 +25,15 @@ TRAIN_MANIFEST_PATH = TRAIN_DATASET_DIR / "manifest.json"
 TEST_DATASET_DIR = PROJECT_DIR / "data/geom_drugs_conformers/test"
 TEST_MANIFEST_PATH = TEST_DATASET_DIR / "manifest.json"
 
+XL_PROCESSED_DIR = PROJECT_DIR / "data/processed_xl"
+
 conformer_train_dir = PROJECT_DIR / "sampling/geom_conformer_train"
 conformer_test_dir = PROJECT_DIR / "sampling/geom_conformer_test"
+conformer_xl_dir = PROJECT_DIR / "sampling/xl_processed"
 
 conformer_train_dir.mkdir(parents=True, exist_ok=True)
 conformer_test_dir.mkdir(parents=True, exist_ok=True)
+conformer_xl_dir.mkdir(parents=True, exist_ok=True)
 
 NUM_TEST = 50
 NUM_GEN_SAMPLES = 20

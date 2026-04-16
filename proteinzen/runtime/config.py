@@ -206,6 +206,7 @@ def config_sampling_hydra_store():
         save_traj=False,
         output_motif_chains=False,
         checkpoint_idx=-1,
+        identity_rot_noise=False,
         hydra_defaults=[
             {"sampler": "default"},
             {"corrupter": "default"},

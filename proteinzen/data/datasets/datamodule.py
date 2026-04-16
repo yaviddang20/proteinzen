@@ -158,8 +158,17 @@ def load_input(record: Record, data_dir, include_h: bool = False):
         # Replace old chains array with new one
         chains = new_chains
 
+    atoms = structure["atoms"]
+    if "chirality" not in atoms.dtype.names:
+        new_dtype = atoms.dtype.descr + [("chirality", "i1")]
+        new_atoms = np.empty(atoms.shape, dtype=new_dtype)
+        for name in atoms.dtype.names:
+            new_atoms[name] = atoms[name]
+        new_atoms["chirality"] = 0
+        atoms = new_atoms
+
     struct = Structure(
-        atoms=structure["atoms"],
+        atoms=atoms,
         bonds=structure["bonds"],
         residues=structure["residues"],
         chains=chains, # chains var accounting for missing cyclic_period
