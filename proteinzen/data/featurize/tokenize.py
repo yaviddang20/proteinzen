@@ -558,6 +558,7 @@ class StructureTokenizer:
                 is_atomized=False,
                 element=-1,
                 charge=0,
+                chirality=0,
                 tensor7=rigid_tensor7[i],
                 is_present=rigid_mask[i],
                 rigids_noising_mask=noise_rigid,

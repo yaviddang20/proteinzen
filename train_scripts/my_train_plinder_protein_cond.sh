@@ -4,10 +4,10 @@ source $dir/../env_vars.sh
 python ${REPO_ROOT}/train.py \
     domain=protein \
     paradigm=multiframefm \
-    datamodule.batch_size=20 \
+    datamodule.batch_size=2 \
     datamodule.num_workers=8 \
-    model.c_s=256 \
-    model.c_cond=256 \
+    model.c_s=768 \
+    model.c_cond=768 \
     model.c_frame=256 \
     model.c_framepair=64 \
     model.z_broadcast=true \
@@ -18,11 +18,11 @@ python ${REPO_ROOT}/train.py \
     model.use_qk_norm=true \
     model.use_amp=true \
     model.rot_preconditioning=true \
-    model.num_blocks=8 \
+    model.num_blocks=12 \
     lmodule.use_ema=true \
     lmodule.strict_weight_loading=false \
-    corrupter.use_stochastic_centering=false \
-    corrupter.center_on_motif=false \
+    corrupter.use_stochastic_centering=true \
+    corrupter.center_on_motif=true \
     corrupter.trans_prior_std=3 \
     dataset.config="'${REPO_ROOT}/configs/train/data/plinder_protein_cond.yaml'" \
     +dataset.val_config="'${REPO_ROOT}/configs/train/data/plinder_val.yaml'" \
@@ -40,4 +40,8 @@ python ${REPO_ROOT}/train.py \
     lmodule.scale_ring_planarity_loss=false \
     dataset.include_h=true \
     lmodule.use_cosine_annealing=true \
-    lmodule.cosine_annealing_T_max=500
+    lmodule.cosine_annealing_T_max=500 \
+    lmodule.cosine_annealing_epoch_offset=0 \
+    lmodule.use_trans_mse_loss=true \
+    lmodule.scale_trans_mse_loss=true \
+    "experiment.warm_start='${REPO_ROOT}/outputs/zen_geom_identityRot_256_conformer_3std_stereo_hydrogen/train/lightning_logs/version_50130/checkpoints/last.ckpt'"
