@@ -49,6 +49,7 @@ class _ChainConditioningBase(TrainingTask):
         beta_p2=1.0,
         t_min=0.01,
         t_max=0.99,
+        shift_time_scale=False,
         condition_mol_type="PROTEIN",
     ):
         assert t_sched in ["lognorm", "mixed_beta", "uniform"]
