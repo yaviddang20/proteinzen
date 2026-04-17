@@ -328,6 +328,9 @@ class TrainingDataset(torch.utils.data.Dataset):
                     interface_id=sample.interface_id
                 )
 
+        if len(tokenized_data.tokens) == 0:
+            return self.__getitem__(idx)
+
         features = featurize(
             tokenized_data,
             task_data,
@@ -492,6 +495,9 @@ class ValidationDataset(torch.utils.data.Dataset):
 
         features = featurize(
             tokenized_data,
+        if len(tokenized_data.tokens) == 0:
+            return self.__getitem__(idx)
+
             task_data,
             max_tokens=self.max_crop_residues,
             max_rigids=self.max_crop_rigids

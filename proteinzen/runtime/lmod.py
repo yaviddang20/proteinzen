@@ -714,14 +714,19 @@ class BiomoleculeModule(L.LightningModule):
         gt_trans = ru.Rigid.from_tensor_7(batch['rigids']['rigids_1']).get_trans().cpu().numpy()  # [B, R, 3]
         pred_trans = outputs['denoised_rigids'].get_trans().cpu().numpy()  # [B, R, 3]
 
+        ref_elements = batch['rigids']['rigids_ref_element']  # [B, R] int, H=1, -1=non-atom
+
         indices = list(range(min(n_samples, B)))
         for i in indices:
             smiles = smiles_list[i]
             if not smiles:
                 continue
             mask = rigids_mask[i].cpu().numpy().astype(bool)
-            gt_coords = gt_trans[i][mask]
-            pred_coords = pred_trans[i][mask]
+            elements = ref_elements[i].cpu().numpy()
+            # keep only heavy atoms (element > 1 and valid atom, i.e. != -1)
+            heavy_mask = mask & (elements != 1) & (elements != -1)
+            gt_coords = gt_trans[i][heavy_mask]
+            pred_coords = pred_trans[i][heavy_mask]
             path = os.path.join(out_dir, f"sample_{i:02d}.pdb")
             try:
                 write_val_pdb(smiles, gt_coords, pred_coords, path)

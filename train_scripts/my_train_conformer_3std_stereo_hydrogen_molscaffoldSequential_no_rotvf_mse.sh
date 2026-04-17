@@ -25,7 +25,7 @@ python ${REPO_ROOT}/train.py \
     corrupter.center_on_motif=false \
     corrupter.trans_prior_std=3 \
     dataset.config="'${REPO_ROOT}/configs/train/data/geom_conformer_scaffold_sequential.yaml'" \
-    +dataset.val_config="'${REPO_ROOT}/configs/train/data/geom_conformer_val.yaml'" \
+    +dataset.val_config="'${REPO_ROOT}/configs/train/data/geom_conformer_scaffold_sequential_val.yaml'" \
     experiment.lightning.devices=8 \
     experiment.lightning.strategy=ddp_find_unused_parameters_true \
     experiment.checkpointer.train_time_interval=null \
@@ -45,6 +45,7 @@ python ${REPO_ROOT}/train.py \
     lmodule.use_cosine_annealing=true \
     lmodule.cosine_annealing_T_max=500 \
     lmodule.use_trans_mse_loss=true \
+    "experiment.warm_start='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_hydrogen_molscaffold_no_rotvf_mse/train/lightning_logs/version_64743/checkpoints/last.ckpt'" \
 
 # python train.py \
 #     domain=protein \
