@@ -30,7 +30,7 @@ python ${REPO_ROOT}/train.py \
     experiment.lightning.strategy=ddp_find_unused_parameters_true \
     experiment.checkpointer.train_time_interval=null \
     experiment.checkpointer.every_n_train_steps=500 \
-    hydra.run.dir="'${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_hydrogen_molscaffold_no_rotvf_mse/train'" \
+    hydra.run.dir="'${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_hydrogen_molscaffoldSequential_no_rotvf_mse/train'" \
     experiment.lightning.max_epochs=-1 \
     model.use_bond_rotation=false \
     experiment.lightning.accumulate_grad_batches=2 \
@@ -45,7 +45,7 @@ python ${REPO_ROOT}/train.py \
     lmodule.use_cosine_annealing=true \
     lmodule.cosine_annealing_T_max=500 \
     lmodule.use_trans_mse_loss=true \
-    "experiment.warm_start='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_hydrogen_molscaffold_no_rotvf_mse/train/lightning_logs/version_64743/checkpoints/last.ckpt'" \
+    "experiment.warm_start='${REPO_ROOT}/outputs/geom_identityRot_256_conformer_3std_stereo_hydrogen_molscaffoldSequential_no_rotvf_mse/train/lightning_logs/version_66251/checkpoints/last.ckpt'" \
 
 # python train.py \
 #     domain=protein \
