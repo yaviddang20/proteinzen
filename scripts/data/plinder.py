@@ -209,6 +209,13 @@ def process_system(
         print(f"Failed to parse {system_id}")
         return
 
+    # Skip systems with DNA or RNA chains (not supported by tokenizer)
+    dna_id = const.chain_type_ids["DNA"]
+    rna_id = const.chain_type_ids["RNA"]
+    for chain in structure.chains:
+        if int(chain["mol_type"]) in (dna_id, rna_id):
+            return
+
     # Load ligand SDF files
     ligand_sdfs = get_ligand_sdfs(system_dir)
     n_total_atoms = len(structure.atoms)
