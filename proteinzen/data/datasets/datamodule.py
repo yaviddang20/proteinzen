@@ -292,6 +292,22 @@ class TrainingDataset(torch.utils.data.Dataset):
         task = task_sampler.sample_task()
 
         struct, rot_bond_data = load_input(sample.record, Path(dataset.data_dir), include_h=self.include_h)
+
+        # Skip structures where a PROTEIN chain contains nucleotide residues
+        # (gemmi can misclassify DNA chains as PeptideL/PROTEIN)
+        _nuc_names = {'DA', 'DC', 'DG', 'DT', 'A', 'G', 'C', 'U'}
+        _protein_id = const.chain_type_ids["PROTEIN"]
+        _has_nuc_in_protein = False
+        for _chain in struct.chains:
+            if int(_chain['mol_type']) != _protein_id:
+                continue
+            rs, re = int(_chain['res_idx']), int(_chain['res_idx']) + int(_chain['res_num'])
+            if set(struct.residues['name'][rs:re].tolist()) & _nuc_names:
+                _has_nuc_in_protein = True
+                break
+        if _has_nuc_in_protein:
+            return self.__getitem__(idx)
+
         chain_mask = struct.mask
         remove_chain_masks = [struct.chains['mol_type'] == i for i in self.remove_mol_types]
         for remove_mask in remove_chain_masks:
@@ -460,6 +476,20 @@ class ValidationDataset(torch.utils.data.Dataset):
         task = task_sampler.sample_task()
 
         struct, rot_bond_data = load_input(sample.record, Path(dataset.data_dir), include_h=self.include_h)
+
+        _nuc_names = {'DA', 'DC', 'DG', 'DT', 'A', 'G', 'C', 'U'}
+        _protein_id = const.chain_type_ids["PROTEIN"]
+        _has_nuc_in_protein = False
+        for _chain in struct.chains:
+            if int(_chain['mol_type']) != _protein_id:
+                continue
+            rs, re = int(_chain['res_idx']), int(_chain['res_idx']) + int(_chain['res_num'])
+            if set(struct.residues['name'][rs:re].tolist()) & _nuc_names:
+                _has_nuc_in_protein = True
+                break
+        if _has_nuc_in_protein:
+            return self.__getitem__(idx)
+
         chain_mask = struct.mask
         remove_chain_masks = [struct.chains['mol_type'] == i for i in self.remove_mol_types]
         for remove_mask in remove_chain_masks:
