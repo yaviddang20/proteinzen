@@ -209,12 +209,20 @@ def process_system(
         print(f"Failed to parse {system_id}")
         return
 
-    # Skip systems with DNA or RNA chains (not supported by tokenizer)
+    # Skip systems with nucleic acid content (DNA/RNA — not supported by tokenizer)
+    # Check both mol_type (correctly parsed chains) and residue names (gemmi misclassification)
+    _nuc_residues = {'A', 'G', 'C', 'U', 'DA', 'DG', 'DC', 'DT'}
     dna_id = const.chain_type_ids["DNA"]
     rna_id = const.chain_type_ids["RNA"]
     for chain in structure.chains:
         if int(chain["mol_type"]) in (dna_id, rna_id):
             return
+        # Catch gemmi misclassifying DNA chains as PeptideL
+        res_start = int(chain["res_idx"])
+        res_end = res_start + int(chain["res_num"])
+        for res in structure.residues[res_start:res_end]:
+            if str(res["name"]) in _nuc_residues:
+                return
 
     # Load ligand SDF files
     ligand_sdfs = get_ligand_sdfs(system_dir)
