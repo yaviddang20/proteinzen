@@ -269,18 +269,22 @@ def bond_angle_rmse(inputs, denoiser_outputs, eps=1e-8):
     B, L_pad, _ = gt_xyz.shape
     device = gt_xyz.device
     
-    # Pad token_bonds
+    # Build bond mask in rigid space via rigids_to_token mapping
     token_bonds = inputs["token"]["token_bonds"]
     if token_bonds.dim() == 2:
-        token_bonds = token_bonds.unsqueeze(0).expand(B, -1, -1)
-    
-    L = token_bonds.shape[-1]
-    pad = L_pad - L
-    if pad > 0:
-        token_bonds = F.pad(token_bonds, (0, pad, 0, pad), value=0)
-    
-    bond_mask = (token_bonds > 0)
-    
+        token_bonds = token_bonds.unsqueeze(0).expand(B, -1, -1).contiguous()
+
+    rigids_to_token = inputs["rigids"]["rigids_to_token"]  # [B, L_pad]
+    L_tok = token_bonds.shape[-1]
+    ri_tok_clamped = rigids_to_token.clamp(0, L_tok - 1)
+    bond_matrix = token_bonds[
+        torch.arange(B, device=device)[:, None, None],
+        ri_tok_clamped[:, :, None],
+        ri_tok_clamped[:, None, :]
+    ]  # [B, L_pad, L_pad]
+
+    bond_mask = (bond_matrix > 0)
+
     # Remove diagonal and apply masks
     diag = torch.eye(L_pad, device=device, dtype=torch.bool)[None, :, :]
     bond_mask = bond_mask & ~diag
