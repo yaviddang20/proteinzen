@@ -729,7 +729,8 @@ class BiomoleculeModule(L.LightningModule):
     def _write_val_pdbs(self, batch, outputs, t_val: float, n_samples: int = 5):
         """Write n_samples two-MODEL PDBs (GT + predicted) for visual inspection."""
         epoch = self.trainer.current_epoch
-        out_dir = os.path.join(os.getcwd(), f"val_pdbs/epoch_{epoch:04d}/t_{t_val}")
+        log_dir = self.trainer.log_dir or os.getcwd()
+        out_dir = os.path.join(log_dir, f"val_pdbs/epoch_{epoch:04d}/t_{t_val}")
         os.makedirs(out_dir, exist_ok=True)
 
         B = batch["t"].shape[0]
@@ -738,7 +739,15 @@ class BiomoleculeModule(L.LightningModule):
         gt_trans = ru.Rigid.from_tensor_7(rigids['rigids_1']).get_trans().cpu().numpy()
         pred_trans = outputs['denoised_rigids'].get_trans().cpu().numpy()
         ref_elements = rigids['rigids_ref_element'].cpu().numpy()         # [B, R]
-        rigids_seq_idx = rigids['rigids_seq_idx'].cpu().numpy()           # [B, R]
+        rigids_seq_idx = rigids['rigids_seq_idx'].cpu().numpy()           # [B, R] residue idx
+        rigids_to_token = rigids['rigids_to_token'].cpu().numpy()         # [B, R] token idx
+
+        # per-sample unscaled trans MSE
+        gt_t = torch.from_numpy(gt_trans)
+        pred_t = outputs['denoised_rigids'].get_trans().cpu()
+        rmask = rigids['rigids_mask'].cpu()
+        n_rigids = rmask.long().sum(dim=-1).clamp(min=1)
+        per_sample_mse = (torch.square(gt_t - pred_t).sum(-1) * rmask).sum(-1) / n_rigids  # [B]
 
         token = batch['token']
         mol_types_tok = token['mol_type'].cpu().numpy()   # [B, T]
@@ -752,12 +761,14 @@ class BiomoleculeModule(L.LightningModule):
             if heavy_mask.sum() == 0:
                 continue
 
+            tok_idx = rigids_to_token[i][heavy_mask]   # token indices, safe to index token arrays
             seq_idx = rigids_seq_idx[i][heavy_mask]
-            mol_types = mol_types_tok[i][seq_idx]
-            res_types = res_types_tok[i][seq_idx]
-            asym_ids = asym_ids_tok[i][seq_idx]
+            mol_types = mol_types_tok[i][tok_idx]
+            res_types = res_types_tok[i][tok_idx]
+            asym_ids = asym_ids_tok[i][tok_idx]
 
-            path = os.path.join(out_dir, f"sample_{i:02d}.pdb")
+            mse_val = per_sample_mse[i].item()
+            path = os.path.join(out_dir, f"sample_{i:02d}_mse{mse_val:.3f}.pdb")
             try:
                 write_val_pdb(
                     gt_trans[i][heavy_mask],
