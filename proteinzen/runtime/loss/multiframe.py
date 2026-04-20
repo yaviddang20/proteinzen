@@ -211,36 +211,40 @@ def bond_length_rmse(inputs, denoiser_outputs):
         dim=-1
     )  # [B, L_pad, L_pad]
 
-    # Build padded bond matrix
-    token_bonds = inputs['token']['token_bonds']  # [L, L] or [B, L, L]
-    
+    # Build bond matrix in rigid space
+    # token_bonds is token-space [L_tok, L_tok] or [B, L_tok, L_tok]
+    # rigids_to_token maps each rigid index -> token index
+    token_bonds = inputs['token']['token_bonds']  # [L_tok, L_tok] or [B, L_tok, L_tok]
+    rigids_to_token = inputs['rigids']['rigids_to_token']  # [B, L_pad] rigid->token index
+
     if token_bonds.dim() == 2:
         token_bonds = token_bonds.unsqueeze(0).expand(B, -1, -1)
-    
-    L = token_bonds.shape[-1]
-    pad = L_pad - L
 
-    if pad > 0:
-        token_bonds = torch.nn.functional.pad(
-            token_bonds,
-            (0, pad, 0, pad),
-            value=0
-        )
-
-    token_bonds_mask = token_bonds > 0  # [B, L_tok, L_tok]
+    # Map rigid indices to token indices and look up bond existence
+    # ri, rj are rigid indices; look up their token indices and check bond
+    ri_tok = rigids_to_token  # [B, L_pad]
     L_tok = token_bonds.shape[-1]
+    ri_tok_clamped = ri_tok.clamp(0, L_tok - 1)
+    # [B, L_pad, L_pad] bond existence in rigid space
+    bond_matrix = token_bonds[
+        torch.arange(B, device=token_bonds.device)[:, None, None],
+        ri_tok_clamped[:, :, None],
+        ri_tok_clamped[:, None, :]
+    ]
+
+    token_bonds_mask = bond_matrix > 0  # [B, L_pad, L_pad]
 
     # Only keep upper triangle to avoid double-counting
-    triu_mask = torch.triu(torch.ones(L_tok, L_tok, device=token_bonds.device, dtype=torch.bool), diagonal=1)
-    token_bonds_mask = token_bonds_mask & triu_mask[None, :, :]  # [B, L_tok, L_tok]
-    
-    # Apply position mask: both endpoints must be valid (trim to token space)
-    pos_mask = total_mask[:, :L_tok, None] & total_mask[:, None, :L_tok]  # [B, L_tok, L_tok]
+    triu_mask = torch.triu(torch.ones(L_pad, L_pad, device=token_bonds.device, dtype=torch.bool), diagonal=1)
+    token_bonds_mask = token_bonds_mask & triu_mask[None, :, :]  # [B, L_pad, L_pad]
+
+    # Apply position mask: both endpoints must be valid
+    pos_mask = total_mask[:, :, None] & total_mask[:, None, :]  # [B, L_pad, L_pad]
     final_mask = token_bonds_mask & pos_mask
-    
-    # Extract valid bonds across all batches (trim pairwise dists to token space)
-    gt_bonds = gt_dists[:, :L_tok, :L_tok][final_mask]  # [N_total_bonds]
-    pred_bonds = pred_dists[:, :L_tok, :L_tok][final_mask]  # [N_total_bonds]
+
+    # Extract valid bonds across all batches
+    gt_bonds = gt_dists[final_mask]  # [N_total_bonds]
+    pred_bonds = pred_dists[final_mask]  # [N_total_bonds]
     
     if gt_bonds.numel() == 0:
         return torch.tensor(0.0, device=gt_dists.device)
