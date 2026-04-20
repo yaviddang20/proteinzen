@@ -796,9 +796,6 @@ class StructureTokenizer:
                         chain, res, token, ret_rigids
                     )
 
-                    token = replace(token, seq_noising_mask=True)
-                    ret_rigids = [replace(r, rigids_noising_mask=True) for r in ret_rigids]
-
                     token_data.append(astuple(token))
                     rigid_data.extend([astuple(r) for r in ret_rigids])
 
