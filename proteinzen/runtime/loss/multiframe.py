@@ -227,19 +227,20 @@ def bond_length_rmse(inputs, denoiser_outputs):
             value=0
         )
 
-    token_bonds_mask = token_bonds > 0  # [B, L_pad, L_pad]
-    
+    token_bonds_mask = token_bonds > 0  # [B, L_tok, L_tok]
+    L_tok = token_bonds.shape[-1]
+
     # Only keep upper triangle to avoid double-counting
-    triu_mask = torch.triu(torch.ones(L_pad, L_pad, device=token_bonds.device, dtype=torch.bool), diagonal=1)
-    token_bonds_mask = token_bonds_mask & triu_mask[None, :, :]  # [B, L_pad, L_pad]
+    triu_mask = torch.triu(torch.ones(L_tok, L_tok, device=token_bonds.device, dtype=torch.bool), diagonal=1)
+    token_bonds_mask = token_bonds_mask & triu_mask[None, :, :]  # [B, L_tok, L_tok]
     
-    # Apply position mask: both endpoints must be valid
-    pos_mask = total_mask[:, :, None] & total_mask[:, None, :]  # [B, L_pad, L_pad]
+    # Apply position mask: both endpoints must be valid (trim to token space)
+    pos_mask = total_mask[:, :L_tok, None] & total_mask[:, None, :L_tok]  # [B, L_tok, L_tok]
     final_mask = token_bonds_mask & pos_mask
     
-    # Extract valid bonds across all batches
-    gt_bonds = gt_dists[final_mask]  # [N_total_bonds]
-    pred_bonds = pred_dists[final_mask]  # [N_total_bonds]
+    # Extract valid bonds across all batches (trim pairwise dists to token space)
+    gt_bonds = gt_dists[:, :L_tok, :L_tok][final_mask]  # [N_total_bonds]
+    pred_bonds = pred_dists[:, :L_tok, :L_tok][final_mask]  # [N_total_bonds]
     
     if gt_bonds.numel() == 0:
         return torch.tensor(0.0, device=gt_dists.device)
