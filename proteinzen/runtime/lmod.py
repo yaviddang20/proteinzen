@@ -30,8 +30,6 @@ from proteinzen.data.featurize.sampling import construct_atoms, update_structure
 from proteinzen.data.featurize.tokenize import Tokenized
 # from proteinzen.data.write.mmcif import to_mmcif
 from proteinzen.data.write.pdb import to_pdb
-from rdkit import Chem
-from rdkit.Chem import AllChem, rdMolAlign, rdmolfiles
 
 from .utils import gen_pbar_str
 from .ema import EMAModel
@@ -281,43 +279,72 @@ def compute_xtb_energies(elements, positions, mask):
     return torch.tensor(energies, dtype=torch.float32, device=elements.device)
 
 
-def _mol_from_smiles_with_coords(smiles: str, coords: np.ndarray) -> Chem.Mol:
-    """Build an RDKit mol from SMILES and set atom positions from coords [N, 3]."""
-    mol = AllChem.MolFromSmiles(smiles)
-    if mol is None:
-        return None
-    mol = AllChem.RemoveHs(mol)
-    if mol.GetNumAtoms() != len(coords):
-        return None
-    conf = Chem.Conformer(mol.GetNumAtoms())
-    for i, (x, y, z) in enumerate(coords):
-        conf.SetAtomPosition(i, (float(x), float(y), float(z)))
-    mol.AddConformer(conf, assignId=True)
-    return mol
+_ELEMENT_SYMBOLS = {1: 'H', 6: 'C', 7: 'N', 8: 'O', 9: 'F', 15: 'P', 16: 'S', 17: 'Cl', 35: 'Br', 53: 'I'}
+_CHAIN_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 
-def _clean_pdb_block(block: str) -> str:
-    lines = block.splitlines(keepends=True)
-    return "".join(l for l in lines if not l.startswith(("END", "CONECT")))
+def _write_model_block(
+    f,
+    coords: np.ndarray,
+    elements: np.ndarray,
+    mol_types: np.ndarray,
+    res_types: np.ndarray,
+    asym_ids: np.ndarray,
+    seq_idxs: np.ndarray,
+    model_num: int,
+):
+    from proteinzen.boltz.data import const
+    from proteinzen.openfold.data import residue_constants as rc
+
+    protein_id = const.chain_type_ids["PROTEIN"]
+    nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
+
+    f.write(f"MODEL        {model_num}\n")
+    res_idx_counter = {}  # asym_id → residue serial
+    for i, (xyz, el, mol_type, res_type, asym_id, seq_idx) in enumerate(
+        zip(coords, elements, mol_types, res_types, asym_ids, seq_idxs)
+    ):
+        sym = _ELEMENT_SYMBOLS.get(int(el), 'X')
+        x, y, z = float(xyz[0]), float(xyz[1]), float(xyz[2])
+        chain_letter = _CHAIN_ALPHABET[int(asym_id) % len(_CHAIN_ALPHABET)]
+
+        if int(mol_type) == protein_id:
+            record = "ATOM  "
+            one_letter = rc.restypes_with_x[int(res_type)] if int(res_type) < len(rc.restypes_with_x) else 'X'
+            res_name = rc.restype_1to3.get(one_letter, 'UNK')
+            atom_name = " CA "
+        elif int(mol_type) == nonpolymer_id:
+            record = "HETATM"
+            res_name = "LIG"
+            atom_name = f" {sym:<3}"
+        else:
+            # RNA/DNA
+            record = "ATOM  "
+            res_name = "UNK"
+            atom_name = " CA "
+
+        res_serial = int(seq_idx) + 1
+        f.write(
+            f"{record}{i+1:>5} {atom_name} {res_name:>3} {chain_letter}{res_serial:>4}    "
+            f"{x:>8.3f}{y:>8.3f}{z:>8.3f}  1.00  0.00          {sym:>2}\n"
+        )
+    f.write("ENDMDL\n")
 
 
-def write_val_pdb(smiles: str, gt_coords: np.ndarray, pred_coords: np.ndarray, path: str):
-    """Write a two-MODEL PDB: MODEL 1 = GT, MODEL 2 = predicted (aligned to GT)."""
-    ref = _mol_from_smiles_with_coords(smiles, gt_coords)
-    probe = _mol_from_smiles_with_coords(smiles, pred_coords)
-    if ref is None or probe is None:
-        return
-    try:
-        rdMolAlign.AlignMol(probe, ref)
-    except Exception:
-        pass
+def write_val_pdb(
+    gt_coords: np.ndarray,
+    pred_coords: np.ndarray,
+    elements: np.ndarray,
+    mol_types: np.ndarray,
+    res_types: np.ndarray,
+    asym_ids: np.ndarray,
+    seq_idxs: np.ndarray,
+    path: str,
+):
+    """Write a two-MODEL PDB: MODEL 1 = GT, MODEL 2 = predicted."""
     with open(path, "w") as f:
-        f.write("MODEL        1\n")
-        f.write(_clean_pdb_block(rdmolfiles.MolToPDBBlock(ref, flavor=4)))
-        f.write("ENDMDL\n")
-        f.write("MODEL        2\n")
-        f.write(_clean_pdb_block(rdmolfiles.MolToPDBBlock(probe, flavor=4)))
-        f.write("ENDMDL\n")
+        _write_model_block(f, gt_coords, elements, mol_types, res_types, asym_ids, seq_idxs, 1)
+        _write_model_block(f, pred_coords, elements, mol_types, res_types, asym_ids, seq_idxs, 2)
         f.write("END\n")
 
 
@@ -701,35 +728,47 @@ class BiomoleculeModule(L.LightningModule):
 
     def _write_val_pdbs(self, batch, outputs, t_val: float, n_samples: int = 5):
         """Write n_samples two-MODEL PDBs (GT + predicted) for visual inspection."""
-        smiles_list = batch.get('smiles', [])
-        if not smiles_list:
-            return
-
         epoch = self.trainer.current_epoch
         out_dir = os.path.join(os.getcwd(), f"val_pdbs/epoch_{epoch:04d}/t_{t_val}")
         os.makedirs(out_dir, exist_ok=True)
 
         B = batch["t"].shape[0]
-        rigids_mask = batch['rigids']['rigids_mask']  # [B, R]
-        gt_trans = ru.Rigid.from_tensor_7(batch['rigids']['rigids_1']).get_trans().cpu().numpy()  # [B, R, 3]
-        pred_trans = outputs['denoised_rigids'].get_trans().cpu().numpy()  # [B, R, 3]
+        rigids = batch['rigids']
+        rigids_mask = rigids['rigids_mask'].cpu().numpy().astype(bool)   # [B, R]
+        gt_trans = ru.Rigid.from_tensor_7(rigids['rigids_1']).get_trans().cpu().numpy()
+        pred_trans = outputs['denoised_rigids'].get_trans().cpu().numpy()
+        ref_elements = rigids['rigids_ref_element'].cpu().numpy()         # [B, R]
+        rigids_seq_idx = rigids['rigids_seq_idx'].cpu().numpy()           # [B, R]
 
-        ref_elements = batch['rigids']['rigids_ref_element']  # [B, R] int, H=1, -1=non-atom
+        token = batch['token']
+        mol_types_tok = token['mol_type'].cpu().numpy()   # [B, T]
+        res_types_tok = token['res_type'].cpu().numpy()   # [B, T]
+        asym_ids_tok = token['asym_id'].cpu().numpy()     # [B, T]
 
-        indices = list(range(min(n_samples, B)))
-        for i in indices:
-            smiles = smiles_list[i]
-            if not smiles:
-                continue
-            mask = rigids_mask[i].cpu().numpy().astype(bool)
-            elements = ref_elements[i].cpu().numpy()
-            # keep only heavy atoms (element > 1 and valid atom, i.e. != -1)
+        for i in range(min(n_samples, B)):
+            mask = rigids_mask[i]
+            elements = ref_elements[i]
             heavy_mask = mask & (elements != 1) & (elements != -1)
-            gt_coords = gt_trans[i][heavy_mask]
-            pred_coords = pred_trans[i][heavy_mask]
+            if heavy_mask.sum() == 0:
+                continue
+
+            seq_idx = rigids_seq_idx[i][heavy_mask]
+            mol_types = mol_types_tok[i][seq_idx]
+            res_types = res_types_tok[i][seq_idx]
+            asym_ids = asym_ids_tok[i][seq_idx]
+
             path = os.path.join(out_dir, f"sample_{i:02d}.pdb")
             try:
-                write_val_pdb(smiles, gt_coords, pred_coords, path)
+                write_val_pdb(
+                    gt_trans[i][heavy_mask],
+                    pred_trans[i][heavy_mask],
+                    elements[heavy_mask],
+                    mol_types,
+                    res_types,
+                    asym_ids,
+                    seq_idx,
+                    path,
+                )
             except Exception as e:
                 log.warning(f"val PDB write failed for sample {i}: {e}")
 
