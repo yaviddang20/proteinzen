@@ -218,7 +218,7 @@ def bond_length_rmse(inputs, denoiser_outputs):
     rigids_to_token = inputs['rigids']['rigids_to_token']  # [B, L_pad] rigid->token index
 
     if token_bonds.dim() == 2:
-        token_bonds = token_bonds.unsqueeze(0).expand(B, -1, -1)
+        token_bonds = token_bonds.unsqueeze(0).expand(B, -1, -1).contiguous()
 
     # Map rigid indices to token indices and look up bond existence
     # ri, rj are rigid indices; look up their token indices and check bond
