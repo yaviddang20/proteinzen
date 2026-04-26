@@ -29,6 +29,7 @@ python sample.py \
 
 import argparse
 import json
+import random
 from pathlib import Path
 
 import yaml
@@ -52,8 +53,8 @@ def main():
                         help="Std of initial ligand translation noise (Å)")
     parser.add_argument("--system-ids", nargs="+", default=None,
                         help="Restrict to these system IDs (default: all in manifest.json)")
-    parser.add_argument("--max-systems", type=int, default=None,
-                        help="Cap the number of systems (useful for debugging)")
+    parser.add_argument("--n-systems", type=int, default=30,
+                        help="Randomly sample this many systems (seed=42); default: 30")
     args = parser.parse_args()
 
     manifest_path = args.data_dir / "manifest.json"
@@ -70,8 +71,9 @@ def main():
         if missing:
             print(f"Warning: {len(missing)} requested system(s) not in manifest: {sorted(missing)[:5]}...")
 
-    if args.max_systems is not None:
-        manifest = manifest[:args.max_systems]
+    if args.n_systems is not None and args.n_systems < len(manifest):
+        rng = random.Random(42)
+        manifest = rng.sample(manifest, args.n_systems)
 
     tasks = []
     skipped = 0
