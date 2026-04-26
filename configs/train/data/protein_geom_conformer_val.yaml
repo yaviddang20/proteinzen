@@ -14,7 +14,7 @@ datasets:
     task_sampler:
       _target_: proteinzen.runtime.training.task.TaskSampler
       task_list:
-        - _target_: proteinzen.runtime.training.unconditional.UnconditionalGeneration
+        - _target_: proteinzen.runtime.training.chain_conditioning.ProteinConditioned
           prob: 1.0
           t_sched: lognorm
           lognorm_mu: 0.0
