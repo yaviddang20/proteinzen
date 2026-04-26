@@ -511,7 +511,8 @@ class MultiRigidPairEmbedder(nn.Module):
                  inf=1e9,
                  num_bond_types=len(const.bond_types) + 1,
                  use_qk_norm=False,
-                 use_self_folding=False
+                 use_self_folding=False,
+                 patch_unit_vec_bug=False
     ):
         super().__init__()
 
@@ -523,6 +524,7 @@ class MultiRigidPairEmbedder(nn.Module):
         self.relpos_clip = relpos_clip
         self.no_blocks = no_blocks
         self.inf = inf
+        self.patch_unit_vec_bug = patch_unit_vec_bug
 
         self.c_a = (
             num_rbf

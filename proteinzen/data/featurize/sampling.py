@@ -181,7 +181,7 @@ def generate_protein_structure_template(  # noqa: C901, PLR0915
 
 def sample_noise_from_struct_template(  # noqa: C901, PLR0915
     struct: Structure,
-    igso3: so3_utils.SampleIGSO3,
+    igso3: Optional[so3_utils.SampleIGSO3] = None,
     task_masks: Optional[dict[str, np.ndarray]] = None,
     trans_std=16,
 ) -> Tuple[np.ndarray, np.array, np.ndarray, np.ndarray]:

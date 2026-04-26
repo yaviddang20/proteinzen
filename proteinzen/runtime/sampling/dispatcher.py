@@ -8,6 +8,7 @@ from .unconditional import UnconditionalSampling
 from .unconditional_smiles import UnconditionalSamplingFromSMILES
 from .unconditional_smiles import UnconditionalSamplingFromMol
 from .motif_scaffolding import MotifScaffoldingTask
+from .protein_pocket import ProteinPocketConditionedSampling
 
 
 class BiomoleculeTaskDispatcher(Dataset):
@@ -15,7 +16,8 @@ class BiomoleculeTaskDispatcher(Dataset):
         "motif_scaffolding": MotifScaffoldingTask,
         "unconditional": UnconditionalSampling,
         "unconditional_smiles": UnconditionalSamplingFromSMILES,
-        "unconditional_mol": UnconditionalSamplingFromMol
+        "unconditional_mol": UnconditionalSamplingFromMol,
+        "protein_pocket_conditioned": ProteinPocketConditionedSampling,
     }
 
     def __init__(
