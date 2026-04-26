@@ -49,8 +49,6 @@ def main():
                         help="Output YAML path")
     parser.add_argument("--num-samples", type=int, default=10,
                         help="Number of ligand conformers to generate per system")
-    parser.add_argument("--trans-std", type=float, default=16.0,
-                        help="Std of initial ligand translation noise (Å)")
     parser.add_argument("--system-ids", nargs="+", default=None,
                         help="Restrict to these system IDs (default: all in manifest.json)")
     parser.add_argument("--n-systems", type=int, default=30,
@@ -89,7 +87,6 @@ def main():
             "name": system_id,
             "npz_path": str(npz_path.resolve()),
             "num_samples": args.num_samples,
-            "trans_std": args.trans_std,
         })
 
     if skipped:
