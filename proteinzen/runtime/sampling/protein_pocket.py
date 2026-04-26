@@ -14,9 +14,46 @@ from proteinzen.boltz.data.types import Structure, Connection
 from proteinzen.data.featurize.assembler import featurize
 from proteinzen.data.featurize.sampling import sample_noise_from_struct_template
 from proteinzen.data.featurize.tokenize import Tokenized
-from proteinzen.data.datasets.datamodule import strip_h_from_structure
 
 from .task import SamplingTask
+
+
+def _strip_h(struct: Structure) -> Structure:
+    """Remove hydrogen atoms (element=1), reindexing residues/chains/bonds."""
+    atoms = struct.atoms
+    heavy_mask = atoms["element"] != 1
+    heavy_indices = np.where(heavy_mask)[0]
+    old_to_new = np.full(len(atoms), -1, dtype=np.int32)
+    old_to_new[heavy_indices] = np.arange(len(heavy_indices), dtype=np.int32)
+
+    new_atoms = atoms[heavy_mask]
+
+    bonds = struct.bonds
+    if len(bonds) > 0:
+        bond_heavy = (old_to_new[bonds["atom_1"]] >= 0) & (old_to_new[bonds["atom_2"]] >= 0)
+        new_bonds = bonds[bond_heavy].copy()
+        new_bonds["atom_1"] = old_to_new[new_bonds["atom_1"]]
+        new_bonds["atom_2"] = old_to_new[new_bonds["atom_2"]]
+    else:
+        new_bonds = bonds.copy()
+
+    cumulative_heavy = np.concatenate([[0], np.cumsum(heavy_mask)])
+
+    new_residues = struct.residues.copy()
+    for i, res in enumerate(new_residues):
+        start = res["atom_idx"]
+        end = start + res["atom_num"]
+        new_residues[i]["atom_idx"] = cumulative_heavy[start]
+        new_residues[i]["atom_num"] = cumulative_heavy[end] - cumulative_heavy[start]
+
+    new_chains = struct.chains.copy()
+    for i, chain in enumerate(new_chains):
+        start = chain["atom_idx"]
+        end = start + chain["atom_num"]
+        new_chains[i]["atom_idx"] = cumulative_heavy[start]
+        new_chains[i]["atom_num"] = cumulative_heavy[end] - cumulative_heavy[start]
+
+    return replace(struct, atoms=new_atoms, bonds=new_bonds, residues=new_residues, chains=new_chains)
 
 
 def load_structure_from_npz(npz_path: str, include_h: bool = False) -> Structure:
@@ -52,7 +89,7 @@ def load_structure_from_npz(npz_path: str, include_h: bool = False) -> Structure
     )
 
     if not include_h:
-        struct = strip_h_from_structure(struct)
+        struct = _strip_h(struct)
 
     return struct
 
