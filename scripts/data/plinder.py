@@ -224,11 +224,26 @@ def process_system(
             if str(res["name"]) in _nuc_residues:
                 return
 
+    # Skip systems where any ligand has < 10 heavy atoms or < 5 carbon atoms
+    nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
+    protein_id = const.chain_type_ids["PROTEIN"]
+    for chain in structure.chains:
+        if int(chain["mol_type"]) != nonpolymer_id:
+            continue
+        rs = int(chain["res_idx"])
+        re = rs + int(chain["res_num"])
+        for res in structure.residues[rs:re]:
+            atom_start = int(res["atom_idx"])
+            atom_end = atom_start + int(res["atom_num"])
+            lig_atoms = structure.atoms[atom_start:atom_end]
+            n_heavy = len(lig_atoms)
+            n_carbon = int((lig_atoms["element"] == 6).sum())
+            if n_heavy < 10 or n_carbon < 5:
+                return
+
     # Load ligand SDF files
     ligand_sdfs = get_ligand_sdfs(system_dir)
     n_total_atoms = len(structure.atoms)
-    nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
-    protein_id = const.chain_type_ids["PROTEIN"]
 
     # Compute rot_bond data for each NONPOLYMER chain
     all_rot_bond_data = []
