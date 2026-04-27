@@ -206,6 +206,16 @@ def load_structure_from_npz(npz_path: str, include_h: bool = False) -> Structure
     if not include_h:
         struct = _strip_h(struct)
 
+    # PDB format requires single-character chain names; plinder uses names like "1.A"
+    CHAIN_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    new_chain_names = struct.chains["name"].copy()
+    for i, name in enumerate(new_chain_names):
+        if len(str(name).strip()) != 1:
+            new_chain_names[i] = CHAIN_ALPHABET[i % len(CHAIN_ALPHABET)]
+    new_chains = struct.chains.copy()
+    new_chains["name"] = new_chain_names
+    struct = replace(struct, chains=new_chains)
+
     return struct
 
 
