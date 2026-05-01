@@ -445,14 +445,15 @@ def multiframe_fm_loss_dense_batch(
     gt_rigids = sym_permute_gt_rigids(denoised_rigids.get_trans(), gt_rigids, inputs)
 
     num_rigids_per_batch = rigids_mask.long().sum(dim=-1).clip(min=1)
+    num_noised_rigids_per_batch = total_mask.long().sum(dim=-1).clip(min=1)
 
     gt_frame_trans = gt_rigids.get_trans()
     pred_frame_trans = denoised_rigids.get_trans()
     ref_frame_trans = noised_rigids.get_trans()
     pred_frame_trans_se = torch.square(gt_frame_trans - pred_frame_trans).sum(dim=-1)
-    pred_frame_trans_mse = (pred_frame_trans_se * total_mask).sum(-1) / num_rigids_per_batch
+    pred_frame_trans_mse = (pred_frame_trans_se * total_mask).sum(-1) / num_noised_rigids_per_batch
     ref_frame_trans_se = torch.square(gt_frame_trans - ref_frame_trans).sum(dim=-1)
-    ref_frame_trans_mse = (ref_frame_trans_se * total_mask).sum(-1) / num_rigids_per_batch
+    ref_frame_trans_mse = (ref_frame_trans_se * total_mask).sum(-1) / num_noised_rigids_per_batch
 
     # Heavy-atom-only pred MSE (element != 1, i.e. not hydrogen)
     is_heavy = (inputs['rigids']['rigids_ref_element'] != 1).float()
