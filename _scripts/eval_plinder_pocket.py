@@ -27,11 +27,13 @@ python _scripts/eval_plinder_pocket.py \\
 
 import argparse
 import json
+import multiprocessing as mp
 import sys
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+from joblib import Parallel, delayed
 from rdkit import Chem, RDLogger
 from rdkit.Chem import rdMolAlign
 from tqdm.auto import tqdm
@@ -281,6 +283,18 @@ def eval_system(system_id: str, gen_pdb_paths, gt_struct):
     return records
 
 
+def _eval_system_job(system_id: str, gen_pdb_paths, npz_path: str, include_h: bool, max_protein_residues: int):
+    """Top-level worker for joblib — loads GT and evaluates one system."""
+    RDLogger.DisableLog("rdApp.*")
+    try:
+        gt_struct = load_structure_from_npz(npz_path, include_h=include_h)
+    except Exception as e:
+        return system_id, [], f"npz load error: {e}"
+    gt_struct = _crop_protein_to_pocket(gt_struct, max_protein_residues)
+    records = eval_system(system_id, gen_pdb_paths, gt_struct)
+    return system_id, records, None
+
+
 # ============================================================
 # Aggregation
 # ============================================================
@@ -344,6 +358,8 @@ def main():
                         help="Keep hydrogen atoms (match the --include-h flag used at sample time)")
     parser.add_argument("--delta", type=float, nargs="+", default=[2.0, 5.0],
                         help="RMSD thresholds for coverage reporting (Å; default: 2.0 5.0)")
+    parser.add_argument("--n-jobs", type=int, default=max(1, mp.cpu_count() // 2),
+                        help="Parallel workers (default: half of CPU count)")
     parser.add_argument("--verbose", action="store_true",
                         help="Print per-system details during evaluation")
     args = parser.parse_args()
@@ -384,48 +400,53 @@ def main():
     if missing:
         print(f"  Note: {len(missing)} manifest systems have no samples")
 
-    # ---- main evaluation loop ----
+    # ---- build job list ----
+    jobs = []
+    for sid in common:
+        mid = sid[1:3]
+        npz_path = args.data_dir / "structures" / mid / f"{sid}.npz"
+        if not npz_path.exists():
+            print(f"  SKIP {sid}: npz not found")
+            continue
+        jobs.append((sid, groups[sid], str(npz_path)))
+
+    print(f"  Running {len(jobs)} systems with {args.n_jobs} workers...")
+
+    # ---- parallel evaluation ----
+    results = Parallel(n_jobs=args.n_jobs, backend="loky")(
+        delayed(_eval_system_job)(sid, pdbs, npz, args.include_h, args.max_protein_residues)
+        for sid, pdbs, npz in tqdm(jobs, desc="evaluating")
+    )
+
+    # ---- collect results ----
     all_records: list[dict] = []
     records_by_system: dict[str, list[dict]] = {}
     n_atom_mismatch = 0
 
-    for sid in tqdm(common, desc="evaluating"):
-        mid = sid[1:3]
-        npz_path = args.data_dir / "structures" / mid / f"{sid}.npz"
-        if not npz_path.exists():
-            tqdm.write(f"  SKIP {sid}: npz not found")
+    for sid, sys_records, err in results:
+        if err:
+            print(f"  SKIP {sid}: {err}")
             continue
-
-        try:
-            gt_struct = load_structure_from_npz(str(npz_path), include_h=args.include_h)
-        except Exception as e:
-            tqdm.write(f"  SKIP {sid}: npz load error — {e}")
-            continue
-
-        gt_struct = _crop_protein_to_pocket(gt_struct, args.max_protein_residues)
-
-        sys_records = eval_system(sid, groups[sid], gt_struct)
         if not sys_records:
-            tqdm.write(f"  SKIP {sid}: no valid samples")
+            if args.verbose:
+                print(f"  SKIP {sid}: no valid samples")
             continue
 
         mismatch_count = sum(1 for r in sys_records if r["note"])
         n_atom_mismatch += mismatch_count
-        if args.verbose and mismatch_count:
+        if args.verbose:
             for r in sys_records:
                 if r["note"]:
-                    tqdm.write(f"  [{sid}] sample {r['sample_idx']}: {r['note']}")
-
-        records_by_system[sid] = sys_records
-        all_records.extend(sys_records)
-
-        if args.verbose:
+                    print(f"  [{sid}] sample {r['sample_idx']}: {r['note']}")
             pk = [r["pocket_rmsd"] for r in sys_records if np.isfinite(r["pocket_rmsd"])]
             if pk:
-                tqdm.write(
+                print(
                     f"  {sid}: {len(pk)} samples, "
                     f"pocket RMSD min={min(pk):.2f} mean={np.mean(pk):.2f}"
                 )
+
+        records_by_system[sid] = sys_records
+        all_records.extend(sys_records)
 
     if n_atom_mismatch:
         print(f"\nWarning: {n_atom_mismatch} samples had atom-count mismatches (skipped)")
