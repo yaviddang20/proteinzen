@@ -82,14 +82,14 @@ def pos_rmsd(A: np.ndarray, B: np.ndarray) -> float:
 # ============================================================
 
 def parse_pdb_atoms(pdb_path: str):
-    """Return (prot_coords, lig_coords, lig_serial_to_local, conect) from a PDB file.
+    """Return (prot_coords, lig_coords, lig_elements, conect) from a PDB file.
 
-    prot_coords : (N_prot, 3) float64 — ATOM records.
-    lig_coords  : (N_lig,  3) float64 — HETATM records.
-    lig_serial_to_local : dict mapping PDB serial number → 0-based HETATM index.
-    conect      : list of (local_i, local_j) bond pairs for the ligand.
+    prot_coords  : (N_prot, 3) float64 — ATOM records.
+    lig_coords   : (N_lig,  3) float64 — HETATM records.
+    lig_elements : list of element symbols (str) for each HETATM atom.
+    conect       : set of (local_i, local_j) bond pairs for the ligand (i < j).
     """
-    prot, lig = [], []
+    prot, lig, lig_elements = [], [], []
     lig_serial_to_local: dict[int, int] = {}
     raw_conects: list[tuple[int, int]] = []
 
@@ -106,12 +106,17 @@ def parse_pdb_atoms(pdb_path: str):
                 try:
                     serial = int(line[6:11])
                     x, y, z = float(line[30:38]), float(line[38:46]), float(line[46:54])
+                    # element symbol is at cols 77-78 (0-indexed 76:78)
+                    element = line[76:78].strip() if len(line) > 76 else ""
+                    if not element:
+                        # fall back to first non-digit character of atom name (cols 13-16)
+                        element = line[12:16].strip().lstrip("0123456789") or "C"
                     lig_serial_to_local[serial] = len(lig)
                     lig.append((x, y, z))
+                    lig_elements.append(element.capitalize())
                 except ValueError:
                     pass
             elif rec == "CONECT":
-                # "CONECT" atom1 [atom2 atom3 atom4] — multiple partners on one line
                 try:
                     nums = [int(line[6 + 5 * i : 11 + 5 * i]) for i in range(4)
                             if line[6 + 5 * i : 11 + 5 * i].strip()]
@@ -124,14 +129,13 @@ def parse_pdb_atoms(pdb_path: str):
     prot_arr = np.array(prot, dtype=np.float64) if prot else np.zeros((0, 3))
     lig_arr  = np.array(lig,  dtype=np.float64) if lig  else np.zeros((0, 3))
 
-    # Keep only ligand–ligand CONECT bonds (deduplicated, directed i < j)
     conect_set: set[tuple[int, int]] = set()
     for s1, s2 in raw_conects:
         if s1 in lig_serial_to_local and s2 in lig_serial_to_local:
             a, b = lig_serial_to_local[s1], lig_serial_to_local[s2]
             conect_set.add((min(a, b), max(a, b)))
 
-    return prot_arr, lig_arr, conect_set
+    return prot_arr, lig_arr, lig_elements, conect_set
 
 
 def ligand_mol_from_pdb(pdb_path: str):
@@ -140,18 +144,17 @@ def ligand_mol_from_pdb(pdb_path: str):
     Returns (mol, coords) where coords is (N_lig, 3) in PDB-file coordinates,
     or (None, None) on failure.
     """
-    prot_coords, lig_coords, conect = parse_pdb_atoms(pdb_path)
+    _, lig_coords, lig_elements, conect = parse_pdb_atoms(pdb_path)
     n_lig = len(lig_coords)
     if n_lig == 0:
         return None, None
 
-    # Build a fake PDB block with only the HETATM atoms, renumbered 1..n_lig,
-    # plus CONECT records using the local indices.
     lines = []
-    for i, (x, y, z) in enumerate(lig_coords):
+    for i, ((x, y, z), elem) in enumerate(zip(lig_coords, lig_elements)):
+        name = f"{elem:<2}"
         lines.append(
-            f"HETATM{i+1:5d}  C   LIG A   1    "
-            f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           C  "
+            f"HETATM{i+1:5d} {name}   LIG A   1    "
+            f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          {elem:>2}  "
         )
     for a, b in conect:
         lines.append(f"CONECT{a+1:5d}{b+1:5d}")
@@ -246,7 +249,7 @@ def eval_system(system_id: str, gen_pdb_paths, gt_struct):
 
     records = []
     for idx, pdb_path in enumerate(sorted(gen_pdb_paths)):
-        gen_prot, gen_lig, _ = parse_pdb_atoms(str(pdb_path))
+        gen_prot, gen_lig, _, _ = parse_pdb_atoms(str(pdb_path))
 
         if len(gen_prot) != n_gt_prot:
             records.append(dict(
@@ -481,7 +484,7 @@ def main():
     )
 
     # ---- per-system table ----
-    print(f"\n--- Per-system summary (sorted by min pocket RMSD) ---")
+    print("\n--- Per-system summary (sorted by min pocket RMSD) ---")
     header = f"  {'system_id':<42} {'n':>4} {'min_pk':>7} {'mean_pk':>8} {'min_bst':>8}"
     print(header)
     rows = []
@@ -495,9 +498,11 @@ def main():
             float(np.mean(pk)) if pk else np.inf,
             min(bst) if bst else np.inf,
         ))
+    def _fmt(v):
+        return f"{v:.3f}" if np.isfinite(v) else "  inf"
+
     rows.sort(key=lambda x: x[2])
     for sid, n, mn_pk, avg_pk, mn_bst in rows:
-        def _fmt(v): return f"{v:.3f}" if np.isfinite(v) else "  inf"
         print(f"  {sid:<42} {n:>4} {_fmt(mn_pk):>7} {_fmt(avg_pk):>8} {_fmt(mn_bst):>8}")
 
 
