@@ -8,13 +8,13 @@ For each system:
      (Because sampling centers coordinates on the protein COM, this alignment
      is theoretically just a translation, but we do Kabsch for robustness.)
   4. Apply the same rigid transform to the generated ligand.
-  5. Compute:
-       - pocket_rmsd : RMSD between the pocket-aligned generated ligand and
-                       the GT ligand, using positional atom correspondence
-                       (no further ligand alignment).
-       - best_rmsd   : symmetry-aware best-RMSD via rdMolAlign.GetBestRMS.
-                       Both the GT and generated ligand use the topology from the
-                       generated PDB's CONECT records. Falls back to inf on failure.
+  5. Compute two symmetry-permutation-invariant metrics:
+       - pk  : pocket-aligned RMSD — Kabsch on protein pocket, apply same transform
+               to gen ligand, best-permutation positional RMSD vs GT ligand.
+               Measures docking accuracy (is the ligand in the right place?).
+       - lig : ligand-aligned RMSD — best-permutation + best-rotation Kabsch on
+               the ligand itself. Measures conformer quality regardless of pocket
+               position (same as GetBestRMS but using correct atom types).
 
 Usage
 -----
@@ -35,7 +35,6 @@ from pathlib import Path
 import numpy as np
 from joblib import Parallel, delayed
 from rdkit import Chem, RDLogger
-from rdkit.Chem import rdMolAlign
 from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -183,23 +182,51 @@ def _clone_with_coords(mol, coords: np.ndarray):
     return rw.GetMol()
 
 
-def best_rmsd_rdkit(mol_template, gt_coords: np.ndarray, gen_aligned_coords: np.ndarray) -> float:
-    """Symmetry-aware RMSD using GetBestRMS.
+def _get_permutations(mol_template, gt_coords, gen_coords):
+    """Return list of valid atom permutations via substructure matching.
 
-    mol_template : RDKit mol whose topology is used for both GT and gen mols.
-    gt_coords    : (N, 3) GT ligand coordinates.
-    gen_aligned_coords : (N, 3) pocket-aligned generated ligand coordinates.
-
-    Returns inf on any failure.
+    Each permutation p is an array where p[i] = gen atom index for gt atom i.
+    Returns None on failure.
     """
     gt_mol  = _clone_with_coords(mol_template, gt_coords)
-    gen_mol = _clone_with_coords(mol_template, gen_aligned_coords)
+    gen_mol = _clone_with_coords(mol_template, gen_coords)
     if gt_mol is None or gen_mol is None:
-        return float("inf")
+        return None
     try:
-        return float(rdMolAlign.GetBestRMS(Chem.RemoveHs(gt_mol), Chem.RemoveHs(gen_mol)))
+        matches = gen_mol.GetSubstructMatches(gt_mol, uniquify=False, maxMatches=10000)
+        return [np.array(m, dtype=np.intp) for m in matches] if matches else None
     except Exception:
-        return float("inf")
+        return None
+
+
+def pocket_rmsd_sym(mol_template, gt_coords: np.ndarray, gen_aligned_coords: np.ndarray) -> float:
+    """Best-permutation positional RMSD after pocket alignment — no re-rotation.
+
+    Measures docking accuracy: is the ligand in the right place in the pocket?
+    """
+    perms = _get_permutations(mol_template, gt_coords, gen_aligned_coords)
+    if perms is None:
+        return pos_rmsd(gt_coords, gen_aligned_coords)  # fallback: identity permutation
+    return min(pos_rmsd(gt_coords, gen_aligned_coords[p]) for p in perms)
+
+
+def lig_rmsd_sym(mol_template, gt_coords: np.ndarray, gen_coords: np.ndarray) -> float:
+    """Best-permutation + best-rotation RMSD aligned on the ligand itself.
+
+    Measures conformer quality regardless of position in the pocket.
+    For each valid atom permutation, Kabsch-aligns gen onto gt and computes RMSD.
+    """
+    perms = _get_permutations(mol_template, gt_coords, gen_coords)
+    if perms is None:
+        perms = [np.arange(len(gt_coords), dtype=np.intp)]
+    best = float("inf")
+    for p in perms:
+        permuted = gen_coords[p]
+        R, t = kabsch(permuted, gt_coords)
+        r = pos_rmsd(gt_coords, apply_transform(permuted, R, t))
+        if r < best:
+            best = r
+    return best
 
 
 # ============================================================
@@ -238,7 +265,7 @@ def extract_gt_coords(struct):
 def eval_system(system_id: str, gen_pdb_paths, gt_struct):
     """Evaluate all generated samples for one system.
 
-    Returns list of dicts: system_id, sample_idx, pocket_rmsd, best_rmsd, note.
+    Returns list of dicts: system_id, sample_idx, pk, lig, note.
     """
     gt_prot, gt_lig = extract_gt_coords(gt_struct)
     n_gt_prot = len(gt_prot)
@@ -254,7 +281,7 @@ def eval_system(system_id: str, gen_pdb_paths, gt_struct):
         if len(gen_prot) != n_gt_prot:
             records.append(dict(
                 system_id=system_id, sample_idx=idx,
-                pocket_rmsd=np.inf, best_rmsd=np.inf,
+                pk=np.inf, lig=np.inf,
                 note=f"protein atom count mismatch: gen={len(gen_prot)} gt={n_gt_prot}",
             ))
             continue
@@ -262,24 +289,25 @@ def eval_system(system_id: str, gen_pdb_paths, gt_struct):
         if len(gen_lig) != n_gt_lig:
             records.append(dict(
                 system_id=system_id, sample_idx=idx,
-                pocket_rmsd=np.inf, best_rmsd=np.inf,
+                pk=np.inf, lig=np.inf,
                 note=f"ligand atom count mismatch: gen={len(gen_lig)} gt={n_gt_lig}",
             ))
             continue
 
-        # Kabsch: align generated protein onto GT protein
+        # Kabsch: align generated protein pocket onto GT protein pocket
         R, t = kabsch(gen_prot, gt_prot)
         gen_lig_aligned = apply_transform(gen_lig, R, t)
 
-        p_rmsd = pos_rmsd(gen_lig_aligned, gt_lig)
-
-        # Best RMSD: build mol from CONECT records (shared topology for GT and gen)
         mol_template, _ = ligand_mol_from_pdb(str(pdb_path))
-        b_rmsd = best_rmsd_rdkit(mol_template, gt_lig, gen_lig_aligned)
+
+        # pk:  pocket-aligned, best permutation, no ligand re-rotation
+        # lig: best permutation + best ligand rotation, ignores pocket position
+        pk   = pocket_rmsd_sym(mol_template, gt_lig, gen_lig_aligned)
+        lig  = lig_rmsd_sym(mol_template, gt_lig, gen_lig)
 
         records.append(dict(
             system_id=system_id, sample_idx=idx,
-            pocket_rmsd=p_rmsd, best_rmsd=b_rmsd,
+            pk=pk, lig=lig,
             note="",
         ))
 
@@ -330,17 +358,17 @@ def mean_per_system(records_by_system, key):
     return means
 
 
-def print_block(label, pocket_vals, best_vals, deltas):
+def print_block(label, pk_vals, lig_vals, deltas):
     print(f"\n--- {label} ---")
-    print(f"  n            : {len(pocket_vals)}")
-    print(f"  pocket RMSD  : {mean_finite(pocket_vals):.3f} Å  (mean)")
+    print(f"  n          : {len(pk_vals)}")
+    print(f"  pk  (mean) : {mean_finite(pk_vals):.3f} Å")
     for d in deltas:
-        print(f"  COV pocket < {d:.1f}Å : {cov(pocket_vals, d)*100:.1f}%")
-    n_best = sum(np.isfinite(v) for v in best_vals)
-    if n_best:
-        print(f"  best RMSD    : {mean_finite(best_vals):.3f} Å  (mean, {n_best}/{len(best_vals)} finite)")
+        print(f"  COV pk  < {d:.1f}Å : {cov(pk_vals, d)*100:.1f}%")
+    n_lig = sum(np.isfinite(v) for v in lig_vals)
+    if n_lig:
+        print(f"  lig (mean) : {mean_finite(lig_vals):.3f} Å  ({n_lig}/{len(lig_vals)} finite)")
         for d in deltas:
-            print(f"  COV best   < {d:.1f}Å : {cov(best_vals, d)*100:.1f}%")
+            print(f"  COV lig < {d:.1f}Å : {cov(lig_vals, d)*100:.1f}%")
 
 
 # ============================================================
@@ -441,11 +469,11 @@ def main():
             for r in sys_records:
                 if r["note"]:
                     print(f"  [{sid}] sample {r['sample_idx']}: {r['note']}")
-            pk = [r["pocket_rmsd"] for r in sys_records if np.isfinite(r["pocket_rmsd"])]
-            if pk:
+            pks = [r["pk"] for r in sys_records if np.isfinite(r["pk"])]
+            if pks:
                 print(
-                    f"  {sid}: {len(pk)} samples, "
-                    f"pocket RMSD min={min(pk):.2f} mean={np.mean(pk):.2f}"
+                    f"  {sid}: {len(pks)} samples, "
+                    f"pk min={min(pks):.2f} mean={np.mean(pks):.2f}"
                 )
 
         records_by_system[sid] = sys_records
@@ -459,13 +487,13 @@ def main():
         return
 
     # ---- aggregate ----
-    all_pocket = [r["pocket_rmsd"] for r in all_records]
-    all_best   = [r["best_rmsd"]   for r in all_records]
+    all_pk  = [r["pk"]  for r in all_records]
+    all_lig = [r["lig"] for r in all_records]
 
-    sys_min_pocket  = min_per_system(records_by_system, "pocket_rmsd")
-    sys_min_best    = min_per_system(records_by_system, "best_rmsd")
-    sys_mean_pocket = mean_per_system(records_by_system, "pocket_rmsd")
-    sys_mean_best   = mean_per_system(records_by_system, "best_rmsd")
+    sys_min_pk   = min_per_system(records_by_system, "pk")
+    sys_min_lig  = min_per_system(records_by_system, "lig")
+    sys_mean_pk  = mean_per_system(records_by_system, "pk")
+    sys_mean_lig = mean_per_system(records_by_system, "lig")
 
     deltas = args.delta
 
@@ -473,37 +501,36 @@ def main():
     print(f"  PLINDER POCKET EVAL  —  {len(records_by_system)} systems")
     print(f"{'='*60}")
 
-    print_block("Per-sample (all samples pooled)", all_pocket, all_best, deltas)
+    print_block("Per-sample (all samples pooled)", all_pk, all_lig, deltas)
     print_block(
-        "Per-system best sample (min pocket RMSD per system)",
-        sys_min_pocket, sys_min_best, deltas,
+        "Per-system best sample (min pk per system)",
+        sys_min_pk, sys_min_lig, deltas,
     )
     print_block(
-        "Per-system mean (mean pocket RMSD per system)",
-        sys_mean_pocket, sys_mean_best, deltas,
+        "Per-system mean",
+        sys_mean_pk, sys_mean_lig, deltas,
     )
 
     # ---- per-system table ----
-    print("\n--- Per-system summary (sorted by min pocket RMSD) ---")
-    header = f"  {'system_id':<42} {'n':>4} {'min_pk':>7} {'mean_pk':>8} {'min_bst':>8}"
-    print(header)
+    print("\n--- Per-system summary (sorted by min pk) ---")
+    print(f"  {'system_id':<42} {'n':>4} {'min_pk':>7} {'mean_pk':>8} {'min_lig':>8}")
     rows = []
     for sid, recs in records_by_system.items():
-        pk  = [r["pocket_rmsd"] for r in recs if np.isfinite(r["pocket_rmsd"])]
-        bst = [r["best_rmsd"]   for r in recs if np.isfinite(r["best_rmsd"])]
+        pks  = [r["pk"]  for r in recs if np.isfinite(r["pk"])]
+        ligs = [r["lig"] for r in recs if np.isfinite(r["lig"])]
         rows.append((
-            sid,
-            len(recs),
-            min(pk)  if pk  else np.inf,
-            float(np.mean(pk)) if pk else np.inf,
-            min(bst) if bst else np.inf,
+            sid, len(recs),
+            min(pks)  if pks  else np.inf,
+            float(np.mean(pks)) if pks else np.inf,
+            min(ligs) if ligs else np.inf,
         ))
+
     def _fmt(v):
         return f"{v:.3f}" if np.isfinite(v) else "  inf"
 
     rows.sort(key=lambda x: x[2])
-    for sid, n, mn_pk, avg_pk, mn_bst in rows:
-        print(f"  {sid:<42} {n:>4} {_fmt(mn_pk):>7} {_fmt(avg_pk):>8} {_fmt(mn_bst):>8}")
+    for sid, n, mn_pk, avg_pk, mn_lig in rows:
+        print(f"  {sid:<42} {n:>4} {_fmt(mn_pk):>7} {_fmt(avg_pk):>8} {_fmt(mn_lig):>8}")
 
 
 if __name__ == "__main__":
