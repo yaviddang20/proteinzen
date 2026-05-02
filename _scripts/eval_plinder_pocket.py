@@ -284,19 +284,16 @@ def _write_pdb_block(coords: np.ndarray, elements: list, chain: str, res_name: s
 
 
 def write_pair_pdb(path: Path, gt_prot: np.ndarray, gt_lig: np.ndarray,
-                   gen_lig: np.ndarray, lig_elements: list):
-    """Write a two-model PDB: MODEL 1 = GT (protein + ligand), MODEL 2 = gen ligand only.
-
-    The protein context (gt_prot) is written as CA-only ATOM records in model 1
-    using element C as a placeholder — sufficient for visualisation.
-    gen_lig is the already-transformed generated ligand (pocket-aligned or lig-aligned).
-    """
-    prot_elements = ["C"] * len(gt_prot)
+                   gen_lig: np.ndarray, lig_elements: list, include_protein: bool = True):
+    """Write a two-model PDB: MODEL 1 = GT ligand (+ protein if include_protein),
+    MODEL 2 = transformed gen ligand only."""
     lines = []
 
     lines.append("MODEL        1")
-    lines += _write_pdb_block(gt_prot, prot_elements, "A", "ALA", "ATOM",    res_num=1)
-    lines += _write_pdb_block(gt_lig,  lig_elements,  "B", "LIG", "HETATM", res_num=1)
+    if include_protein:
+        prot_elements = ["C"] * len(gt_prot)
+        lines += _write_pdb_block(gt_prot, prot_elements, "A", "ALA", "ATOM",    res_num=1)
+    lines += _write_pdb_block(gt_lig, lig_elements, "B", "LIG", "HETATM", res_num=1)
     lines.append("ENDMDL")
 
     lines.append("MODEL        2")
@@ -612,6 +609,7 @@ def main():
                 lig_dir / f"{sid}_lig{best_lig_rec['lig']:.2f}.pdb",
                 best_lig_rec["gt_prot"], best_lig_rec["gt_lig"],
                 best_lig_rec["gen_lig_lig"], best_lig_rec["lig_elements"],
+                include_protein=False,
             )
         n_written += 1
 
