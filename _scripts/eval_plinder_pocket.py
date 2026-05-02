@@ -210,23 +210,31 @@ def pocket_rmsd_sym(mol_template, gt_coords: np.ndarray, gen_aligned_coords: np.
     return min(pos_rmsd(gt_coords, gen_aligned_coords[p]) for p in perms)
 
 
-def lig_rmsd_sym(mol_template, gt_coords: np.ndarray, gen_coords: np.ndarray) -> float:
-    """Best-permutation + best-rotation RMSD aligned on the ligand itself.
+def _lig_rmsd_and_coords(mol_template, gt_coords: np.ndarray, gen_coords: np.ndarray):
+    """Best-permutation + best-rotation ligand RMSD, also returning the aligned coords.
 
-    Measures conformer quality regardless of position in the pocket.
-    For each valid atom permutation, Kabsch-aligns gen onto gt and computes RMSD.
+    Returns (rmsd, aligned_gen_coords) where aligned_gen_coords is gen_coords
+    after applying the best permutation and Kabsch rotation onto gt_coords.
     """
     perms = _get_permutations(mol_template, gt_coords, gen_coords)
     if perms is None:
         perms = [np.arange(len(gt_coords), dtype=np.intp)]
-    best = float("inf")
+    best_r = float("inf")
+    best_coords = gen_coords
     for p in perms:
         permuted = gen_coords[p]
         R, t = kabsch(permuted, gt_coords)
-        r = pos_rmsd(gt_coords, apply_transform(permuted, R, t))
-        if r < best:
-            best = r
-    return best
+        aligned = apply_transform(permuted, R, t)
+        r = pos_rmsd(gt_coords, aligned)
+        if r < best_r:
+            best_r = r
+            best_coords = aligned
+    return best_r, best_coords
+
+
+def lig_rmsd_sym(mol_template, gt_coords: np.ndarray, gen_coords: np.ndarray) -> float:
+    r, _ = _lig_rmsd_and_coords(mol_template, gt_coords, gen_coords)
+    return r
 
 
 # ============================================================
@@ -259,6 +267,47 @@ def extract_gt_coords(struct):
 
 
 # ============================================================
+# PDB output
+# ============================================================
+
+def _write_pdb_block(coords: np.ndarray, elements: list, chain: str, res_name: str,
+                     record: str, res_num: int = 1) -> list:
+    """Return a list of PDB ATOM/HETATM lines for a set of coords."""
+    lines = []
+    for i, ((x, y, z), elem) in enumerate(zip(coords, elements)):
+        name = f"{elem:<2}"
+        lines.append(
+            f"{record:<6}{i+1:5d} {name}   {res_name:3s} {chain:1s}{res_num:4d}    "
+            f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          {elem:>2}  "
+        )
+    return lines
+
+
+def write_pair_pdb(path: Path, gt_prot: np.ndarray, gt_lig: np.ndarray,
+                   gen_lig: np.ndarray, lig_elements: list):
+    """Write a two-model PDB: MODEL 1 = GT (protein + ligand), MODEL 2 = gen ligand only.
+
+    The protein context (gt_prot) is written as CA-only ATOM records in model 1
+    using element C as a placeholder — sufficient for visualisation.
+    gen_lig is the already-transformed generated ligand (pocket-aligned or lig-aligned).
+    """
+    prot_elements = ["C"] * len(gt_prot)
+    lines = []
+
+    lines.append("MODEL        1")
+    lines += _write_pdb_block(gt_prot, prot_elements, "A", "ALA", "ATOM",    res_num=1)
+    lines += _write_pdb_block(gt_lig,  lig_elements,  "B", "LIG", "HETATM", res_num=1)
+    lines.append("ENDMDL")
+
+    lines.append("MODEL        2")
+    lines += _write_pdb_block(gen_lig, lig_elements, "B", "LIG", "HETATM", res_num=1)
+    lines.append("ENDMDL")
+
+    lines.append("END")
+    path.write_text("\n".join(lines) + "\n")
+
+
+# ============================================================
 # Per-system evaluation
 # ============================================================
 
@@ -276,7 +325,7 @@ def eval_system(system_id: str, gen_pdb_paths, gt_struct):
 
     records = []
     for idx, pdb_path in enumerate(sorted(gen_pdb_paths)):
-        gen_prot, gen_lig, _, _ = parse_pdb_atoms(str(pdb_path))
+        gen_prot, gen_lig, lig_elements, _ = parse_pdb_atoms(str(pdb_path))
 
         if len(gen_prot) != n_gt_prot:
             records.append(dict(
@@ -296,18 +345,23 @@ def eval_system(system_id: str, gen_pdb_paths, gt_struct):
 
         # Kabsch: align generated protein pocket onto GT protein pocket
         R, t = kabsch(gen_prot, gt_prot)
-        gen_lig_aligned = apply_transform(gen_lig, R, t)
+        gen_lig_pk = apply_transform(gen_lig, R, t)   # pocket-aligned gen ligand
 
         mol_template, _ = ligand_mol_from_pdb(str(pdb_path))
 
         # pk:  pocket-aligned, best permutation, no ligand re-rotation
-        # lig: best permutation + best ligand rotation, ignores pocket position
-        pk   = pocket_rmsd_sym(mol_template, gt_lig, gen_lig_aligned)
-        lig  = lig_rmsd_sym(mol_template, gt_lig, gen_lig)
+        # lig: best permutation + best ligand Kabsch, ignores pocket position
+        pk  = pocket_rmsd_sym(mol_template, gt_lig, gen_lig_pk)
+        lig, gen_lig_lig = _lig_rmsd_and_coords(mol_template, gt_lig, gen_lig)
 
         records.append(dict(
             system_id=system_id, sample_idx=idx,
             pk=pk, lig=lig,
+            # aligned coords + elements for PDB output
+            gt_prot=gt_prot, gt_lig=gt_lig,
+            gen_lig_pk=gen_lig_pk,       # pocket-aligned gen ligand
+            gen_lig_lig=gen_lig_lig,     # ligand-aligned gen ligand
+            lig_elements=lig_elements,
             note="",
         ))
 
@@ -531,6 +585,37 @@ def main():
     rows.sort(key=lambda x: x[2])
     for sid, n, mn_pk, avg_pk, mn_lig in rows:
         print(f"  {sid:<42} {n:>4} {_fmt(mn_pk):>7} {_fmt(avg_pk):>8} {_fmt(mn_lig):>8}")
+
+    # ---- PDB output ----
+    pk_dir  = args.samples_dir.parent / "aligned_pocket"
+    lig_dir = args.samples_dir.parent / "aligned_lig"
+    pk_dir.mkdir(exist_ok=True)
+    lig_dir.mkdir(exist_ok=True)
+
+    n_written = 0
+    for sid, recs in records_by_system.items():
+        valid = [r for r in recs if not r["note"]]
+        if not valid:
+            continue
+
+        best_pk_rec = min(valid, key=lambda r: r["pk"])
+        if np.isfinite(best_pk_rec["pk"]):
+            write_pair_pdb(
+                pk_dir / f"{sid}_pk{best_pk_rec['pk']:.2f}.pdb",
+                best_pk_rec["gt_prot"], best_pk_rec["gt_lig"],
+                best_pk_rec["gen_lig_pk"], best_pk_rec["lig_elements"],
+            )
+
+        best_lig_rec = min(valid, key=lambda r: r["lig"])
+        if np.isfinite(best_lig_rec["lig"]):
+            write_pair_pdb(
+                lig_dir / f"{sid}_lig{best_lig_rec['lig']:.2f}.pdb",
+                best_lig_rec["gt_prot"], best_lig_rec["gt_lig"],
+                best_lig_rec["gen_lig_lig"], best_lig_rec["lig_elements"],
+            )
+        n_written += 1
+
+    print(f"\nWrote PDB pairs for {n_written} systems → {pk_dir.parent}")
 
 
 if __name__ == "__main__":
