@@ -242,10 +242,7 @@ def lig_rmsd_sym(mol_template, gt_coords: np.ndarray, gen_coords: np.ndarray) ->
 # ============================================================
 
 def extract_gt_coords(struct):
-    """Return (prot_coords, lig_coords) as (N, 3) float64 arrays.
-
-    Only is_present atoms are included — matching the PDB writer behaviour.
-    """
+    """Return (prot_coords, lig_coords) as (N, 3) float64 — only is_present atoms."""
     protein_id    = const.chain_type_ids["PROTEIN"]
     nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
 
@@ -254,12 +251,11 @@ def extract_gt_coords(struct):
         mol = int(chain["mol_type"])
         a0  = int(chain["atom_idx"])
         atoms = struct.atoms[a0 : a0 + int(chain["atom_num"])]
-        coords  = atoms["coords"]
         present = atoms["is_present"].astype(bool)
         if mol == protein_id:
-            prot_list.append(coords[present])
+            prot_list.append(atoms["coords"][present])
         elif mol == nonpolymer_id:
-            lig_list.append(coords[present])
+            lig_list.append(atoms["coords"][present])
 
     prot = np.concatenate(prot_list, 0) if prot_list else np.zeros((0, 3))
     lig  = np.concatenate(lig_list,  0) if lig_list  else np.zeros((0, 3))
@@ -270,37 +266,43 @@ def extract_gt_coords(struct):
 # PDB output
 # ============================================================
 
-def _write_pdb_block(coords: np.ndarray, elements: list, chain: str, res_name: str,
-                     record: str, res_num: int = 1) -> list:
-    """Return a list of PDB ATOM/HETATM lines for a set of coords."""
+def _hetatm_lines(coords: np.ndarray, elements: list) -> list:
+    """Minimal HETATM block for a ligand — no residue context needed for vis."""
     lines = []
     for i, ((x, y, z), elem) in enumerate(zip(coords, elements)):
-        name = f"{elem:<2}"
+        name = f" {elem:<3}" if len(elem) == 1 else f"{elem:<4}"
         lines.append(
-            f"{record:<6}{i+1:5d} {name}   {res_name:3s} {chain:1s}{res_num:4d}    "
+            f"HETATM{i+1:5d} {name} LIG B   1    "
             f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          {elem:>2}  "
         )
     return lines
 
 
-def write_pair_pdb(path: Path, gt_prot: np.ndarray, gt_lig: np.ndarray,
-                   gen_lig: np.ndarray, lig_elements: list, include_protein: bool = True):
-    """Write a two-model PDB: MODEL 1 = GT ligand (+ protein if include_protein),
-    MODEL 2 = transformed gen ligand only."""
-    lines = []
+def _gt_pdb_body(gt_struct) -> str:
+    """PDB body for the GT structure (protein + ligand) without the trailing END."""
+    from proteinzen.data.write.pdb import to_pdb
+    return to_pdb(gt_struct).rsplit("END", 1)[0]
 
-    lines.append("MODEL        1")
-    if include_protein:
-        prot_elements = ["C"] * len(gt_prot)
-        lines += _write_pdb_block(gt_prot, prot_elements, "A", "ALA", "ATOM",    res_num=1)
-    lines += _write_pdb_block(gt_lig, lig_elements, "B", "LIG", "HETATM", res_num=1)
-    lines.append("ENDMDL")
 
-    lines.append("MODEL        2")
-    lines += _write_pdb_block(gen_lig, lig_elements, "B", "LIG", "HETATM", res_num=1)
-    lines.append("ENDMDL")
+def write_pocket_pdb(path: Path, gt_struct, gen_lig_pk: np.ndarray, lig_elements: list):
+    """aligned_pocket: MODEL 1 = GT protein + GT ligand, MODEL 2 = pocket-aligned gen ligand."""
+    gt_body = _gt_pdb_body(gt_struct)
+    lines = ["MODEL        1", gt_body.rstrip(), "ENDMDL",
+             "MODEL        2"]
+    lines += _hetatm_lines(gen_lig_pk, lig_elements)
+    lines += ["ENDMDL", "END"]
+    path.write_text("\n".join(lines) + "\n")
 
-    lines.append("END")
+
+def write_lig_pdb(path: Path, gt_struct, gen_lig_lig: np.ndarray, lig_elements: list):
+    """aligned_lig: MODEL 1 = GT ligand only, MODEL 2 = lig-aligned gen ligand."""
+    # Extract just the HETATM lines from the GT to_pdb output
+    gt_hetatm = [ln for ln in _gt_pdb_body(gt_struct).splitlines()
+                 if ln.startswith("HETATM")]
+    lines = ["MODEL        1"] + gt_hetatm + ["ENDMDL",
+             "MODEL        2"]
+    lines += _hetatm_lines(gen_lig_lig, lig_elements)
+    lines += ["ENDMDL", "END"]
     path.write_text("\n".join(lines) + "\n")
 
 
@@ -354,10 +356,9 @@ def eval_system(system_id: str, gen_pdb_paths, gt_struct):
         records.append(dict(
             system_id=system_id, sample_idx=idx,
             pk=pk, lig=lig,
-            # aligned coords + elements for PDB output
-            gt_prot=gt_prot, gt_lig=gt_lig,
-            gen_lig_pk=gen_lig_pk,       # pocket-aligned gen ligand
-            gen_lig_lig=gen_lig_lig,     # ligand-aligned gen ligand
+            # transformed coords for PDB output
+            gen_lig_pk=gen_lig_pk,
+            gen_lig_lig=gen_lig_lig,
             lig_elements=lig_elements,
             note="",
         ))
@@ -484,12 +485,14 @@ def main():
 
     # ---- build job list ----
     jobs = []
+    npz_by_sid: dict[str, str] = {}
     for sid in common:
         mid = sid[1:3]
         npz_path = args.data_dir / "structures" / mid / f"{sid}.npz"
         if not npz_path.exists():
             print(f"  SKIP {sid}: npz not found")
             continue
+        npz_by_sid[sid] = str(npz_path)
         jobs.append((sid, groups[sid], str(npz_path)))
 
     print(f"  Running {len(jobs)} systems with {args.n_jobs} workers...")
@@ -595,21 +598,27 @@ def main():
         if not valid:
             continue
 
+        npz_path = npz_by_sid.get(sid)
+        if npz_path is None:
+            continue
+        try:
+            gt_struct = load_structure_from_npz(npz_path, include_h=args.include_h)
+            gt_struct = _crop_protein_to_pocket(gt_struct, args.max_protein_residues)
+        except Exception:
+            continue
+
         best_pk_rec = min(valid, key=lambda r: r["pk"])
         if np.isfinite(best_pk_rec["pk"]):
-            write_pair_pdb(
+            write_pocket_pdb(
                 pk_dir / f"{sid}_pk{best_pk_rec['pk']:.2f}.pdb",
-                best_pk_rec["gt_prot"], best_pk_rec["gt_lig"],
-                best_pk_rec["gen_lig_pk"], best_pk_rec["lig_elements"],
+                gt_struct, best_pk_rec["gen_lig_pk"], best_pk_rec["lig_elements"],
             )
 
         best_lig_rec = min(valid, key=lambda r: r["lig"])
         if np.isfinite(best_lig_rec["lig"]):
-            write_pair_pdb(
+            write_lig_pdb(
                 lig_dir / f"{sid}_lig{best_lig_rec['lig']:.2f}.pdb",
-                best_lig_rec["gt_prot"], best_lig_rec["gt_lig"],
-                best_lig_rec["gen_lig_lig"], best_lig_rec["lig_elements"],
-                include_protein=False,
+                gt_struct, best_lig_rec["gen_lig_lig"], best_lig_rec["lig_elements"],
             )
         n_written += 1
 
