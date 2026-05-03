@@ -279,9 +279,19 @@ def _hetatm_lines(coords: np.ndarray, elements: list) -> list:
 
 
 def _gt_pdb_body(gt_struct) -> str:
-    """PDB body for the GT structure (protein + ligand) without the trailing END."""
+    """PDB body for the GT structure (protein + ligand) without the trailing END.
+
+    Bonds are stripped before calling to_pdb: the CONECT writer in to_pdb indexes
+    atom_reindex_ter by absolute atom index, which crashes when the cropped struct
+    has is_present=False atoms (the list is shorter than the total atom count).
+    CONECT records aren't needed for visualisation anyway.
+    """
+    from dataclasses import replace as dc_replace
     from proteinzen.data.write.pdb import to_pdb
-    return to_pdb(gt_struct).rsplit("END", 1)[0]
+    empty_bonds = gt_struct.bonds[:0]
+    empty_conns = gt_struct.connections[:0]
+    clean_struct = dc_replace(gt_struct, bonds=empty_bonds, connections=empty_conns)
+    return to_pdb(clean_struct).rsplit("END", 1)[0]
 
 
 def write_pocket_pdb(path: Path, gt_struct, gen_lig_pk: np.ndarray, lig_elements: list):
