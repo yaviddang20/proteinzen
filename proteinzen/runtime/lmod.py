@@ -548,13 +548,9 @@ class BiomoleculeModule(L.LightningModule):
         # ---- t-stratified losses (TRAIN ONLY) ----
         if stage == "train":
             t = batch["t"]
+            _skip = {"loss", "frameflow_loss", "frame_vf_loss_unscaled", "loss_per_batch"}
             for loss_name, loss_list in loss_dict.items():
-                if loss_name in [
-                    "loss",
-                    "frameflow_loss",
-                    "frame_vf_loss_unscaled",
-                    "loss_per_batch",
-                ]:
+                if loss_name in _skip:
                     continue
                 if t.numel() != loss_list.numel():
                     continue
@@ -576,6 +572,40 @@ class BiomoleculeModule(L.LightningModule):
                     sync_dist=False,
                 )
 
+            # t-stratified per-task losses
+            for task_key, task_loss in loss_by_task.items():
+                t_per_sample = t[:task_loss.shape[0]]
+                if t_per_sample.numel() != task_loss.numel():
+                    continue
+                stratified = t_stratified_loss(batch_t=t_per_sample, batch_loss=task_loss, loss_name=task_key)
+                stratified = {
+                    f"task/train/{k}": torch.round(
+                        torch.as_tensor(v, device=t.device), decimals=3
+                    )
+                    for k, v in stratified.items()
+                }
+                self.log_dict(
+                    stratified,
+                    logger=True,
+                    on_epoch=True,
+                    prog_bar=False,
+                    batch_size=t_per_sample.shape[0],
+                    sync_dist=False,
+                )
+
+        # ---- val: per-task losses (val uses fixed t values via stage name) ----
+        if stage.startswith("val"):
+            for key, value in loss_by_task.items():
+                self.log(
+                    f"task/{stage}/{key}",
+                    value.mean(),
+                    logger=True,
+                    on_epoch=True,
+                    prog_bar=False,
+                    batch_size=value.shape[0],
+                    sync_dist=False,
+                )
+
         # ---- final logging ----
         self.log_dict(
             log_dict,
@@ -583,7 +613,7 @@ class BiomoleculeModule(L.LightningModule):
             on_epoch=True,
             prog_bar=True,
             batch_size=batch["t"].shape[0],
-            sync_dist=True,
+            sync_dist=False,
         )
 
     def _shared_step(self, batch, return_outputs=False):
@@ -727,7 +757,12 @@ class BiomoleculeModule(L.LightningModule):
             )
 
     def _write_val_pdbs(self, batch, outputs, t_val: float, n_samples: int = 5):
-        """Write n_samples two-MODEL PDBs (GT + predicted) for visual inspection."""
+        """Write n_samples two-MODEL PDBs (GT + predicted) for visual inspection.
+
+        MODEL 1 = full GT structure (protein + ligand ground truth coords).
+        MODEL 2 = GT protein coords + predicted ligand coords.
+        For unconditional tasks both models use pred coords for all atoms.
+        """
         epoch = self.trainer.current_epoch
         log_dir = self.trainer.log_dir or os.getcwd()
         out_dir = os.path.join(log_dir, f"val_pdbs/epoch_{epoch:04d}/t_{t_val}")
@@ -735,19 +770,26 @@ class BiomoleculeModule(L.LightningModule):
 
         B = batch["t"].shape[0]
         rigids = batch['rigids']
-        rigids_mask = rigids['rigids_mask'].cpu().numpy().astype(bool)   # [B, R]
+        rigids_mask = rigids['rigids_mask'].cpu().numpy().astype(bool)           # [B, R]
+        rigids_noising_mask = rigids['rigids_noising_mask'].cpu().numpy().astype(bool)  # [B, R]
         gt_trans = ru.Rigid.from_tensor_7(rigids['rigids_1']).get_trans().cpu().numpy()
         pred_trans = outputs['denoised_rigids'].get_trans().cpu().numpy()
-        ref_elements = rigids['rigids_ref_element'].cpu().numpy()         # [B, R]
-        rigids_seq_idx = rigids['rigids_seq_idx'].cpu().numpy()           # [B, R] residue idx
-        rigids_to_token = rigids['rigids_to_token'].cpu().numpy()         # [B, R] token idx
+        ref_elements = rigids['rigids_ref_element'].cpu().numpy()                # [B, R]
+        rigids_seq_idx = rigids['rigids_seq_idx'].cpu().numpy()                  # [B, R]
+        rigids_to_token = rigids['rigids_to_token'].cpu().numpy()                # [B, R]
+        rigids_sc_idx = rigids['rigids_sidechain_idx'].cpu().numpy()             # [B, R]
 
-        # per-sample unscaled trans MSE
-        gt_t = torch.from_numpy(gt_trans)
-        pred_t = outputs['denoised_rigids'].get_trans().cpu()
-        rmask = rigids['rigids_mask'].cpu()
-        n_rigids = rmask.long().sum(dim=-1).clamp(min=1)
-        per_sample_mse = (torch.square(gt_t - pred_t).sum(-1) * rmask).sum(-1) / n_rigids  # [B]
+        # For MODEL 2: use GT coords for conditioned (fixed) rigids, pred for generated rigids.
+        # Protein rigids have rigids_noising_mask=False → use GT; ligand has True → use pred.
+        pred_trans_display = np.where(
+            rigids_noising_mask[:, :, None], pred_trans, gt_trans
+        )
+
+        # Ligand-only MSE (only noised rigids, excluding protein Cα sentinels element=-1)
+        noised_atom_mask = rigids_mask & rigids_noising_mask & (ref_elements != 1) & (ref_elements != -1)
+        n_noised = noised_atom_mask.sum(axis=-1).clip(min=1)
+        se = np.square(pred_trans - gt_trans).sum(axis=-1)
+        per_sample_mse = (se * noised_atom_mask).sum(axis=-1) / n_noised
 
         token = batch['token']
         mol_types_tok = token['mol_type'].cpu().numpy()   # [B, T]
@@ -757,23 +799,29 @@ class BiomoleculeModule(L.LightningModule):
         for i in range(min(n_samples, B)):
             mask = rigids_mask[i]
             elements = ref_elements[i]
-            heavy_mask = mask & (elements != 1) & (elements != -1)
-            if heavy_mask.sum() == 0:
+            # Protein: only backbone rigid (sidechain_idx=0), written as CA.
+            # Ligand: all heavy atoms (element != 1 and != -1).
+            is_protein_backbone = (elements == -1) & (rigids_sc_idx[i] == 0)
+            is_ligand_heavy = (elements != 1) & (elements != -1)
+            write_mask = mask & (is_protein_backbone | is_ligand_heavy)
+            if write_mask.sum() == 0:
                 continue
 
-            tok_idx = rigids_to_token[i][heavy_mask]   # token indices, safe to index token arrays
-            seq_idx = rigids_seq_idx[i][heavy_mask]
+            tok_idx = rigids_to_token[i][write_mask]
+            seq_idx = rigids_seq_idx[i][write_mask]
             mol_types = mol_types_tok[i][tok_idx]
             res_types = res_types_tok[i][tok_idx]
             asym_ids = asym_ids_tok[i][tok_idx]
+            # Treat protein sentinel element (-1) as carbon (CA) for PDB writing
+            elems_for_pdb = np.where(elements[write_mask] == -1, 6, elements[write_mask])
 
             mse_val = per_sample_mse[i].item()
             path = os.path.join(out_dir, f"sample_{i:02d}_mse{mse_val:.3f}.pdb")
             try:
                 write_val_pdb(
-                    gt_trans[i][heavy_mask],
-                    pred_trans[i][heavy_mask],
-                    elements[heavy_mask],
+                    gt_trans[i][write_mask],
+                    pred_trans_display[i][write_mask],
+                    elems_for_pdb,
                     mol_types,
                     res_types,
                     asym_ids,
@@ -781,7 +829,7 @@ class BiomoleculeModule(L.LightningModule):
                     path,
                 )
             except Exception as e:
-                log.warning(f"val PDB write failed for sample {i}: {e}")
+                log.warning(f"val PDB write failed for sample {i}: {e}", exc_info=True)
 
     def on_validation_epoch_end(self):
         metrics = self.trainer.callback_metrics
@@ -796,7 +844,7 @@ class BiomoleculeModule(L.LightningModule):
                 "val/composite_pred_trans_mse",
                 composite,
                 prog_bar=True,
-                sync_dist=True,
+                sync_dist=False,
             )
 
     # def training_step(self, batch, batch_idx):
