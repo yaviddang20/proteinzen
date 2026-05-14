@@ -778,6 +778,7 @@ class BiomoleculeModule(L.LightningModule):
         rigids_seq_idx = rigids['rigids_seq_idx'].cpu().numpy()                  # [B, R]
         rigids_to_token = rigids['rigids_to_token'].cpu().numpy()                # [B, R]
         rigids_sc_idx = rigids['rigids_sidechain_idx'].cpu().numpy()             # [B, R]
+        is_atom_mask = rigids['rigids_is_atom_mask'].cpu().numpy().astype(bool)  # [B, R] True=ligand
 
         # For MODEL 2: use GT coords for conditioned (fixed) rigids, pred for generated rigids.
         # Protein rigids have rigids_noising_mask=False → use GT; ligand has True → use pred.
@@ -785,8 +786,8 @@ class BiomoleculeModule(L.LightningModule):
             rigids_noising_mask[:, :, None], pred_trans, gt_trans
         )
 
-        # Ligand-only MSE (only noised rigids, excluding protein Cα sentinels element=-1)
-        noised_atom_mask = rigids_mask & rigids_noising_mask & (ref_elements != 1) & (ref_elements != -1)
+        # MSE over generated (noised) ligand atom rigids only — heavy atoms only (element != 1)
+        noised_atom_mask = rigids_mask & rigids_noising_mask & is_atom_mask & (ref_elements != 1)
         n_noised = noised_atom_mask.sum(axis=-1).clip(min=1)
         se = np.square(pred_trans - gt_trans).sum(axis=-1)
         per_sample_mse = (se * noised_atom_mask).sum(axis=-1) / n_noised
@@ -800,16 +801,21 @@ class BiomoleculeModule(L.LightningModule):
             mask = rigids_mask[i]
             elements = ref_elements[i]
             # Protein: only backbone rigid (sidechain_idx=0), written as CA.
-            # Ligand: all heavy atoms (element != 1 and != -1).
+            # Ligand: all heavy atoms (is_atom_mask=True, element != 1).
             is_protein_backbone = (elements == -1) & (rigids_sc_idx[i] == 0)
-            is_ligand_heavy = (elements != 1) & (elements != -1)
+            is_ligand_heavy = is_atom_mask[i] & (elements != 1)
             write_mask = mask & (is_protein_backbone | is_ligand_heavy)
             if write_mask.sum() == 0:
                 continue
 
             tok_idx = rigids_to_token[i][write_mask]
             seq_idx = rigids_seq_idx[i][write_mask]
-            mol_types = mol_types_tok[i][tok_idx]
+            # mol_type: derive from is_atom_mask directly rather than token lookup
+            # to avoid any token-indexing issues
+            atom_flag = is_atom_mask[i][write_mask]  # True=ligand, False=protein backbone
+            mol_type_arr = np.where(atom_flag,
+                                    const.chain_type_ids["NONPOLYMER"],
+                                    const.chain_type_ids["PROTEIN"])
             res_types = res_types_tok[i][tok_idx]
             asym_ids = asym_ids_tok[i][tok_idx]
             # Treat protein sentinel element (-1) as carbon (CA) for PDB writing
@@ -822,7 +828,7 @@ class BiomoleculeModule(L.LightningModule):
                     gt_trans[i][write_mask],
                     pred_trans_display[i][write_mask],
                     elems_for_pdb,
-                    mol_types,
+                    mol_type_arr,
                     res_types,
                     asym_ids,
                     seq_idx,
