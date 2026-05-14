@@ -29,6 +29,7 @@ import numpy as np
 import pyarrow.parquet as pq
 import rdkit
 from rdkit import Chem
+from rdkit.Chem import rdMolDescriptors
 from tqdm import tqdm
 
 from mmcif import parse_mmcif
@@ -111,56 +112,171 @@ def get_ligand_sdfs(system_dir: Path) -> dict:
     return {f.stem: f for f in ligand_dir.glob("*.sdf")}
 
 
-def compute_rot_bond_data(mol: Chem.Mol, atom_offset: int, n_total_atoms: int) -> dict:
-    """Compute rot_bond arrays for a ligand mol, offsetting into the global atom array."""
+# Canonical SMILES for common crystallography buffer/cryo-protectant artifacts.
+# Built at import time so comparison uses RDKit canonical form.
+_BUFFER_SMILES_RAW = [
+    "OCC(O)CO",           # glycerol (GOL)
+    "OCCO",               # ethylene glycol (EDO)
+    "OCC(C)O",            # 1,2-propanediol
+    "CC(O)CC(C)CO",       # 2-methyl-2,4-pentanediol (MPD)
+    "CS(C)=O",            # DMSO (DMS)
+    "CCO",                # ethanol (EOH)
+    "CO",                 # methanol (MOH)
+    "CC(C)O",             # isopropanol (IPA)
+    "OCCS",               # beta-mercaptoethanol (BME)
+    "OCC(S)C(S)CO",       # DTT
+    "OCC(N)(CO)CO",       # Tris (TRS)
+    "c1cnc[nH]1",         # imidazole (IMD)
+    "CC#N",               # acetonitrile (ACN)
+    "OC(CC(=O)O)(CC(=O)O)C(=O)O",    # citric acid (CIT)
+    "[O-]C(=O)C(O)C(O)C([O-])=O",    # tartrate (TLA)
+    "OC(C(O)C(=O)O)C(=O)O",           # tartaric acid
+    "OCC[NH+]1CCOCC1",               # morpholine-ethanol (MES-like)
+    "OCCNCCS(=O)(=O)O",              # HEPES-like fragment
+    "OCC[NH+]1CCN(CCS([O-])(=O)=O)CC1",  # HEPES
+    "O=C1CCCCC1",         # cyclohexanone
+    "OCCOCCO",            # diethylene glycol (PEG2)
+    "OCCOCCOCCO",         # triethylene glycol (PEG3)
+    "OCCOCCOCCOCCO",      # PEG4
+    "C(CO)O",             # 1,3-propanediol
+    "OCC(O)C(O)CO",       # erythritol
+    "OCC(O)C(O)C(O)CO",   # xylitol / ribitol
+]
+_BUFFER_SMILES = set()
+for _s in _BUFFER_SMILES_RAW:
+    _m = Chem.MolFromSmiles(_s)
+    if _m is not None:
+        _BUFFER_SMILES.add(Chem.MolToSmiles(_m))
+
+
+def _longest_unbranched_hydrocarbon_chain(mol: Chem.Mol) -> int:
+    """Length of the longest unbranched chain of non-ring carbons bonded only to C/H."""
+    pure_c = {
+        a.GetIdx() for a in mol.GetAtoms()
+        if a.GetAtomicNum() == 6
+        and not a.IsInRing()
+        and all(n.GetAtomicNum() in (1, 6) for n in a.GetNeighbors())
+    }
+    adj: dict[int, list[int]] = {i: [] for i in pure_c}
+    for bond in mol.GetBonds():
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        if i in pure_c and j in pure_c:
+            adj[i].append(j)
+            adj[j].append(i)
+
+    visited: set[int] = set()
+    max_chain = 0
+    for start in pure_c:
+        if start in visited:
+            continue
+        component: list[int] = []
+        stack = [start]
+        comp_vis: set[int] = set()
+        while stack:
+            node = stack.pop()
+            if node in comp_vis:
+                continue
+            comp_vis.add(node)
+            component.append(node)
+            for nb in adj[node]:
+                if nb not in comp_vis:
+                    stack.append(nb)
+        visited.update(comp_vis)
+        # Linear (unbranched) iff every node has at most 2 neighbors within the component
+        if all(len(adj[n]) <= 2 for n in component):
+            max_chain = max(max_chain, len(component))
+    return max_chain
+
+
+def is_valid_ligand(mol: Chem.Mol) -> bool:
+    """Return False for ligands that fail biological/therapeutic relevance filters."""
+    # Minimum size
+    n_heavy = mol.GetNumAtoms()
+    n_carbon = sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() == 6)
+    if n_heavy < 5 or n_carbon < 2:
+        return False
+
+    # Unspecified atoms (wildcard / unknown element)
+    if any(a.GetAtomicNum() == 0 for a in mol.GetAtoms()):
+        return False
+
+    # Highly charged
+    if abs(Chem.GetFormalCharge(mol)) > 2:
+        return False
+
+    # Long unbranched hydrocarbon linker (lipid/detergent contamination)
+    if _longest_unbranched_hydrocarbon_chain(mol) > 12:
+        return False
+
+    # Common buffer/cryoprotectant artifacts
+    if Chem.MolToSmiles(mol) in _BUFFER_SMILES:
+        return False
+
+    return True
+
+
+def compute_rot_bond_data(mol: Chem.Mol) -> dict:
+    """Compute rot_bond arrays for a ligand mol in local (0-indexed) ligand atom space.
+
+    All arrays use local indices 0..n_lig-1.  The datamodule remaps them to global
+    cropped rigid space at load time using rigids_is_atom_mask, which correctly
+    handles protein cropping without requiring any global offset here.
+    """
     rot_bonds, frag_a = compute_rot_bond_fragments(mol)  # (B,2), (B, n_lig)
     ring_masks = compute_ring_atom_masks(mol)              # (R, n_lig)
     sym_groups, sym_group_sizes = compute_sym_groups(mol)  # (G, max_sz), (G,)
-
     n_lig = mol.GetNumAtoms()
-    B = rot_bonds.shape[0]
-    R = ring_masks.shape[0]
-
-    # Offset rot_bonds atom indices into global atom array
-    if B > 0:
-        rot_bonds_global = rot_bonds + atom_offset
-        frag_a_global = np.zeros((B, n_total_atoms), dtype=bool)
-        frag_a_global[:, atom_offset:atom_offset + n_lig] = frag_a
-    else:
-        rot_bonds_global = np.zeros((0, 2), dtype=np.int32)
-        frag_a_global = np.zeros((0, n_total_atoms), dtype=bool)
-
-    if R > 0:
-        ring_masks_global = np.zeros((R, n_total_atoms), dtype=bool)
-        ring_masks_global[:, atom_offset:atom_offset + n_lig] = ring_masks
-    else:
-        ring_masks_global = np.zeros((0, n_total_atoms), dtype=bool)
-
     return {
-        "rot_bonds": rot_bonds_global,
-        "rot_frag_a": frag_a_global,
-        "ring_masks": ring_masks_global,
+        "rot_bonds": rot_bonds,    # (B, 2) local
+        "rot_frag_a": frag_a,      # (B, n_lig) local
+        "ring_masks": ring_masks,  # (R, n_lig) local
+        "n_lig": n_lig,
         "sym_groups": sym_groups,
         "sym_group_sizes": sym_group_sizes,
     }
 
 
-def merge_rot_bond_data(all_data: list, n_total_atoms: int) -> dict:
-    """Concatenate rot_bond data from multiple ligands."""
+def merge_rot_bond_data(all_data: list) -> dict:
+    """Merge rot_bond data from multiple ligands using cumulative n_lig offsets.
+
+    Produces arrays in merged local space: ligand-1 atoms 0..n1-1,
+    ligand-2 atoms n1..n1+n2-1, etc.  The datamodule remaps to global rigid space.
+    """
     if not all_data:
         return {
             "rot_bonds": np.zeros((0, 2), dtype=np.int32),
-            "rot_frag_a": np.zeros((0, n_total_atoms), dtype=bool),
-            "ring_masks": np.zeros((0, n_total_atoms), dtype=bool),
+            "rot_frag_a": np.zeros((0, 0), dtype=bool),
+            "ring_masks": np.zeros((0, 0), dtype=bool),
             "sym_groups": np.zeros((0, 1), dtype=np.int32),
             "sym_group_sizes": np.zeros(0, dtype=np.int32),
         }
 
-    rot_bonds = np.concatenate([d["rot_bonds"] for d in all_data], axis=0)
-    rot_frag_a = np.concatenate([d["rot_frag_a"] for d in all_data], axis=0)
-    ring_masks = np.concatenate([d["ring_masks"] for d in all_data], axis=0)
+    total_n_lig = sum(d["n_lig"] for d in all_data)
 
-    # sym_groups: take from first ligand with any groups, or empty
+    rot_bonds_list, rot_frag_a_list, ring_masks_list = [], [], []
+    n_cumulative = 0
+    for d in all_data:
+        n = d["n_lig"]
+        B_i = d["rot_bonds"].shape[0]
+        R_i = d["ring_masks"].shape[0]
+
+        if B_i > 0:
+            rot_bonds_list.append(d["rot_bonds"] + n_cumulative)
+            fa = np.zeros((B_i, total_n_lig), dtype=bool)
+            fa[:, n_cumulative:n_cumulative + n] = d["rot_frag_a"]
+            rot_frag_a_list.append(fa)
+
+        if R_i > 0:
+            rm = np.zeros((R_i, total_n_lig), dtype=bool)
+            rm[:, n_cumulative:n_cumulative + n] = d["ring_masks"]
+            ring_masks_list.append(rm)
+
+        n_cumulative += n
+
+    rot_bonds = np.concatenate(rot_bonds_list, axis=0) if rot_bonds_list else np.zeros((0, 2), dtype=np.int32)
+    rot_frag_a = np.concatenate(rot_frag_a_list, axis=0) if rot_frag_a_list else np.zeros((0, total_n_lig), dtype=bool)
+    ring_masks = np.concatenate(ring_masks_list, axis=0) if ring_masks_list else np.zeros((0, total_n_lig), dtype=bool)
+
     sym_groups = np.zeros((0, 1), dtype=np.int32)
     sym_group_sizes = np.zeros(0, dtype=np.int32)
     for d in all_data:
@@ -224,51 +340,37 @@ def process_system(
             if str(res["name"]) in _nuc_residues:
                 return
 
-    # Skip systems where any ligand has < 10 heavy atoms or < 5 carbon atoms
     nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
     protein_id = const.chain_type_ids["PROTEIN"]
-    for chain in structure.chains:
-        if int(chain["mol_type"]) != nonpolymer_id:
-            continue
-        rs = int(chain["res_idx"])
-        re = rs + int(chain["res_num"])
-        for res in structure.residues[rs:re]:
-            atom_start = int(res["atom_idx"])
-            atom_end = atom_start + int(res["atom_num"])
-            lig_atoms = structure.atoms[atom_start:atom_end]
-            n_heavy = len(lig_atoms)
-            n_carbon = int((lig_atoms["element"] == 6).sum())
-            if n_heavy < 10 or n_carbon < 5:
-                return
 
-    # Load ligand SDF files
+    # Load ligand SDF files and validate each ligand mol
     ligand_sdfs = get_ligand_sdfs(system_dir)
-    n_total_atoms = len(structure.atoms)
 
-    # Compute rot_bond data for each NONPOLYMER chain
     all_rot_bond_data = []
     for chain in structure.chains:
         if int(chain["mol_type"]) != nonpolymer_id:
             continue
 
         chain_name = chain["name"].strip()
-        atom_offset = int(chain["atom_idx"])
 
         # Find matching SDF — try by chain name, then take first available
         sdf_path = ligand_sdfs.get(chain_name)
         if sdf_path is None and ligand_sdfs:
             sdf_path = next(iter(ligand_sdfs.values()))
         if sdf_path is None:
-            continue
+            return  # no SDF for this ligand chain → skip system
 
         mol = Chem.SDMolSupplier(str(sdf_path), removeHs=True, sanitize=True)[0]
         if mol is None:
-            continue
+            return
 
-        rot_data = compute_rot_bond_data(mol, atom_offset, n_total_atoms)
+        if not is_valid_ligand(mol):
+            return
+
+        rot_data = compute_rot_bond_data(mol)
         all_rot_bond_data.append(rot_data)
 
-    rot_bond_data = merge_rot_bond_data(all_rot_bond_data, n_total_atoms)
+    rot_bond_data = merge_rot_bond_data(all_rot_bond_data)
 
     # Build ChainInfo list
     cluster_id = clusters.get(system_id, -1)

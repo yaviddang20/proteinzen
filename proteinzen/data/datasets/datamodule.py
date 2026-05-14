@@ -197,6 +197,56 @@ def load_input(record: Record, data_dir, include_h: bool = False):
     return struct, rot_bond_data
 
 
+def _apply_rot_bond_data_to_features(features: dict, rot_bond_data) -> None:
+    """Remap rot_bond data from local ligand atom space to global padded rigid space.
+
+    rot_bonds/rot_frag_a/ring_masks are stored in local (0-indexed) ligand atom space.
+    After cropping, rigids_is_atom_mask identifies which rigid positions are atomized
+    ligand atoms.  We scatter the local arrays to those positions so indices are correct
+    in the cropped+padded rigid tensor, regardless of how many protein residues were
+    cropped out.
+
+    Works for pure-ligand data (GEOM) where atom_positions = [0..n-1] — the remap is
+    then an identity operation.
+    """
+    L_pad = features['rigids']['rigids_mask'].shape[0]
+    atom_positions = torch.where(features['rigids']['rigids_is_atom_mask'])[0]
+    n_atom_pos = atom_positions.shape[0]
+
+    if rot_bond_data is not None and rot_bond_data['rot_bonds'].shape[0] > 0:
+        rb_local = torch.from_numpy(rot_bond_data['rot_bonds']).long()  # (B, 2)
+        n_lig_local = rot_bond_data['rot_frag_a'].shape[1]
+        n_map = min(n_lig_local, n_atom_pos)
+        target = atom_positions[:n_map]
+        features['rot_bonds'] = target[rb_local.clamp(0, max(n_map - 1, 0))]
+        fa_local = torch.from_numpy(rot_bond_data['rot_frag_a'])  # (B, n_lig)
+        fa_global = torch.zeros(fa_local.shape[0], L_pad, dtype=torch.bool)
+        fa_global[:, target] = fa_local[:, :n_map]
+        features['rot_frag_a'] = fa_global
+    else:
+        features['rot_bonds'] = torch.zeros((0, 2), dtype=torch.long)
+        features['rot_frag_a'] = torch.zeros((0, L_pad), dtype=torch.bool)
+
+    if rot_bond_data is not None:
+        rm_local = torch.from_numpy(rot_bond_data['ring_masks'])  # (R, n_lig)
+        R = rm_local.shape[0]
+        if R > 0:
+            n_lig_local = rm_local.shape[1]
+            n_map = min(n_lig_local, n_atom_pos)
+            target = atom_positions[:n_map]
+            rm_global = torch.zeros(R, L_pad, dtype=torch.bool)
+            rm_global[:, target] = rm_local[:, :n_map]
+            features['ring_masks'] = rm_global
+        else:
+            features['ring_masks'] = torch.zeros((0, L_pad), dtype=torch.bool)
+        features['sym_groups'] = torch.from_numpy(rot_bond_data['sym_groups']).long()
+        features['sym_group_sizes'] = torch.from_numpy(rot_bond_data['sym_group_sizes']).long()
+    else:
+        features['ring_masks'] = torch.zeros((0, L_pad), dtype=torch.bool)
+        features['sym_groups'] = torch.zeros((0, 1), dtype=torch.long)
+        features['sym_group_sizes'] = torch.zeros(0, dtype=torch.long)
+
+
 def mirror_structure(struct: Structure) -> Structure:
     """Reflect all atom coordinates across the x-axis and swap CW/CCW chirality tags.
 
@@ -356,21 +406,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         features['task'] = task
         features['structure'] = struct
 
-        if rot_bond_data is not None and rot_bond_data['rot_bonds'].shape[0] > 0:
-            features['rot_bonds'] = torch.from_numpy(rot_bond_data['rot_bonds']).long()
-            features['rot_frag_a'] = torch.from_numpy(rot_bond_data['rot_frag_a'])
-        else:
-            features['rot_bonds'] = torch.zeros((0, 2), dtype=torch.long)
-            features['rot_frag_a'] = torch.zeros((0, 0), dtype=torch.bool)
-
-        if rot_bond_data is not None:
-            features['ring_masks'] = torch.from_numpy(rot_bond_data['ring_masks'])
-            features['sym_groups'] = torch.from_numpy(rot_bond_data['sym_groups']).long()
-            features['sym_group_sizes'] = torch.from_numpy(rot_bond_data['sym_group_sizes']).long()
-        else:
-            features['ring_masks'] = torch.zeros((0, 0), dtype=torch.bool)
-            features['sym_groups'] = torch.zeros((0, 1), dtype=torch.long)
-            features['sym_group_sizes'] = torch.zeros(0, dtype=torch.long)
+        _apply_rot_bond_data_to_features(features, rot_bond_data)
 
         e_min = sample.e_min
         features['e_min'] = torch.tensor(e_min, dtype=torch.float32) if e_min is not None else torch.tensor(float('nan'), dtype=torch.float32)
@@ -535,21 +571,7 @@ class ValidationDataset(torch.utils.data.Dataset):
         features['task'] = task
         features['structure'] = struct
 
-        if rot_bond_data is not None and rot_bond_data['rot_bonds'].shape[0] > 0:
-            features['rot_bonds'] = torch.from_numpy(rot_bond_data['rot_bonds']).long()
-            features['rot_frag_a'] = torch.from_numpy(rot_bond_data['rot_frag_a'])
-        else:
-            features['rot_bonds'] = torch.zeros((0, 2), dtype=torch.long)
-            features['rot_frag_a'] = torch.zeros((0, 0), dtype=torch.bool)
-
-        if rot_bond_data is not None:
-            features['ring_masks'] = torch.from_numpy(rot_bond_data['ring_masks'])
-            features['sym_groups'] = torch.from_numpy(rot_bond_data['sym_groups']).long()
-            features['sym_group_sizes'] = torch.from_numpy(rot_bond_data['sym_group_sizes']).long()
-        else:
-            features['ring_masks'] = torch.zeros((0, 0), dtype=torch.bool)
-            features['sym_groups'] = torch.zeros((0, 1), dtype=torch.long)
-            features['sym_group_sizes'] = torch.zeros(0, dtype=torch.long)
+        _apply_rot_bond_data_to_features(features, rot_bond_data)
 
         e_min = sample.e_min
         features['e_min'] = torch.tensor(e_min, dtype=torch.float32) if e_min is not None else torch.tensor(float('nan'), dtype=torch.float32)
