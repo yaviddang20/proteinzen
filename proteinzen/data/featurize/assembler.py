@@ -172,6 +172,11 @@ def process_rigid_features(
     # Filter to tokens' atoms
     token_data = data.tokens
     rigid_data = data.rigids
+    # rigid_data may contain rigids for ALL tokens (pre-crop). Filter to only the
+    # rigids that belong to the current (possibly cropped) token set so that
+    # position 0..N_cropped_rigids-1 in the assembled tensors match token_data.
+    cropped_token_idxs = token_data["token_idx"]
+    rigid_data = rigid_data[np.isin(rigid_data["token_idx"], cropped_token_idxs)]
     rigid_to_token = []
     rigid_to_seq_idx = []
 
@@ -228,6 +233,7 @@ def process_rigid_features(
         sidechain_idx = pad_dim(sidechain_idx, 0, pad_len)
         new_rigids_noising_mask = pad_dim(new_rigids_noising_mask, 0, pad_len, value=True)
         rigids_seq_idx = pad_dim(rigids_seq_idx, 0, pad_len)
+        is_atom_mask = pad_dim(is_atom_mask, 0, pad_len)
 
         tensor7_pad = torch.zeros((pad_len, 7), device=tensor7.device, dtype=tensor7.dtype)
         tensor7_pad[:, 0] = 1

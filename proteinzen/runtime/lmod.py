@@ -800,6 +800,12 @@ class BiomoleculeModule(L.LightningModule):
         for i in range(min(n_samples, B)):
             mask = rigids_mask[i]
             elements = ref_elements[i]
+            log.info(f"[write_val_pdbs DEBUG] sample {i}: rigids shape {mask.shape}, "
+                     f"is_atom_mask sum={is_atom_mask[i].sum()}, "
+                     f"rigids_noising_mask sum={rigids_noising_mask[i].sum()}, "
+                     f"elements==-1 sum={(elements==-1).sum()}, "
+                     f"mask sum={mask.sum()}, "
+                     f"unique elements (first 20 nonzero): {np.unique(elements[elements!=0])[:20]}")
             # Protein: only backbone rigid (sidechain_idx=0), written as CA.
             # Ligand: all heavy atoms (is_atom_mask=True, element != 1).
             is_protein_backbone = (elements == -1) & (rigids_sc_idx[i] == 0)
