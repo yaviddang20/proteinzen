@@ -479,6 +479,9 @@ def finalize(outdir: Path) -> None:
 def process(args, clusters: dict, annotations: dict, split: dict) -> None:
     plinder_dir = args.plinder_dir
     outdir = args.outdir
+    if args.overwrite and outdir.exists():
+        import shutil
+        shutil.rmtree(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
     system_ids = [sid for sid, s in split.items() if s in args.splits]
@@ -522,6 +525,8 @@ if __name__ == "__main__":
     parser.add_argument("--num-processes", type=int, default=multiprocessing.cpu_count())
     parser.add_argument("--max-systems", type=int, default=None,
                         help="Cap number of systems per split (for debugging)")
+    parser.add_argument("--overwrite", action="store_true", default=False,
+                        help="Delete and recreate the output directory before processing")
     args = parser.parse_args()
 
     # Set rdkit pickle options
