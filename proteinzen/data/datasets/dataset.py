@@ -28,9 +28,11 @@ class MMCIFDataset(data.Dataset):
             overfit_num=None,
             count_on_protein_res=False,
             use_conformer_record=True,
+            interface_crop=False,
         ):
         self._log = logging.getLogger(__name__)
         self.data_dir = data_dir
+        self.interface_crop = interface_crop
         self.min_num_res = min_num_res
         self.max_num_res = max_num_res
         self.subset = subset

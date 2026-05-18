@@ -339,6 +339,8 @@ class TrainingDataset(torch.utils.data.Dataset):
         dataset = self.datasets[dataset_idx]
         task_sampler = dataset.task_sampler
         sample: Sample = next(self.samples[dataset_idx])
+        if dataset.interface_crop:
+            sample.interface_id = 0
         task = task_sampler.sample_task()
 
         struct, rot_bond_data = load_input(sample.record, Path(dataset.data_dir), include_h=self.include_h)
@@ -483,6 +485,7 @@ class ValidationDataset(torch.utils.data.Dataset):
         self.lap_pe_k = lap_pe_k
 
         for dataset in datasets:
+            interface_id = 0 if dataset.interface_crop else None
             for entry in dataset.manifest:
                 if isinstance(entry, ConformerRecord):
                     boltzmann_weights = entry.boltzmann_weights
@@ -497,9 +500,9 @@ class ValidationDataset(torch.utils.data.Dataset):
                         md=entry.md,
                         affinity=entry.affinity,
                     )
-                    self.samples.append(Sample(record=record, e_min=entry.e_min))
+                    self.samples.append(Sample(record=record, e_min=entry.e_min, interface_id=interface_id))
                 else:
-                    self.samples.append(Sample(record=entry))
+                    self.samples.append(Sample(record=entry, interface_id=interface_id))
 
     def __getitem__(self, idx):
         dataset_idx = np.random.choice(
