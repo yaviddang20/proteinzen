@@ -172,11 +172,6 @@ def process_rigid_features(
     # Filter to tokens' atoms
     token_data = data.tokens
     rigid_data = data.rigids
-    # rigid_data may contain rigids for ALL tokens (pre-crop). Filter to only the
-    # rigids that belong to the current (possibly cropped) token set so that
-    # position 0..N_cropped_rigids-1 in the assembled tensors match token_data.
-    cropped_token_idxs = token_data["token_idx"]
-    rigid_data = rigid_data[np.isin(rigid_data["token_idx"], cropped_token_idxs)]
     rigid_to_token = []
     rigid_to_seq_idx = []
 

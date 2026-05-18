@@ -314,5 +314,11 @@ class Cropper:
         token_bonds = token_bonds[np.isin(token_bonds["token_1"], indices)]
         token_bonds = token_bonds[np.isin(token_bonds["token_2"], indices)]
 
-        # Return the cropped tokens
-        return replace(data, tokens=token_data, bonds=token_bonds)
+        # Filter rigids to only those belonging to the cropped token set.
+        # Without this, data.rigids stays as the full pre-crop array, causing
+        # a length mismatch vs rigid_to_token (built from token_data["rigid_num"])
+        # in the assembler — the collate then silently truncates all feature tensors
+        # to the shorter rigid_to_token length, cutting off all ligand atoms.
+        rigid_data = data.rigids[np.isin(data.rigids["token_idx"], indices)]
+
+        return replace(data, tokens=token_data, bonds=token_bonds, rigids=rigid_data)
