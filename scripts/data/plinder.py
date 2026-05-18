@@ -470,7 +470,7 @@ def finalize(outdir: Path) -> None:
     if failed:
         print(f"Failed to parse {failed} record files")
     with open(outdir / "manifest.json", "w") as f:
-        json.dump(records, f)
+        json.dump(records, f, indent=2)
     print(f"Wrote manifest with {len(records)} entries")
 
 
