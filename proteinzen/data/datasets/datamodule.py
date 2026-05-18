@@ -341,6 +341,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         sample: Sample = next(self.samples[dataset_idx])
         if dataset.interface_crop:
             sample.interface_id = 0
+            sample.chain_id = None
         task = task_sampler.sample_task()
 
         struct, rot_bond_data = load_input(sample.record, Path(dataset.data_dir), include_h=self.include_h)
