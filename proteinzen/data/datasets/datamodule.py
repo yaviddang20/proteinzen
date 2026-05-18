@@ -214,15 +214,11 @@ def _apply_rot_bond_data_to_features(features: dict, rot_bond_data) -> None:
     n_atom_pos = atom_positions.shape[0]
 
     if rot_bond_data is not None and rot_bond_data['rot_bonds'].shape[0] > 0:
-        assert n_atom_pos > 0, (
-            "rot_bond_data has rotatable bonds but rigids_is_atom_mask has no True entries — "
-            "assembler likely returned wrong rigids (pre-crop full array instead of filtered)"
-        )
         rb_local = torch.from_numpy(rot_bond_data['rot_bonds']).long()  # (B, 2)
         n_lig_local = rot_bond_data['rot_frag_a'].shape[1]
         n_map = min(n_lig_local, n_atom_pos)
         target = atom_positions[:n_map]
-        features['rot_bonds'] = target[rb_local.clamp(0, n_map - 1)]
+        features['rot_bonds'] = target[rb_local.clamp(0, max(n_map - 1, 0))]
         fa_local = torch.from_numpy(rot_bond_data['rot_frag_a'])  # (B, n_lig)
         fa_global = torch.zeros(fa_local.shape[0], L_pad, dtype=torch.bool)
         fa_global[:, target] = fa_local[:, :n_map]

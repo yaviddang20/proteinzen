@@ -228,7 +228,6 @@ def process_rigid_features(
         sidechain_idx = pad_dim(sidechain_idx, 0, pad_len)
         new_rigids_noising_mask = pad_dim(new_rigids_noising_mask, 0, pad_len, value=True)
         rigids_seq_idx = pad_dim(rigids_seq_idx, 0, pad_len)
-        is_atom_mask = pad_dim(is_atom_mask, 0, pad_len)
 
         tensor7_pad = torch.zeros((pad_len, 7), device=tensor7.device, dtype=tensor7.dtype)
         tensor7_pad[:, 0] = 1
