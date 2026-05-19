@@ -283,6 +283,9 @@ _ELEMENT_SYMBOLS = {1: 'H', 6: 'C', 7: 'N', 8: 'O', 9: 'F', 15: 'P', 16: 'S', 17
 _CHAIN_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 
+_BB_ATOM_NAMES = {0: " N  ", 1: " CA ", 2: " C  "}
+
+
 def _write_model_block(
     f,
     coords: np.ndarray,
@@ -291,6 +294,7 @@ def _write_model_block(
     res_types: np.ndarray,
     asym_ids: np.ndarray,
     seq_idxs: np.ndarray,
+    sc_idxs: np.ndarray,
     model_num: int,
 ):
     from proteinzen.boltz.data import const
@@ -300,10 +304,16 @@ def _write_model_block(
     nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
 
     f.write(f"MODEL        {model_num}\n")
-    res_idx_counter = {}  # asym_id → residue serial
-    for i, (xyz, el, mol_type, res_type, asym_id, seq_idx) in enumerate(
-        zip(coords, elements, mol_types, res_types, asym_ids, seq_idxs)
+    prev_asym_id = None
+    atom_serial = 0
+    for i, (xyz, el, mol_type, res_type, asym_id, seq_idx, sc_idx) in enumerate(
+        zip(coords, elements, mol_types, res_types, asym_ids, seq_idxs, sc_idxs)
     ):
+        # Write TER when chain changes
+        if prev_asym_id is not None and int(asym_id) != int(prev_asym_id):
+            f.write(f"TER   {atom_serial+1:>5}\n")
+        prev_asym_id = asym_id
+
         sym = _ELEMENT_SYMBOLS.get(int(el), 'X')
         x, y, z = float(xyz[0]), float(xyz[1]), float(xyz[2])
         chain_letter = _CHAIN_ALPHABET[int(asym_id) % len(_CHAIN_ALPHABET)]
@@ -312,20 +322,20 @@ def _write_model_block(
             record = "ATOM  "
             one_letter = rc.restypes_with_x[int(res_type)] if int(res_type) < len(rc.restypes_with_x) else 'X'
             res_name = rc.restype_1to3.get(one_letter, 'UNK')
-            atom_name = " CA "
+            atom_name = _BB_ATOM_NAMES.get(int(sc_idx), " CA ")
         elif int(mol_type) == nonpolymer_id:
             record = "HETATM"
             res_name = "LIG"
             atom_name = f" {sym:<3}"
         else:
-            # RNA/DNA
             record = "ATOM  "
             res_name = "UNK"
             atom_name = " CA "
 
         res_serial = int(seq_idx) + 1
+        atom_serial = i + 1
         f.write(
-            f"{record}{i+1:>5} {atom_name} {res_name:>3} {chain_letter}{res_serial:>4}    "
+            f"{record}{atom_serial:>5} {atom_name} {res_name:>3} {chain_letter}{res_serial:>4}    "
             f"{x:>8.3f}{y:>8.3f}{z:>8.3f}  1.00  0.00          {sym:>2}\n"
         )
     f.write("ENDMDL\n")
@@ -339,12 +349,13 @@ def write_val_pdb(
     res_types: np.ndarray,
     asym_ids: np.ndarray,
     seq_idxs: np.ndarray,
+    sc_idxs: np.ndarray,
     path: str,
 ):
     """Write a two-MODEL PDB: MODEL 1 = GT, MODEL 2 = predicted."""
     with open(path, "w") as f:
-        _write_model_block(f, gt_coords, elements, mol_types, res_types, asym_ids, seq_idxs, 1)
-        _write_model_block(f, pred_coords, elements, mol_types, res_types, asym_ids, seq_idxs, 2)
+        _write_model_block(f, gt_coords, elements, mol_types, res_types, asym_ids, seq_idxs, sc_idxs, 1)
+        _write_model_block(f, pred_coords, elements, mol_types, res_types, asym_ids, seq_idxs, sc_idxs, 2)
         f.write("END\n")
 
 
@@ -800,9 +811,9 @@ class BiomoleculeModule(L.LightningModule):
         for i in range(min(n_samples, B)):
             mask = rigids_mask[i]
             elements = ref_elements[i]
-            # Protein: only backbone rigid (sidechain_idx=0), written as CA.
+            # Protein: all 3 backbone frames (N/CA/C, element==-1).
             # Ligand: all heavy atoms (is_atom_mask=True, element != 1).
-            is_protein_backbone = (elements == -1) & (rigids_sc_idx[i] == 0)
+            is_protein_backbone = (elements == -1)
             is_ligand_heavy = is_atom_mask[i] & (elements != 1)
             write_mask = mask & (is_protein_backbone | is_ligand_heavy)
             if write_mask.sum() == 0:
@@ -810,15 +821,14 @@ class BiomoleculeModule(L.LightningModule):
 
             tok_idx = rigids_to_token[i][write_mask]
             seq_idx = rigids_seq_idx[i][write_mask]
-            # mol_type: derive from is_atom_mask directly rather than token lookup
-            # to avoid any token-indexing issues
+            sc_idx = rigids_sc_idx[i][write_mask]
             atom_flag = is_atom_mask[i][write_mask]  # True=ligand, False=protein backbone
             mol_type_arr = np.where(atom_flag,
                                     const.chain_type_ids["NONPOLYMER"],
                                     const.chain_type_ids["PROTEIN"])
             res_types = res_types_tok[i][tok_idx]
             asym_ids = asym_ids_tok[i][tok_idx]
-            # Treat protein sentinel element (-1) as carbon (CA) for PDB writing
+            # Treat protein sentinel element (-1) as carbon for PDB element column
             elems_for_pdb = np.where(elements[write_mask] == -1, 6, elements[write_mask])
 
             mse_val = per_sample_mse[i].item()
@@ -832,6 +842,7 @@ class BiomoleculeModule(L.LightningModule):
                     res_types,
                     asym_ids,
                     seq_idx,
+                    sc_idx,
                     path,
                 )
             except Exception as e:
