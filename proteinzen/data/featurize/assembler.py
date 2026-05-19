@@ -171,11 +171,7 @@ def process_rigid_features(
     """
     # Filter to tokens' atoms
     token_data = data.tokens
-    rigid_indices = []
-    for token in token_data:
-        start = int(token["rigid_idx"])
-        rigid_indices.extend(range(start, start + int(token["rigid_num"])))
-    rigid_data = data.rigids[rigid_indices]
+    rigid_data = data.rigids
     rigid_to_token = []
     rigid_to_seq_idx = []
 

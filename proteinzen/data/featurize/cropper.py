@@ -314,5 +314,12 @@ class Cropper:
         token_bonds = token_bonds[np.isin(token_bonds["token_1"], indices)]
         token_bonds = token_bonds[np.isin(token_bonds["token_2"], indices)]
 
+        # Only keep rigids belonging to the cropped tokens
+        rigid_indices = []
+        for token in token_data:
+            start = int(token["rigid_idx"])
+            rigid_indices.extend(range(start, start + int(token["rigid_num"])))
+        cropped_rigids = data.rigids[rigid_indices]
+
         # Return the cropped tokens
-        return replace(data, tokens=token_data, bonds=token_bonds)
+        return replace(data, tokens=token_data, bonds=token_bonds, rigids=cropped_rigids)
