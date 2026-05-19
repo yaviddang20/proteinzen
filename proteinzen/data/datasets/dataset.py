@@ -76,6 +76,8 @@ class MMCIFDataset(data.Dataset):
                     break
             if _exclude_record:
                 continue
+            if self.interface_crop and not record.get('interfaces'):
+                continue
             # apply some filtering critera that we might change at train time
             if self.count_on_protein_res:
                 num_res = sum(chain['num_residues'] for chain in record['chains'] if chain['mol_type'] == 0)
