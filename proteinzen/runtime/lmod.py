@@ -283,79 +283,126 @@ _ELEMENT_SYMBOLS = {1: 'H', 6: 'C', 7: 'N', 8: 'O', 9: 'F', 15: 'P', 16: 'S', 17
 _CHAIN_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 
-_BB_ATOM_NAMES = {0: " N  ", 1: " CA ", 2: " C  "}
-
-
-def _write_model_block(
-    f,
-    coords: np.ndarray,
-    elements: np.ndarray,
-    mol_types: np.ndarray,
-    res_types: np.ndarray,
-    asym_ids: np.ndarray,
-    seq_idxs: np.ndarray,
-    sc_idxs: np.ndarray,
-    model_num: int,
-):
-    from proteinzen.boltz.data import const
+def _build_all_atom_records(rigid_tensor7, rigids_mask, ref_elements, is_atom_mask,
+                             rigids_sc_idx, rigids_to_token, rigids_seq_idx,
+                             res_types_tok, asym_ids_tok):
+    """Return a list of atom dicts for one sample, with full sidechains for protein."""
+    from collections import defaultdict
+    from proteinzen.data.featurize.tokenize import RES_TO_AA
+    from proteinzen.utils import coarse_grain as cg_utils
     from proteinzen.openfold.data import residue_constants as rc
 
     protein_id = const.chain_type_ids["PROTEIN"]
     nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
 
+    records = []
+
+    # --- Protein: group 3 backbone rigids per token, reconstruct all atoms ---
+    protein_bb_mask = rigids_mask & (ref_elements == -1)
+    token_to_sc = defaultdict(dict)
+    for r_idx in np.where(protein_bb_mask)[0]:
+        tok = int(rigids_to_token[r_idx])
+        sc = int(rigids_sc_idx[r_idx])
+        token_to_sc[tok][sc] = r_idx
+
+    for tok in sorted(token_to_sc.keys()):
+        sc_map = token_to_sc[tok]
+        if len(sc_map) != 3:
+            continue
+        r_indices = [sc_map[sc] for sc in (0, 1, 2)]
+        tensor7 = torch.as_tensor(rigid_tensor7[r_indices])
+        rigids_obj = ru.Rigid.from_tensor_7(tensor7)
+
+        res_type = int(res_types_tok[tok])
+        aa_type = RES_TO_AA[res_type]
+        seq_t = torch.tensor([aa_type])
+        dummy_mask = torch.ones(1, dtype=torch.bool)
+        atom14, atom14_mask = cg_utils.compute_atom14_from_cg_frames(
+            rigids_obj, dummy_mask, seq_t, return_atom_mask=True
+        )
+        atom14 = atom14.squeeze(0).numpy()
+        atom14_mask = atom14_mask.squeeze(0).bool().numpy()
+
+        one_letter = rc.restypes_with_x[res_type] if res_type < len(rc.restypes_with_x) else 'X'
+        res_name = rc.restype_1to3.get(one_letter, 'UNK')
+        atom14_names = rc.restype_name_to_atom14_names.get(res_name, [])
+        asym_id = int(asym_ids_tok[tok])
+        seq_idx = int(rigids_seq_idx[r_indices[1]])  # use CA rigid's seq_idx
+
+        for aname, present, xyz in zip(atom14_names, atom14_mask, atom14):
+            if not present or not aname:
+                continue
+            records.append({
+                'asym_id': asym_id, 'seq_idx': seq_idx, 'res_name': res_name,
+                'atom_name': aname, 'element': aname[0], 'xyz': xyz,
+                'mol_type': protein_id,
+            })
+
+    # --- Ligand: use rigid translations directly ---
+    ligand_mask = rigids_mask & is_atom_mask & (ref_elements != 1)
+    for r_idx in np.where(ligand_mask)[0]:
+        tok = int(rigids_to_token[r_idx])
+        asym_id = int(asym_ids_tok[tok])
+        seq_idx = int(rigids_seq_idx[r_idx])
+        el = int(ref_elements[r_idx])
+        elem_sym = _ELEMENT_SYMBOLS.get(el, 'X')
+        xyz = rigid_tensor7[r_idx, 4:]
+        records.append({
+            'asym_id': asym_id, 'seq_idx': seq_idx, 'res_name': 'LIG',
+            'atom_name': elem_sym, 'element': elem_sym, 'xyz': xyz,
+            'mol_type': nonpolymer_id,
+        })
+
+    records.sort(key=lambda r: (r['asym_id'], r['seq_idx']))
+    return records
+
+
+def _write_model_block(f, atom_records, model_num):
+    protein_id = const.chain_type_ids["PROTEIN"]
+    nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
+
     f.write(f"MODEL        {model_num}\n")
     prev_asym_id = None
-    atom_serial = 0
-    for i, (xyz, el, mol_type, res_type, asym_id, seq_idx, sc_idx) in enumerate(
-        zip(coords, elements, mol_types, res_types, asym_ids, seq_idxs, sc_idxs)
-    ):
-        # Write TER when chain changes
-        if prev_asym_id is not None and int(asym_id) != int(prev_asym_id):
-            f.write(f"TER   {atom_serial+1:>5}\n")
+    for i, rec in enumerate(atom_records):
+        asym_id = rec['asym_id']
+        if prev_asym_id is not None and asym_id != prev_asym_id:
+            f.write(f"TER   {i:>5}\n")
         prev_asym_id = asym_id
 
-        sym = _ELEMENT_SYMBOLS.get(int(el), 'X')
-        x, y, z = float(xyz[0]), float(xyz[1]), float(xyz[2])
-        chain_letter = _CHAIN_ALPHABET[int(asym_id) % len(_CHAIN_ALPHABET)]
+        chain_letter = _CHAIN_ALPHABET[asym_id % len(_CHAIN_ALPHABET)]
+        x, y, z = float(rec['xyz'][0]), float(rec['xyz'][1]), float(rec['xyz'][2])
+        res_serial = rec['seq_idx'] + 1
+        elem = rec['element'].upper()
+        aname = rec['atom_name']
+        pdb_aname = f" {aname:<3}" if len(aname) < 4 else aname
 
-        if int(mol_type) == protein_id:
-            record = "ATOM  "
-            one_letter = rc.restypes_with_x[int(res_type)] if int(res_type) < len(rc.restypes_with_x) else 'X'
-            res_name = rc.restype_1to3.get(one_letter, 'UNK')
-            atom_name = _BB_ATOM_NAMES.get(int(sc_idx), " CA ")
-        elif int(mol_type) == nonpolymer_id:
+        if rec['mol_type'] == nonpolymer_id:
             record = "HETATM"
-            res_name = "LIG"
-            atom_name = f" {sym:<3}"
         else:
             record = "ATOM  "
-            res_name = "UNK"
-            atom_name = " CA "
 
-        res_serial = int(seq_idx) + 1
-        atom_serial = i + 1
         f.write(
-            f"{record}{atom_serial:>5} {atom_name} {res_name:>3} {chain_letter}{res_serial:>4}    "
-            f"{x:>8.3f}{y:>8.3f}{z:>8.3f}  1.00  0.00          {sym:>2}\n"
+            f"{record}{i+1:>5} {pdb_aname} {rec['res_name']:>3} {chain_letter}{res_serial:>4}    "
+            f"{x:>8.3f}{y:>8.3f}{z:>8.3f}  1.00  0.00          {elem:>2}\n"
         )
     f.write("ENDMDL\n")
 
 
-def write_val_pdb(
-    gt_coords: np.ndarray,
-    pred_coords: np.ndarray,
-    elements: np.ndarray,
-    mol_types: np.ndarray,
-    res_types: np.ndarray,
-    asym_ids: np.ndarray,
-    seq_idxs: np.ndarray,
-    sc_idxs: np.ndarray,
-    path: str,
-):
-    """Write a two-MODEL PDB: MODEL 1 = GT, MODEL 2 = predicted."""
+def write_val_pdb(gt_rigid7, pred_rigid7, rigids_mask, ref_elements, is_atom_mask,
+                  rigids_sc_idx, rigids_to_token, rigids_seq_idx,
+                  res_types_tok, asym_ids_tok, path):
+    """Write a two-MODEL PDB: MODEL 1 = GT, MODEL 2 = predicted, with full sidechains."""
+    gt_records = _build_all_atom_records(
+        gt_rigid7, rigids_mask, ref_elements, is_atom_mask,
+        rigids_sc_idx, rigids_to_token, rigids_seq_idx, res_types_tok, asym_ids_tok,
+    )
+    pred_records = _build_all_atom_records(
+        pred_rigid7, rigids_mask, ref_elements, is_atom_mask,
+        rigids_sc_idx, rigids_to_token, rigids_seq_idx, res_types_tok, asym_ids_tok,
+    )
     with open(path, "w") as f:
-        _write_model_block(f, gt_coords, elements, mol_types, res_types, asym_ids, seq_idxs, sc_idxs, 1)
-        _write_model_block(f, pred_coords, elements, mol_types, res_types, asym_ids, seq_idxs, sc_idxs, 2)
+        _write_model_block(f, gt_records, 1)
+        _write_model_block(f, pred_records, 2)
         f.write("END\n")
 
 
@@ -808,41 +855,33 @@ class BiomoleculeModule(L.LightningModule):
         res_types_tok = token['res_type'].cpu().numpy()   # [B, T]
         asym_ids_tok = token['asym_id'].cpu().numpy()     # [B, T]
 
-        for i in range(min(n_samples, B)):
-            mask = rigids_mask[i]
-            elements = ref_elements[i]
-            # Protein: all 3 backbone frames (N/CA/C, element==-1).
-            # Ligand: all heavy atoms (is_atom_mask=True, element != 1).
-            is_protein_backbone = (elements == -1)
-            is_ligand_heavy = is_atom_mask[i] & (elements != 1)
-            write_mask = mask & (is_protein_backbone | is_ligand_heavy)
-            if write_mask.sum() == 0:
-                continue
+        gt_rigid7 = rigids['rigids_1'].cpu().numpy()          # [B, R, 7]
+        pred_rigid7 = outputs['denoised_rigids'].to_tensor_7().cpu().numpy()  # [B, R, 7]
+        # For MODEL 2: use GT for fixed (non-noised) rigids, pred for generated
+        pred_rigid7_display = np.where(
+            rigids_noising_mask[:, :, None], pred_rigid7, gt_rigid7
+        )
 
-            tok_idx = rigids_to_token[i][write_mask]
-            seq_idx = rigids_seq_idx[i][write_mask]
-            sc_idx = rigids_sc_idx[i][write_mask]
-            atom_flag = is_atom_mask[i][write_mask]  # True=ligand, False=protein backbone
-            mol_type_arr = np.where(atom_flag,
-                                    const.chain_type_ids["NONPOLYMER"],
-                                    const.chain_type_ids["PROTEIN"])
-            res_types = res_types_tok[i][tok_idx]
-            asym_ids = asym_ids_tok[i][tok_idx]
-            # Treat protein sentinel element (-1) as carbon for PDB element column
-            elems_for_pdb = np.where(elements[write_mask] == -1, 6, elements[write_mask])
+        for i in range(min(n_samples, B)):
+            has_protein = ((ref_elements[i] == -1) & rigids_mask[i]).any()
+            has_ligand = (is_atom_mask[i] & rigids_mask[i] & (ref_elements[i] != 1)).any()
+            if not has_protein and not has_ligand:
+                continue
 
             mse_val = per_sample_mse[i].item()
             path = os.path.join(out_dir, f"sample_{i:02d}_mse{mse_val:.3f}.pdb")
             try:
                 write_val_pdb(
-                    gt_trans[i][write_mask],
-                    pred_trans_display[i][write_mask],
-                    elems_for_pdb,
-                    mol_type_arr,
-                    res_types,
-                    asym_ids,
-                    seq_idx,
-                    sc_idx,
+                    gt_rigid7[i],
+                    pred_rigid7_display[i],
+                    rigids_mask[i],
+                    ref_elements[i],
+                    is_atom_mask[i],
+                    rigids_sc_idx[i],
+                    rigids_to_token[i],
+                    rigids_seq_idx[i],
+                    res_types_tok[i],
+                    asym_ids_tok[i],
                     path,
                 )
             except Exception as e:
