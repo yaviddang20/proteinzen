@@ -251,8 +251,18 @@ class Cropper:
         dists = valid_tokens["center_coords"] - query["center_coords"]
         indices = np.argsort(np.linalg.norm(dists, axis=1))
 
-        # Select cropped indices
+        # When cropping around a protein-ligand interface, seed the crop with
+        # all NONPOLYMER tokens from that interface so the budget loop fills
+        # remaining space with protein residues and the ligand is never dropped.
         cropped: set[int] = set()
+        if interface_id is not None:
+            nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
+            iface = interfaces[interface_id]
+            iface_chains = {int(iface["chain_1"]), int(iface["chain_2"])}
+            for token in token_data:
+                if int(token["mol_type"]) == nonpolymer_id and int(token["asym_id"]) in iface_chains:
+                    cropped.add(int(token["token_idx"]))
+
         total_rigids = 0
         for idx in indices:
             # Get the token
@@ -312,14 +322,4 @@ class Cropper:
         # Only keep bonds within the cropped tokens
         indices = token_data["token_idx"]
         token_bonds = token_bonds[np.isin(token_bonds["token_1"], indices)]
-        token_bonds = token_bonds[np.isin(token_bonds["token_2"], indices)]
-
-        # Only keep rigids belonging to the cropped tokens
-        rigid_indices = []
-        for token in token_data:
-            start = int(token["rigid_idx"])
-            rigid_indices.extend(range(start, start + int(token["rigid_num"])))
-        cropped_rigids = data.rigids[rigid_indices]
-
-        # Return the cropped tokens
-        return replace(data, tokens=token_data, bonds=token_bonds, rigids=cropped_rigids)
+        tok
