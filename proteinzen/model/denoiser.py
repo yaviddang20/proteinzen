@@ -429,6 +429,7 @@ class Embedder(nn.Module):
         rigids_token_uid,
         rigids_idx,
         rigids_is_atomized_mask,
+        rigids_noising_mask=None,
         rigids_lap_pe=None,
     ):
         nodes_to_rigids = fn.partial(gather_helper, token_gather_idx=rigids_token_uid)
@@ -436,6 +437,9 @@ class Embedder(nn.Module):
         rigids_init = self.rigid_init(nodes_to_rigids(node_init))
         if self.predict_time:
             time_embed = self.rigid_time_embed(self.timestep_embedder(t))
+            # Fixed (non-noised) rigids are always at t=0 — zero out their time embedding
+            if rigids_noising_mask is not None:
+                time_embed = time_embed * rigids_noising_mask[..., None]
         else:
             time_embed = torch.zeros_like(rigids_init)
         rigids_idx_embed = self.rigid_idx_embed(rigids_idx)
@@ -578,6 +582,7 @@ class Embedder(nn.Module):
             rigids_token_uid,
             rigids_idx,
             rigids_is_atomized_mask,
+            rigids_noising_mask=rigids_noising_mask,
             rigids_lap_pe=rigids_lap_pe,
         )
 
