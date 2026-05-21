@@ -396,6 +396,8 @@ def collate(data_list):
         batched_data_list['smiles'] = [data['smiles'] for data in data_list]
     if 'name' in data_list[0]:
         batched_data_list['name'] = [data['name'] for data in data_list]
+    if 'record_id' in data_list[0]:
+        batched_data_list['record_id'] = [data['record_id'] for data in data_list]
     if 'input_data' in data_list[0]:
         batched_data_list['input_data'] = [asdict(data['input_data']) for data in data_list]
 

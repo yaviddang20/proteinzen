@@ -408,6 +408,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         )
         features['task'] = task
         features['structure'] = struct
+        features['record_id'] = sample.record.id
 
         _apply_rot_bond_data_to_features(features, rot_bond_data)
 
@@ -574,6 +575,7 @@ class ValidationDataset(torch.utils.data.Dataset):
         )
         features['task'] = task
         features['structure'] = struct
+        features['record_id'] = sample.record.id
 
         _apply_rot_bond_data_to_features(features, rot_bond_data)
 

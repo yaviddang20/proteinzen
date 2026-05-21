@@ -862,6 +862,8 @@ class BiomoleculeModule(L.LightningModule):
             rigids_noising_mask[:, :, None], pred_rigid7, gt_rigid7
         )
 
+        record_ids = batch.get('record_id', [None] * B)
+
         for i in range(min(n_samples, B)):
             has_protein = ((ref_elements[i] == -1) & rigids_mask[i]).any()
             has_ligand = (is_atom_mask[i] & rigids_mask[i] & (ref_elements[i] != 1)).any()
@@ -869,7 +871,10 @@ class BiomoleculeModule(L.LightningModule):
                 continue
 
             mse_val = per_sample_mse[i].item()
-            path = os.path.join(out_dir, f"sample_{i:02d}_mse{mse_val:.3f}.pdb")
+            rid = record_ids[i] if record_ids[i] is not None else f"sample_{i:02d}"
+            # sanitize for filename
+            rid = rid.replace("/", "_").replace(" ", "_")
+            path = os.path.join(out_dir, f"{rid}_mse={mse_val:.3f}.pdb")
             try:
                 write_val_pdb(
                     gt_rigid7[i],
