@@ -622,13 +622,13 @@ class BiomoleculeDataModule(L.LightningDataModule):
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
 
-    def build_dataloader(self, x, collate_fn):
+    def build_dataloader(self, x, collate_fn, shuffle=False):
         dataloader = DataLoader(
             x,
             num_workers=self.num_workers,
             batch_size=self.batch_size,
             collate_fn=collate_fn,
-            shuffle=False,
+            shuffle=shuffle,
         )
         return dataloader
 
@@ -636,7 +636,7 @@ class BiomoleculeDataModule(L.LightningDataModule):
         return self.build_dataloader(self.train_dataset, collate)
 
     def val_dataloader(self):
-        return self.build_dataloader(self.val_dataset, collate)
+        return self.build_dataloader(self.val_dataset, collate, shuffle=True)
 
 
 class BiomoleculeSamplingDataModule(L.LightningDataModule):
