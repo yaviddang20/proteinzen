@@ -821,7 +821,9 @@ class BiomoleculeModule(L.LightningModule):
     def _collect_val_pdb_data(self, batch, outputs, t_val: float, n_samples: int = 5):
         """Extract all GPU tensors to CPU numpy — call in main thread before spawning writer thread."""
         epoch = self.trainer.current_epoch
-        log_dir = self.trainer.log_dir or os.getcwd()
+        # trainer.log_dir does a strategy.broadcast() — must be called on ALL ranks.
+        # Since _collect_val_pdb_data runs on rank 0 only, use default_root_dir instead.
+        log_dir = self.trainer.default_root_dir or os.getcwd()
         out_dir = os.path.join(log_dir, f"val_pdbs/epoch_{epoch:04d}/t_{t_val}")
         os.makedirs(out_dir, exist_ok=True)
 
