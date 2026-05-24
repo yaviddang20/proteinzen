@@ -295,10 +295,14 @@ def _gt_pdb_body(gt_struct) -> str:
 
 
 def write_pocket_pdb(path: Path, gt_struct, gen_lig_pk: np.ndarray, lig_elements: list):
-    """aligned_pocket: MODEL 1 = GT protein + GT ligand, MODEL 2 = pocket-aligned gen ligand."""
+    """aligned_pocket: MODEL 1 = GT protein + GT ligand, MODEL 2 = GT protein + pocket-aligned gen ligand."""
     gt_body = _gt_pdb_body(gt_struct)
+    # Extract only the protein ATOM lines from the GT body (no HETATM/ligand)
+    prot_lines = [ln for ln in gt_body.splitlines() if ln.startswith("ATOM")]
     lines = ["MODEL        1", gt_body.rstrip(), "ENDMDL",
              "MODEL        2"]
+    lines += prot_lines
+    lines += ["TER"]
     lines += _hetatm_lines(gen_lig_pk, lig_elements)
     lines += ["ENDMDL", "END"]
     path.write_text("\n".join(lines) + "\n")
