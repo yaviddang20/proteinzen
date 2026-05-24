@@ -7,7 +7,6 @@ import warnings
 from dataclasses import replace
 import os
 import json
-import threading
 
 from xtb.interface import Calculator, Param
 
@@ -803,13 +802,12 @@ class BiomoleculeModule(L.LightningModule):
             batch_t["t"] = torch.full((*batch_t["t"].shape,), t_val, device=device)
 
             if write_pdbs:
+                import threading
                 loss_dict, batch_out, outputs = self._shared_step(batch_t, return_outputs=True)
-                # Write PDBs in a daemon thread so rank 0 doesn't block the NCCL allreduce
-                threading.Thread(
-                    target=self._write_val_pdbs,
-                    args=(batch_out, outputs, t_val),
-                    daemon=True,
-                ).start()
+                # Phase 1 (main thread): extract all GPU tensors → numpy now, before any NCCL sync
+                pdb_data = self._collect_val_pdb_data(batch_out, outputs, t_val)
+                # Phase 2 (background thread): pure CPU/numpy file writing, no CUDA ops
+                threading.Thread(target=self._write_val_pdbs, args=(pdb_data,), daemon=True).start()
             else:
                 loss_dict = self._shared_step(batch_t)
 
@@ -820,13 +818,8 @@ class BiomoleculeModule(L.LightningModule):
                 stage=f"val/t_{t_val}",
             )
 
-    def _write_val_pdbs(self, batch, outputs, t_val: float, n_samples: int = 5):
-        """Write n_samples two-MODEL PDBs (GT + predicted) for visual inspection.
-
-        MODEL 1 = full GT structure (protein + ligand ground truth coords).
-        MODEL 2 = GT protein coords + predicted ligand coords.
-        For unconditional tasks both models use pred coords for all atoms.
-        """
+    def _collect_val_pdb_data(self, batch, outputs, t_val: float, n_samples: int = 5):
+        """Extract all GPU tensors to CPU numpy — call in main thread before spawning writer thread."""
         epoch = self.trainer.current_epoch
         log_dir = self.trainer.log_dir or os.getcwd()
         out_dir = os.path.join(log_dir, f"val_pdbs/epoch_{epoch:04d}/t_{t_val}")
@@ -834,51 +827,61 @@ class BiomoleculeModule(L.LightningModule):
 
         B = batch["t"].shape[0]
         rigids = batch['rigids']
-        rigids_mask = rigids['rigids_mask'].cpu().numpy().astype(bool)           # [B, R]
-        rigids_noising_mask = rigids['rigids_noising_mask'].cpu().numpy().astype(bool)  # [B, R]
-        gt_trans = ru.Rigid.from_tensor_7(rigids['rigids_1']).get_trans().cpu().numpy()
-        pred_trans = outputs['denoised_rigids'].get_trans().cpu().numpy()
-        ref_elements = rigids['rigids_ref_element'].cpu().numpy()                # [B, R]
-        rigids_seq_idx = rigids['rigids_seq_idx'].cpu().numpy()                  # [B, R]
-        rigids_to_token = rigids['rigids_to_token'].cpu().numpy()                # [B, R]
-        rigids_sc_idx = rigids['rigids_sidechain_idx'].cpu().numpy()             # [B, R]
-        is_atom_mask = rigids['rigids_is_atom_mask'].cpu().numpy().astype(bool)  # [B, R] True=ligand
+        # All .cpu().numpy() calls happen here in the main thread — no CUDA ops in the writer thread
+        rigids_mask          = rigids['rigids_mask'].cpu().numpy().astype(bool)
+        rigids_noising_mask  = rigids['rigids_noising_mask'].cpu().numpy().astype(bool)
+        gt_trans             = ru.Rigid.from_tensor_7(rigids['rigids_1']).get_trans().cpu().numpy()
+        pred_trans           = outputs['denoised_rigids'].get_trans().cpu().numpy()
+        ref_elements         = rigids['rigids_ref_element'].cpu().numpy()
+        rigids_seq_idx       = rigids['rigids_seq_idx'].cpu().numpy()
+        rigids_to_token      = rigids['rigids_to_token'].cpu().numpy()
+        rigids_sc_idx        = rigids['rigids_sidechain_idx'].cpu().numpy()
+        is_atom_mask         = rigids['rigids_is_atom_mask'].cpu().numpy().astype(bool)
+        gt_rigid7            = rigids['rigids_1'].cpu().numpy()
+        pred_rigid7          = outputs['denoised_rigids'].to_tensor_7().cpu().numpy()
+        res_types_tok        = batch['token']['res_type'].cpu().numpy()
+        asym_ids_tok         = batch['token']['asym_id'].cpu().numpy()
 
-        # For MODEL 2: use GT coords for conditioned (fixed) rigids, pred for generated rigids.
-        # Protein rigids have rigids_noising_mask=False → use GT; ligand has True → use pred.
-        pred_trans_display = np.where(
-            rigids_noising_mask[:, :, None], pred_trans, gt_trans
-        )
+        pred_rigid7_display = np.where(rigids_noising_mask[:, :, None], pred_rigid7, gt_rigid7)
 
-        # MSE over generated (noised) ligand atom rigids only — heavy atoms only (element != 1)
         noised_atom_mask = rigids_mask & rigids_noising_mask & is_atom_mask & (ref_elements != 1)
         n_noised = noised_atom_mask.sum(axis=-1).clip(min=1)
         se = np.square(pred_trans - gt_trans).sum(axis=-1)
         per_sample_mse = (se * noised_atom_mask).sum(axis=-1) / n_noised
 
-        token = batch['token']
-        mol_types_tok = token['mol_type'].cpu().numpy()   # [B, T]
-        res_types_tok = token['res_type'].cpu().numpy()   # [B, T]
-        asym_ids_tok = token['asym_id'].cpu().numpy()     # [B, T]
-
-        gt_rigid7 = rigids['rigids_1'].cpu().numpy()          # [B, R, 7]
-        pred_rigid7 = outputs['denoised_rigids'].to_tensor_7().cpu().numpy()  # [B, R, 7]
-        # For MODEL 2: use GT for fixed (non-noised) rigids, pred for generated
-        pred_rigid7_display = np.where(
-            rigids_noising_mask[:, :, None], pred_rigid7, gt_rigid7
+        return dict(
+            out_dir=out_dir, B=B, n_samples=n_samples,
+            rigids_mask=rigids_mask, rigids_noising_mask=rigids_noising_mask,
+            ref_elements=ref_elements, is_atom_mask=is_atom_mask,
+            rigids_sc_idx=rigids_sc_idx, rigids_to_token=rigids_to_token,
+            rigids_seq_idx=rigids_seq_idx, res_types_tok=res_types_tok,
+            asym_ids_tok=asym_ids_tok, gt_rigid7=gt_rigid7,
+            pred_rigid7_display=pred_rigid7_display, per_sample_mse=per_sample_mse,
+            record_ids=batch.get('record_id', [None] * B),
         )
 
-        record_ids = batch.get('record_id', [None] * B)
+    def _write_val_pdbs(self, data: dict):
+        """Write PDB files from pre-extracted numpy data. Safe to call from a background thread
+        (no CUDA ops — all tensors are already numpy; PyTorch CPU ops in write_val_pdb are fine)."""
+        out_dir   = data['out_dir']
+        B         = data['B']
+        n_samples = data['n_samples']
+        rigids_mask         = data['rigids_mask']
+        ref_elements        = data['ref_elements']
+        is_atom_mask        = data['is_atom_mask']
+        gt_rigid7           = data['gt_rigid7']
+        pred_rigid7_display = data['pred_rigid7_display']
+        per_sample_mse      = data['per_sample_mse']
+        record_ids          = data['record_ids']
 
         for i in range(min(n_samples, B)):
             has_protein = ((ref_elements[i] == -1) & rigids_mask[i]).any()
-            has_ligand = (is_atom_mask[i] & rigids_mask[i] & (ref_elements[i] != 1)).any()
+            has_ligand  = (is_atom_mask[i] & rigids_mask[i] & (ref_elements[i] != 1)).any()
             if not has_protein and not has_ligand:
                 continue
 
-            mse_val = per_sample_mse[i].item()
+            mse_val = float(per_sample_mse[i])
             rid = record_ids[i] if record_ids[i] is not None else f"sample_{i:02d}"
-            # sanitize for filename
             rid = rid.replace("/", "_").replace(" ", "_")
             path = os.path.join(out_dir, f"{rid}_mse={mse_val:.3f}.pdb")
             try:
@@ -888,11 +891,11 @@ class BiomoleculeModule(L.LightningModule):
                     rigids_mask[i],
                     ref_elements[i],
                     is_atom_mask[i],
-                    rigids_sc_idx[i],
-                    rigids_to_token[i],
-                    rigids_seq_idx[i],
-                    res_types_tok[i],
-                    asym_ids_tok[i],
+                    data['rigids_sc_idx'][i],
+                    data['rigids_to_token'][i],
+                    data['rigids_seq_idx'][i],
+                    data['res_types_tok'][i],
+                    data['asym_ids_tok'][i],
                     path,
                 )
             except Exception as e:
