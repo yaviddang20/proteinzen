@@ -7,6 +7,7 @@ import warnings
 from dataclasses import replace
 import os
 import json
+import threading
 
 from xtb.interface import Calculator, Param
 
@@ -803,7 +804,12 @@ class BiomoleculeModule(L.LightningModule):
 
             if write_pdbs:
                 loss_dict, batch_out, outputs = self._shared_step(batch_t, return_outputs=True)
-                self._write_val_pdbs(batch_out, outputs, t_val)
+                # Write PDBs in a daemon thread so rank 0 doesn't block the NCCL allreduce
+                threading.Thread(
+                    target=self._write_val_pdbs,
+                    args=(batch_out, outputs, t_val),
+                    daemon=True,
+                ).start()
             else:
                 loss_dict = self._shared_step(batch_t)
 
