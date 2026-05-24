@@ -806,6 +806,10 @@ class BiomoleculeModule(L.LightningModule):
                 loss_dict, batch_out, outputs = self._shared_step(batch_t, return_outputs=True)
                 # Phase 1 (main thread): extract all GPU tensors → numpy now, before any NCCL sync
                 pdb_data = self._collect_val_pdb_data(batch_out, outputs, t_val)
+                # Free GPU tensors immediately — rank 0 otherwise holds extra GPU memory
+                # through training's first backward pass, causing OOM on other ranks
+                del batch_out, outputs
+                torch.cuda.empty_cache()
                 # Phase 2 (background thread): pure CPU/numpy file writing, no CUDA ops
                 threading.Thread(target=self._write_val_pdbs, args=(pdb_data,), daemon=True).start()
             else:
