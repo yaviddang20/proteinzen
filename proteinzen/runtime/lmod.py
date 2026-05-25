@@ -315,8 +315,8 @@ def _build_all_atom_records(rigid_tensor7, rigids_mask, ref_elements, is_atom_ma
 
         res_type = int(res_types_tok[tok])
         aa_type = RES_TO_AA[res_type]
-        seq_t = torch.tensor([aa_type])
-        dummy_mask = torch.ones(1, dtype=torch.bool)
+        seq_t = torch.tensor([aa_type], device='cpu')
+        dummy_mask = torch.ones(1, dtype=torch.bool, device='cpu')
         atom14, atom14_mask = cg_utils.compute_atom14_from_cg_frames(
             rigids_obj, dummy_mask, seq_t, return_atom_mask=True
         )
