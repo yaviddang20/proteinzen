@@ -227,6 +227,7 @@ class MultiSE3Interpolant:
                  trans_g_t_fn="fn1",
                  use_harmonic_prior=False,
                  mol_harmonic_prior_std=None,
+                 debug_protein_pocket_mask=False,
     ):
         self._igso3 = None
 
@@ -277,6 +278,7 @@ class MultiSE3Interpolant:
         self._trans_g_t_fn = trans_g_t_fn
 
         self.use_harmonic_prior = use_harmonic_prior
+        self.debug_protein_pocket_mask = debug_protein_pocket_mask
         # default scale matches Gaussian prior std so behaviour is consistent out of the box
         self.mol_harmonic_prior_std = mol_harmonic_prior_std if mol_harmonic_prior_std is not None else trans_prior_std
         self._mol_harmonic_prior = MolecularHarmonicPrior() if use_harmonic_prior else None
@@ -637,6 +639,10 @@ class MultiSE3Interpolant:
             stoch_center = torch.randn_like(center) * self.sig_perturb
             trans_0 = trans_0 + stoch_center[..., None, :]
 
+        if self.debug_protein_pocket_mask:
+            protein_rigid_mask = rigids_mask.bool() & ~rigids_noising_mask.bool()
+            rigids_data["rigids_mask"] = rigids_data["rigids_mask"] * ~protein_rigid_mask
+
         trans_time = batch['trans_t']
         rot_time = batch['rot_t']
 
@@ -679,6 +685,12 @@ class MultiSE3Interpolant:
         )
         rigids_data["rigids_1"] = rigids_1.to_tensor_7()
         rigids_data["gt_rot_vf"] = rot_vf
+
+        if self.debug_protein_pocket_mask:
+            # Zero out protein (non-noised) rigids from the model's view.
+            # CoM centering and alignment are already done above.
+            protein_rigid_mask = rigids_mask.bool() & ~rigids_noising_mask.bool()
+            rigids_data["rigids_mask"] = rigids_data["rigids_mask"] * ~protein_rigid_mask
 
         return batch
 
