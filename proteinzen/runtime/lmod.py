@@ -1725,9 +1725,11 @@ class BiomoleculeSamplingModule(L.LightningModule):
         rigids_0 = ru.Rigid.from_tensor_7(rigids_data['rigids_t'])
         trans_0 = rigids_0.get_trans()
         rotmats_0 = rigids_0.get_rots().get_rot_mats()
-        if self.run_cfg.get('identity_rot_noise', False):
-            rotmats_0 = torch.eye(3, device=rotmats_0.device, dtype=rotmats_0.dtype).expand_as(rotmats_0).clone()
         rigids_noising_mask = rigids_data['rigids_noising_mask']
+        if self.run_cfg.get('identity_rot_noise', False):
+            noising_mask = torch.as_tensor(rigids_noising_mask, dtype=torch.bool, device=rotmats_0.device)
+            identity = torch.eye(3, device=rotmats_0.device, dtype=rotmats_0.dtype).expand_as(rotmats_0).clone()
+            rotmats_0 = torch.where(noising_mask[:, None, None], identity, rotmats_0)
         seq_noising_mask = token_data['seq_noising_mask']
 
         prot_traj = [(
@@ -1760,7 +1762,9 @@ class BiomoleculeSamplingModule(L.LightningModule):
             
 
             if self.run_cfg.get('no_rot_sampling', False):
-                prot_traj_point = (prot_traj_point[0], rotmats_0, prot_traj_point[2])
+                noising_mask = torch.as_tensor(rigids_noising_mask, dtype=torch.bool, device=rotmats_0.device)
+                frozen_rots = torch.where(noising_mask[:, None, None], rotmats_0, prot_traj_point[1])
+                prot_traj_point = (prot_traj_point[0], frozen_rots, prot_traj_point[2])
             prot_traj.append(prot_traj_point)
             clean_traj.append(clean_traj_point)
             t_1 = t_2
