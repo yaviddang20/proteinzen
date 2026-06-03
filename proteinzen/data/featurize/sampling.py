@@ -573,8 +573,10 @@ def construct_atoms(
                 # we check if an unindexed motif residue to be scaffolded maps to the current residue
                 token_set = copy_tokens_to_residues[unindexed_to_motif_idx[res_idx]]
                 # print(residue, token_set)
-            elif res_idx in copy_tokens_to_residues:
+            elif res_idx in copy_tokens_to_residues and residue['is_standard']:
                 # otherwise we just assume that the mapping is indexed
+                # only apply to standard residues — ligands reuse res_idx=0 per chain
+                # and would otherwise collide with protein copy tokens
                 token_set = copy_tokens_to_residues[res_idx]
                 # print(residue, token_set)
             else:
