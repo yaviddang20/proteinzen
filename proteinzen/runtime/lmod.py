@@ -791,9 +791,10 @@ class BiomoleculeModule(L.LightningModule):
         device = batch["t"].device
         B = batch["t"].shape[0]
 
+        num_gpus = max(1, self.trainer.world_size)
+        n_samples = max(5, num_gpus) // num_gpus
         write_pdbs = (
             self.trainer.current_epoch % 5 == 0
-            and self.trainer.global_rank == 0
             and batch_idx == 0  # only first val batch
         )
 
@@ -802,16 +803,11 @@ class BiomoleculeModule(L.LightningModule):
             batch_t["t"] = torch.full((*batch_t["t"].shape,), t_val, device=device)
 
             if write_pdbs:
-                import threading
                 loss_dict, batch_out, outputs = self._shared_step(batch_t, return_outputs=True)
-                # Phase 1 (main thread): extract all GPU tensors → numpy now, before any NCCL sync
-                pdb_data = self._collect_val_pdb_data(batch_out, outputs, t_val)
-                # Free GPU tensors immediately — rank 0 otherwise holds extra GPU memory
-                # through training's first backward pass, causing OOM on other ranks
+                pdb_data = self._collect_val_pdb_data(batch_out, outputs, t_val, n_samples=n_samples)
                 del batch_out, outputs
                 torch.cuda.empty_cache()
-                # Phase 2 (background thread): pure CPU/numpy file writing, no CUDA ops
-                threading.Thread(target=self._write_val_pdbs, args=(pdb_data,), daemon=True).start()
+                self._write_val_pdbs(pdb_data)
             else:
                 loss_dict = self._shared_step(batch_t)
 
@@ -823,10 +819,10 @@ class BiomoleculeModule(L.LightningModule):
             )
 
     def _collect_val_pdb_data(self, batch, outputs, t_val: float, n_samples: int = 5):
-        """Extract all GPU tensors to CPU numpy — call in main thread before spawning writer thread."""
+        """Extract all GPU tensors to CPU numpy."""
         epoch = self.trainer.current_epoch
-        log_dir = self._captured_log_dir
-        out_dir = os.path.join(log_dir, f"val_pdbs/epoch_{epoch:04d}/t_{t_val}")
+        rank = self.trainer.global_rank
+        out_dir = os.path.join(self.trainer.log_dir, f"val_pdbs/epoch_{epoch:04d}/t_{t_val}")
         os.makedirs(out_dir, exist_ok=True)
 
         B = batch["t"].shape[0]
@@ -854,7 +850,7 @@ class BiomoleculeModule(L.LightningModule):
         per_sample_mse = (se * noised_atom_mask).sum(axis=-1) / n_noised
 
         return dict(
-            out_dir=out_dir, B=B, n_samples=n_samples,
+            out_dir=out_dir, B=B, n_samples=n_samples, rank=rank,
             rigids_mask=rigids_mask, rigids_noising_mask=rigids_noising_mask,
             ref_elements=ref_elements, is_atom_mask=is_atom_mask,
             rigids_sc_idx=rigids_sc_idx, rigids_to_token=rigids_to_token,
@@ -865,11 +861,10 @@ class BiomoleculeModule(L.LightningModule):
         )
 
     def _write_val_pdbs(self, data: dict):
-        """Write PDB files from pre-extracted numpy data. Safe to call from a background thread
-        (no CUDA ops — all tensors are already numpy; PyTorch CPU ops in write_val_pdb are fine)."""
         out_dir   = data['out_dir']
         B         = data['B']
         n_samples = data['n_samples']
+        rank      = data['rank']
         rigids_mask         = data['rigids_mask']
         ref_elements        = data['ref_elements']
         is_atom_mask        = data['is_atom_mask']
@@ -887,7 +882,7 @@ class BiomoleculeModule(L.LightningModule):
             mse_val = float(per_sample_mse[i])
             rid = record_ids[i] if record_ids[i] is not None else f"sample_{i:02d}"
             rid = rid.replace("/", "_").replace(" ", "_")
-            path = os.path.join(out_dir, f"{rid}_mse={mse_val:.3f}.pdb")
+            path = os.path.join(out_dir, f"{rid}_rank{rank}_mse={mse_val:.3f}.pdb")
             try:
                 write_val_pdb(
                     gt_rigid7[i],
@@ -1590,11 +1585,6 @@ class BiomoleculeModule(L.LightningModule):
 
         return ret
 
-
-    def on_fit_start(self):
-        # Capture log_dir while all ranks are active (trainer.log_dir triggers a broadcast).
-        # Store it so rank-0-only code in _collect_val_pdb_data can use the versioned path.
-        self._captured_log_dir = self.trainer.log_dir
 
     def on_train_start(self):
         if self.use_cosine_annealing:
