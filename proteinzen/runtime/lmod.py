@@ -825,9 +825,7 @@ class BiomoleculeModule(L.LightningModule):
     def _collect_val_pdb_data(self, batch, outputs, t_val: float, n_samples: int = 5):
         """Extract all GPU tensors to CPU numpy — call in main thread before spawning writer thread."""
         epoch = self.trainer.current_epoch
-        # trainer.log_dir does a strategy.broadcast() — must be called on ALL ranks.
-        # Since _collect_val_pdb_data runs on rank 0 only, use default_root_dir instead.
-        log_dir = self.trainer.default_root_dir or os.getcwd()
+        log_dir = self._captured_log_dir
         out_dir = os.path.join(log_dir, f"val_pdbs/epoch_{epoch:04d}/t_{t_val}")
         os.makedirs(out_dir, exist_ok=True)
 
@@ -1592,6 +1590,11 @@ class BiomoleculeModule(L.LightningModule):
 
         return ret
 
+
+    def on_fit_start(self):
+        # Capture log_dir while all ranks are active (trainer.log_dir triggers a broadcast).
+        # Store it so rank-0-only code in _collect_val_pdb_data can use the versioned path.
+        self._captured_log_dir = self.trainer.log_dir
 
     def on_train_start(self):
         if self.use_cosine_annealing:
