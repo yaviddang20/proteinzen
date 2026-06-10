@@ -19,4 +19,6 @@ sed -e "s|OUTFILE|${REPO_ROOT}/outputs/sge_outs/train_${SUBMIT_TIME}|g" \
     > "${REPO_ROOT}/scripts/submit_scripts/autogen_scripts/train_${SUBMIT_TIME}.sh"
 echo "#ARGS = ${@:3}" >> "${REPO_ROOT}/scripts/submit_scripts/autogen_scripts/train_${SUBMIT_TIME}.sh"
 
-qsub -terse "${REPO_ROOT}/scripts/submit_scripts/autogen_scripts/train_${SUBMIT_TIME}.sh" "${@:3}"
+sbatch "${REPO_ROOT}/scripts/submit_scripts/autogen_scripts/train_${SUBMIT_TIME}.sh" "${@:3}"
+# --dependency=afterany:2870
+# --begin=2010-01-20T12:34:00

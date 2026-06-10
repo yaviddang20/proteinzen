@@ -4,12 +4,13 @@ https://github.com/jwohlwend/boltz/blob/main/src/boltz/data/crop/cropper.py
 """
 from dataclasses import replace
 from typing import Optional
+import traceback
 
 import numpy as np
 from scipy.spatial.distance import cdist
 
 from proteinzen.boltz.data import const
-from proteinzen.data.featurize.tokenize import Tokenized
+from proteinzen.data.featurize.tokenize import Token, Rigid, TokenData, RigidData, Tokenized
 
 
 def pick_random_token(
@@ -100,10 +101,13 @@ def pick_interface_token(
     # If no interface, pick from the chains
     if tokens_1.size and (not tokens_2.size):
         query = pick_random_token(tokens_1, random)
+        # print("random from chain1 ", chain_1)
     elif tokens_2.size and (not tokens_1.size):
         query = pick_random_token(tokens_2, random)
+        # print("random from chain2 ", chain_2)
     elif (not tokens_1.size) and (not tokens_2.size):
         query = pick_random_token(tokens, random)
+        # print("random from all")
     else:
         # If we have tokens, compute distances
         tokens_1_coords = tokens_1["center_coords"]
@@ -112,9 +116,13 @@ def pick_interface_token(
         dists = cdist(tokens_1_coords, tokens_2_coords)
         cuttoff = dists < const.interface_cutoff
 
+        # print(dists)
+        # print(cuttoff)
+
         # In rare cases, the interface cuttoff is slightly
         # too small, then we slightly expand it if it happens
         if not np.any(cuttoff):
+            print("raising cutoff")
             cuttoff = dists < (const.interface_cutoff + 5.0)
 
         tokens_1 = tokens_1[np.any(cuttoff, axis=1)]
@@ -122,6 +130,74 @@ def pick_interface_token(
 
         # Select random token
         candidates = np.concatenate([tokens_1, tokens_2])
+        # print(candidates)
+        query = pick_random_token(candidates, random)
+
+    return query
+
+
+def pick_interface_noised_token(
+    tokens: np.ndarray,
+    interface: np.ndarray,
+    random: np.random.RandomState,
+) -> np.ndarray:
+    """Pick a random token from an interface.
+
+    Parameters
+    ----------
+    tokens : np.ndarray
+        The token data.
+    interface : int
+        The interface ID.
+    random : np.ndarray
+        The random state for reproducibility.
+
+    Returns
+    -------
+    np.ndarray
+        The selected token.
+
+    """
+    # Sample random interface
+    chain_1 = int(interface["chain_1"])
+    chain_2 = int(interface["chain_2"])
+
+    tokens_1 = tokens[tokens["asym_id"] == chain_1]
+    tokens_2 = tokens[tokens["asym_id"] == chain_2]
+
+    # If no interface, pick from the chains
+    if tokens_1.size and (not tokens_2.size):
+        query = pick_random_token(tokens_1, random)
+        # print("random from chain1 ", chain_1)
+    elif tokens_2.size and (not tokens_1.size):
+        query = pick_random_token(tokens_2, random)
+        # print("random from chain2 ", chain_2)
+    elif (not tokens_1.size) and (not tokens_2.size):
+        query = pick_random_token(tokens, random)
+        # print("random from all")
+    else:
+        # If we have tokens, compute distances
+        tokens_1_coords = tokens_1["center_coords"]
+        tokens_2_coords = tokens_2["center_coords"]
+
+        dists = cdist(tokens_1_coords, tokens_2_coords)
+        cuttoff = dists < const.interface_cutoff
+
+        # print(dists)
+        # print(cuttoff)
+
+        # In rare cases, the interface cuttoff is slightly
+        # too small, then we slightly expand it if it happens
+        if not np.any(cuttoff):
+            print("raising cutoff")
+            cuttoff = dists < (const.interface_cutoff + 5.0)
+
+        tokens_1 = tokens_1[np.any(cuttoff, axis=1)]
+        tokens_2 = tokens_2[np.any(cuttoff, axis=0)]
+
+        # Select random token
+        candidates = np.concatenate([tokens_1, tokens_2])
+        # print(candidates)
         query = pick_random_token(candidates, random)
 
     return query
@@ -130,7 +206,13 @@ def pick_interface_token(
 class Cropper:
     """Interpolate between contiguous and spatial crops."""
 
-    def __init__(self, min_neighborhood: int = 0, max_neighborhood: int = 40) -> None:
+    def __init__(
+        self,
+        min_neighborhood: int = 0,
+        max_neighborhood: int = 40,
+        attempt_to_keep_full_binder_chain: bool = False,
+        full_binder_chain_cap: int = 256
+    ) -> None:
         """Initialize the cropper.
 
         Modulates the type of cropping to be performed.
@@ -149,6 +231,9 @@ class Cropper:
         """
         sizes = list(range(min_neighborhood, max_neighborhood + 1, 2))
         self.neighborhood_sizes = sizes
+
+        self.attempt_to_keep_full_binder_chain = attempt_to_keep_full_binder_chain
+        self.full_binder_chain_cap = full_binder_chain_cap
 
     def crop(  # noqa: PLR0915
         self,
@@ -187,6 +272,12 @@ class Cropper:
             msg = "Only one of chain_id or interface_id can be provided."
             raise ValueError(msg)
 
+        if self.attempt_to_keep_full_binder_chain:
+            assert max_tokens > self.full_binder_chain_cap, (
+                "if we want to try to keep a full binder chain, "
+                "make sure that we can accomedate the whole chain in the crop!"
+            )
+
         # Randomly select a neighborhood size
         neighborhood_size = random.choice(self.neighborhood_sizes)
 
@@ -214,25 +305,55 @@ class Cropper:
             raise ValueError(msg)
 
         # Pick a random token, chain, or interface
+        # try:
+        #     if chain_id is not None:
+        #         query = pick_chain_token(valid_tokens, chain_id, random)
+        #     elif interface_id is not None:
+        #         interface = interfaces[interface_id]
+        #         query = pick_interface_token(valid_tokens, interface, random)
+
+        #     # if any of the rigids are not noised, this suggests we have a motif
+        #     # so we try to keep it in the crop
+        #     elif (~data.rigids['rigids_noising_mask']).any():
+        #         fixed_rigids_mask = ~data.rigids['rigids_noising_mask'] & data.rigids['is_present']
+        #         fixed_rigids = data.rigids[fixed_rigids_mask]
+        #         com_coord = fixed_rigids['tensor7'][..., 4:].mean(axis=0)
+        #         rigid_sq_dist_to_com = np.sum((fixed_rigids['tensor7'][..., 4:] - com_coord[None]) ** 2, axis=-1)
+        #         rigid_select_weights = 1 / (rigid_sq_dist_to_com ** 1.5 + 1e-5)  # cubic inverse distance
+        #         rigid_select_probs = rigid_select_weights / rigid_select_weights.sum()
+        #         rigid_select = np.random.choice(fixed_rigids, p=rigid_select_probs)
+        #         # print(rigid_select, set(fixed_rigids['token_idx']))
+        #         query = token_data[rigid_select['token_idx']]
+
+        interface = None
         try:
-            if chain_id is not None:
+            # if any of the tokens are copied, this suggests we have a motif
+            # so we try to keep it in the crop
+
+            present_copy_mask = data.tokens['is_copy'] & data.tokens['resolved_mask']
+            if present_copy_mask.any():
+                is_copy_rigid = present_copy_mask[data.rigids['token_idx']]
+                fixed_copy_rigids_mask = (
+                    ~data.rigids['rigids_noising_mask']
+                    & data.rigids['is_present']
+                    & is_copy_rigid
+                )
+                assert fixed_copy_rigids_mask.sum() > 0, "we have copied residues but don't see any fixed rigids!"
+                fixed_copy_rigids = data.rigids[fixed_copy_rigids_mask]
+                com_coord = fixed_copy_rigids['tensor7'][..., 4:].mean(axis=0)
+                rigid_sq_dist_to_com = np.sum((fixed_copy_rigids['tensor7'][..., 4:] - com_coord[None]) ** 2, axis=-1)
+                rigid_select_weights = 1 / (rigid_sq_dist_to_com ** 1.5 + 1e-5)  # cubic inverse distance
+                rigid_select_probs = rigid_select_weights / rigid_select_weights.sum()
+                rigid_select = np.random.choice(fixed_copy_rigids, p=rigid_select_probs)
+                query = token_data[rigid_select['token_idx']]
+                # print("motif", query)
+            elif chain_id is not None:
                 query = pick_chain_token(valid_tokens, chain_id, random)
+                # print("chain", query)
             elif interface_id is not None:
                 interface = interfaces[interface_id]
                 query = pick_interface_token(valid_tokens, interface, random)
-
-            # if any of the rigids are not noised, this suggests we have a motif
-            # so we try to keep it in the crop
-            elif (~data.rigids['rigids_noising_mask']).any():
-                fixed_rigids_mask = ~data.rigids['rigids_noising_mask'] & data.rigids['is_present']
-                fixed_rigids = data.rigids[fixed_rigids_mask]
-                com_coord = fixed_rigids['tensor7'][..., 4:].mean(axis=0)
-                rigid_sq_dist_to_com = np.sum((fixed_rigids['tensor7'][..., 4:] - com_coord[None]) ** 2, axis=-1)
-                rigid_select_weights = 1 / (rigid_sq_dist_to_com ** 1.5 + 1e-5)  # cubic inverse distance
-                rigid_select_probs = rigid_select_weights / rigid_select_weights.sum()
-                rigid_select = np.random.choice(fixed_rigids, p=rigid_select_probs)
-                # print(rigid_select, set(fixed_rigids['token_idx']))
-                query = token_data[rigid_select['token_idx']]
+                # print("specified interface", interface, interface_id, query)
             elif valid_interfaces.size:
                 idx = random.randint(len(valid_interfaces))
                 interface = valid_interfaces[idx]
@@ -241,8 +362,10 @@ class Cropper:
                 idx = random.randint(len(valid_chains))
                 chain_id = valid_chains[idx]["asym_id"]
                 query = pick_chain_token(valid_tokens, chain_id, random)
+                # print("random chain", query)
         except Exception as e:
             print(f"ran into cropping error {e}, just doing random cropping")
+            traceback.print_exc()
             idx = random.randint(len(valid_chains))
             chain_id = valid_chains[idx]["asym_id"]
             query = pick_chain_token(valid_tokens, chain_id, random)
@@ -251,19 +374,31 @@ class Cropper:
         dists = valid_tokens["center_coords"] - query["center_coords"]
         indices = np.argsort(np.linalg.norm(dists, axis=1))
 
-        # When cropping around a protein-ligand interface, seed the crop with
-        # all NONPOLYMER tokens from that interface so the budget loop fills
-        # remaining space with protein residues and the ligand is never dropped.
         cropped: set[int] = set()
-        if interface_id is not None:
-            nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
-            iface = interfaces[interface_id]
-            iface_chains = {int(iface["chain_1"]), int(iface["chain_2"])}
-            for token in token_data:
-                if int(token["mol_type"]) == nonpolymer_id and int(token["asym_id"]) in iface_chains:
-                    cropped.add(int(token["token_idx"]))
-
+        
         total_rigids = 0
+
+        if self.attempt_to_keep_full_binder_chain and interface is not None:
+            chain_1_tokens = token_data[token_data["asym_id"] == interface[0]]
+            chain_1_tokens = chain_1_tokens[chain_1_tokens['is_resolved']]
+            chain_2_tokens = token_data[token_data["asym_id"] == interface[1]]
+            chain_2_tokens = chain_2_tokens[chain_2_tokens['is_resolved']]
+            chain_1_rep_rigid = chain_1_tokens[0]['rigid_idx']
+            chain_1_is_noised = data.rigids[chain_1_rep_rigid]['rigids_noising_mask']
+            chain_2_rep_rigid = chain_2_tokens[0]['rigid_idx']
+            chain_2_is_noised = data.rigids[chain_2_rep_rigid]['rigids_noising_mask']
+
+            if chain_1_is_noised and len(chain_1_tokens) < self.full_binder_chain_cap:
+                new_tokens = chain_1_tokens
+            elif chain_2_is_noised and len(chain_2_tokens) < self.full_binder_chain_cap:
+                new_tokens = chain_2_tokens
+            else:
+                new_tokens = np.array([], dtype=Token)
+
+            cropped.update(set(new_tokens['token_idx']))
+            new_rigids = np.sum(new_tokens["rigid_num"])
+            total_rigids += new_rigids
+
         for idx in indices:
             # Get the token
             token = valid_tokens[idx]
@@ -319,17 +454,46 @@ class Cropper:
         # Get the cropped tokens sorted by index
         token_data = token_data[sorted(cropped)]
 
+        # Get the cropped rigids
+        # and renumber the indicies
+        new_rigids = []
+        new_tokens = []
+        new_rigids_idx = 0
+
+        old_token_to_new_token = {}
+
+        for new_token_idx, token in enumerate(token_data):
+            new_token = token.copy()
+            old_token_to_new_token[token["token_idx"]] = new_token_idx
+            new_token["token_idx"] = new_token_idx
+            new_token["rigid_idx"] = new_rigids_idx
+            new_tokens.append(new_token)
+
+            rigids_start = token["rigid_idx"]
+            rigids_end = rigids_start + token["rigid_num"]
+            rigids = data.rigids[rigids_start:rigids_end].copy()
+            rigids["rigid_idx"] = rigids["rigid_idx"] - rigids["rigid_idx"].min() + new_rigids_idx
+            rigids["token_idx"] = new_token_idx
+            new_rigids_idx += token["rigid_num"]
+            new_rigids.append(rigids)
+
         # Only keep bonds within the cropped tokens
         indices = token_data["token_idx"]
         token_bonds = token_bonds[np.isin(token_bonds["token_1"], indices)]
         token_bonds = token_bonds[np.isin(token_bonds["token_2"], indices)]
 
-        # Only keep rigids belonging to the cropped tokens
-        rigid_indices = []
-        for token in token_data:
-            start = int(token["rigid_idx"])
-            rigid_indices.extend(range(start, start + int(token["rigid_num"])))
-        cropped_rigids = data.rigids[rigid_indices]
+        # Reindex bonds if they exist as well
+        if len(token_bonds) > 0:
+            new_token_bonds = []
+            for bond in token_bonds:
+                new_bond = bond.copy()
+                new_bond["token_1"] = old_token_to_new_token[new_bond["token_1"]]
+                new_bond["token_2"] = old_token_to_new_token[new_bond["token_2"]]
+                new_token_bonds.append(new_bond)
+            token_bonds = np.stack(new_token_bonds)
+
+        token_data = np.stack(new_tokens)
+        rigid_data = np.concatenate(new_rigids)
 
         # Return the cropped tokens
-        return replace(data, tokens=token_data, bonds=token_bonds, rigids=cropped_rigids)
+        return replace(data, tokens=token_data, bonds=token_bonds, rigids=rigid_data)

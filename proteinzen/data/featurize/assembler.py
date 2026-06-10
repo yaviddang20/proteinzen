@@ -78,6 +78,7 @@ def process_token_features(
     sym_id = from_numpy(token_data["sym_id"].copy()).long()
     mol_type = from_numpy(token_data["mol_type"].copy()).long()
     res_type = from_numpy(token_data["res_type"].copy()).long()
+    hotspot_type = from_numpy(token_data["hotspot_type"].copy()).long()
     token_to_rep_rigid = torch.as_tensor(token_to_rep_rigid).long()
     seq_index = torch.as_tensor(seq_index, dtype=torch.long)
 
@@ -119,6 +120,7 @@ def process_token_features(
             sym_id = pad_dim(sym_id, 0, pad_len)
             mol_type = pad_dim(mol_type, 0, pad_len)
             res_type = pad_dim(res_type, 0, pad_len)
+            hotspot_type = pad_dim(hotspot_type, 0, pad_len)
             pad_mask = pad_dim(pad_mask, 0, pad_len)
             resolved_mask = pad_dim(resolved_mask, 0, pad_len)
             token_to_rep_rigid = pad_dim(token_to_rep_rigid, 0, pad_len)
@@ -133,6 +135,7 @@ def process_token_features(
         "sym_id": sym_id,
         "mol_type": mol_type,
         "res_type": res_type,
+        "hotspot_type": hotspot_type,
         "token_to_rep_rigid": token_to_rep_rigid,
         "token_bonds": bonds.long(),
         "token_pad_mask": pad_mask,
@@ -208,6 +211,7 @@ def process_rigid_features(
     rigid_to_token = torch.tensor(rigid_to_token, dtype=torch.long)
     new_rigids_noising_mask = from_numpy(rigid_data['rigids_noising_mask'].copy()).bool()
     rigids_seq_idx = from_numpy(rigid_to_seq_idx.copy()).long()
+    rigids_num_real_axes = from_numpy(rigid_data['num_real_input_axes']).long()
 
     # Compute padding and apply
     if max_rigids is not None:
@@ -228,6 +232,7 @@ def process_rigid_features(
         sidechain_idx = pad_dim(sidechain_idx, 0, pad_len)
         new_rigids_noising_mask = pad_dim(new_rigids_noising_mask, 0, pad_len, value=True)
         rigids_seq_idx = pad_dim(rigids_seq_idx, 0, pad_len)
+        rigids_num_real_axes = pad_dim(rigids_num_real_axes, 0, pad_len)
 
         tensor7_pad = torch.zeros((pad_len, 7), device=tensor7.device, dtype=tensor7.dtype)
         tensor7_pad[:, 0] = 1
@@ -243,6 +248,7 @@ def process_rigid_features(
         "rigids_ref_element": ref_element.long(),
         "rigids_ref_charge": ref_charge.float(),
         "rigids_ref_chirality": ref_chirality.long(),
+        "rigids_num_real_axes": rigids_num_real_axes.long(),
         "rigids_resolved_mask": resolved_mask.bool(),
         "rigids_pad_mask": pad_mask.bool(),
         "rigids_to_token": rigid_to_token,

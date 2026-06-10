@@ -1,8 +1,10 @@
 from functools import partialmethod
 
+import copy
 import math
 import numpy as np
 import torch
+import networkx as nx
 
 from proteinzen.boltz.data import const
 
@@ -15,6 +17,8 @@ from .task import TrainingTask
 def rigid_noise_to_atom_noise(residue, atoms, rigid_noising_mask):
     res_name = residue['name']
 
+    rigid_noise_entry = [0]
+
     bb_group = ['N', 'CA', 'C', 'O', 'CB']
     # bb_frame = ['C', 'CA', 'N']
     group2 = cg.coarse_grain_sidechain_groups[res_name][2]
@@ -23,13 +27,29 @@ def rigid_noise_to_atom_noise(residue, atoms, rigid_noising_mask):
     # use bb frame if frame2 doesn't exist
     if len(group2) == 0:
         group2 = bb_group
+        rigid_noise_entry.append(0)
+    else:
+        rigid_noise_entry.append(1)
     # use frame2 frame if frame3 doesn't exist
     if len(group3) == 0:
         group3 = group2
+        rigid_noise_entry.append(rigid_noise_entry[-1])
+    else:
+        rigid_noise_entry.append(2)
 
     atom_noise_mapping = {}
     frame_atom_groups = [bb_group, group2, group3]
-    for i, atom_groups in enumerate(frame_atom_groups):
+    for i, atom_groups in zip(rigid_noise_entry, frame_atom_groups):
+        noise_atom = rigid_noising_mask[i]
+        for atom_name in atom_groups:
+            atom_id = convert_atom_str_to_tuple(atom_name)
+            atom_noise_mapping[atom_id] = noise_atom
+
+    # this makes backbone override sidechain for noising CB
+    # which is necessary otherwise most sidechains will
+    # overwrite backbone denoising via CB
+    # TODO: probably a cleaner way of doing this?
+    for i, atom_groups in zip([0], frame_atom_groups[:1]):
         noise_atom = rigid_noising_mask[i]
         for atom_name in atom_groups:
             atom_id = convert_atom_str_to_tuple(atom_name)
@@ -67,9 +87,10 @@ class MotifScaffolding(TrainingTask):
                  max_num_segments=4,
                  p_is_unindexed=0.8,
                  name_override=None,
-                 p_fix_tip=0.0,
-                 p_fix_bb=0.5,
-                 p_fix_all=0.5
+                 p_fix_tip=0.25,
+                 p_redesign_sidechain=0.25,
+                 p_fix_all=0.25,
+                 p_repack=0.25
     ):
         assert t_sched in ['lognorm', 'mixed_beta', 'uniform']
         assert mode in ['mixed']
@@ -90,9 +111,10 @@ class MotifScaffolding(TrainingTask):
         self.p_is_unindexed = p_is_unindexed
 
         self.p_fix_tip = p_fix_tip
-        self.p_fix_bb = p_fix_bb
+        self.p_redesign_sidechain = p_redesign_sidechain
         self.p_fix_all = p_fix_all
-        assert np.isclose(sum([p_fix_tip, p_fix_bb, p_fix_all]), 1.0)
+        self.p_repack = p_repack
+        assert np.isclose(sum([p_fix_tip, p_redesign_sidechain, p_fix_all, p_repack]), 1.0)
 
         if name_override is not None:
             self.name = name_override
@@ -119,6 +141,30 @@ class MotifScaffolding(TrainingTask):
         M = np.concatenate(permuted_list, axis=0)
         return torch.as_tensor(M, dtype=torch.bool)
 
+    def _select_chain_group_mask(self, data):
+        if data.mask.sum() > 1:
+            # if we have more than one chain to motif scaffold
+            # restrict the possible motif residues to be
+            # from a connected component of the graph
+            # e.g. all chains within a component have a valid interface
+            # to at least one other chain within the component
+            edge_index = np.stack([data.interfaces['chain_1'], data.interfaces['chain_2']], axis=-1)
+            # we assume all interfaces are valid, as the datamodule should remove all invalid interfaces
+            # edge_index = edge_index[data.interfaces['valid']]
+            interface_graph = nx.Graph()
+            interface_graph.add_edges_from(edge_index.tolist())
+            subgraphs = list(nx.connected_components(interface_graph))
+            choice_subgraph_idx = np.random.choice(len(subgraphs))
+            choice_subgraph = subgraphs[choice_subgraph_idx]
+            new_mask = np.zeros_like(data.mask)
+            for node in choice_subgraph:
+                new_mask[node] = True
+            return new_mask
+        elif data.mask.sum() == 1:
+            return data.mask
+        else:
+            raise ValueError(f"no valid chains in sample {data}")
+
     def sample_t_and_mask(self, data):
         residues = data.residues
         atoms = data.atoms
@@ -139,20 +185,43 @@ class MotifScaffolding(TrainingTask):
         else:
             raise ValueError(f"self.t_sched={self.t_sched} not recognized")
 
-        resolved_mask = data.residues['is_present']
-        num_resolved_residues = resolved_mask.sum()
-        motif_mask = self.generate_motif_mask(num_resolved_residues)
-        residue_noising_mask = np.ones_like(resolved_mask)
-        residue_noising_mask[resolved_mask] = ~motif_mask
-        res_type_noising_mask = residue_noising_mask.copy()
+        # restrict motif residues
+        # to standard protein residues
+        # TODO: maybe lift this if we allow for atomization
+        potential_motif_mask = data.residues['is_present']
+        chain_mask = self._select_chain_group_mask(data)
+        for chain, select_chain in zip(data.chains, chain_mask):
+            res_start = chain["res_idx"]
+            res_end = chain["res_idx"] + chain["res_num"]
+            is_protein = chain["mol_type"] == const.chain_type_ids["PROTEIN"]
+            potential_motif_mask[res_start:res_end] &= is_protein & select_chain
+
+        potential_motif_mask &= data.residues['is_standard']
+        potential_motif_mask &= (data.residues['name'] != 'UNK')
+
+        num_potential_residues = potential_motif_mask.sum()
+        motif_mask = self.generate_motif_mask(num_potential_residues)
+        residue_noising_mask = np.ones_like(potential_motif_mask)
+        residue_noising_mask[potential_motif_mask] = ~motif_mask
+        res_type_noising_mask = copy.deepcopy(residue_noising_mask)
 
         atom_noising_mask = []
         if self.mode == 'mixed':
-            noise_select = torch.rand_like(torch.as_tensor(residue_noising_mask), dtype=torch.float32).numpy(force=True)
-            fix_tip = noise_select < self.p_fix_tip
-            noise_sidechain_only = noise_select > (1 - self.p_fix_bb)
+            noise_select = torch.rand_like(
+                torch.as_tensor(residue_noising_mask).clone(),
+                dtype=torch.float32
+            ).numpy(force=True)
+
+            cond_bounds = np.cumsum([0, self.p_fix_tip, self.p_redesign_sidechain, self.p_repack, self.p_fix_all])
+            fix_tip = (cond_bounds[0] <= noise_select) & (noise_select < cond_bounds[1])
+            redesign_sidechain = (cond_bounds[1] <= noise_select) & (noise_select < cond_bounds[2])
+            repack = (cond_bounds[2] <= noise_select) & (noise_select < cond_bounds[3])
+            fix_all = (cond_bounds[3] <= noise_select) & (noise_select < cond_bounds[4])
+
             res_type_noising_mask[~residue_noising_mask & fix_tip] = False
-            res_type_noising_mask[~residue_noising_mask & noise_sidechain_only] = True
+            res_type_noising_mask[~residue_noising_mask & redesign_sidechain] = True
+            res_type_noising_mask[~residue_noising_mask & repack] = False
+            res_type_noising_mask[~residue_noising_mask & fix_all] = False
 
             for chain in data.chains:
                 # Get residue indices
@@ -164,13 +233,21 @@ class MotifScaffolding(TrainingTask):
                     atom_idx = residue['atom_idx']
                     atom_num = residue['atom_num']
                     atoms = data.atoms[atom_idx:atom_idx+atom_num]
+
+                    res_idx = res_start + i
                     if residue["is_standard"] and (residue['name'] != 'UNK') and is_protein:
-                        if fix_tip[i] & (~residue_noising_mask[i]):
-                            rigid_noise_mask = [True, False, True]
-                        elif noise_sidechain_only[i] & (~residue_noising_mask[i]):
-                            rigid_noise_mask = [False, True, True]
-                        elif ~residue_noising_mask[i]:
-                            rigid_noise_mask = [False for _ in range(3)]
+                        fixed_residue = ~residue_noising_mask[res_idx]
+                        if fixed_residue:
+                            if fix_tip[res_idx]:
+                                rigid_noise_mask = [True, False, True]
+                            elif redesign_sidechain[res_idx]:
+                                rigid_noise_mask = [False, True, True]
+                            elif repack[res_idx]:
+                                rigid_noise_mask = [False, True, True]
+                            elif fix_all[res_idx]:
+                                rigid_noise_mask = [False for _ in range(3)]
+                            else:
+                                raise ValueError("fixed residue must fit into one of four noising categories")
                         else:
                             rigid_noise_mask = [True for _ in range(3)]
                         atom_noising_mask.append(rigid_noise_to_atom_noise(residue, atoms, rigid_noise_mask))
@@ -222,149 +299,3 @@ class InverseRotamerMotifScaffolding(MotifScaffolding):
 class MixedMotifScaffolding(MotifScaffolding):
     name: str = "mixed_motif_scaffolding"
     __init__ = partialmethod(MotifScaffolding.__init__, mode='mixed')
-
-
-# inspired by Genie2
-class MinimalMotifScaffolding(TrainingTask):
-    name: str = "min_motif_scaffolding"
-    def __init__(self,
-                 prob=0.0,
-                 t_sched='lognorm',
-                 mode='mixed',
-                 lognorm_mu=0.0,
-                 lognorm_sig=1.0,
-                 beta_p1=1.9,
-                 beta_p2=1.0,
-                 shift_time_scale=False,
-                 t_min=0.01,
-                 t_max=0.99,
-                 max_res_islands=8,
-                 max_res_per_island=3,
-                 p_is_unindexed=0.8,
-                 name_override=None,
-                 p_fix_tip=0.35,
-                 p_fix_bb=0.35,
-                 p_fix_all=0.30
-    ):
-        assert t_sched in ['lognorm', 'mixed_beta', 'uniform']
-        assert mode in ['mixed']
-        self.prob = prob
-        self.t_sched = t_sched
-        self.mode = mode
-        self.lognorm_mu = lognorm_mu
-        self.lognorm_sig = lognorm_sig
-        self.beta_p1 = beta_p1
-        self.beta_p2 = beta_p2
-        self.t_min = t_min
-        self.t_max = t_max
-        self.shift_time_scale = shift_time_scale
-
-        self.max_res_islands = max_res_islands
-        self.max_res_per_island = max_res_per_island
-        self.p_is_unindexed = p_is_unindexed
-
-        self.p_fix_tip = p_fix_tip
-        self.p_fix_bb = p_fix_bb
-        self.p_fix_all = p_fix_all
-        assert np.isclose(sum([p_fix_tip, p_fix_bb, p_fix_all]), 1.0)
-
-        if name_override is not None:
-            self.name = name_override
-
-    def generate_motif_mask(self, N):
-        num_segments = np.random.randint(1, self.max_res_islands+1)
-        # we switch this from Genie2
-        # to increase the probability of sampling minimal motifs
-        # we also give the option to lower the maximum number of residues sampled
-        # num_res = np.random.randint(math.floor(0.05 * N), math.ceil(0.5 * N) + 1)
-        # # when N < 80 it's possible for num_segments > num_res
-        # num_res = max(num_segments + 1, num_res)
-        L = np.random.choice(self.max_res_per_island, size=num_segments) + 1
-        num_res = np.sum(L)
-        permute_list = [[0] for _ in range(N - num_res)] + [np.ones((l,)) for l in L]
-        permutation = np.random.permutation(len(permute_list))
-        permuted_list = [permute_list[i] for i in permutation]
-        M = np.concatenate(permuted_list, axis=0)
-        return torch.as_tensor(M, dtype=torch.bool)
-
-    def sample_t_and_mask(self, data):
-        residues = data.residues
-        atoms = data.atoms
-
-        device = 'cpu'
-        if self.t_sched == 'lognorm':
-            ln_sig = self.lognorm_mu + torch.randn(1, device=device).float() * self.lognorm_sig
-            t = torch.sigmoid(ln_sig)
-        elif self.t_sched == 'mixed_beta':
-            u = torch.rand(1)
-            if u < 0.02:
-                t = torch.rand(1, device=device).float()
-            else:
-                dist = torch.distributions.beta.Beta(self.beta_p1, self.beta_p2)
-                t = dist.sample((1,)).to(device)
-        elif self.t_sched == 'uniform':
-            t = torch.rand(1, device=device).float()
-        else:
-            raise ValueError(f"self.t_sched={self.t_sched} not recognized")
-
-        resolved_mask = data.residues['is_present']
-        num_resolved_residues = resolved_mask.sum()
-        motif_mask = self.generate_motif_mask(num_resolved_residues)
-        residue_noising_mask = np.ones_like(resolved_mask)
-        residue_noising_mask[resolved_mask] = ~motif_mask
-        res_type_noising_mask = residue_noising_mask.copy()
-
-        atom_noising_mask = []
-        if self.mode == 'mixed':
-            noise_select = torch.rand_like(torch.as_tensor(residue_noising_mask), dtype=torch.float32).numpy(force=True)
-            fix_tip = noise_select < self.p_fix_tip
-            noise_sidechain_only = noise_select > (1 - self.p_fix_bb)
-            res_type_noising_mask[~residue_noising_mask & fix_tip] = False
-            res_type_noising_mask[~residue_noising_mask & noise_sidechain_only] = True
-
-            for chain in data.chains:
-                # Get residue indices
-                res_start = chain["res_idx"]
-                res_end = chain["res_idx"] + chain["res_num"]
-                is_protein = chain["mol_type"] == const.chain_type_ids["PROTEIN"]
-
-                for i, residue in enumerate(data.residues[res_start:res_end]):
-                    atom_idx = residue['atom_idx']
-                    atom_num = residue['atom_num']
-                    atoms = data.atoms[atom_idx:atom_idx+atom_num]
-                    if residue["is_standard"] and (residue['name'] != 'UNK') and is_protein:
-                        if fix_tip[i] & (~residue_noising_mask[i]):
-                            rigid_noise_mask = [True, False, True]
-                        elif noise_sidechain_only[i] & (~residue_noising_mask[i]):
-                            rigid_noise_mask = [False, True, True]
-                        elif ~residue_noising_mask[i]:
-                            rigid_noise_mask = [False for _ in range(3)]
-                        else:
-                            rigid_noise_mask = [True for _ in range(3)]
-                        atom_noising_mask.append(rigid_noise_to_atom_noise(residue, atoms, rigid_noise_mask))
-                    else:
-                        atom_noising_mask.append([True for _ in atoms])
-
-        else:
-            raise ValueError()
-        atom_noising_mask = np.concatenate(atom_noising_mask)
-
-        is_unindexed_residue = torch.rand_like(torch.as_tensor(residue_noising_mask), dtype=torch.float32) < self.p_is_unindexed
-        is_unindexed_residue = is_unindexed_residue.numpy(force=True)
-
-        copy_indexed_residue_mask = ~residue_noising_mask & ~is_unindexed_residue
-        copy_unindexed_residue_mask = ~residue_noising_mask & is_unindexed_residue
-        copy_atomized_residue_mask = np.zeros_like(res_type_noising_mask)
-
-        return {
-            "t": t.numpy(force=True),
-            "atom_noising_mask": atom_noising_mask,
-            "res_type_noising_mask": res_type_noising_mask,
-            "copy_indexed_residue_mask": copy_indexed_residue_mask,
-            "copy_unindexed_residue_mask": copy_unindexed_residue_mask,
-            "copy_atomized_residue_mask": copy_atomized_residue_mask,
-        }
-
-    def max_added_tokens(self, N):
-        res_cap = self.max_res_per_island * self.max_res_islands
-        return res_cap

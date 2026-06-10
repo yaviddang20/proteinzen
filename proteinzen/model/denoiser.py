@@ -11,6 +11,7 @@ from scipy.optimize import linear_sum_assignment
 from proteinzen.boltz.data import const
 
 from proteinzen.model.modules.attention import ConditionedTransformerPairBias
+from proteinzen.model.utils import gather_helper
 from proteinzen.openfold.layers.layers import InvariantPointAttention, Dropout, TriangleMultiplicationOutgoing, TriangleMultiplicationIncoming, permute_final_dims
 from proteinzen.openfold.layers.layers_v2 import (
     Linear, ConditionedInvariantPointAttention, BackboneUpdate, TorsionAngles, LayerNorm, AdaLN, ConditionedTransition,
@@ -230,10 +231,18 @@ class Embedder(nn.Module):
                  use_qk_norm=False,
                  restype_dict=const.token_ids,
                  num_elements=const.num_elements,
-                 patch_unit_vec_bug=False,
                  predict_time=False,
                  use_lap_pe=False,
                  lap_pe_k=8,
+                 # hot fixes
+                 add_same_chain_feature=False,
+                 disable_absolute_res_idx=False,
+                 embed_token_is_copy_mask=False,
+                 embed_hotspot_type=False,
+                 embed_rigids_num_real_axes=False,
+                 patch_unit_vec_bug=False,
+                 embed_rigids_noising_mask=False,
+                 use_entity_id_unmasking=False,
     ):
         super().__init__()
         self.c_s = c_s
@@ -243,6 +252,7 @@ class Embedder(nn.Module):
         self.block_k = block_k
         self.use_lap_pe = use_lap_pe
         self.lap_pe_k = lap_pe_k
+        self.disable_absolute_res_idx = disable_absolute_res_idx
 
         self.timestep_embedder = fn.partial(
             get_timestep_embedding_flexshape,
@@ -263,6 +273,15 @@ class Embedder(nn.Module):
         )
         # self.node_is_atomized_embed = Linear(1, c_s, bias=False)
         self.node_is_unindexed_embed = Linear(1, c_s, bias=False)
+        if embed_token_is_copy_mask:
+            self.node_is_copy_embed = Linear(1, c_s, bias=False)
+        else:
+            self.node_is_copy_embed = None
+        if embed_hotspot_type:
+            self.node_hotspot_type_embed = nn.Embedding(3, c_s)
+        else:
+            self.node_hotspot_type_embed = None
+
 
         self.rigid_init = Linear(self.c_s, c_frame, bias=False)
         self.rigid_time_embed = Linear(index_embed_size, c_frame, bias=False)
@@ -274,6 +293,15 @@ class Embedder(nn.Module):
         # self.rigid_is_unindexed_embed = Linear(1, c_frame, bias=False)
         if use_lap_pe:
             self.rigid_lap_pe_embed = Linear(lap_pe_k, c_frame, bias=False)
+        # self.rigid_is_unindexed_embed = Linear(1, c_frame, bias=False)
+        if embed_rigids_num_real_axes:
+            self.rigids_num_real_axes = nn.Embedding(3, c_frame)
+        else:
+            self.rigids_num_real_axes = None
+        if embed_rigids_noising_mask:
+            self.rigids_noising_mask_embed = Linear(1, c_frame, bias=False)
+        else:
+            self.rigids_noising_mask_embed = None
 
         self.framepair_init = FramepairEmbedder(
             c_framepair
@@ -365,10 +393,12 @@ class Embedder(nn.Module):
             use_qk_norm=use_qk_norm,
             use_self_folding=use_self_folding,
             patch_unit_vec_bug=patch_unit_vec_bug,
+            add_same_chain_feature=add_same_chain_feature,
+            use_entity_id_unmasking=use_entity_id_unmasking
         )
-        
+
         self.predict_time = predict_time
-        
+
     def _gen_node_features(
         self,
         seq,
@@ -378,6 +408,8 @@ class Embedder(nn.Module):
         rigids,
         token_gather_idx,
         is_unindexed_mask,
+        is_copy_mask,
+        token_hotspot_type,
         # is_atomized_mask,
         sc_rigids=None,
         sf_rigids=None
@@ -398,6 +430,8 @@ class Embedder(nn.Module):
             node_sf_rigids = None
 
         node_seq_idx_embed = self.index_embedder(seq_idx)
+        if self.disable_absolute_res_idx:
+            node_seq_idx_embed = node_seq_idx_embed * 0
         node_init = self.node_init(node_seq_idx_embed) * (~is_unindexed_mask[..., None])
         visible_seq = seq * seq_mask + self.mask_token * (~seq_mask)
         visible_seq = visible_seq * (~seq_noising_mask) + self.mask_token * seq_noising_mask
@@ -412,6 +446,12 @@ class Embedder(nn.Module):
             + self.node_is_unindexed_embed(is_unindexed_mask[..., None].float())
         )
 
+        if self.node_is_copy_embed:
+            node_init = node_init + self.node_is_copy_embed(is_copy_mask[..., None].float())
+
+        if self.node_hotspot_type_embed:
+            node_init = node_init + self.node_hotspot_type_embed(token_hotspot_type.long())
+
         return {
             "node_init": node_init,
             "node_rigids": ru.Rigid.from_tensor_7(node_rigids),
@@ -425,11 +465,12 @@ class Embedder(nn.Module):
         rigids_element,
         rigids_charge,
         rigids_chirality,
+        rigids_num_real_axes,
         t,
         rigids_token_uid,
         rigids_idx,
         rigids_is_atomized_mask,
-        rigids_noising_mask=None,
+        rigids_noising_mask,
         rigids_lap_pe=None,
     ):
         nodes_to_rigids = fn.partial(gather_helper, token_gather_idx=rigids_token_uid)
@@ -446,10 +487,10 @@ class Embedder(nn.Module):
         is_atomized_embed = self.rigid_is_atomized_embed(rigids_is_atomized_mask[..., None].float())
         element_mask = (rigids_element != -1)
         element_embed = self.rigid_element_embed(rigids_element * element_mask) * element_mask[..., None]
-        charge_embed = self.rigid_charge_embed(rigids_charge.unsqueeze(-1).float())
         chirality_embed = self.rigid_chirality_embed(
             rigids_chirality.unsqueeze(-1).float()
         ) * rigids_is_atomized_mask[..., None].float()
+        charge_embed = self.rigid_charge_embed(rigids_charge.unsqueeze(-1))
 
         rigids_init = (
             rigids_init
@@ -463,6 +504,12 @@ class Embedder(nn.Module):
 
         if self.use_lap_pe and rigids_lap_pe is not None:
             rigids_init = rigids_init + self.rigid_lap_pe_embed(rigids_lap_pe)
+
+        if self.rigids_num_real_axes is not None:
+            rigids_init = rigids_init + self.rigids_num_real_axes(rigids_num_real_axes)
+
+        if self.rigids_noising_mask_embed is not None:
+            rigids_init = rigids_init + self.rigids_noising_mask_embed(rigids_noising_mask[..., None].float())
 
         return rigids_init
 
@@ -511,15 +558,19 @@ class Embedder(nn.Module):
             token_seq_idx,
             token_seq_noising_mask,
             token_seq_mask,
-            token_chain_idx,
+            token_asym_id,
+            token_entity_id,
             # token_is_atomized_mask,
             token_is_unindexed_mask,
+            token_is_copy_mask,
+            token_hotspot_type,
             token_gather_idx,
             t,
             rigids,
             rigids_element,
             rigids_charge,
             rigids_chirality,
+            rigids_num_real_axes,
             rigids_token_uid,
             rigids_idx,
             rigids_mask,
@@ -537,8 +588,12 @@ class Embedder(nn.Module):
         n_padding = (self.block_q - n_rigids % self.block_q) % self.block_q
         n_attn_blocks = (n_rigids + n_padding) // self.block_q
 
-        indexing_matrix = get_indexing_matrix(n_attn_blocks, W=self.block_q, H=self.block_k, device=rigids.device)
-        
+        indexing_matrix = get_indexing_matrix(
+            n_attn_blocks,
+            W=self.block_q,
+            H=self.block_k,
+            device=t.device
+        )
         to_queries = lambda x: x.view(n_batch, n_attn_blocks, self.block_q, -1)
         to_keys = fn.partial(
             single_to_keys, indexing_matrix=indexing_matrix, W=self.block_q, H=self.block_k
@@ -556,7 +611,8 @@ class Embedder(nn.Module):
             rigids,
             token_gather_idx,
             token_is_unindexed_mask,
-            # token_is_atomized_mask,
+            token_is_copy_mask,
+            token_hotspot_type,
             sc_rigids=sc_rigids,
             sf_rigids=sf_rigids
         )
@@ -566,7 +622,8 @@ class Embedder(nn.Module):
             node_data['node_rigids'],
             token_mask,
             token_seq_idx,
-            token_chain_idx,
+            token_asym_id,
+            token_entity_id,
             token_is_unindexed_mask,
             token_bonds,
             sc_rigids=node_data['node_sc_rigids'],
@@ -578,6 +635,7 @@ class Embedder(nn.Module):
             rigids_element,
             rigids_charge,
             rigids_chirality,
+            rigids_num_real_axes,
             t,
             rigids_token_uid,
             rigids_idx,
@@ -709,9 +767,6 @@ class Embedder(nn.Module):
 
         return ret
 
-
-
-
 class IpaDenoiser(nn.Module):
     def __init__(self,
                  c_s=256,
@@ -722,6 +777,7 @@ class IpaDenoiser(nn.Module):
                  c_hidden=256,
                  c_hidden_trig=32,
                  num_heads=8,
+                 num_attn_pair_bias_heads=4,
                  num_qk_points=8,
                  num_v_points=12,
                  num_blocks=4,
@@ -755,6 +811,15 @@ class IpaDenoiser(nn.Module):
                  predict_min_conformer=False,
                  use_lap_pe=False,
                  lap_pe_k=8,
+                 pred_distogram=False,
+                 pred_bb_fafe=False,
+                 pred_local_fafe=False,
+                 num_pairwise_pred_bins=64,
+                 num_local_pred_bins=50,
+                 distogram_min_bin=2,
+                 distogram_max_bin=22,
+                 pair_trans_fafe_min_bin=0,
+                 pair_trans_fafe_max_bin=31,
                  ):
         super().__init__()
         # self.diffuser = diffuser
@@ -778,6 +843,11 @@ class IpaDenoiser(nn.Module):
         self.predict_time = predict_time
         self.predict_energy = predict_energy
         self.predict_min_conformer = predict_min_conformer
+        self.distogram_min_bin = distogram_min_bin
+        self.distogram_max_bin = distogram_max_bin
+        self.pair_trans_fafe_min_bin = pair_trans_fafe_min_bin
+        self.pair_trans_fafe_max_bin = pair_trans_fafe_max_bin
+        self.num_pairwise_pred_bins = num_pairwise_pred_bins
 
         for b in range(num_blocks):
             if use_conditioned_ipa:
@@ -809,7 +879,7 @@ class IpaDenoiser(nn.Module):
                 c_s=c_s,
                 c_cond=c_cond,
                 c_z=c_z,
-                no_heads=4,
+                no_heads=num_attn_pair_bias_heads,
                 n_layers=2,
                 row_dropout=tfmr_row_dropout_r,
                 use_qk_norm=use_qk_norm,
@@ -892,6 +962,25 @@ class IpaDenoiser(nn.Module):
         self.energy_pred = EnergyPredictor(c_frame)
         self.min_conformer_pred = MinConformerPredictor(c_frame)
         self.detach_grad_pre_seq_pred = detach_grad_pre_seq_pred
+
+        if pred_distogram:
+            self.distogram_head = Linear(c_z, num_pairwise_pred_bins, bias=False)
+        else:
+            self.distogram_head = None
+
+        if pred_bb_fafe:
+            self.pair_trans_fafe_head = Linear(c_z, num_pairwise_pred_bins, bias=False)
+            self.pair_rot_fafe_head = Linear(c_z, num_pairwise_pred_bins, bias=False)
+        else:
+            self.pair_trans_fafe_head = None
+            self.pair_rot_fafe_head = None
+
+        if pred_local_fafe:
+            self.local_trans_fafe_head = Linear(c_frame, num_local_pred_bins, bias=False)
+            self.local_rot_fafe_head = Linear(c_frame, num_local_pred_bins, bias=False)
+        else:
+            self.local_trans_fafe_head = None
+            self.local_rot_fafe_head = None
 
         if predict_final_rot and not accumulate_rot_vf_output:
             self.final_rot_head = nn.Sequential(
@@ -1070,7 +1159,51 @@ class IpaDenoiser(nn.Module):
             'energy_pred_val': self.energy_pred(rigids_embed_flat, rigids_mask_flat) if self.predict_energy else None,
             'min_conformer_pred_val': self.min_conformer_pred(rigids_embed_flat) if self.predict_min_conformer else None,
         }
+
+        if input_feats['n_padding'] > 0:
+            rigids_embed = rigids_embed_flat[..., :-input_feats['n_padding'], :]
+        else:
+            rigids_embed = rigids_embed_flat
+        model_out.update(
+            self._confidence_metrics(rigids_embed, edge_embed)
+        )
         return model_out
+
+    def _confidence_metrics(self, rigids_embed, edge_embed):
+        metrics = {}
+        if self.distogram_head is not None:
+            distogram_logits = self.distogram_head(edge_embed)
+            metrics["distogram_logits"] = distogram_logits
+            lower = torch.linspace(
+                self.distogram_min_bin,
+                self.distogram_max_bin,
+                self.num_pairwise_pred_bins,
+                device=distogram_logits.device)
+            upper = torch.cat([lower[1:], lower.new_tensor([1e8])], dim=-1)
+            metrics["distogram_bin_lower"] = lower
+            metrics["distogram_bin_upper"] = upper
+
+        if self.pair_trans_fafe_head is not None:
+            metrics["pair_trans_fafe_logits"] = self.pair_trans_fafe_head(edge_embed)
+            lower = torch.linspace(
+                self.pair_trans_fafe_min_bin,
+                self.pair_trans_fafe_max_bin,
+                self.num_pairwise_pred_bins,
+                device=distogram_logits.device)
+            upper = torch.cat([lower[1:], lower.new_tensor([1e8])], dim=-1)
+            metrics["pair_trans_fafe_bin_lower"] = lower
+            metrics["pair_trans_fafe_bin_upper"] = upper
+
+        if self.pair_rot_fafe_head is not None:
+            metrics["pair_rot_fafe_logits"] = self.pair_rot_fafe_head(edge_embed)
+
+        if self.local_trans_fafe_head is not None:
+            metrics["local_trans_fafe_logits"] = self.local_trans_fafe_head(rigids_embed)
+
+        if self.local_rot_fafe_head is not None:
+            metrics["local_rot_fafe_logits"] = self.local_rot_fafe_head(rigids_embed)
+
+        return metrics
 
 
 class Pairformer(nn.Module):
@@ -1265,13 +1398,14 @@ class IpaMultiRigidDenoiser(nn.Module):
                  c_hidden_trig=32,
                  c_hidden_trig_embedder=64,
                  num_heads=16,
+                 num_attn_pair_bias_heads=4,
                  num_qk_points=8,
                  num_v_points=12,
                  num_blocks=12,
                  trans_preconditioning=False,
                  rot_preconditioning=True,
                  block_q=16,
-                 block_k=96,
+                 block_k=64,
                  use_conditioned_ipa=True,
                  use_conditioned_rigid_transformer=False,
                  rigid_transformer_num_blocks=1,
@@ -1308,6 +1442,16 @@ class IpaMultiRigidDenoiser(nn.Module):
                  predict_min_conformer=False,
                  use_lap_pe=False,
                  lap_pe_k=8,
+                 add_same_chain_feature=False,
+                 disable_absolute_res_idx=False,
+                 embed_hotspot_type=False,
+                 embed_rigids_num_real_axes=False,
+                 embed_token_is_copy_mask=False,
+                 embed_rigids_noising_mask=False,
+                 use_entity_id_unmasking=False,
+                 pred_distogram=False,
+                 pred_local_fafe=False,
+                 pred_pae=False
                  ):
         super().__init__()
 
@@ -1335,6 +1479,7 @@ class IpaMultiRigidDenoiser(nn.Module):
             c_hidden=c_hidden // num_heads,
             c_hidden_trig=c_hidden_trig,
             num_heads=num_heads,
+            num_attn_pair_bias_heads=num_attn_pair_bias_heads,
             num_qk_points=num_qk_points,
             num_v_points=num_v_points,
             num_blocks=num_blocks,
@@ -1367,6 +1512,9 @@ class IpaMultiRigidDenoiser(nn.Module):
             predict_min_conformer=predict_min_conformer,
             use_lap_pe=use_lap_pe,
             lap_pe_k=lap_pe_k,
+            pred_distogram=pred_distogram,
+            pred_local_fafe=pred_local_fafe,
+            pred_bb_fafe=pred_pae,
         )
 
         self.embedder = Embedder(
@@ -1389,6 +1537,13 @@ class IpaMultiRigidDenoiser(nn.Module):
             predict_time=predict_time,
             use_lap_pe=use_lap_pe,
             lap_pe_k=lap_pe_k,
+            add_same_chain_feature=add_same_chain_feature,
+            disable_absolute_res_idx=disable_absolute_res_idx,
+            embed_hotspot_type=embed_hotspot_type,
+            embed_token_is_copy_mask=embed_token_is_copy_mask,
+            embed_rigids_num_real_axes=embed_rigids_num_real_axes,
+            embed_rigids_noising_mask=embed_rigids_noising_mask,
+            use_entity_id_unmasking=use_entity_id_unmasking
         )
 
         if use_pairformer:
@@ -1447,15 +1602,19 @@ class IpaMultiRigidDenoiser(nn.Module):
                 token_seq=token_data['res_type'],
                 token_seq_mask=token_data['token_mask'],
                 token_seq_noising_mask=token_data['seq_noising_mask'],
-                token_chain_idx=token_data['asym_id'],
+                token_asym_id=token_data['asym_id'],
+                token_entity_id=token_data['entity_id'],
                 # token_is_atomized_mask=token_data['token_is_atomized_mask'],
                 token_is_unindexed_mask=token_data['token_is_unindexed_mask'],
+                token_is_copy_mask=token_data['token_is_copy_mask'],
+                token_hotspot_type=token_data['hotspot_type'],
                 token_gather_idx=token_data['token_to_rep_rigid'],
                 t=data['t'],
                 rigids=rigids_data['rigids_t'],
                 rigids_element=rigids_data['rigids_ref_element'],
                 rigids_charge=rigids_data['rigids_ref_charge'],
                 rigids_chirality=rigids_data['rigids_ref_chirality'],
+                rigids_num_real_axes=rigids_data['rigids_num_real_axes'],
                 rigids_token_uid=rigids_data['rigids_to_token'],
                 rigids_idx=rigids_data['rigids_sidechain_idx'],
                 rigids_mask=rigids_data['rigids_mask'],
@@ -1516,9 +1675,9 @@ class IpaMultiRigidDenoiser(nn.Module):
         seq_noising_mask = token_data['seq_noising_mask']
         pred_seq = pred_seq * seq_noising_mask + token_data['seq'] * (~seq_noising_mask)
 
-        # if rigids_out.to_tensor_7().isnan().any() or pred_seq.isnan().any():
-        #     print("caught a nan in forward")
-        #     exit()
+        if rigids_out.to_tensor_7().isnan().any() or pred_seq.isnan().any():
+            print("caught a nan in forward")
+            exit()
 
         ret = {}
         ret['denoised_rigids'] = rigids_out
@@ -1549,6 +1708,20 @@ class IpaMultiRigidDenoiser(nn.Module):
                 )
                 ret['bond_updated_trans'] = updated_trans
                 ret['bond_angles'] = angles
+        if "distogram_logits" in score_dict:
+            ret['distogram_logits'] = score_dict['distogram_logits']
+            ret['distogram_bin_lower'] = score_dict['distogram_bin_lower']
+            ret['distogram_bin_upper'] = score_dict['distogram_bin_upper']
+        if "local_trans_fafe_logits" in score_dict:
+            ret["local_trans_fafe_logits"] = score_dict['local_trans_fafe_logits']
+        if "local_rot_fafe_logits" in score_dict:
+            ret["local_rot_fafe_logits"] = score_dict['local_rot_fafe_logits']
+        if "pair_trans_fafe_logits" in score_dict:
+            ret["pair_trans_fafe_logits"] = score_dict['pair_trans_fafe_logits']
+            ret['pair_trans_fafe_bin_lower'] = score_dict['pair_trans_fafe_bin_lower']
+            ret['pair_trans_fafe_bin_upper'] = score_dict['pair_trans_fafe_bin_upper']
+        if "pair_rot_fafe_logits" in score_dict:
+            ret["local_rot_fafe_logits"] = score_dict['local_rot_fafe_logits']
 
         if self.direct_rot_vf_output:
             pred_rot_vf = score_dict['pred_rot_vf'].float() * self.rot_vf_scaling
@@ -1560,8 +1733,11 @@ class IpaMultiRigidDenoiser(nn.Module):
             token_rigids = gather_helper(rigids_out.to_tensor_7(), token_data['token_to_rep_rigid'])
             token_rigids = ru.Rigid.from_tensor_7(token_rigids)
 
+            # TODO: this should probably be a scatter instead of a gather
+            token_noising_mask = gather_helper(rigids_data['rigids_noising_mask'][..., None], token_data['token_to_rep_rigid']).squeeze(-1)
+
             motif_rigid_mask = token_data['token_is_copy_mask']
-            protein_rigid_mask = ~token_data['token_is_copy_mask']
+            protein_rigid_mask = ~token_data['token_is_copy_mask'] & token_noising_mask
             dist_mask = motif_rigid_mask[..., None] & protein_rigid_mask[..., None, :]
             res_CA_pos = token_rigids.get_trans()
             trans_dist = torch.cdist(res_CA_pos, res_CA_pos)

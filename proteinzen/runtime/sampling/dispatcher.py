@@ -1,6 +1,6 @@
 
-from hydra_zen import load_from_yaml
-from torch.utils.data import Dataset # IterableDataset
+from hydra_zen import load_from_yaml, instantiate
+from torch.utils.data import Dataset, BatchSampler
 from torch_geometric.data import Batch
 
 from .task import SamplingTask
@@ -11,14 +11,8 @@ from .motif_scaffolding import MotifScaffoldingTask
 from .protein_pocket import ProteinPocketConditionedSampling
 
 
+
 class BiomoleculeTaskDispatcher(Dataset):
-    name_to_task_class = {
-        "motif_scaffolding": MotifScaffoldingTask,
-        "unconditional": UnconditionalSampling,
-        "unconditional_smiles": UnconditionalSamplingFromSMILES,
-        "unconditional_mol": UnconditionalSamplingFromMol,
-        "protein_pocket_conditioned": ProteinPocketConditionedSampling,
-    }
 
     def __init__(
         self,
@@ -39,10 +33,9 @@ class BiomoleculeTaskDispatcher(Dataset):
 
         self.config = load_from_yaml(tasks_yaml)
 
-        for task_dict in self.config['tasks']:
-            task_class = self.name_to_task_class[task_dict['task']]
-            task = task_class(trans_std=trans_std, include_h=include_h, **task_dict)
-            self.task_objs.append((task_dict, task))
+        task_list = instantiate(self.config)
+        for task in task_list:
+            self.task_objs.append((None, task))
 
         self.batches = self._optimal_batching()
 
@@ -80,3 +73,40 @@ class BiomoleculeTaskDispatcher(Dataset):
         #     batches.append(current_batch)
 
         return all_samples
+
+
+class TaskBatchSampler:
+    def __init__(
+        self,
+        dataset: BiomoleculeTaskDispatcher,
+        batch_size: int
+    ):
+        self.dataset = dataset
+
+        samples_per_task = {}
+        for i, sample in enumerate(dataset.batches):
+            task = sample['task']
+            if task in samples_per_task:
+                samples_per_task[task].append(i)
+            else:
+                samples_per_task[task] = [i]
+
+        self.batch_idxs = []
+
+        for task, task_samples in samples_per_task.items():
+            batch = []
+            for i in task_samples:
+                if len(batch) < batch_size:
+                    batch.append(i)
+                else:
+                    self.batch_idxs.append(batch)
+                    batch = [i]
+            if len(batch) > 0:
+                self.batch_idxs.append(batch)
+
+    def __iter__(self):
+        for batch in self.batch_idxs:
+            yield batch
+
+    def __len__(self):
+        return len(self.batch_idxs)

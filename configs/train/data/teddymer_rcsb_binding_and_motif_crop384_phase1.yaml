@@ -1,0 +1,241 @@
+_target_: proteinzen.data.datasets.datamodule.TrainingDataset
+max_crop_residues: 384
+max_crop_rigids: 1152
+use_cropper: true
+crop_max_neighbors: 20
+
+samples_per_epoch: 2500
+dataset_probs: [0.4, 0.6]
+datasets:
+  - _target_: proteinzen.data.datasets.dataset.MMCIFDataset
+    remove_mol_types:
+      - "DNA"
+      - "RNA"
+      - "NONPOLYMER"
+    chain_content_criteria:
+      "PROTEIN": 2
+    min_interface_size: 20
+    only_valid_multichain: true
+    data_dir: /mnt/scratch/user/ali16/data/rcsb_boltz_new_interfaces
+    data_sampler:
+      _target_: proteinzen.boltz.data.sample.cluster.ClusterSampler
+    task_sampler:
+      _target_: proteinzen.runtime.training.task.TaskSampler
+      task_list:
+        - _target_: proteinzen.runtime.training.binder_design.BinderDesignWithBindingMotif
+          noise_target: false
+          prob: 0.5
+          t_sched: uniform
+          lognorm_mu: 0.0
+          lognorm_sig: 1.0
+          mixed_beta_mix_rate: 0.1
+          beta_p1: 1.0
+          beta_p2: 1.9
+          t_min: 0.00
+          t_max: 0.99
+          max_num_motif_res: 0
+          max_noised_chains: 1
+          interface_num_res_cap: 8
+          p_binding: 0.5
+          p_nonbinding: 0.0
+          p_both: 0.5
+          p_none: 0.0
+          name_override: binder_design
+        - _target_: proteinzen.runtime.training.binder_design.BinderDesignWithBindingMotif
+          noise_target: false
+          prob: 0.15
+          t_sched: uniform
+          lognorm_mu: 0.0
+          lognorm_sig: 1.0
+          mixed_beta_mix_rate: 0.1
+          beta_p1: 1.0
+          beta_p2: 1.9
+          t_min: 0.00
+          t_max: 0.99
+          max_noised_chains: 1
+          interface_num_res_cap: 8
+          motif_is_unindexed: true
+          motif_redesign_seq_rate: 0.5
+          motif_repack_rate: 0.5
+          p_binding: 0.15
+          p_nonbinding: 0.075
+          p_both: 0.075
+          p_none: 0.70
+          name_override: binder_design_unindexed_redesigned_motif
+        - _target_: proteinzen.runtime.training.binder_design.BinderDesignWithBindingMotif
+          noise_target: false
+          prob: 0.15
+          t_sched: uniform
+          lognorm_mu: 0.0
+          lognorm_sig: 1.0
+          mixed_beta_mix_rate: 0.1
+          beta_p1: 1.0
+          beta_p2: 1.9
+          t_min: 0.00
+          t_max: 0.99
+          max_noised_chains: 1
+          interface_num_res_cap: 8
+          motif_is_unindexed: true
+          motif_redesign_seq_rate: 0.0
+          p_binding: 0.15
+          p_nonbinding: 0.075
+          p_both: 0.075
+          p_none: 0.70
+          name_override: binder_design_unindexed_motif
+        - _target_: proteinzen.runtime.training.binder_design.BinderDesignWithBindingMotif
+          noise_target: false
+          prob: 0.10
+          t_sched: uniform
+          lognorm_mu: 0.0
+          lognorm_sig: 1.0
+          mixed_beta_mix_rate: 0.1
+          beta_p1: 1.0
+          beta_p2: 1.9
+          t_min: 0.00
+          t_max: 0.99
+          max_noised_chains: 1
+          interface_num_res_cap: 8
+          motif_is_unindexed: false
+          motif_redesign_seq_rate: 0.5
+          motif_repack_rate: 0.5
+          p_binding: 0.15
+          p_nonbinding: 0.075
+          p_both: 0.075
+          p_none: 0.70
+          name_override: binder_design_indexed_redesigned_motif
+        - _target_: proteinzen.runtime.training.binder_design.BinderDesignWithBindingMotif
+          noise_target: false
+          prob: 0.10
+          t_sched: uniform
+          lognorm_mu: 0.0
+          lognorm_sig: 1.0
+          mixed_beta_mix_rate: 0.1
+          beta_p1: 1.0
+          beta_p2: 1.9
+          t_min: 0.00
+          t_max: 0.99
+          max_noised_chains: 1
+          interface_num_res_cap: 8
+          motif_is_unindexed: false
+          motif_redesign_seq_rate: 0.0
+          p_binding: 0.15
+          p_nonbinding: 0.075
+          p_both: 0.075
+          p_none: 0.70
+          name_override: binder_design_indexed_motif
+  - _target_: proteinzen.data.datasets.dataset.MMCIFDataset
+    remove_mol_types:
+      - "DNA"
+      - "RNA"
+      - "NONPOLYMER"
+    chain_content_criteria:
+      "PROTEIN": 2
+    min_interface_size: 20
+    only_valid_multichain: true
+    data_dir: /mnt/scratch/user/ali16/data/teddymer_boltz_new_interfaces
+    data_sampler:
+      _target_: proteinzen.boltz.data.sample.random.RandomSampler
+    task_sampler:
+      _target_: proteinzen.runtime.training.task.TaskSampler
+      task_list:
+        - _target_: proteinzen.runtime.training.binder_design.BinderDesignWithBindingMotif
+          noise_target: false
+          prob: 0.5
+          t_sched: uniform
+          lognorm_mu: 0.0
+          lognorm_sig: 1.0
+          mixed_beta_mix_rate: 0.1
+          beta_p1: 1.0
+          beta_p2: 1.9
+          t_min: 0.00
+          t_max: 0.99
+          max_num_motif_res: 0
+          max_noised_chains: 1
+          interface_num_res_cap: 8
+          p_binding: 0.5
+          p_nonbinding: 0.0
+          p_both: 0.5
+          p_none: 0.0
+          name_override: binder_design
+        - _target_: proteinzen.runtime.training.binder_design.BinderDesignWithBindingMotif
+          noise_target: false
+          prob: 0.15
+          t_sched: uniform
+          lognorm_mu: 0.0
+          lognorm_sig: 1.0
+          mixed_beta_mix_rate: 0.1
+          beta_p1: 1.0
+          beta_p2: 1.9
+          t_min: 0.00
+          t_max: 0.99
+          max_noised_chains: 1
+          interface_num_res_cap: 8
+          motif_is_unindexed: true
+          motif_redesign_seq_rate: 0.5
+          motif_repack_rate: 0.5
+          p_binding: 0.15
+          p_nonbinding: 0.075
+          p_both: 0.075
+          p_none: 0.70
+          name_override: binder_design_unindexed_redesigned_motif
+        - _target_: proteinzen.runtime.training.binder_design.BinderDesignWithBindingMotif
+          noise_target: false
+          prob: 0.15
+          t_sched: uniform
+          lognorm_mu: 0.0
+          lognorm_sig: 1.0
+          mixed_beta_mix_rate: 0.1
+          beta_p1: 1.0
+          beta_p2: 1.9
+          t_min: 0.00
+          t_max: 0.99
+          max_noised_chains: 1
+          interface_num_res_cap: 8
+          motif_is_unindexed: true
+          motif_redesign_seq_rate: 0.0
+          p_binding: 0.15
+          p_nonbinding: 0.075
+          p_both: 0.075
+          p_none: 0.70
+          name_override: binder_design_unindexed_motif
+        - _target_: proteinzen.runtime.training.binder_design.BinderDesignWithBindingMotif
+          noise_target: false
+          prob: 0.10
+          t_sched: uniform
+          lognorm_mu: 0.0
+          lognorm_sig: 1.0
+          mixed_beta_mix_rate: 0.1
+          beta_p1: 1.0
+          beta_p2: 1.9
+          t_min: 0.00
+          t_max: 0.99
+          max_noised_chains: 1
+          interface_num_res_cap: 8
+          motif_is_unindexed: false
+          motif_redesign_seq_rate: 0.5
+          motif_repack_rate: 0.5
+          p_binding: 0.15
+          p_nonbinding: 0.075
+          p_both: 0.075
+          p_none: 0.70
+          name_override: binder_design_indexed_redesigned_motif
+        - _target_: proteinzen.runtime.training.binder_design.BinderDesignWithBindingMotif
+          noise_target: false
+          prob: 0.10
+          t_sched: uniform
+          lognorm_mu: 0.0
+          lognorm_sig: 1.0
+          mixed_beta_mix_rate: 0.1
+          beta_p1: 1.0
+          beta_p2: 1.9
+          t_min: 0.00
+          t_max: 0.99
+          max_noised_chains: 1
+          interface_num_res_cap: 8
+          motif_is_unindexed: false
+          motif_redesign_seq_rate: 0.0
+          p_binding: 0.15
+          p_nonbinding: 0.075
+          p_both: 0.075
+          p_none: 0.70
+          name_override: binder_design_indexed_motif

@@ -29,10 +29,15 @@ class MMCIFDataset(data.Dataset):
             count_on_protein_res=False,
             use_conformer_record=True,
             interface_crop=False,
+            remove_mol_types=None,
+            chain_content_criteria=None,
+            min_percent_protein: float | None = None,
+            min_interface_size: int | None = None,
+            only_valid_multichain: bool = False
         ):
         self._log = logging.getLogger(__name__)
-        self.data_dir = data_dir
         self.interface_crop = interface_crop
+        self.data_dir = data_dir
         self.min_num_res = min_num_res
         self.max_num_res = max_num_res
         self.subset = subset
@@ -42,16 +47,40 @@ class MMCIFDataset(data.Dataset):
         self.task_sampler = task_sampler
         self.data_sampler = data_sampler
         self.overfit_num = overfit_num
-        self.count_on_protein_res = count_on_protein_res
+
         self.use_conformer_record = use_conformer_record
         self.mode = mode
         self.data_dir = f"{self.data_dir}/{self.mode}"
         print("Initializing MMCIFDataset in mode:", mode)
+
+        self.count_on_protein_res = count_on_protein_res
+        self.min_percent_protein = min_percent_protein
+        self.min_interface_size = min_interface_size
+        self.only_valid_multichain = only_valid_multichain
+
+        if self.min_interface_size:
+            print("WARNING: the current implementation of min_interface_size currently counts via residue and may mark interfaces with small molecules as invalid")
+
         if exclude_mol_types is None:
             self.exclude_mol_types = []
         else:
             print("Excluding molecules that contain chains of types:", exclude_mol_types)
             self.exclude_mol_types = [const.chain_types.index(s) for s in exclude_mol_types]
+
+        if remove_mol_types is None:
+            self.remove_mol_types = []
+        else:
+            print("Removing chains which are purely composed of the following types:", remove_mol_types)
+            self.remove_mol_types = [const.chain_types.index(s) for s in remove_mol_types]
+
+        if chain_content_criteria:
+            print(f"Only training on samples that have at minimum the following chain content: {chain_content_criteria}")
+            self.chain_content_criteria = {
+                const.chain_types.index(s): v
+                for s, v in chain_content_criteria.items()
+            }
+        else:
+            self.chain_content_criteria = {}
 
         self._init_metadata()
 
@@ -91,15 +120,98 @@ class MMCIFDataset(data.Dataset):
                 resolution = record['structures'][0]['resolution']
             else:
                 raise ValueError(f"Record {record['id']} has no structure or structures")
+
+            # remove records which will be empty when we remove mol types we're removing
+            _empty_record = True
+            for chain in record['chains']:
+                if chain['mol_type'] not in self.remove_mol_types and chain['valid']:
+                    _empty_record = False
+                    break
+            if _empty_record:
+                continue
+
+            # mark all chains that will be masked as invalid
+            for chain in record['chains']:
+                if chain['mol_type'] in self.remove_mol_types:
+                    chain['valid'] = False
+            # mark interfaces with invalid chains as invalid
+            is_chain_valid = {
+                chain['chain_id']: chain['valid']
+                for chain in record['chains']
+            }
+            for interface in record['interfaces']:
+                interface_chains_are_valid = is_chain_valid[interface['chain_1']] and is_chain_valid[interface['chain_2']]
+                interface['valid'] = interface['valid'] and interface_chains_are_valid
+
+            # remove records which don't have a specified chain composition
+            if self.chain_content_criteria:
+                keep_mol = True
+                num_chains_per_type = {
+                    mol_type: 0
+                    for mol_type in const.chain_type_ids.values()
+                }
+                for chain in record['chains']:
+                    remove_chain = (chain['mol_type'] in self.remove_mol_types)
+                    exclude_chain = (chain['mol_type'] in self.exclude_mol_types)
+                    if not (remove_chain or exclude_chain) and chain['valid']:
+                        num_chains_per_type[chain['mol_type']] += 1
+
+                for mol_type, mol_type_criteria in self.chain_content_criteria.items():
+                    if num_chains_per_type[mol_type] < mol_type_criteria:
+                        keep_mol = False
+
+                if not keep_mol:
+                    continue
+
+            # ensure a minimum protein content
+            if self.min_percent_protein:
+                num_protein_res = sum(chain['num_resolved_residues'] for chain in record['chains'] if chain['mol_type'] == const.chain_type_ids["PROTEIN"])
+                num_res = sum(chain['num_resolved_residues'] for chain in record['chains'])
+                if num_protein_res / num_res < self.min_percent_protein:
+                    continue
+
+            # ensure a minimum interface size
+            if self.min_interface_size:
+                # TODO: there's probably a smarter way of dealing with this wrt making sure we dont exclude small molecule interfaces
+                for interface in record['interfaces']:
+                    interface_size = min(interface['chain_1_num_res'], interface['chain_2_num_res'])
+                    if interface_size < self.min_interface_size:
+                        interface['valid'] = False
+
+            # remove records with no valid interfaces
+            if self.only_valid_multichain:
+                has_valid_interface = False
+                for interface in record['interfaces']:
+                    if interface['valid']:
+                        has_valid_interface = True
+                        break
+                if not has_valid_interface:
+                    continue
+
+            # apply some filtering critera that we might change at train time
+            if self.count_on_protein_res:
+                num_res = sum(chain['num_resolved_residues'] for chain in record['chains'] if chain['mol_type'] == const.chain_type_ids['PROTEIN'])
+            else:
+                num_res = sum(chain['num_resolved_residues'] for chain in record['chains'])
+            if num_res > self.max_num_res or num_res < self.min_num_res:
+                continue
+            resolution = record['structure']['resolution']
             if resolution is not None and resolution > self.max_resolution:
                 continue
             if self.split is not None and record['id'] not in self.split:
                 continue
+
+
+            record['is_af2_struct'] = record['id'].startswith("AF-")
+
+
             if self.use_conformer_record:
                 self.manifest.append(ConformerRecord.from_dict(record))
             else:
                 self.manifest.append(Record.from_dict(record))
+
             num_records += 1
+            
             if self.overfit_num is not None and num_records >= self.overfit_num:
                 print(f"Overfitting on {num_records} records:\n", self.manifest)
                 break
@@ -107,6 +219,14 @@ class MMCIFDataset(data.Dataset):
         # if self.overfit_num is not None:
         #     self.manifest = self.manifest[-self.overfit_num:]
         #     print("overfit entries:", self.manifest)
+            # if record['structure']['coil_percent'] > (1 - self.min_percent_ordered):
+            #     continue
+
+
+
+        if self.overfit_num is not None:
+            self.manifest = self.manifest[-self.overfit_num:]
+            print("overfit entries:", self.manifest)
 
     def __len__(self):
         return len(self.manifest)

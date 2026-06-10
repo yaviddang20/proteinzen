@@ -323,7 +323,11 @@ def compute_covalent_ligands(
     return covalent_chain_ids
 
 
-def compute_interfaces(atom_data: np.ndarray, chain_data: np.ndarray) -> np.ndarray:
+def compute_interfaces(
+    atom_data: np.ndarray,
+    res_data: np.ndarray,
+    chain_data: np.ndarray
+) -> np.ndarray:
     """Compute the chain-chain interfaces from a gemmi structure.
 
     Parameters
@@ -345,28 +349,66 @@ def compute_interfaces(atom_data: np.ndarray, chain_data: np.ndarray) -> np.ndar
         chain_ids.extend([idx] * chain["atom_num"])
     chain_ids = np.array(chain_ids)
 
+    res_idxs = []
+    for chain in chain_data:
+        res_start = chain['res_idx']
+        res_end = res_start + chain['res_num']
+        for residue in res_data[res_start:res_end]:
+            res_idxs.extend([int(residue['res_idx'])] * residue['atom_num'])
+    res_idxs = np.array(res_idxs)
+
     # Filte to present atoms
     coords = atom_data["coords"]
     mask = atom_data["is_present"]
 
     coords = coords[mask]
     chain_ids = chain_ids[mask]
+    res_idxs = res_idxs[mask]
 
     # Compute the distance matrix
     tree = KDTree(coords, metric="euclidean")
     query = tree.query_radius(coords, const.atom_interface_cutoff)
 
-    # Get unique chain pairs
-    interfaces = set()
-    for c1, pairs in zip(chain_ids, query):
-        chains = np.unique(chain_ids[pairs])
-        chains = chains[chains != c1]
-        interfaces.update((c1, c2) for c2 in chains)
+    interface_pairs = set()
+    for c1, c1_res_idx, pairs in zip(
+        chain_ids, res_idxs, query
+    ):
+        c2_chains = chain_ids[pairs]
+        c2_res_idx = res_idxs[pairs]
+
+        # remove intrachain interactions and get unique remaining interactions
+        c2_chain_res = np.stack([c2_chains, c2_res_idx], axis=0)
+        c2_chain_res = np.unique(c2_chain_res, axis=-1)
+        c2_chain_res = c2_chain_res[..., c2_chain_res[0] != c1]
+        c2_chains, c2_res_idx = c2_chain_res[0], c2_chain_res[1]
+
+        for c2, c2_res_idx in zip(c2_chains, c2_res_idx):
+            interface_pair_key = (
+                (c1, c2, c1_res_idx, c2_res_idx) if c1 < c2
+                else (c2, c1, c2_res_idx, c1_res_idx)
+            )
+            interface_pairs.update(((int(i) for i in interface_pair_key),))
 
     # Get unique chain pairs
-    interfaces = [(min(i, j), max(i, j)) for i, j in interfaces]
-    interfaces = list({(int(i), int(j)) for i, j in interfaces})
-    interfaces = np.array(interfaces, dtype=Interface)
+    interface_residues = {}
+    for c1, c2, c1_res_idx, c2_res_idx in interface_pairs:
+        if (c1, c2) not in interface_residues:
+            interface_residues[(c1, c2)] = [(c1_res_idx, c2_res_idx)]
+        else:
+            interface_residues[(c1, c2)].append((c1_res_idx, c2_res_idx))
+    interface_data = []
+
+    for (c1, c2), res_idx_list in interface_residues.items():
+        c1_res, c2_res = zip(*res_idx_list)
+        interface_data.append(
+            (c1, c2, len(set(c1_res)), len(set(c2_res)))
+        )
+
+    # Get unique chain pairs
+    interfaces = np.array(
+        interface_data,
+        dtype=Interface
+    )
     return interfaces
 
 
@@ -874,6 +916,7 @@ def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
     structure.remove_hydrogens()
     structure.remove_alternative_conformations()
     structure.remove_empty_chains()
+    structure.setup_entities()
 
     # Expand assembly 1
     if use_assembly and structure.assemblies:
@@ -1105,7 +1148,7 @@ def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
     mask = np.ones(len(chain_data), dtype=bool)
 
     # Compute interface chains (find chains with a heavy atom within 5A)
-    interfaces = compute_interfaces(atoms, chains)
+    interfaces = compute_interfaces(atoms, residues, chains)
 
     # Return parsed structure
     info = StructureInfo(

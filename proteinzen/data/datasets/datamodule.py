@@ -303,6 +303,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.max_crop_residues = max_crop_residues
         self.max_crop_rigids = max_crop_rigids
         self.samples_per_epoch = samples_per_epoch
+
         if dataset_probs is None:
             self.dataset_probs = [1/len(datasets) for _ in datasets]
         else:
@@ -325,6 +326,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.include_h = include_h
         self.use_identity_rot = use_identity_rot
         self.lap_pe_k = lap_pe_k
+        self.mask_nonstandard = mask_nonstandard
 
         for dataset in datasets:
             records = dataset.manifest
@@ -347,7 +349,6 @@ class TrainingDataset(torch.utils.data.Dataset):
         struct, rot_bond_data = load_input(sample.record, Path(dataset.data_dir), include_h=self.include_h)
 
         # Skip structures where a PROTEIN chain contains nucleotide residues
-        # (gemmi can misclassify DNA chains as PeptideL/PROTEIN)
         _nuc_names = {'DA', 'DC', 'DG', 'DT', 'A', 'G', 'C', 'U'}
         _protein_id = const.chain_type_ids["PROTEIN"]
         _has_nuc_in_protein = False
@@ -361,13 +362,29 @@ class TrainingDataset(torch.utils.data.Dataset):
         if _has_nuc_in_protein:
             return self.__getitem__(idx)
 
-        chain_mask = struct.mask
+        new_struct_mask = struct.mask.copy()
+        for i, chain in enumerate(sample.record.chains):
+            new_struct_mask[i] = chain.valid
+
         remove_chain_masks = [struct.chains['mol_type'] == i for i in self.remove_mol_types]
         for remove_mask in remove_chain_masks:
-            chain_mask[remove_mask] = False
+            new_struct_mask[remove_mask] = False
 
-        if np.random.random() < 0.5:
-            struct = mirror_structure(struct)
+        # if np.random.random() < 0.5:
+        #     struct = mirror_structure(struct)
+
+        struct = replace(struct, mask=new_struct_mask)
+        # update interface data with record information
+        interface_ids = [(c1, c2) for c1, c2 in zip(struct.interfaces['chain_1'], struct.interfaces['chain_2'])]
+        interfaces_to_retain = set(
+            [
+                (interface.chain_1, interface.chain_2)
+                for interface in sample.record.interfaces if interface.valid
+            ]
+        )
+        keep_interface = [interface in interfaces_to_retain for interface in interface_ids]
+        struct = replace(struct, interfaces=struct.interfaces[keep_interface])
+
 
         if self.mask_nonstandard:
             struct = mask_nonstandard_residues(struct)
@@ -386,6 +403,18 @@ class TrainingDataset(torch.utils.data.Dataset):
             structure=struct
         )
 
+        if "seed_interface" in task_data:
+            interface_tuples = [tuple(sorted((i.chain_1, i.chain_2))) for i in sample.record.interfaces if i.valid]
+            try:
+                interface_id = interface_tuples.index(task_data['seed_interface'])
+                sample = replace(sample, interface_id=interface_id, chain_id=None)
+            except ValueError as e:
+                valid_interfaces = struct.interfaces
+                valid_interfaces = valid_interfaces[struct.mask[valid_interfaces["chain_1"]]]
+                valid_interfaces = valid_interfaces[struct.mask[valid_interfaces["chain_2"]]]
+                print(sample.record.id, "interface id context", valid_interfaces, interface_tuples, task_data['seed_interface'], struct.chains[struct.mask])
+                raise e
+
         if self.cropper is not None:
             crop_size = self.max_crop_residues - task.max_added_tokens(token_data.shape[0])
             if len(tokenized_data.tokens) > crop_size:
@@ -397,8 +426,8 @@ class TrainingDataset(torch.utils.data.Dataset):
                     interface_id=sample.interface_id
                 )
 
-        if len(tokenized_data.tokens) == 0:
-            return self.__getitem__(idx)
+        # if len(tokenized_data.tokens) == 0:
+        #     return self.__getitem__(idx)
 
         features = featurize(
             tokenized_data,
@@ -531,10 +560,26 @@ class ValidationDataset(torch.utils.data.Dataset):
         if _has_nuc_in_protein:
             return self.__getitem__(idx)
 
-        chain_mask = struct.mask
+        new_struct_mask = struct.mask.copy()
+        for i, chain in enumerate(sample.record.chains):
+            new_struct_mask[i] = chain.valid
+
         remove_chain_masks = [struct.chains['mol_type'] == i for i in self.remove_mol_types]
         for remove_mask in remove_chain_masks:
-            chain_mask[remove_mask] = False
+            new_struct_mask[remove_mask] = False
+
+        struct = replace(struct, mask=new_struct_mask)
+
+
+        interface_ids = [(c1, c2) for c1, c2 in zip(struct.interfaces['chain_1'], struct.interfaces['chain_2'])]
+        interfaces_to_retain = set(
+            [
+                (interface.chain_1, interface.chain_2)
+                for interface in sample.record.interfaces if interface.valid
+            ]
+        )
+        keep_interface = [interface in interfaces_to_retain for interface in interface_ids]
+        struct = replace(struct, interfaces=struct.interfaces[keep_interface])
 
         if self.mask_nonstandard:
             struct = mask_nonstandard_residues(struct)
@@ -552,6 +597,18 @@ class ValidationDataset(torch.utils.data.Dataset):
             bonds=token_bonds,
             structure=struct
         )
+
+        if "seed_interface" in task_data:
+            interface_tuples = [tuple(sorted((i.chain_1, i.chain_2))) for i in sample.record.interfaces if i.valid]
+            try:
+                interface_id = interface_tuples.index(task_data['seed_interface'])
+                sample = replace(sample, interface_id=interface_id, chain_id=None)
+            except ValueError as e:
+                valid_interfaces = struct.interfaces
+                valid_interfaces = valid_interfaces[struct.mask[valid_interfaces["chain_1"]]]
+                valid_interfaces = valid_interfaces[struct.mask[valid_interfaces["chain_2"]]]
+                print(sample.record.id, "interface id context", valid_interfaces, interface_tuples, task_data['seed_interface'], struct.chains[struct.mask])
+                raise e
 
         if self.cropper is not None:
             crop_size = self.max_crop_residues - task.max_added_tokens(token_data.shape[0])
@@ -612,7 +669,6 @@ class ValidationDataset(torch.utils.data.Dataset):
 class BiomoleculeDataModule(L.LightningDataModule):
     def __init__(self,
                  train_dataset: TrainingDataset,
-                 val_dataset: ValidationDataset,
                  batch_size,  # this is PER GPU
                  num_workers,
                  ):
@@ -647,6 +703,8 @@ class BiomoleculeSamplingDataModule(L.LightningDataModule):
                  use_collate_for_pad=False,
                  trans_std: float = 3,
                  include_h: bool = False,
+                 batch_same_task_only=False,
+                 use_collate_for_pad=False
     ):
         super().__init__()
         self.batching_mode = batching_mode
@@ -668,4 +726,28 @@ class BiomoleculeSamplingDataModule(L.LightningDataModule):
             collate_fn=collate,
             shuffle=False
         )
+
+        if batch_same_task_only:
+            self.batch_sampler = TaskBatchSampler(
+                self.task_dispatcher,
+                self.batch_size
+            )
+        else:
+            self.batch_sampler = None
+
+    def predict_dataloader(self):
+        if self.batch_sampler is not None:
+            dataloader = DataLoader(
+                self.task_dispatcher,
+                batch_sampler=self.batch_sampler,
+                collate_fn=collate,
+                shuffle=False
+            )
+        else:
+            dataloader = DataLoader(
+                self.task_dispatcher,
+                batch_size=self.batch_size,
+                collate_fn=collate,
+                shuffle=False
+            )
         return dataloader

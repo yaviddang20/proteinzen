@@ -4,8 +4,6 @@ import logging
 import os
 import shutil
 
-os.environ.setdefault("REPO_ROOT", os.path.dirname(os.path.abspath(__file__)))
-
 import hydra
 from hydra_zen import zen
 import omegaconf
@@ -98,6 +96,7 @@ class Experiment:
             devices=devices,
             strategy=DDPStrategy(cluster_environment=LightningEnvironment(), find_unused_parameters=True),
             # reload_dataloaders_every_n_epochs=1,
+            # strategy='ddp_find_unused_parameters_true',
             # detect_anomaly=True
         )
         trainer_cfg = omegaconf.OmegaConf.to_container(trainer_cfg)

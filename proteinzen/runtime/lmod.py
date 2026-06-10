@@ -18,6 +18,7 @@ import tree
 import lightning as L
 from lightning.pytorch.callbacks import BasePredictionWriter
 import sys
+import p_tqdm
 
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from proteinzen.boltz.data import const
@@ -28,8 +29,13 @@ from proteinzen.openfold.utils import rigid_utils as ru
 from proteinzen.boltz.data.types import Structure
 from proteinzen.data.featurize.sampling import construct_atoms, update_structure
 from proteinzen.data.featurize.tokenize import Tokenized
+from proteinzen.data.featurize.sampling import construct_atoms
 # from proteinzen.data.write.mmcif import to_mmcif
 from proteinzen.data.write.pdb import to_pdb
+
+from proteinzen.model.utils import gather_helper
+from proteinzen.model.denoiser_v2 import MonotonicIncreasingFn
+from proteinzen.stoch_interp.integration import Integrator
 
 from .utils import gen_pbar_str
 from .ema import EMAModel
@@ -55,7 +61,7 @@ for c in ['CYS', 'GLU', 'HIS', 'PRO', 'GLN', 'ARG', 'TRP']:
     DEFAULT_RESTYPE_WEIGHT[c] = 2.0
 
 
-def t_stratified_loss(batch_t, batch_loss, num_bins=4, loss_name=None):
+def t_stratified_loss(batch_t, batch_loss, num_bins=10, loss_name=None):
     """Stratify loss by binning t."""
     batch_t = batch_t.float().numpy(force=True)
     batch_loss = batch_loss.float().numpy(force=True)
@@ -285,7 +291,7 @@ _CHAIN_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012345678
 
 def _build_all_atom_records(rigid_tensor7, rigids_mask, ref_elements, is_atom_mask,
                              rigids_sc_idx, rigids_to_token, rigids_seq_idx,
-                             res_types_tok, asym_ids_tok):
+                             res_types_tok, asym_ids_tok, token_residue_idx=None):
     """Return a list of atom dicts for one sample, with full sidechains for protein."""
     from collections import defaultdict
     from proteinzen.data.featurize.tokenize import RES_TO_AA
@@ -327,7 +333,7 @@ def _build_all_atom_records(rigid_tensor7, rigids_mask, ref_elements, is_atom_ma
         res_name = rc.restype_1to3.get(one_letter, 'UNK')
         atom14_names = rc.restype_name_to_atom14_names.get(res_name, [])
         asym_id = int(asym_ids_tok[tok])
-        seq_idx = int(rigids_seq_idx[r_indices[1]])  # use CA rigid's seq_idx
+        seq_idx = int(token_residue_idx[int(rigids_seq_idx[r_indices[1]])]) if token_residue_idx is not None else int(rigids_seq_idx[r_indices[1]])
 
         for aname, present, xyz in zip(atom14_names, atom14_mask, atom14):
             if not present or not aname:
@@ -343,7 +349,7 @@ def _build_all_atom_records(rigid_tensor7, rigids_mask, ref_elements, is_atom_ma
     for r_idx in np.where(ligand_mask)[0]:
         tok = int(rigids_to_token[r_idx])
         asym_id = int(asym_ids_tok[tok])
-        seq_idx = int(rigids_seq_idx[r_idx])
+        seq_idx = int(token_residue_idx[int(rigids_seq_idx[r_idx])]) if token_residue_idx is not None else int(rigids_seq_idx[r_idx])
         el = int(ref_elements[r_idx])
         elem_sym = _ELEMENT_SYMBOLS.get(el, 'X')
         xyz = rigid_tensor7[r_idx, 4:]
@@ -390,15 +396,17 @@ def _write_model_block(f, atom_records, model_num):
 
 def write_val_pdb(gt_rigid7, pred_rigid7, rigids_mask, ref_elements, is_atom_mask,
                   rigids_sc_idx, rigids_to_token, rigids_seq_idx,
-                  res_types_tok, asym_ids_tok, path):
+                  res_types_tok, asym_ids_tok, path, token_residue_idx=None):
     """Write a two-MODEL PDB: MODEL 1 = GT, MODEL 2 = predicted, with full sidechains."""
     gt_records = _build_all_atom_records(
         gt_rigid7, rigids_mask, ref_elements, is_atom_mask,
         rigids_sc_idx, rigids_to_token, rigids_seq_idx, res_types_tok, asym_ids_tok,
+        token_residue_idx=token_residue_idx,
     )
     pred_records = _build_all_atom_records(
         pred_rigid7, rigids_mask, ref_elements, is_atom_mask,
         rigids_sc_idx, rigids_to_token, rigids_seq_idx, res_types_tok, asym_ids_tok,
+        token_residue_idx=token_residue_idx,
     )
     with open(path, "w") as f:
         _write_model_block(f, gt_records, 1)
@@ -447,6 +455,14 @@ class BiomoleculeModule(L.LightningModule):
                  scale_trans_mse_loss=False,
                  use_min_conformer_head=False,
                  accumulate_grad_batches=1,
+                 no_seq_loss=False,
+                 distogram_loss=False,
+                 pred_local_fafe_loss=False,
+                 pae_loss=False,
+                 use_interface_fafe_loss=False,
+                 use_interchain_fafe_loss=False,
+                 use_brownian_rot_path_loss=False,
+                 # use_stabilized_high_t_loss=False
     ):
         super().__init__()
         self._log = logging.getLogger(__name__)
@@ -478,11 +494,25 @@ class BiomoleculeModule(L.LightningModule):
         self.use_posthoc_ema = use_posthoc_ema
         self.use_euclidean_for_rots = use_euclidean_for_rots
         self.learnable_noise_schedule = learnable_noise_schedule
+        self.no_seq_loss = no_seq_loss
         self.direct_rot_vf_loss = direct_rot_vf_loss
         self.rot_angle_weight = rot_angle_weight
         self.atom_rigid_upweight = atom_rigid_upweight
         self.apply_self_folding = apply_self_folding
         self.automatic_optimization = True
+        self.distogram_loss = distogram_loss
+        self.pred_local_fafe_loss = pred_local_fafe_loss
+        self.pae_loss = pae_loss
+        self.use_interface_fafe_loss = use_interface_fafe_loss
+        self.use_interchain_fafe_loss = use_interchain_fafe_loss
+        self.use_brownian_rot_path_loss = use_brownian_rot_path_loss
+        # self.use_stabilized_high_t_loss = use_stabilized_high_t_loss
+
+        if learnable_noise_schedule:
+            self.automatic_optimization = False
+            self.t_sched = MonotonicIncreasingFn(n_res_ident=const.num_tokens)
+        else:
+            self.t_sched = None
 
         seq_weight_tensor = torch.as_tensor([seq_weight[c] for c in const.tokens])
         self.seq_weight = seq_weight_tensor
@@ -675,10 +705,34 @@ class BiomoleculeModule(L.LightningModule):
         )
 
     def _shared_step(self, batch, return_outputs=False):
-        # stochastic corruption for BOTH train and val
-        batch["trans_t"] = batch["t"]
-        batch["rot_t"] = batch["t"]
-        batch = self.corrupter.corrupt_dense_batch(batch, self.identity_rot_noise)
+
+        corrupter = self.corrupter
+        if self.t_sched is not None:
+            t = batch['t']
+            res_type = batch['token']['res_type']
+            rigid_parent_res = batch['rigids']['rigids_seq_idx']
+            with torch.no_grad():
+                t_per_aa_ident = self.t_sched(t)
+            _, dlogk_per_aa_ident = torch.func.jvp(
+                lambda x: self.t_sched(1-x),
+                (t,),
+                (torch.ones_like(t),)
+            )
+            velocity_factor_per_aa_ident = dlogk_per_aa_ident / (1 - t_per_aa_ident.clip(max=0.99))
+            t_per_aa_ident.requires_grad = True
+            t_per_res = gather_helper(t_per_aa_ident, res_type)
+            velocity_factor_per_res = gather_helper(velocity_factor_per_aa_ident, res_type)
+            t_per_rigid = gather_helper(t_per_res, rigid_parent_res)
+            velocity_factor_per_rigid = gather_helper(velocity_factor_per_res, rigid_parent_res)
+            batch['trans_t'] = t_per_rigid[..., 0]
+            batch['rot_t'] = t_per_rigid[..., 1]
+            batch['velocity_factor_per_rigid'] = velocity_factor_per_rigid
+        else:
+            t_per_aa_ident = None
+            batch['trans_t'] = batch['t']
+            batch['rot_t'] = batch['t']
+
+        batch = corrupter.corrupt_dense_batch(batch, self.identity_rot_noise)
 
         # self-conditioning (optional)
         self_conditioning = None
@@ -841,6 +895,7 @@ class BiomoleculeModule(L.LightningModule):
         pred_rigid7          = outputs['denoised_rigids'].to_tensor_7().cpu().numpy()
         res_types_tok        = batch['token']['res_type'].cpu().numpy()
         asym_ids_tok         = batch['token']['asym_id'].cpu().numpy()
+        token_residue_idx    = batch['token']['residue_idx'].cpu().numpy()
 
         pred_rigid7_display = np.where(rigids_noising_mask[:, :, None], pred_rigid7, gt_rigid7)
 
@@ -855,7 +910,8 @@ class BiomoleculeModule(L.LightningModule):
             ref_elements=ref_elements, is_atom_mask=is_atom_mask,
             rigids_sc_idx=rigids_sc_idx, rigids_to_token=rigids_to_token,
             rigids_seq_idx=rigids_seq_idx, res_types_tok=res_types_tok,
-            asym_ids_tok=asym_ids_tok, gt_rigid7=gt_rigid7,
+            asym_ids_tok=asym_ids_tok, token_residue_idx=token_residue_idx,
+            gt_rigid7=gt_rigid7,
             pred_rigid7_display=pred_rigid7_display, per_sample_mse=per_sample_mse,
             record_ids=batch.get('record_id', [None] * B),
         )
@@ -896,6 +952,7 @@ class BiomoleculeModule(L.LightningModule):
                     data['res_types_tok'][i],
                     data['asym_ids_tok'][i],
                     path,
+                    token_residue_idx=data['token_residue_idx'][i],
                 )
             except Exception as e:
                 log.warning(f"val PDB write failed for sample {i}: {e}", exc_info=True)
@@ -916,6 +973,7 @@ class BiomoleculeModule(L.LightningModule):
                 sync_dist=False,
             )
 
+    #     return loss_dict
     # def training_step(self, batch, batch_idx):
     #     # update EMA
     #     if self.ema is not None and self.global_step > 0:
@@ -925,96 +983,51 @@ class BiomoleculeModule(L.LightningModule):
     #     if self.ema_short is not None and self.global_step > 0:
     #         self.ema_short.update_parameters(self.model, self.global_step-1)
 
+    #     has_sequential = any(t.name == 'mol_sequential_scaffolding' for t in batch['task'])
+
     #     # corrupt data
     #     corrupter = self.corrupter
-    #     batch['trans_t'] = batch['t']
-    #     batch['rot_t'] = batch['t']
-    #     batch = corrupter.corrupt_dense_batch(batch, self.identity_rot_noise)
-
-    #     # print("rigids_data", batch['rigids'])
-    #     # print("token_data", batch['token'])
-
-    #     # torch.save(batch['rigids'], 'rigids.pt')
-    #     # torch.save(batch['token'], 'token.pt')
-    #     # torch.save(batch['input_data'], 'input_data.pt')
-
-    #     # print("token_data", batch['token'])
-    #     # print(batch)
-
-
-    #     # run denoiser, with self-conditioning as necessary
-    #     model = self.model
-    #     if model.self_conditioning and np.random.uniform() < self.self_condition_rate:
+    #     if self.t_sched is not None:
+    #         t = batch['t']
+    #         res_type = batch['token']['res_type']
+    #         rigid_parent_res = batch['rigids']['rigids_seq_idx']
     #         with torch.no_grad():
-    #             self_conditioning = model(batch)
-
-    #             # run denoising with the predicted seq of the self conditioning denoising step
-    #             if self.apply_self_folding:
-    #                 pred_seq_batch = self._generate_folding_batch(batch, self_conditioning['pred_seq'])
-    #                 # run "folding"
-    #                 self_folding = model(pred_seq_batch)
-    #             else:
-    #                 self_folding = None
-
+    #             t_per_aa_ident = self.t_sched(t)
+    #         _, dlogk_per_aa_ident = torch.func.jvp(
+    #             lambda x: self.t_sched(1-x),
+    #             (t,),
+    #             (torch.ones_like(t),)
+    #         )
+    #         velocity_factor_per_aa_ident = dlogk_per_aa_ident / (1 - t_per_aa_ident.clip(max=0.99))
+    #         t_per_aa_ident.requires_grad = True
+    #         t_per_res = gather_helper(t_per_aa_ident, res_type)
+    #         velocity_factor_per_res = gather_helper(velocity_factor_per_aa_ident, res_type)
+    #         t_per_rigid = gather_helper(t_per_res, rigid_parent_res)
+    #         velocity_factor_per_rigid = gather_helper(velocity_factor_per_res, rigid_parent_res)
+    #         batch['trans_t'] = t_per_rigid[..., 0]
+    #         batch['rot_t'] = t_per_rigid[..., 1]
+    #         batch['velocity_factor_per_rigid'] = velocity_factor_per_rigid
     #     else:
-    #         self_conditioning = None
-    #         self_folding = None
-    #     outputs = model(batch, self_conditioning, self_folding)
+    #         t_per_aa_ident = None
+    #         batch['trans_t'] = batch['t']
+    #         batch['rot_t'] = batch['t']
+    #     batch = corrupter.corrupt_dense_batch(batch)
 
-    #     # post_processed_outputs = self._post_process_outputs(batch, outputs)
+    #     self_conditioning = None
+    #     self_folding = None
+    #     if (
+    #         self.model.self_conditioning
+    #         and np.random.uniform() < self.self_condition_rate
+    #     ):
+    #         with torch.no_grad():
+    #             self_conditioning = self.model(batch)
+    #             if self.apply_self_folding:
+    #                 pred_seq_batch = self._generate_folding_batch(
+    #                     batch, self_conditioning["pred_seq"]
+    #                 )
+    #                 self_folding = self.model(pred_seq_batch)
 
-    #     # for i, (post_processed_output, batch_item) in enumerate(zip(
-    #     #     post_processed_outputs,
-    #     #     batch['input_data']
-    #     # )):
-    #     #     input_structure = Structure(**batch_item['structure'])
-    #     #     output_data = post_processed_output['output_data']
-    #     #     output_struct = Structure(**output_data['structure'])
-    #     #     tokenized_output = Tokenized(
-    #     #         tokens=output_data['tokens'],
-    #     #         rigids=output_data['rigids'],
-    #     #         bonds=output_data['bonds'],
-    #     #         structure=output_struct
-    #     #     )
-    #     #     new_residues = []
-    #     #     for residue in output_struct.residues:
-    #     #         new_residue = (
-    #     #             residue['name'],
-    #     #             residue['res_type'],
-    #     #             residue['res_idx'],
-    #     #             residue['atom_idx'],
-    #     #             residue['atom_num'],
-    #     #             residue['atom_center'],
-    #     #             residue['atom_disto'],
-    #     #             residue['is_standard'],
-    #     #             residue['is_present'],
-    #     #             False  # is_copy
-    #     #         )
-    #     #         new_residues.append(new_residue)
-    #     #     new_residues = np.array(new_residues, dtype=SamplingResidue)
-    #     #     output_struct = replace(output_struct, residues=new_residues)
-
-    #     #     output_struct = construct_atoms(tokenized_output, output_struct)
-    #     #     output_struct = update_structure(output_struct, tokenized_output.rigids['tensor7'])
-
-    #     #     seen_asym_id = []
-    #     #     chain_mask = []
-    #     #     for chain in output_struct.chains:
-    #     #         if chain['asym_id'] not in seen_asym_id:
-    #     #             seen_asym_id.append(chain['asym_id'])
-    #     #             chain_mask.append(True)
-    #     #         else:
-    #     #             chain_mask.append(False)
-    #     #     output_struct = replace(output_struct, mask=np.array(chain_mask))
-
-    #     #     output_pdb_str = to_pdb(output_struct)
-    #     #     with open(f"output_pdb_{i}.pdb", "w") as f:
-    #     #         f.write(output_pdb_str)
-    #     #     input_pdb_str = to_pdb(input_structure)
-    #     #     with open(f"input_pdb_{i}.pdb", "w") as f:
-    #     #         f.write(input_pdb_str)
-    #     #     print("written to", os.getcwd())
-    #     # exit()
+    #     outputs = self.model(batch, self_conditioning, self_folding)
 
     #     # compute loss
     #     loss_dict = self._loss_step(batch, outputs)
@@ -1035,14 +1048,11 @@ class BiomoleculeModule(L.LightningModule):
     #             loss_by_task[task.name + "_frame_vf_loss"] = []
     #         if task.name + "_frame_vf_loss_unscaled" not in loss_by_task:
     #             loss_by_task[task.name + "_frame_vf_loss_unscaled"] = []
-    #         if task.name + "_pred_trans_mse" not in loss_by_task:
-    #             loss_by_task[task.name + "_pred_trans_mse"] = []
 
     #         loss_by_task[task.name + "_loss"].append(loss_dict['loss_per_batch'][i])
     #         loss_by_task[task.name + "_seq_loss"].append(loss_dict["seq_loss"][i])
     #         loss_by_task[task.name + "_frame_vf_loss"].append(loss_dict['frame_vf_loss'][i])
     #         loss_by_task[task.name + "_frame_vf_loss_unscaled"].append(loss_dict['frame_vf_loss_unscaled'][i])
-    #         loss_by_task[task.name + "_pred_trans_mse"].append(loss_dict['pred_trans_mse'][i])
 
     #     loss_by_task = {
     #         key: torch.stack(values)
@@ -1096,7 +1106,42 @@ class BiomoleculeModule(L.LightningModule):
     #         batch_size=t.shape[0],
     #         sync_dist=True)
 
-    #     return loss_dict
+    #     if self.t_sched is None:
+    #         return loss_dict
+    #     else:
+    #         opt_ret = self.optimizers()
+    #         if isinstance(opt_ret, dict):
+    #             opt = opt_ret['optimizer']
+    #         else:
+    #             opt = opt_ret
+    #         opt.zero_grad()
+    #         loss = loss_dict['loss']
+    #         self.manual_backward(loss)
+    #         per_res_trans_vf_loss = loss_dict['raw_trans_vf_loss']
+    #         per_res_rot_vf_loss = loss_dict['raw_rot_vf_loss']
+    #         stack_vf_loss = torch.stack([per_res_trans_vf_loss, per_res_rot_vf_loss], dim=-1).detach()
+
+    #         t = batch['t']
+    #         res_type = batch['token']['res_type']
+    #         rigid_parent_res = batch['rigids']['rigids_seq_idx']
+    #         t_per_aa_ident_redo = self.t_sched(t)
+    #         t_per_res_redo = gather_helper(t_per_aa_ident_redo, res_type)
+    #         t_per_rigid_redo = gather_helper(t_per_res_redo, rigid_parent_res)
+    #         assert t_per_aa_ident is not None and t_per_aa_ident.grad is not None
+    #         t_per_res_redo_grad = gather_helper(t_per_aa_ident.grad, res_type)
+    #         t_per_rigid_redo_grad = gather_helper(t_per_res_redo_grad, rigid_parent_res)
+    #         t_sched_grad = 2 * t_per_rigid_redo_grad * stack_vf_loss
+    #         self.manual_backward(t_per_rigid_redo, gradient=t_sched_grad)
+    #         # with torch.no_grad():
+    #         #     torch.set_printoptions(threshold=10000000)
+    #         #     for name, parameter in self.t_sched.named_parameters():
+    #         #         print(name, parameter.grad)
+    #         with torch.no_grad():
+    #             torch.set_printoptions(threshold=10000000)
+    #             print(self.t_sched(torch.arange(10, device=t.device)[..., None] / 10))
+    #             exit()
+    #         opt.step()
+
 
     def _loss_step(self, inputs, outputs):
         token_seq = inputs['token']['seq']
@@ -1110,7 +1155,7 @@ class BiomoleculeModule(L.LightningModule):
         rigidwise_weight = seq_weight[rigids_seq]
 
         frame_fm_loss_dict = multiframe_fm_loss_dense_batch(
-            inputs, outputs, sep_rot_loss=True, use_euclidean_for_rots=self.use_euclidean_for_rots,
+            inputs, outputs, sep_rot_loss=not self.learnable_noise_schedule, # use_euclidean_for_rots=self.use_euclidean_for_rots,
             t_norm_clip=0.9,
             rot_vf_angle_loss_weight=self.rot_angle_weight,
             fafe_l2_block_mask_size=1,
@@ -1122,6 +1167,11 @@ class BiomoleculeModule(L.LightningModule):
             scale_ring_planarity_loss=self.scale_ring_planarity_loss,
             use_fafe_loss=self.use_fafe_loss,
             use_rot_vf_loss=self.use_rot_vf_loss,
+            t_sched_weight=inputs['velocity_factor_per_rigid'] if 'velocity_factor_per_rigid' in inputs else None,
+            compute_interface_fafe=self.use_interface_fafe_loss,
+            compute_interchain_fafe=self.use_interchain_fafe_loss,
+            brownian_rot_path=self.use_brownian_rot_path_loss,
+            # stabilize_high_t_loss=self.use_stabilized_t_loss
         )
 
         frame_vf_loss = (
@@ -1142,7 +1192,7 @@ class BiomoleculeModule(L.LightningModule):
 
         atomic_loss = (
             0.25 * atomic_loss_dict["seq_loss"]
-        )
+        ) if not self.no_seq_loss else 0
 
         if self.direct_rot_vf_loss:
             loss = (
@@ -1214,6 +1264,27 @@ class BiomoleculeModule(L.LightningModule):
         if min_conformer_active:
             loss_dict['min_conformer_trans_mse'] = min_conformer_trans_mse
             loss_dict['min_conformer_heavy_trans_mse'] = min_conformer_heavy_trans_mse
+
+        if self.use_interface_fafe_loss:
+            loss = loss + 0.5 * frame_fm_loss_dict['scaled_interface_fafe']
+
+        if self.use_interchain_fafe_loss:
+            loss = loss + 0.5 * frame_fm_loss_dict['scaled_interchain_fafe']
+
+        if self.distogram_loss:
+            loss = loss + 0.1 * frame_fm_loss_dict['distogram_cross_entropy']
+
+        if self.pred_local_fafe_loss:
+            loss = loss + 0.1 * frame_fm_loss_dict['pred_local_trans_fafe_loss'] + 0.1 * frame_fm_loss_dict['pred_local_rot_fafe_loss']
+
+        if self.pae_loss:
+            loss = loss + 0.1 * frame_fm_loss_dict['pae_cross_entropy']
+
+        loss_dict = {"loss": loss.mean(), "frame_vf_loss": frame_vf_loss, "frame_vf_loss_unscaled": unscaled_frame_vf_loss}
+        loss_dict['loss_per_batch'] = loss
+
+        # if self.t_sched is not None:
+        #     self.
 
         # TODO: for some reason this does not play well with nccl between different tasks
         # if 'motif_idx' in outputs:
@@ -1288,7 +1359,7 @@ class BiomoleculeModule(L.LightningModule):
             on_step=None,
             on_epoch=True,
             batch_size=1,
-            sync_dist=False
+            sync_dist=True
         )
 
 
@@ -1302,8 +1373,9 @@ class BiomoleculeModule(L.LightningModule):
         pred_rigids = final_denoiser_out['denoised_rigids']
         pred_tensor7 = pred_rigids.to_tensor_7().numpy(force=True)
         pred_seq = final_denoiser_out["pred_seq"].numpy(force=True)
-
-
+        task_name = batch['task'][0]
+        non_copy_task_names = {"protein_conditioned_generate_ligand", "ligand_conditioned_generate_protein"}
+        
         for i, input_data in enumerate(batch['input_data']):
             # chop off any padding for pred_rigids and pred_seq
             num_rigids = input_data['rigids']['tensor7'].shape[0]
@@ -1321,7 +1393,12 @@ class BiomoleculeModule(L.LightningModule):
             token_data = output_data['tokens']
             token_is_copy_mask = token_data['is_copy']
             motif_idx = final_denoiser_out["motif_idx"][i, :num_tokens]
+            
+            # if task_name in non_copy_task_names:
+            #     motif_select_mask = (~token_data['seq_noising_mask'] & token_data['resolved_mask'])
+            # else:
             motif_select_mask = (token_is_copy_mask & token_data['resolved_mask'])
+
             motif_seq_fixed = ~token_data['seq_noising_mask']
             # actual idxs
             fixed_bb_res_idx = motif_idx[motif_select_mask]
@@ -1600,7 +1677,14 @@ class BiomoleculeModule(L.LightningModule):
             params = self.model.bond_rotation_head.parameters()
         else:
             params = self.model.parameters()
-        optimizer = self.optim(params)
+
+        if self.t_sched is not None:
+            optimizer = self.optim(
+                list(params)
+                + list(self.t_sched.parameters())
+            )
+        else:
+            optimizer = self.optim(params)
 
         if self.use_cosine_annealing:
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -1647,7 +1731,7 @@ class BiomoleculeSamplingModule(L.LightningModule):
     def __init__(
         self,
         model,
-        corrupter,
+        integrator_init,
         run_cfg,
     ):
         super().__init__()
@@ -1655,137 +1739,22 @@ class BiomoleculeSamplingModule(L.LightningModule):
         self.model = model
         # the actual ema params don't matter here, we just wanna be able to load the weights
         self.ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(0.999))
-        self.corrupter = corrupter
+        self.integrator: Integrator = integrator_init(self.ema.module)
         self.run_cfg = run_cfg
 
     def predict_step(self, batch, batch_idx):
-        # structure_dict = batch['input_data'][0]['structure']
-        # structure = Structure(**structure_dict)
-        # pdb_str = to_pdb(structure)
-        # with open(f"clean_data_mol_predict.pdb", "w") as f:
-        #     f.write(pdb_str)
-        # exit()
         # Set-up time
-
-        # self.corrupter.num_timesteps = 20
-        ts = torch.linspace(0.0, 1.0, self.corrupter.num_timesteps)
-        # ts = torch.linspace(1.0, 0.0, self.corrupter.num_timesteps)
-
-        rigids_data = batch['rigids']
-        rigids_data['rigids_t'] = rigids_data['rigids_1']
-        token_data = batch['token']
-        # print("rigids_data before", rigids_data['rigids_ref_element'])
-
-        rigids_data_center = rigids_data['rigids_t'][:, :, 4:].mean(dim=1)
-        rigids_data['rigids_t'][:, :, 4:] -= rigids_data_center[..., None, :]
-
-        # rigids_data['rigids_t'] = rigids_data['rigids_t'][:, :, :4]
-
-        # test_rigids_data = torch.load('outputs/geom_identityRot_frame_384/train/rigids.pt')
-        # test_token_data = torch.load('outputs/geom_identityRot_frame_384/train/token.pt')
-        # batch['input_data'] = torch.load('outputs/geom_identityRot_frame_384/train/input_data.pt')
-        # batch['rigids'] = test_rigids_data
-        # batch['token'] = test_token_data
-        # rigids_data = test_rigids_data
-        # token_data = test_token_data
-
-        # rigids_data['rigids_t'][:, :, :4] = test_rigids_data['rigids_t'][:, :32, :4]
-
-        # print("rigids_data after", rigids_data['rigids_ref_element'])
-        # print("token_data", token_data)
-        # exit()
-
-
-        for batch_item in batch['input_data']:
-            residues = batch_item['structure']['residues']
-            new_residues = []
-            for residue in residues:
-                new_residue = (
-                    residue['name'],
-                    residue['res_type'],
-                    residue['res_idx'],
-                    residue['atom_idx'],
-                    residue['atom_num'],
-                    residue['atom_center'],
-                    residue['atom_disto'],
-                    residue['is_standard'],
-                    residue['is_present'],
-                    False  # is_copy
-                )
-                new_residues.append(new_residue)
-            batch_item['structure']['residues'] =  np.array(new_residues, dtype=SamplingResidue)
-
-        rigids_0 = ru.Rigid.from_tensor_7(rigids_data['rigids_t'])
-        trans_0 = rigids_0.get_trans()
-        rotmats_0 = rigids_0.get_rots().get_rot_mats()
-        rigids_noising_mask = rigids_data['rigids_noising_mask']
-        if self.run_cfg.get('identity_rot_noise', False):
-            noising_mask = torch.as_tensor(rigids_noising_mask, dtype=torch.bool, device=rotmats_0.device)
-            identity = torch.eye(3, device=rotmats_0.device, dtype=rotmats_0.dtype).expand_as(rotmats_0).clone()
-            rotmats_0 = torch.where(noising_mask[:, :, None, None], identity, rotmats_0)
-        seq_noising_mask = token_data['seq_noising_mask']
-
-        prot_traj = [(
-            trans_0,
-            rotmats_0,
-            None
-        )]
-
-        # print(trans_0)
-        # exit()
-
-        clean_traj = []
-        
-
-        # set up initial integration conditions
-        t_1 = ts[0]
-        prev_denoiser_out = None
-        for t_2 in tqdm.tqdm(ts[1:]):
-            trans_t, rotmats_t, _ = prot_traj[-1]
-            prev_denoiser_out, prot_traj_point, clean_traj_point = self._integration_step(
-                self.ema.module,
-                batch,
-                trans_t,
-                rotmats_t,
-                t_1,
-                t_2,
-                self_conditioning=prev_denoiser_out
-            )
-
-            
-
-            if self.run_cfg.get('no_rot_sampling', False):
-                noising_mask = torch.as_tensor(rigids_noising_mask, dtype=torch.bool, device=rotmats_0.device)
-                frozen_rots = torch.where(noising_mask[:, :, None, None], rotmats_0, prot_traj_point[1])
-                prot_traj_point = (prot_traj_point[0], frozen_rots, prot_traj_point[2])
-            prot_traj.append(prot_traj_point)
-            clean_traj.append(clean_traj_point)
-            t_1 = t_2
-
-        trans_t, rotmats_t, _ = prot_traj[-1]
-        # final_denoiser_out, prot_traj_point, _ = self._integration_step(
-        #     self.ema.module,
-        #     batch,
-        #     trans_t,
-        #     rotmats_t,
-        #     ts[-1],
-        #     ts[-1],
-        #     self_conditioning=prev_denoiser_out,
-        #     apply_step=False
-        # )
-        final_denoiser_out = self.ema.module(
-            batch,
-            self_condition=prev_denoiser_out,
-            self_folding=None
+        assert (batch['t'] == batch['t'][0]).all(), "batch t must all be the same"
+        ts = torch.linspace(
+            float(batch['t'][0]),
+            1.0,
+            self.run_cfg['num_timesteps']
         )
-        pred_rigids = final_denoiser_out['denoised_rigids']
-        pred_trans_1 = pred_rigids.get_trans()
-        pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
-        prot_traj_point = (pred_trans_1, pred_rotmats_1, final_denoiser_out["pred_seq"].detach().cpu())
 
-        # Process model output.
-        # prot_traj = prot_traj[1:]
-        prot_traj[0] = (trans_0, rotmats_0, prot_traj_point[2])
+        clean_traj, prot_traj, final_denoiser_out = self.integrator.sample(
+            batch,
+            ts
+        )
 
         ret = self._post_process_outputs(
             batch,
@@ -1795,125 +1764,6 @@ class BiomoleculeSamplingModule(L.LightningModule):
         )
 
         return ret
-
-    def chk(self, name, x):
-        if not torch.isfinite(x).all():
-            raise RuntimeError(f"NaN/Inf in {name}")
-
-    def _integration_step(
-        self,
-        model,
-        batch,
-        trans_t_1,
-        rotmats_t_1,
-        t_1,
-        t_2,
-        self_conditioning=None,
-        apply_step=True
-    ):
-        d_t = t_2 - t_1
-        rigids_data = batch['rigids']
-        token_data = batch['token']
-        rigids_noising_mask = rigids_data['rigids_noising_mask']
-        seq_noising_mask = token_data['seq_noising_mask']
-        num_batch, num_res = seq_noising_mask.shape
-        device = self.device
-        denoiser_out = None
-
-        t_hat, d_t_hat, trans_t_hat = self.corrupter.trans_churn(
-            d_t,
-            t_1,
-            trans_t_1,
-            noising_mask=rigids_noising_mask,
-        )
-
-        _, _, rotmats_t_hat = self.corrupter.rot_churn(
-            d_t,
-            t_1,
-            rotmats_t_1,
-            noising_mask=rigids_noising_mask,
-        )
-
-        # # Run model.
-        rigids_data["trans_t"] = trans_t_hat
-        rigids_data["rotmats_t"] = rotmats_t_hat
-        rigids_data['rigids_t'] = ru.Rigid(
-            rots=ru.Rotation(rot_mats=rotmats_t_hat),
-            trans=trans_t_hat
-        ).to_tensor_7()
-        t = torch.ones(num_batch, device=device)[..., None] * t_hat
-        batch["t"] = t
-
-
-        denoiser_out = model(
-            batch,
-            self_condition=self_conditioning,
-            self_folding=None
-        )
-        
-        
-
-        # total_mask = rigids_noising_mask & rigids_data['rigids_mask']
-        # clean_rigids_1_trans = torch.stack([batch['task'][i]['clean_rigids_1'].get_trans() for i in range(num_batch)])
-        # pred_frame_trans_se = torch.square(clean_rigids_1_trans - denoiser_out['denoised_rigids'].get_trans()).sum(dim=-1)
-        # pred_frame_trans_mse = (pred_frame_trans_se * total_mask).sum(-1) / num_batch
-        # print("pred_frame_trans_mse", pred_frame_trans_mse)
-        # sys.stdout.flush()
-
-        # Process model output.
-        pred_rigids = denoiser_out['denoised_rigids']
-        pred_trans_1 = pred_rigids.get_trans()
-        pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
-
-        # print("1", pred_rotmats_1)
-
-        clean_traj_point = (
-            pred_trans_1,
-            pred_rotmats_1,
-            denoiser_out["pred_seq"].detach().cpu(),
-        )
-
-        # d_t_hat  = d_t
-        # t_hat = t_1
-        # trans_t_hat = trans_t_1
-        # rotmats_t_hat = rotmats_t_1
-
-        trans_d_t_hat = d_t_hat
-        rot_d_t_hat = d_t_hat
-        trans_time = t_hat
-        rot_time = t_hat
-        trans_vf_scale = 1
-        rot_vf_scale = 1
-
-        if apply_step:
-            trans_t_2 = self.corrupter.trans_euler_step(
-                trans_d_t_hat,
-                trans_time,
-                pred_trans_1,
-                trans_t_hat,
-                noising_mask=rigids_noising_mask,
-                vf_scale=trans_vf_scale,
-            )
-            rotmats_t_2 = self.corrupter.rots_euler_step(
-                rot_d_t_hat,
-                rot_time,
-                pred_rotmats_1,
-                rotmats_t_hat,
-                noising_mask=rigids_noising_mask,
-                vf_scale=rot_vf_scale,
-                rot_vf=denoiser_out['pred_rot_vf']
-            )
-
-            prot_traj_point = (
-                trans_t_2,
-                rotmats_t_2,
-                denoiser_out["pred_seq"].detach().cpu(),
-            )
-        else:
-            prot_traj_point = clean_traj_point
-
-        # print("2", rotmats_t_2)
-        return denoiser_out, prot_traj_point, clean_traj_point
 
     def _post_process_outputs(
         self,
@@ -1928,6 +1778,8 @@ class BiomoleculeSamplingModule(L.LightningModule):
         pred_tensor7 = pred_rigids.to_tensor_7().numpy(force=True)
         pred_seq = final_denoiser_out["pred_seq"].numpy(force=True)
 
+        task_name = batch['task'][0]
+        non_copy_task_names = {"protein_conditioned_generate_ligand", "ligand_conditioned_generate_protein"}
 
         for i, input_data in enumerate(batch['input_data']):
             # chop off any padding for pred_rigids and pred_seq
@@ -1946,11 +1798,18 @@ class BiomoleculeSamplingModule(L.LightningModule):
             token_data = output_data['tokens']
             token_is_copy_mask = token_data['is_copy']
             motif_idx = final_denoiser_out["motif_idx"][i, :num_tokens]
+
+            # if task_name in non_copy_task_names:
+            #     motif_select_mask = (~token_data['seq_noising_mask'] & token_data['resolved_mask'])
+            # else:
             motif_select_mask = (token_is_copy_mask & token_data['resolved_mask'])
-            motif_seq_fixed = ~token_data['seq_noising_mask']
-            # actual idxs
-            fixed_bb_res_idx = motif_idx[motif_select_mask]
-            fixed_seq_res_idx = motif_idx[motif_seq_fixed]
+
+            motif_seq_fixed = (motif_select_mask & ~token_data['seq_noising_mask'])
+            # actual residue idxs and chain asym ids
+            motif_res_idx = token_data["res_idx"][motif_idx.numpy(force=True)]
+            fixed_bb_res_idx = motif_res_idx[motif_select_mask]
+            fixed_seq_res_idx = motif_res_idx[motif_seq_fixed]
+
             fixed_bb_chain_idx = token_data['asym_id'][motif_select_mask]
             fixed_seq_chain_idx = token_data['asym_id'][motif_seq_fixed]
 
@@ -2004,28 +1863,54 @@ class BiomoleculeSamplingModule(L.LightningModule):
         return ret
 
 
+def _write_traj(entry):
+    path, traj = entry
+    model_strs = []
+    for i, traj_data in enumerate(traj):
+        traj_struct = Structure(**traj_data['structure'])
+        traj_output = Tokenized(
+            tokens=traj_data['tokens'],
+            rigids=traj_data['rigids'],
+            bonds=traj_data['bonds'],
+            structure=traj_struct,
+
+        )
+        traj_struct = construct_atoms(traj_output, traj_struct)
+        traj_struct = update_structure(traj_struct, traj_output.rigids['tensor7'])
+        pdb_str = to_pdb(traj_struct)
+        model_strs.append(f"MODEL        {i}\n")
+        model_strs.append(pdb_str.split("END")[0])
+        model_strs.append(f"ENDMDL       \n")
+    model_strs.append("END\n")
+
+    model_pdb_str = "".join(model_strs)
+    with open(path, "w") as fp:
+        fp.write(model_pdb_str)
+
+
 class PDBWriter(BasePredictionWriter):
     def __init__(self, output_dir, run_cfg):
         super().__init__(write_interval="batch_and_epoch")
-        self.output_dir = os.path.abspath(output_dir)
-        self.samples_dir = os.path.abspath(os.path.join(output_dir, "samples"))
-        self.metadata_dir = os.path.abspath(os.path.join(output_dir, "metadata"))
-        self.traj_dir = os.path.abspath(os.path.join(output_dir, "traj"))
+        self.output_dir = output_dir
+        self.samples_dir = os.path.join(output_dir, "samples")
+        self.metadata_dir = os.path.join(output_dir, "metadata")
+        self.traj_dir = os.path.join(output_dir, "traj")
         self.run_cfg = run_cfg
 
         os.makedirs(self.samples_dir, exist_ok=True)
         os.makedirs(self.metadata_dir, exist_ok=True)
         os.makedirs(self.traj_dir, exist_ok=True)
 
-
+        self.use_task_name_labels = run_cfg['use_task_name_labels']
         self.samples_metadata = {}
-        self.task_name_counters = {}  # Track counters per task name across function calls
 
     def write_on_batch_end(self, trainer, pl_module, prediction, batch_indices, batch, batch_idx, dataloader_idx):
         pwd = os.getcwd()
         os.chdir(self.samples_dir)
 
         samples_metadata = {}
+
+        traj_list = []
 
         curr_sample_id = 0
         rank = trainer.global_rank
@@ -2043,18 +1928,10 @@ class PDBWriter(BasePredictionWriter):
             )
             struct = construct_atoms(sample_output, struct)
             sample_len = sample_output.tokens.shape[0]
-            # Use task name from YAML if available, otherwise fall back to default naming
-            task_name = sample_data.get('name', None)
-            
-            if task_name is not None:
-                # Initialize counter for this task name if it doesn't exist
-                if task_name not in self.task_name_counters:
-                    self.task_name_counters[task_name] = 0
-                # Use current counter value and increment for next time
-                sample_name = f"{task_name}_{self.task_name_counters[task_name]}"
-                self.task_name_counters[task_name] += 1
+
+            if self.use_task_name_labels:
+                sample_name = sample_data['name'] + f"_gpu{rank}_batch{batch_idx}_idx{curr_sample_id}" #.pdb"
             else:
-                # Fall back to original naming scheme
                 sample_name = f"len_{sample_len}_protein_id{rank}_{batch_idx}_{curr_sample_id}" #.pdb"
             struct = update_structure(struct, sample_output.rigids['tensor7'])
 
@@ -2113,61 +1990,29 @@ class PDBWriter(BasePredictionWriter):
                 clean_traj = sample_data['clean_traj']
                 prot_traj = sample_data['prot_traj']
 
-                if task_name is not None:
-                    traj_base_name = f"{task_name}_{self.task_name_counters[task_name] - 1}"
-                else:
-                    traj_base_name = f"len_{sample_len}_protein_id{rank}_{batch_idx}_{curr_sample_id}"
-                
                 clean_traj_name = os.path.join(
                     self.traj_dir,
-                    f"{traj_base_name}_clean_traj.pdb"
+                    sample_name + f"_clean_traj.pdb"
                 )
                 prot_traj_name = os.path.join(
                     self.traj_dir,
-                    f"{traj_base_name}_prot_traj.pdb"
+                    sample_name + f"_prot_traj.pdb"
                 )
-                clean_model_strs = []
-                prot_model_strs = []
 
-                for i, traj_data in enumerate(clean_traj):
-                    traj_struct = Structure(**traj_data['structure'])
-                    traj_output = Tokenized(
-                        tokens=traj_data['tokens'],
-                        rigids=traj_data['rigids'],
-                        bonds=traj_data['bonds'],
-                        structure=traj_struct,
-
+                traj_list.append(
+                    (
+                        clean_traj_name,
+                        clean_traj
                     )
-                    traj_struct = construct_atoms(traj_output, traj_struct)
-                    traj_struct = update_structure(traj_struct, traj_output.rigids['tensor7'])
-                    pdb_str = to_pdb(traj_struct)
-                    clean_model_strs.append(f"MODEL        {i}\n")
-                    clean_model_strs.append(pdb_str.split("END")[0])
-                    clean_model_strs.append(f"ENDMDL       \n")
-                clean_model_strs.append("END\n")
-
-                with open(clean_traj_name, 'w') as fp:
-                    for pdb_str in clean_model_strs:
-                        fp.write(pdb_str)
-
-                for i, traj_data in enumerate(prot_traj):
-                    traj_struct = Structure(**traj_data['structure'])
-                    traj_output = Tokenized(
-                        tokens=traj_data['tokens'],
-                        rigids=traj_data['rigids'],
-                        bonds=traj_data['bonds'],
-                        structure=traj_struct,
+                )
+                traj_list.append(
+                    (
+                        prot_traj_name,
+                        prot_traj
                     )
-                    traj_struct = construct_atoms(traj_output, traj_struct)
-                    traj_struct = update_structure(traj_struct, traj_output.rigids['tensor7'])
-                    pdb_str = to_pdb(traj_struct)
-                    prot_model_strs.append(f"MODEL        {i}\n")
-                    prot_model_strs.append(pdb_str.split("END")[0])
-                    prot_model_strs.append(f"ENDMDL       \n")
-                prot_model_strs.append("END\n")
-                with open(prot_traj_name, 'w') as fp:
-                    for pdb_str in prot_model_strs:
-                        fp.write(pdb_str)
+                )
+                # _write_traj(clean_traj_name, clean_traj)
+                # _write_traj(prot_traj_name, prot_traj)
 
             sample_path = os.path.abspath(sample_name + ".pdb")
 
@@ -2187,12 +2032,15 @@ class PDBWriter(BasePredictionWriter):
                 "fixed_seq_chain": [chain_mapping[int(i)] for i in sample_data['fixed_seq_chain_idx']],
             }
             curr_sample_id += 1
-        
-        
 
         with open(os.path.join(self.metadata_dir, f"samples_metadata_rank{rank}_batch{batch_idx}.json"), 'w') as fp:
             json.dump(samples_metadata, fp)
         self.samples_metadata.update(samples_metadata)
+
+        for traj_entry in traj_list:
+            _write_traj(traj_entry)
+        # results = p_tqdm.p_map(_write_traj, traj_list, num_cpus=8)
+        # print(results)
 
         os.chdir(pwd)
 
@@ -2207,6 +2055,7 @@ class PDBWriter(BasePredictionWriter):
 
         samples_metadata = {}
         for d in gathered:
+            assert d is not None
             samples_metadata.update(d)
 
         # Now only rank 0 writes/merges
@@ -2231,3 +2080,6 @@ class PDBWriter(BasePredictionWriter):
 
         # (optional) keep ranks in lockstep before exiting
         trainer.strategy.barrier()
+
+    def teardown(self, trainer, pl_module, stage):
+        super().teardown(trainer, pl_module, stage)

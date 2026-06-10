@@ -4,9 +4,10 @@ import os
 import glob
 import shutil
 from typing import Dict, Any
+import functools as fn
 
 import hydra
-from hydra_zen import zen, load_from_yaml, instantiate
+from hydra_zen import zen, load_from_yaml, save_as_yaml, instantiate
 import omegaconf
 import torch
 import numpy as np
@@ -19,16 +20,14 @@ from proteinzen.runtime.config import config_sampling_hydra_store
 from proteinzen.runtime.lmod import BiomoleculeSamplingModule, PDBWriter
 
 # PyTorch 2.6+ changed default weights_only=True which breaks checkpoint loading
-# SIMPLE FIX: Monkey-patch torch.load to use weights_only=False by default
+# Monkey-patch torch.load to use weights_only=False by default
 # This restores the old behavior and avoids the ridiculous safe unpickling errors
 _original_torch_load = torch.load
 def _patched_torch_load(*args, weights_only=None, **kwargs):
-    # If weights_only not explicitly set, default to False (old behavior)
     if weights_only is None:
         weights_only = False
     return _original_torch_load(*args, weights_only=weights_only, **kwargs)
 torch.load = _patched_torch_load
-
 # A logger for this file
 log = logging.getLogger(__name__)
 
@@ -44,7 +43,8 @@ class Experiment:
 
     def predict(self):
         kwargs: Dict[str, Any] = {
-            "use_distributed_sampler": False
+            "use_distributed_sampler": False,
+            "inference_mode": self._cfg['inference_mode']
         }
         if torch.cuda.is_available():
             devices = list(range(torch.cuda.device_count()))
@@ -77,7 +77,9 @@ class Experiment:
 
 
 def main(sampler,
-         corrupter,
+         integrator,
+         model_wrapper,
+         diffeq,
          zen_cfg):
     # change into the output directory
     # os.chdir(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)
@@ -124,13 +126,21 @@ def main(sampler,
         "config.yaml"
     )
     model_cfg = load_from_yaml(config_path)
-    # lmodule_init = instantiate(model_cfg['lmodule'])
     model = instantiate(model_cfg['model'])
 
-    # model = lmodule_init(model, corrupter, None)
-    model = BiomoleculeSamplingModule(model, corrupter, zen_cfg)
-    model.strict_loading = False
+    # create sampling module
+    def integrator_init(model):
+        return integrator(
+            wrapped_model=model_wrapper(model),
+            diffeq=diffeq
+        )
+    model = BiomoleculeSamplingModule(
+        model,
+        integrator_init=integrator_init,
+        run_cfg=zen_cfg
+    )
 
+    # make output directories
     os.makedirs(zen_cfg['out_dir'], exist_ok=True)
     zen_cfg['samples_dir'] = os.path.join(
         zen_cfg['out_dir'], "samples"
@@ -143,11 +153,16 @@ def main(sampler,
     if os.path.isdir(traj_dir):
         shutil.rmtree(traj_dir)
 
-    with open(os.path.join(zen_cfg['out_dir'], "run.log"), 'w') as fp:
-        fp.write(f"Sampling config path: {zen_cfg['sampler']['tasks_yaml']}")
+    # record run params
     shutil.copy(
         zen_cfg['sampler']['tasks_yaml'],
-        os.path.join(zen_cfg['out_dir'], "config.yaml")
+        os.path.join(zen_cfg['out_dir'], "tasks_config.yaml")
+    )
+    zen_cfg_obj = omegaconf.OmegaConf.create(zen_cfg)
+    save_as_yaml(
+        zen_cfg_obj,
+        os.path.join(zen_cfg['out_dir'], "run_config.yaml"),
+        resolve=True
     )
 
 

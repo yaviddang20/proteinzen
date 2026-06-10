@@ -1,5 +1,5 @@
 import copy
-from dataclasses import astuple, asdict, dataclass, replace
+from dataclasses import astuple, asdict, dataclass, replace, fields
 from typing import Tuple, List, Optional, Union
 import functools as fn
 
@@ -11,7 +11,7 @@ from scipy.spatial.transform import Rotation
 
 from proteinzen.boltz.data import const
 from proteinzen.boltz.data.types import (
-    Structure
+    Structure, Atom, Bond, Chain, Connection, Interface, Residue
 )
 
 from proteinzen.openfold.data import residue_constants as rc
@@ -38,6 +38,7 @@ Token = [
     ("is_unindexed", np.dtype("?")),
     ("is_atomized", np.dtype("?")),
     ("seq_noising_mask", np.dtype("?")),
+    ("hotspot_type", np.dtype("i1")),
 ]
 
 Rigid = [
@@ -134,6 +135,7 @@ class TokenData:
     is_unindexed: bool
     is_atomized: bool
     seq_noising_mask: bool
+    hotspot_type: int
 
 
 @dataclass
@@ -151,7 +153,6 @@ class RigidData:
     is_present: bool
     rigids_noising_mask: bool
     num_real_input_axes: int
-
 
 
 def compute_frame(
@@ -319,7 +320,7 @@ def select_axes(atom_coord, neighbors, valid_neighbors, valid_neighbor_coords):
     return None
 
 def gen_rand_rot_frame(trans):
-    quat = Rotation.random().as_quat(canonical=True)
+    quat = Rotation.random().as_quat(canonical=True, scalar_first=True)
     return np.concatenate([quat, trans], axis=0), 0
 
 def gen_semirand_rot_frame(center, x_axis_point):
@@ -404,26 +405,31 @@ def arbitrary_atom_to_frame(
 
     _select_axes = fn.partial(select_axes, valid_neighbors=valid_neighbors, valid_neighbor_coords=valid_neighbor_coords)
     if use_identity_rot:
-        quat = Rotation.identity().as_quat(canonical=True)
+        quat = Rotation.identity().as_quat(canonical=True, scalar_first=True)
         trans = atom["coords"]
         return np.concatenate([quat, trans], axis=0), 0
     else:
         if len(neighbors) == 0:
-            quat = Rotation.identity().as_quat(canonical=True)
+            quat = Rotation.random().as_quat(canonical=True, scalar_first=True)
             trans = atom["coords"]
             return np.concatenate([quat, trans], axis=0), 0
         elif len(neighbors) == 1:
             neighbor_idx = neighbors[0]
             neighbor_neighbors = [n for n in neighbor_graph.neighbors(neighbor_idx) if n in valid_neighbors and n != atom_idx]
+            # print(atom, atom_idx, neighbor_idx, neighbor_neighbors, list(neighbor_graph.edges))
             if len(neighbor_neighbors) > 0:
+                # if we can get a second hop neighbor to define the frame, use that
                 axes = _select_axes(atom["coords"], [neighbor_idx] + neighbor_neighbors)
                 if axes is not None:
+                    # print(atom, 2)
                     return gen_det_rot_frame(atom['coords'], *axes)
             try:
                 neighbor_coord = valid_neighbor_coords[valid_neighbors.index(neighbor_idx)]
+                # print(atom, 1)
                 return gen_semirand_rot_frame(atom['coords'], neighbor_coord)
             except Exception as e:
                 print(f"Caught exception '{e}', replacing with random rotation")
+                # print(atom, 0)
                 return gen_rand_rot_frame(atom['coords'])
         else:
             axes = _select_axes(atom["coords"], neighbors)
@@ -439,6 +445,265 @@ def arbitrary_atom_to_frame(
             print("Error in featurizing rotation, replacing with random rotation")
             return gen_rand_rot_frame(atom['coords'])
 
+
+def generate_copy_structure(
+    struct: Structure,
+    task_data: dict[str, np.ndarray],
+    shuffle_copied_fragments: bool = True
+):
+    # Filter to valid chains only
+    chains = struct.chains[struct.mask]
+
+    copy_indexed_residue_mask = task_data['copy_indexed_residue_mask']
+    copy_unindexed_residue_mask = task_data['copy_unindexed_residue_mask']
+    assert not task_data['copy_atomized_residue_mask'].any(), "generate_copy_structure currently doesn't support copying atomized residues"
+
+    res_copied_indices = []
+    atom_copied_indices = []
+
+    copy_chains = {}
+    copy_residues = []
+    copy_atoms = []
+    frag_ids = []
+    curr_frag_id = 0
+    last_res_idx = None
+    last_chain_id = None
+
+    max_res_idx = 0
+    max_atom_idx = 0
+
+    # parse out the copy structure elements
+    for chain in chains:
+        # Get residue indices
+        res_start = chain["res_idx"]
+        res_end = chain["res_idx"] + chain["res_num"]
+        is_protein = chain["mol_type"] == const.chain_type_ids["PROTEIN"]
+
+        for i, res in enumerate(struct.residues[res_start:res_end]):
+            # Standard residues are tokens
+            if res["is_standard"] and (res['name'] != 'UNK') and is_protein:
+                res_idx = res_start + i #res['res_idx']
+                is_indexed = copy_indexed_residue_mask[res_idx]
+                is_unindexed = copy_unindexed_residue_mask[res_idx]
+                assert not (is_indexed & is_unindexed), f"residue copy of {res_idx} cannot be both indexed and unindexed!"
+
+                if not (is_indexed | is_unindexed):
+                    continue
+
+                # add a new chain entry if it doesn't exist yet
+                chain_name = chain['name']
+                if chain_name not in copy_chains:
+                    chain_copy = chain.copy()
+                    chain_copy['atom_idx'] = max_atom_idx
+                    chain_copy['atom_num'] = 0
+                    chain_copy['res_idx'] = max_res_idx
+                    chain_copy['res_num'] = 0
+                    copy_chains[chain_name] = chain_copy
+
+                # update the chain entry associated with this copied residue
+                copy_chains[chain_name]['res_num'] += 1
+                copy_chains[chain_name]['atom_num'] += res['atom_num']
+                # copy the residue atoms
+                atom_start = res['atom_idx']
+                atom_end = atom_start + res['atom_num']
+                copy_atoms.append(struct.atoms[atom_start:atom_end].copy())
+                # update the residue-to-atoms mapping
+                res_copy = res.copy()
+                res_copy['atom_idx'] = max_atom_idx
+                copy_residues.append(res_copy)
+
+                max_res_idx += 1
+                max_atom_idx += res['atom_num']
+
+                # mark which residue was copied
+                res_copied_indices.append(res_start + i)
+                atom_copied_indices.append(list(range(atom_start, atom_end)))
+                # mark what fragment this residue belongs to
+                if last_res_idx is None:
+                    last_res_idx = res['res_idx']
+                if last_chain_id is None:
+                    last_chain_id = chain['asym_id']
+                # if this residue is adjacent to the previous residue, we keep the frag idx the same
+                # else we increment to the next one
+                is_adj_to_last_res = (abs(last_res_idx - res['res_idx']) < 2 and last_chain_id == chain['asym_id'])
+                if not is_adj_to_last_res:
+                    curr_frag_id += 1
+                frag_ids.append(curr_frag_id)
+                last_res_idx = res['res_idx']
+                last_chain_id = chain['asym_id']
+
+    copy_chains = list(copy_chains.values())
+
+    if shuffle_copied_fragments:
+        # if specified, we shuffle the linear ordering of copied fragments within each copy chain
+        # then shuffle the order of the copy chains themselves
+
+        # assign a chain idx to each copied residue
+        chain_frag_mapping = {}
+        res_partition = np.repeat(
+            np.arange(len(copy_chains)),
+            [c['res_num'] for c in copy_chains]
+        )
+
+        # structure the residues into chains as collection of fragments
+        # being sure to record where each copy residue originally came from
+        for i, residue in enumerate(copy_residues):
+            res_chain_idx = res_partition[i]
+            res_frag_idx = frag_ids[i]
+            if res_chain_idx not in chain_frag_mapping:
+                chain_frag_mapping[res_chain_idx] = {
+                    res_frag_idx: {
+                        "residues": [],
+                        "atoms": [],
+                        "original_res_copy_idx": [],
+                        "original_atom_copy_idx": [],
+                    }
+                }
+            else:
+                if res_frag_idx not in chain_frag_mapping[res_chain_idx]:
+                    chain_frag_mapping[res_chain_idx][res_frag_idx] = {
+                        "residues": [],
+                        "atoms": [],
+                        "original_res_copy_idx": [],
+                        "original_atom_copy_idx": [],
+                    }
+            chain_frag = chain_frag_mapping[res_chain_idx][res_frag_idx]
+            chain_frag['residues'].append(residue)
+            chain_frag['atoms'].append(copy_atoms[i])
+            chain_frag['original_res_copy_idx'].append(res_copied_indices[i])
+            chain_frag['original_atom_copy_idx'].append(atom_copied_indices[i])
+
+        # compute the new order of the copy chains
+        chain_order = np.random.permutation(len(copy_chains))
+
+        # shuffle the fragments by shuffling fragments within chains
+        # in order of chain_order
+        shuffled_chains = []
+        shuffled_residues = []
+        shuffled_atoms = []
+        shuffled_res_copied_indices = []
+        shuffled_atom_copied_indices = []
+        shuffled_frag_ids = []
+        num_res = 0
+        num_atoms = 0
+        for chain_idx in chain_order:
+            chain_frag_list = list(chain_frag_mapping[chain_idx].keys())
+            selected_chain = copy_chains[chain_idx]
+            # renumber the chain metadata
+            # (we don't need to change the counter fields bc we keep the same number of residues)
+            selected_chain['res_idx'] = num_res
+            selected_chain['atom_idx'] = num_atoms
+            shuffled_chains.append(selected_chain)
+
+            frag_order = np.random.permutation(chain_frag_list)
+
+            for frag_idx in frag_order:
+                frag_dict = chain_frag_mapping[chain_idx][frag_idx]
+                frag_residues = frag_dict['residues']
+
+                frag_atom_start = frag_residues[0]['atom_idx']
+                # reindex the residue-to-atoms mapping
+                for residue in frag_residues:
+                    residue['atom_idx'] -= frag_atom_start
+                    residue['atom_idx'] += num_atoms
+                    shuffled_residues.append(residue)
+                    shuffled_frag_ids.append(frag_idx)
+
+                num_res += len(frag_residues)
+                for atoms in frag_dict['atoms']:
+                    shuffled_atoms.append(atoms)
+                    num_atoms += len(atoms)
+                shuffled_res_copied_indices.extend(frag_dict['original_res_copy_idx'])
+                shuffled_atom_copied_indices.extend(frag_dict['original_atom_copy_idx'])
+
+        copy_chains = shuffled_chains
+        copy_residues = shuffled_residues
+        copy_atoms = shuffled_atoms
+        res_copied_indices = shuffled_res_copied_indices
+        atom_copied_indices = shuffled_atom_copied_indices
+        frag_ids = shuffled_frag_ids
+
+    copy_struct = Structure(
+        atoms=np.concatenate(copy_atoms, axis=-1),
+        bonds=np.array([], dtype=Bond),
+        residues=np.stack(copy_residues, axis=0),
+        chains=np.stack(copy_chains, axis=0),
+        connections=np.array([], dtype=Connection),
+        interfaces=np.array([], dtype=Interface),
+        mask=np.array([True for _ in copy_chains])
+    )
+
+    new_copy_struct = copy.deepcopy(copy_struct)
+    new_copy_struct.chains['res_idx'] += len(struct.residues)
+    new_copy_struct.chains['atom_idx'] += len(struct.atoms)
+    new_copy_struct.residues['atom_idx'] += len(struct.atoms)
+
+    struct_new = Structure(
+        **{
+            key: np.concatenate([
+                getattr(struct, key),
+                getattr(new_copy_struct, key)
+            ], axis=-1)
+        for key in [f.name for f in fields(Structure)]
+        }
+    )
+
+    # flatten atom_copied_indices
+    _atom_copied_indices = []
+    for l in atom_copied_indices:
+        _atom_copied_indices.extend(l)
+    atom_copied_indices = _atom_copied_indices
+
+    # create new task data masks
+    new_task_data = {}
+    def extract_mask(mask, indices, replace_value):
+        source_mask = mask.copy()
+        copy_mask = source_mask[indices]
+        if replace_value is not None:
+            source_mask[indices] = replace_value
+        return np.concatenate([source_mask, copy_mask], axis=-1)
+
+    new_task_data['res_type_noising_mask'] = extract_mask(
+        task_data['res_type_noising_mask'],
+        res_copied_indices,
+        True
+    )
+    new_task_data['is_unindexed_residue_mask'] = extract_mask(
+        task_data['copy_unindexed_residue_mask'],
+        res_copied_indices,
+        False
+    )
+    new_task_data['is_indexed_residue_mask'] = extract_mask(
+        task_data['copy_indexed_residue_mask'],
+        res_copied_indices,
+        False
+    )
+    new_task_data['is_atomized_residue_mask'] = extract_mask(
+        task_data['copy_atomized_residue_mask'],
+        res_copied_indices,
+        False
+    )
+    if 'res_hotspot_type' in task_data:
+        new_task_data['res_hotspot_type'] = extract_mask(
+            task_data['res_hotspot_type'],
+            res_copied_indices,
+            None
+        )
+    new_task_data['atom_noising_mask'] = extract_mask(
+        task_data['atom_noising_mask'],
+        atom_copied_indices,
+        True
+    )
+
+    residue_entity_ids = []
+    for chain in struct.chains:
+        residue_entity_ids.extend([chain['entity_id'] for _ in range(chain['res_num'])])
+    max_entity_id = max(residue_entity_ids)
+    residue_entity_ids.extend([i + max_entity_id + 1 for i in frag_ids])
+
+    new_task_data['residue_entity_id'] = np.array(residue_entity_ids)
+
+    return copy_struct, struct_new, new_task_data
 
 
 class StructureTokenizer:
@@ -473,6 +738,8 @@ class StructureTokenizer:
         chain,
         res,
         noise_seq,
+        hotspot_type,
+        entity_id
     ):
         # Get atom indices
         atom_start = res["atom_idx"]
@@ -513,6 +780,7 @@ class StructureTokenizer:
             is_unindexed=False,
             is_atomized=False,
             seq_noising_mask=noise_seq
+            hotspot_type=hotspot_type
         )
 
         # compute a mapping for which rigids correspond to which atoms
@@ -575,27 +843,13 @@ class StructureTokenizer:
         self,
         chain,
         res,
-        bond_graph_override=None,
-        process_isolated=False,
+        hotspot_type,
+        entity_id
     ):
-        if bond_graph_override is None:
-            bond_graph_override = self.bond_graph
-
-        # when we copy an atomized residue
-        # we don't want to leak information about
-        # residue positioning based on the current chain index
-        # so we have the option to process this residue
-        # independent of the current tokenizer state
-        if process_isolated:
-            token_idx = 0
-            rigid_idx = 0
-            atom_to_rigid = {}
-            rigid_to_token = {}
-        else:
-            token_idx = self.token_idx
-            rigid_idx = self.rigid_idx
-            atom_to_rigid = self.atom_to_rigid
-            rigid_to_token = self.rigid_to_token
+        token_idx = self.token_idx
+        rigid_idx = self.rigid_idx
+        atom_to_rigid = self.atom_to_rigid
+        rigid_to_token = self.rigid_to_token
 
         ret_tokens = []
         ret_rigids = []
@@ -627,7 +881,7 @@ class StructureTokenizer:
                 atom_idx if not process_isolated else i,
                 valid_neighbors,
                 valid_neighbor_coords,
-                bond_graph_override,
+                self.bond_graph
                 use_identity_rot=self.use_identity_rot,
             )
 
@@ -641,14 +895,15 @@ class StructureTokenizer:
                 res_name=res["name"],
                 sym_id=chain["sym_id"],
                 asym_id=chain["asym_id"],
-                entity_id=chain["entity_id"],
+                entity_id=entity_id,
                 mol_type=chain["mol_type"],
                 resolved_mask=is_present,
                 center_coords=atom_tensor7[4:],
                 is_copy=False,
                 is_unindexed=False,
                 is_atomized=True,
-                seq_noising_mask=False
+                seq_noising_mask=False,
+                hotspot_type=hotspot_type
             )
             ret_tokens.append(token)
 
@@ -673,88 +928,10 @@ class StructureTokenizer:
             rigid_idx = rigid_idx + 1
             token_idx = token_idx + 1
 
-        if not process_isolated:
-            self.token_idx = token_idx
-            self.rigid_idx = rigid_idx
+        self.token_idx = token_idx
+        self.rigid_idx = rigid_idx
 
         return ret_tokens, ret_rigids
-
-    def _append_copy_features(
-        self,
-        chain,
-        res,
-        token,
-        rigids
-    ):
-        res_idx = res['res_idx']
-        copy_indexed_residue_mask = self.task_data['copy_indexed_residue_mask']
-        copy_unindexed_residue_mask = self.task_data['copy_unindexed_residue_mask']
-        copy_atomized_residue_mask = self.task_data['copy_atomized_residue_mask']
-        is_indexed = copy_indexed_residue_mask[res_idx]
-        is_unindexed = copy_unindexed_residue_mask[res_idx]
-        assert not is_indexed & is_unindexed, f"residue copy of {res_idx} cannot be both indexed and unindexed!"
-
-        # if we're not copying anything, return
-        if not (is_indexed | is_unindexed):
-            return
-
-        if copy_atomized_residue_mask[res_idx]:
-            aa_bond_data = get_standard_protein_residue_bonds(res['name'], atom_idx=0)
-            _bond_graph_override = nx.Graph([(bond["atom_1"], bond["atom_2"]) for bond in aa_bond_data])
-            copy_tokens, copy_rigids = self._get_nonstandard_residue_data(
-                chain, res,
-                bond_graph_override=_bond_graph_override,
-                process_isolated=True
-            )
-
-            self.atomized_bond_store[(chain['asym_id'], res['res_idx'])] = aa_bond_data
-
-            for i, (t, r) in enumerate(zip(copy_tokens, copy_rigids)):
-                _t = copy.deepcopy(t)
-                _t = replace(_t, is_unindexed = not bool(is_indexed))
-                _t = replace(_t, is_atomized = True)
-                self.copy_data.append(
-                    {"token": _t, "rigids": [r], "res_internal_idx": i}
-                )
-        else:
-            copy_token = copy.deepcopy(token)
-            copy_token = replace(copy_token, is_unindexed = not bool(is_indexed))
-            copy_token = replace(copy_token, is_atomized = False)
-            self.copy_data.append({
-                "token": copy_token, "rigids": rigids, "res_internal_idx": 0
-            })
-
-    def _shuffle_copy_fragments(
-        self,
-        copy_data
-    ):
-        # we swap around the order of copied segments
-        # since the ordering of these segments in the model inputs
-        # could potentially serve to leak the ground truth ordering of these segments
-        frag_idx = 0
-        token_0 = asdict(copy_data[0]['token'])
-        last_res_idx = token_0['res_idx']
-        last_chain_id = token_0['asym_id']
-        frag_mapping = {}
-        for i, copy_dict in enumerate(copy_data):
-            token = asdict(copy_dict['token'])
-            chain_id = token['asym_id']
-            if abs(last_res_idx - token['res_idx']) > 1 or chain_id != last_chain_id:
-                frag_idx += 1
-
-            if frag_idx not in frag_mapping:
-                frag_mapping[frag_idx] = [copy_dict]
-            else:
-                frag_mapping[frag_idx].append(copy_dict)
-
-            last_res_idx = token['res_idx']
-            last_chain_id = chain_id
-
-        frag_order = np.random.permutation(frag_idx+1)
-        _new_copy_data = []
-        for i in frag_order:
-            _new_copy_data.extend(frag_mapping[i])
-        return _new_copy_data
 
     def tokenize(
         self,
@@ -771,6 +948,7 @@ class StructureTokenizer:
         token_bonds = []
 
         res_type_noising_mask = self.task_data['res_type_noising_mask']
+        # res_hotspot_type = self.task_data['res_hotspot_type']
 
         # Filter to valid chains only
         chains = self.struct.chains[self.struct.mask]
@@ -785,62 +963,70 @@ class StructureTokenizer:
             is_protein = chain["mol_type"] == const.chain_type_ids["PROTEIN"]
 
             for i, res in enumerate(self.struct.residues[res_start:res_end]):
+                if "res_hotspot_type" in self.task_data:
+                    res_hotspot_type = self.task_data['res_hotspot_type'][res_start + i]
+                else:
+                    res_hotspot_type = 0
+
+                is_unindexed_motif = self.task_data['is_unindexed_residue_mask'][res_start + i]
+                is_indexed_motif = self.task_data['is_indexed_residue_mask'][res_start + i]
+                is_atomized = self.task_data['is_atomized_residue_mask'][res_start + i]
+                entity_id = self.task_data['residue_entity_id'][res_start + i]
+
                 # Standard residues are tokens
                 if res["is_standard"] and (res['name'] != 'UNK') and is_protein:
-                    token, ret_rigids = self._get_standard_protein_residue_data(
-                        chain, res,
-                        noise_seq=res_type_noising_mask[res_start + i]
-                    )
 
-                    self._append_copy_features(
-                        chain, res, token, ret_rigids
-                    )
+                    if not is_atomized:
+                        token, ret_rigids = self._get_standard_protein_residue_data(
+                            chain, res,
+                            noise_seq=res_type_noising_mask[res_start + i],
+                            hotspot_type=res_hotspot_type,
+                            entity_id=entity_id
+                        )
 
-                    token_data.append(astuple(token))
-                    rigid_data.extend([astuple(r) for r in ret_rigids])
+                        token = replace(
+                            token,
+                            is_copy=is_unindexed_motif or is_indexed_motif,
+                            is_unindexed=is_unindexed_motif,
+                        )
+
+                        token_data.append(astuple(token))
+                        rigid_data.extend([astuple(r) for r in ret_rigids])
+                    else:
+                        # add atomized residue bond data to bond graph
+                        aa_bond_data = get_standard_protein_residue_bonds(
+                            res['name'],
+                            atom_idx=res['atom_idx']
+                        )
+                        aa_bond_graph = nx.Graph([(bond["atom_1"], bond["atom_2"]) for bond in aa_bond_data])
+                        self.bond_graph = nx.compose(self.bond_graph, aa_bond_graph)
+
+                        tokens, rigids = self._get_nonstandard_residue_data(
+                            chain, res, hotspot_type=res_hotspot_type,
+                            entity_id=entity_id
+                        )
+
+                        tokens_new = []
+                        for t in tokens:
+                            _t = replace(
+                                t,
+                                is_copy=is_unindexed_motif or is_indexed_motif,
+                                is_unindexed=is_unindexed_motif,
+                                is_atomized=True
+                            )
+                            tokens_new.append(_t)
+
+                        token_data.extend([astuple(t) for t in tokens_new])
+                        rigid_data.extend([astuple(r) for r in rigids])
 
                 # Non-standard are tokenized per atom
                 else:
                     ret_tokens, ret_rigids = self._get_nonstandard_residue_data(
-                        chain, res,
+                        chain, res, hotspot_type=res_hotspot_type,
+                        entity_id=entity_id
                     )
                     token_data.extend([astuple(t) for t in ret_tokens])
                     rigid_data.extend([astuple(r) for r in ret_rigids])
-
-        if self.shuffle_copied_fragments and len(self.copy_data) > 0:
-            copy_data = self._shuffle_copy_fragments(self.copy_data)
-        else:
-            copy_data = self.copy_data
-
-        copy_atomized_bonds = []
-        # append our copied residues onto the tokenized data
-        # this preserves res_idx but assigns the correct token_idx and rigid_idx
-        # as well as specifying proper bookkeeping values
-        for copy_dict in copy_data:
-            # copy_dict = copy.deepcopy(copy_dict)  # TODO: idek if this is necessary
-            token = asdict(copy_dict['token'])
-            rigids = [asdict(r) for r in copy_dict['rigids']]
-
-            token['is_copy'] = True
-            token['token_idx'] = self.token_idx
-            token['rigid_idx'] = self.rigid_idx
-            token_data.append(astuple(TokenData(**token)))
-
-            token_res_tag = (token['asym_id'], token['res_idx'])
-            if token_res_tag in self.atomized_bond_store and copy_dict['res_internal_idx'] == 0:
-                copy_bond_data = self.atomized_bond_store[token_res_tag]
-                copy_bond_data['atom_1'] += self.token_idx
-                copy_bond_data['atom_2'] += self.token_idx
-                copy_bond_data['type'] += 1
-                copy_atomized_bonds.append(copy_bond_data.astype(TokenBond))
-
-            for r in rigids:
-                r['token_idx'] = self.token_idx
-                r['rigid_idx'] = self.rigid_idx
-                rigid_data.append(astuple(RigidData(**r)))
-                self.rigid_idx += 1
-
-            self.token_idx += 1
 
         # Add atom-atom bonds from ligands
         for bond in self.struct.bonds:
@@ -863,9 +1049,6 @@ class StructureTokenizer:
         token_bonds = np.array(token_bonds, dtype=TokenBond)
         rigid_data = np.array(rigid_data, dtype=Rigid)
 
-        if len(copy_atomized_bonds) > 0:
-            token_bonds = np.concatenate([token_bonds] + copy_atomized_bonds)
-
         # mark that we've run this function already
         self.processed = True
         return token_data, rigid_data, token_bonds
@@ -877,6 +1060,7 @@ def tokenize_structure(  # noqa: C901, PLR0915
     shuffle_chains: bool = False,
     shuffle_copied_fragments: bool = True,
     use_identity_rot: bool = True,
+    copy_indexed_residues: bool = True
 ) -> Tuple[np.ndarray, np.array, np.ndarray]:
     """Tokenize a structure.
 
@@ -896,12 +1080,63 @@ def tokenize_structure(  # noqa: C901, PLR0915
 
     """
 
+    chain_residue_mask = []
+    for i, chain in enumerate(struct.chains):
+        chain_residue_mask.extend([struct.mask[i] for _ in range(chain['res_num'])])
+    chain_residue_mask = np.array(chain_residue_mask)
+    unindexed_copy = (task_data['copy_unindexed_residue_mask'] & struct.residues['is_present'] & chain_residue_mask)
+    indexed_copy = (task_data['copy_indexed_residue_mask'] & struct.residues['is_present'] & chain_residue_mask)
+    atomized_copy = (task_data['copy_atomized_residue_mask'] & struct.residues['is_present'] & chain_residue_mask)
+
+    is_unk_standard = (struct.residues['name'] == 'UNK')
+    # prevent copying a nonstandard residues
+    # TODO: in theory we should allow copying of nonstandard residues if they are atomized
+    unindexed_copy[~struct.residues['is_standard']] = False
+    unindexed_copy[is_unk_standard] = False
+    indexed_copy[~struct.residues['is_standard']] = False
+    indexed_copy[is_unk_standard] = False
+    # unindexed_copy[~struct.residues['is_standard']] &= atomized_copy[~struct.residues['is_standard']]
+    # indexed_copy[~struct.residues['is_standard']] &= atomized_copy[~struct.residues['is_standard']]
+
+    perform_copy = (
+        unindexed_copy.any()
+        or (indexed_copy.any() and copy_indexed_residues)
+        or atomized_copy.any()
+    )
+
+    if perform_copy:
+        copy_struct, struct_new, new_task_data = generate_copy_structure(
+            struct,
+            task_data,
+            shuffle_copied_fragments
+        )
+    else:
+        struct_new = struct
+
+        # rename task mask keys to new key names
+        new_task_data = {}
+        new_task_data['res_type_noising_mask'] = task_data['res_type_noising_mask']
+        assert not unindexed_copy.any()
+        new_task_data['is_unindexed_residue_mask'] = task_data['copy_unindexed_residue_mask']
+        assert not atomized_copy.any()
+        new_task_data['is_atomized_residue_mask'] = task_data['copy_atomized_residue_mask']
+        if copy_indexed_residues:
+            assert not indexed_copy.any()
+        new_task_data['is_indexed_residue_mask'] = task_data['copy_indexed_residue_mask']
+        if 'res_hotspot_type' in task_data:
+            new_task_data['res_hotspot_type'] = task_data['res_hotspot_type']
+        new_task_data['atom_noising_mask'] = task_data['atom_noising_mask']
+
+        # add entity ids
+        residue_entity_ids = []
+        for chain in struct.chains:
+            residue_entity_ids.extend([chain['entity_id'] for _ in range(chain['res_num'])])
+        new_task_data['residue_entity_id'] = np.array(residue_entity_ids)
+
     tokenizer = StructureTokenizer(
-        struct,
-        task_data,
+        struct_new,
+        new_task_data,
         shuffle_chains,
-        shuffle_copied_fragments,
-        use_identity_rot=use_identity_rot,
+        use_identity_rot=use_identity_rot
     )
     return tokenizer.tokenize()
-

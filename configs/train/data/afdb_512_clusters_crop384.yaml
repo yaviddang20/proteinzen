@@ -9,7 +9,7 @@ remove_mol_types:
   - "NONPOLYMER"
 datasets:
   - _target_: proteinzen.data.datasets.dataset.MMCIFDataset
-    data_dir: /wynton/group/kortemme/alexjli/data/framediff_boltz
+    data_dir: /home/remote/ali16/data/framediff_boltz
     data_sampler:
       _target_: proteinzen.boltz.data.sample.cluster.ClusterSampler
     task_sampler:
@@ -36,7 +36,7 @@ datasets:
           t_min: 0.01
           t_max: 0.99
           max_frac_res: 0.5
-          max_num_res: 20
+          max_num_res: 100
           p_is_unindexed: 0.0
           p_fix_tip: 0.35
           p_fix_bb: 0.35
@@ -53,14 +53,14 @@ datasets:
           t_min: 0.01
           t_max: 0.99
           max_frac_res: 0.5
-          max_num_res: 20
+          max_num_res: 100
           p_is_unindexed: 1.0
           p_fix_tip: 0.35
           p_fix_bb: 0.35
           p_fix_all: 0.30
           name_override: motif_scaffold_unindexed
   - _target_: proteinzen.data.datasets.dataset.MMCIFDataset
-    data_dir: /wynton/group/kortemme/alexjli/data/afdb_512_clusters_boltz
+    data_dir: /home/remote/ali16/data/afdb_512_clusters_boltz
     data_sampler:
       _target_: proteinzen.boltz.data.sample.cluster.ClusterSampler
     task_sampler:
@@ -87,7 +87,7 @@ datasets:
           t_min: 0.01
           t_max: 0.99
           max_frac_res: 0.5
-          max_num_res: 20
+          max_num_res: 100
           p_is_unindexed: 0.0
           p_fix_tip: 0.35
           p_fix_bb: 0.35
@@ -104,7 +104,7 @@ datasets:
           t_min: 0.01
           t_max: 0.99
           max_frac_res: 0.5
-          max_num_res: 20
+          max_num_res: 60
           p_is_unindexed: 1.0
           p_fix_tip: 0.35
           p_fix_bb: 0.35

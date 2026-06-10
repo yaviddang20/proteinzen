@@ -18,16 +18,7 @@ from proteinzen.openfold.utils import rigid_utils as ru
 
 from cuequivariance_torch import triangle_attention, triangle_multiplicative_update
 
-try:
-    cuda_major, cuda_minor = torch.cuda.get_device_capability(device=None)
-    if cuda_major >= 8:
-        cuet_supported = True
-    else:
-        cuet_supported = False
-except RuntimeError:
-    cuet_supported = False
-print(f"using cuet kernels: {cuet_supported}")
-
+from .common import cuet_supported, compile_supported
 
 def swish(x):
     return x * torch.sigmoid(x)
@@ -62,6 +53,7 @@ class SwishTransition(nn.Module):
         self.lin_b = Linear(c, c*dilation, bias=False)
         self.lin_out = Linear(c*dilation, c, bias=False)
 
+    @torch.compile(disable=not compile_supported)
     def forward(self, x):
         x = self.ln(x)
         a = self.lin_a(x)
@@ -140,6 +132,36 @@ class TriangleAttentionCore(nn.Module):
 
         self.ln = LayerNorm(c_z)
 
+    @torch.compile(disable=not compile_supported)
+    def _prep_qkv_shortcut(self,
+        z: torch.Tensor,
+    ):
+        z = self.ln(z)
+        # [*, Q/K/V, H * C_hidden]
+        q = self.linear_q(z)
+        k = self.linear_k(z)
+        v = self.linear_v(z)
+
+        # [*, Q/K, H, C_hidden]
+        q = q.view(q.shape[:-1] + (self.no_heads, -1))
+        k = k.view(k.shape[:-1] + (self.no_heads, -1))
+        v = v.view(v.shape[:-1] + (self.no_heads, -1))
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        # [*, H, Q/K, C_hidden]
+        q = q.transpose(-2, -3)
+        k = k.transpose(-2, -3)
+        v = v.transpose(-2, -3)
+
+        g = self.sigmoid(self.linear_g(z))
+
+        # [*, Q, H, C_hidden]
+        g = g.view(g.shape[:-1] + (self.no_heads, -1))
+
+        return q, k, v, g
+
     def _prep_qkv(self,
         q_x: torch.Tensor,
         kv_x: torch.Tensor,
@@ -189,7 +211,22 @@ class TriangleAttentionCore(nn.Module):
 
         return o
 
-    def forward(
+    @torch.compile(disable=not compile_supported)
+    def _wrap_up_compiled(self,
+        o: torch.Tensor,
+        g: torch.Tensor
+    ) -> torch.Tensor:
+        o = o * g
+
+        # [*, Q, H * C_hidden]
+        o = flatten_final_dims(o, 2)
+
+        # [*, Q, C_q]
+        o = self.linear_o(o)
+
+        return o
+
+    def _eager_forward(
         self,
         z: torch.Tensor,
         mask_bias: torch.Tensor,
@@ -248,6 +285,58 @@ class TriangleAttentionCore(nn.Module):
             o = o.transpose(-2, -3)
 
         o = self._wrap_up(o, z)
+
+        if not self.starting:
+            o = o.transpose(-2, -3)
+
+        return o
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        mask_bias: torch.Tensor,
+        edge_bias: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            q_x:
+                [*, Q, C_q] query data
+            kv_x:
+                [*, K, C_k] key data
+            biases:
+                List of biases that broadcast to [*, H, Q, K]
+        Returns
+            [*, Q, C_q] attention update
+        """
+        if not self.starting:
+            z = z.transpose(-2, -3)
+            mask_bias = mask_bias.transpose(-4, -1)
+            edge_bias = edge_bias.transpose(-1, -2)
+
+        global cuet_supported
+        global compile_supported
+        biases = [mask_bias, edge_bias]
+
+        # DeepSpeed attention kernel applies scaling internally
+        assert self.use_qk_norm
+        assert self.linear_g is not None
+        q, k, v, g = self._prep_qkv_shortcut(z)
+
+        if cuet_supported:
+            try:
+                o = triangle_attention(q, k, v, bias=edge_bias, mask=mask_bias)
+                o = o.transpose(-2, -3)
+            except RuntimeError as e:
+                print("wasn't able to run triangle_attention from cuet, switching it off")
+                raise e
+        else:
+            attn_mask = 0
+            for b in biases:
+                attn_mask = attn_mask + b
+            o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            o = o.transpose(-2, -3)
+
+        o = self._wrap_up_compiled(o, g)
 
         if not self.starting:
             o = o.transpose(-2, -3)
@@ -343,7 +432,6 @@ class TriangleMultiplicativeUpdate(nn.Module):
             )
             return x
         else:
-            #TODO: check if cuet_supported is set or if this bugged else block is used
             if mask is None:
                 mask = z.new_ones(z.shape[:-1])
 
@@ -395,7 +483,6 @@ class ConditionedPairUpdate(nn.Module):
             rbf_max=50.75,
             inf=1e8,
             include_rel_quat=False,
-            patch_unit_vec_bug=False,
             use_qk_norm=False
         ):
         super().__init__()
@@ -406,7 +493,6 @@ class ConditionedPairUpdate(nn.Module):
         self.D_min = rbf_min / self.NM_TO_ANG_SCALE
         self.D_max = rbf_max / self.NM_TO_ANG_SCALE
         self.inf = inf
-        self.patch_unit_vec_bug = patch_unit_vec_bug
         self.include_rel_quat = include_rel_quat
         if c_cond is None:
             self.c_cond = c_s // 4
@@ -423,6 +509,9 @@ class ConditionedPairUpdate(nn.Module):
                 LayerNorm(c_hidden),
                 Linear(c_hidden, no_heads, bias=False)
             )
+        if compile_supported:
+            self.emb_rbf.compile()
+
         self.ln_third_edge = LayerNorm(c_z)
         self.emb_third_edge = Linear(c_z, no_heads, bias=False)
 
@@ -434,6 +523,8 @@ class ConditionedPairUpdate(nn.Module):
             LayerNorm(c_s),
             Linear(c_s, self.c_cond, bias=False)
         )
+        # if compile_supported:
+        #     self.cond_proj.compile()
         self.transition = ConditionedTransition(c_z, c_cond=self.c_cond*2)
 
         self.dropout_row_layer = DropoutRowwise(dropout)
@@ -441,38 +532,85 @@ class ConditionedPairUpdate(nn.Module):
         self.layer_norm_start = LayerNorm(c_z)
         self.layer_norm_end = LayerNorm(c_z)
 
+    @torch.compile(disable=not compile_supported)
+    def _gen_third_edge(
+        self,
+        edge_embed,
+    ):
+        return self.emb_third_edge(self.ln_third_edge(edge_embed))
+
+    @torch.compile(disable=not compile_supported)
+    def _gen_edge_bias_no_rel_quat(
+        self,
+        edge_embed,
+        coords
+    ):
+        distances = torch.cdist(coords, coords)
+        # [B, I, J, H]
+        dist_bias = self.emb_rbf(
+            rbf(distances, D_min=self.D_min, D_max=self.D_max, D_count=self.num_rbf, device=distances.device)
+        )
+        third_edge = self.emb_third_edge(self.ln_third_edge(edge_embed))
+        edge_bias = dist_bias + third_edge
+        edge_bias = edge_bias.unsqueeze(-4)
+        return edge_bias
+
+    @torch.compile(disable=not compile_supported)
+    def _wrapup(
+        self,
+        node_embed,
+        z
+    ):
+        # B x N x c_cond
+        cond = self.cond_proj(node_embed)
+        num_res = node_embed.shape[-2]
+        cond = torch.cat([
+            torch.tile(cond[..., None, :], (1, 1, num_res, 1)),
+            torch.tile(cond[..., None, :, :], (1, num_res, 1, 1))
+        ], dim=-1)
+        z = z + self.transition(z, cond)
+        return z
+
     def forward(self, node_embed, edge_embed, rigids, edge_mask):
+        global cuet_supported
+        global compile_supported
+
         # get pair bias from rbf of distance
         coords = rigids.get_trans()
-        distances = torch.cdist(coords, coords)
-        if self.include_rel_quat:
-            rots = rigids.get_rots()
-            rel_quats = rots[..., None].invert().compose_q(rots[..., None, :])
-            # [B, I, J, H]
-            dist_bias = self.emb_rbf(
-                torch.cat([
-                    rbf(distances, D_min=self.D_min, D_max=self.D_max, D_count=self.num_rbf, device=distances.device),
-                    rel_quats.get_quats()
-                ], dim=-1)
+        if compile_supported and not self.include_rel_quat:
+            edge_bias = self._gen_edge_bias_no_rel_quat(
+                edge_embed,
+                coords
             )
-
         else:
-            # [B, I, J, H]
-            dist_bias = self.emb_rbf(
-                rbf(distances, D_min=self.D_min, D_max=self.D_max, D_count=self.num_rbf, device=distances.device)
-            )
+            distances = torch.cdist(coords, coords)
+            if self.include_rel_quat:
+                rots = rigids.get_rots()
+                rel_quats = rots[..., None].invert().compose_q(rots[..., None, :])
+                # [B, I, J, H]
+                dist_bias = self.emb_rbf(
+                    torch.cat([
+                        rbf(distances, D_min=self.D_min, D_max=self.D_max, D_count=self.num_rbf, device=distances.device),
+                        rel_quats.get_quats()
+                    ], dim=-1)
+                )
+
+            else:
+                # [B, I, J, H]
+                dist_bias = self.emb_rbf(
+                    rbf(distances, D_min=self.D_min, D_max=self.D_max, D_count=self.num_rbf, device=distances.device)
+                )
+
+            third_edge = self._gen_third_edge(edge_embed)
+            edge_bias = dist_bias + third_edge
+            edge_bias = edge_bias.unsqueeze(-4)
+
         # [B, I, 1, 1, J, H]
         # mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
-        global cuet_supported
         if cuet_supported:
             mask_bias = edge_mask[..., :, None, None, :]
         else:
             mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
-
-        third_edge = self.emb_third_edge(self.ln_third_edge(edge_embed))
-        edge_bias = dist_bias + third_edge
-
-        edge_bias = edge_bias.unsqueeze(-4)
 
         z = edge_embed
         z = z + self.trig_attn_start(
@@ -485,14 +623,15 @@ class ConditionedPairUpdate(nn.Module):
             edge_bias=permute_final_dims(edge_bias, (2, 0, 1)),
             mask_bias=mask_bias
         )
-        # B x N x c_cond
-        cond = self.cond_proj(node_embed)
-        num_res = node_embed.shape[-2]
-        cond = torch.cat([
-            torch.tile(cond[..., None, :], (1, 1, num_res, 1)),
-            torch.tile(cond[..., None, :, :], (1, num_res, 1, 1))
-        ], dim=-1)
-        z = z + self.transition(z, cond)
+        z = self._wrapup(node_embed, z)
+        # # B x N x c_cond
+        # cond = self.cond_proj(node_embed)
+        # num_res = node_embed.shape[-2]
+        # cond = torch.cat([
+        #     torch.tile(cond[..., None, :], (1, 1, num_res, 1)),
+        #     torch.tile(cond[..., None, :, :], (1, num_res, 1, 1))
+        # ], dim=-1)
+        # z = z + self.transition(z, cond)
 
         return z
 
@@ -512,7 +651,9 @@ class MultiRigidPairEmbedder(nn.Module):
                  num_bond_types=len(const.bond_types) + 1,
                  use_qk_norm=False,
                  use_self_folding=False,
-                 patch_unit_vec_bug=False
+                 add_same_chain_feature=False,
+                 patch_unit_vec_bug=False,
+                 use_entity_id_unmasking=False
     ):
         super().__init__()
 
@@ -525,6 +666,7 @@ class MultiRigidPairEmbedder(nn.Module):
         self.no_blocks = no_blocks
         self.inf = inf
         self.patch_unit_vec_bug = patch_unit_vec_bug
+        self.use_entity_id_unmasking = use_entity_id_unmasking
 
         self.c_a = (
             num_rbf
@@ -535,6 +677,11 @@ class MultiRigidPairEmbedder(nn.Module):
         # self.ln_relpos = LayerNorm(2*relpos_clip+1)
         self.lin_z_ij = Linear(2*relpos_clip+1, c_hidden)
         self.lin_token_bonds = nn.Embedding(num_bond_types, c_hidden)
+
+        if add_same_chain_feature:
+            self.lin_same_chain = Linear(1, c_hidden, bias=False)
+        else:
+            self.lin_same_chain = None
 
         self.use_self_folding = use_self_folding
         if use_self_folding:
@@ -555,6 +702,9 @@ class MultiRigidPairEmbedder(nn.Module):
                 LayerNorm(c_hidden),
                 Linear(c_hidden, no_heads, bias=False)
             )
+            if compile_supported:
+                self.trunk[f'edge_bias_{i}'].compile()
+
             self.trunk[f'attn_start_{i}'] = TriangleAttentionCore(c_hidden, c_head, no_heads, starting=True, use_qk_norm=use_qk_norm)
             self.trunk[f'attn_end_{i}'] = TriangleAttentionCore(c_hidden, c_head, no_heads, starting=False, use_qk_norm=use_qk_norm)
             self.trunk[f'transition_{i}'] = SwishTransition(c_hidden)
@@ -593,22 +743,38 @@ class MultiRigidPairEmbedder(nn.Module):
                 rigids,
                 node_mask,
                 seq_idx,
-                chain_idx,
+                asym_id,
+                entity_id,
                 token_is_unindexed_mask,
                 token_bonds,
                 sc_rigids=None,
                 sf_rigids=None,
     ):
         edge_mask = node_mask[..., None] & node_mask[..., None, :]
-        same_chain_mask = (chain_idx[..., None] == chain_idx[..., None, :])
-        pair_is_unindexed_mask = token_is_unindexed_mask[..., None] | token_is_unindexed_mask[..., None, :]
-
+        same_chain_mask = (asym_id[..., None] == asym_id[..., None, :])
+        single_is_unindexed_mask = token_is_unindexed_mask[..., None] | token_is_unindexed_mask[..., None, :]
+        same_entity_mask = (entity_id[..., None] == entity_id[..., None, :])
         relpos_feats = relpos(seq_idx, clip=self.relpos_clip)
-        relpos_feats = relpos_feats * same_chain_mask[..., None]
-        relpos_feats = relpos_feats * ~pair_is_unindexed_mask[..., None]
+
+        if self.use_entity_id_unmasking:
+            # we only expose the sequence distance feature if
+            # (a) both residues are in the same chain and neither is an unindexed residue
+            pair_is_same_indexed_chain_mask = (~single_is_unindexed_mask & same_chain_mask)
+            # (b) both residues are unindexed and have the same entity id
+            pair_is_unindexed_mask = token_is_unindexed_mask[..., None] & token_is_unindexed_mask[..., None, :]
+            pair_is_same_unindexed_segment_mask = pair_is_unindexed_mask & same_entity_mask
+            total_mask = pair_is_same_indexed_chain_mask | pair_is_same_unindexed_segment_mask
+            relpos_feats = relpos_feats * total_mask[..., None]
+        else:
+            relpos_feats = relpos_feats * same_chain_mask[..., None]
+            relpos_feats = relpos_feats * ~single_is_unindexed_mask[..., None]
         # relpos_feats[~same_chain_mask][..., -1] += 1
 
         z = self.lin_z_ij(relpos_feats)
+
+        if self.lin_same_chain is not None:
+            z += self.lin_same_chain(1 - same_chain_mask[..., None].float())
+
         a_current = self._featurize_rigids(rigids, distogram=False)
         if sc_rigids is not None:
             a_sc = self._featurize_rigids(sc_rigids, distogram=True)
@@ -621,9 +787,9 @@ class MultiRigidPairEmbedder(nn.Module):
             a_sf = torch.zeros_like(a_current)
 
         if self.use_self_folding:
-            z = z + self.lin_a_ij(torch.cat([a_current, a_sc, a_sf], dim=-1))
+            z += self.lin_a_ij(torch.cat([a_current, a_sc, a_sf], dim=-1))
         else:
-            z = z + self.lin_a_ij(torch.cat([a_current, a_sc], dim=-1))
+            z += self.lin_a_ij(torch.cat([a_current, a_sc], dim=-1))
 
         z += self.lin_token_bonds(token_bonds) # TODO: * (token_bonds == 0)[..., None]
         z = z * edge_mask[..., None]

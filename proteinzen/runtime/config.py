@@ -12,9 +12,27 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from proteinzen.data.datasets.datamodule import BiomoleculeDataModule, BiomoleculeSamplingDataModule
 
 from proteinzen.stoch_interp.multiframe import MultiSE3Interpolant
+from proteinzen.stoch_interp.integration import EulerIntegrator, EDMIntegrator, PnPIntegrator, EDMIntegrator2, IntervalEquilibrationIntegrator
+from proteinzen.stoch_interp.diffeq import (
+    BaseEulerODEStep, BaseEulerSDEStep, EDMEulerSDEStep, ChromaEulerSDEStep, EDMChromaSDEStep, LowTemperatureSDEStep,
+    GradientGuidedEulerODEStep,
+    EulerODEStepWithGradientLangevinChurn,
+    EulerSDEStepWithGradientLangevinChurn,
+    GradientGuidedEulerSDEStepWithGradientLangevinChurn,
+    LangevinSDEStep,
+    PiecewiseSDEStep,
+    SweepLowTemperatureSDEStep
+)
+from proteinzen.stoch_interp.model_wrapper import (
+    BaseModelForward, RSTFMForward, SequenceEntropyGradient, DistogramCompactGradient,
+    PredLocalFafeGradient
+)
+from proteinzen.stoch_interp.steering.integrator import SteeredIntegrator
+from proteinzen.stoch_interp.steering.reward_scoring import EndpointRewardScorer
+from proteinzen.stoch_interp.steering.rewards.alphafold2_reward import AF2RewardModel
 
 from proteinzen.model.denoiser import IpaMultiRigidDenoiser
-
+from proteinzen.model.denoiser_v2 import FlashIpaMultiRigidDenoiser
 
 from proteinzen.runtime.lmod import BiomoleculeModule
 from proteinzen.runtime.optim import get_std_opt
@@ -55,6 +73,7 @@ def config_hydra_store():
     ## switches to allow for hot-swapping between paradigms and domains
     paradigm_store = store(group="paradigm")
     paradigm_store({"paradigm": "multiframefm"}, name="multiframefm")
+    paradigm_store({"paradigm": "flashmultiframefm"}, name="flashmultiframefm")
 
     domain_store = store(group="domain")
     domain_store({"domain": "protein"}, name="protein")
@@ -63,6 +82,9 @@ def config_hydra_store():
     corruption_store(
         MultiSE3Interpolant,
         name="multiframefm_protein")
+    corruption_store(
+        MultiSE3Interpolant,
+        name="flashmultiframefm_protein")
 
     datamodule_store = store(group="datamodule")
     datamodule_store(
@@ -92,6 +114,7 @@ def config_hydra_store():
     # latent_fm_wrapper = ChimeraLatentWrapper
     model_store = store(group="model")
     model_store(IpaMultiRigidDenoiser, name="multiframefm_protein")
+    model_store(FlashIpaMultiRigidDenoiser, name="flashmultiframefm_protein")
 
     tasks_store = store(group="tasks")
     tasks_store(
@@ -190,14 +213,121 @@ def config_sampling_hydra_store():
     sampler_store(
         builds(
             BiomoleculeSamplingDataModule,
-            include_h=False,
+            batch_same_task_only=True
         ),
         name="default"
     )
-    corrupter_store = store(group="corrupter")
-    corrupter_store(
-        MultiSE3Interpolant,
-        name="default"
+    model_wrapper_store = store(group="model_wrapper")
+    model_wrapper_store(
+        pbuilds(BaseModelForward),
+        name="base"
+    )
+    model_wrapper_store(
+        pbuilds(RSTFMForward),
+        name="rstfm"
+    )
+    model_wrapper_store(
+        pbuilds(SequenceEntropyGradient),
+        name="seq_entropy_gradient"
+    )
+    model_wrapper_store(
+        pbuilds(DistogramCompactGradient),
+        name="distogram_compact_gradient"
+    )
+    model_wrapper_store(
+        pbuilds(PredLocalFafeGradient),
+        name="pred_local_fafe_gradient"
+    )
+
+    integrator_store = store(group="integrator")
+    integrator_store(
+        pbuilds(EulerIntegrator),
+        name="euler"
+    )
+    integrator_store(
+        pbuilds(
+            SteeredIntegrator,
+            reward_model=builds(
+                AF2RewardModel,
+                "binder",
+                "/mnt/scratch/user/ali16/colabdesign/params",
+                {"i_pae": -1},
+                use_multimer=True,
+                use_initial_guess=True,
+                use_initial_atom_pos=False,
+                num_recycles=3
+            ),
+            reward_kwargs={"target_chain": "A", "binder_chain": "B"},
+            keep_endpoint_pdbs=True,
+            endpoint_rollout_speedup=10
+        ),
+        name="ipae_steered_euler"
+    )
+    integrator_store(
+        pbuilds(EDMIntegrator),
+        name="edm"
+    )
+    integrator_store(
+        pbuilds(PnPIntegrator),
+        name="pnp"
+    )
+    integrator_store(
+        pbuilds(IntervalEquilibrationIntegrator),
+        name="interval_equil"
+    )
+
+    diffeq_store = store(group="diffeq")
+    diffeq_store(
+        BaseEulerODEStep,
+        name="base_euler_ode"
+    )
+    diffeq_store(
+        GradientGuidedEulerODEStep,
+        name="gradient_euler_ode"
+    )
+    diffeq_store(
+        EulerODEStepWithGradientLangevinChurn,
+        name="euler_ode_with_gradient_langevin_churn"
+    )
+    diffeq_store(
+        BaseEulerSDEStep,
+        name="base_euler_sde"
+    )
+    diffeq_store(
+        LowTemperatureSDEStep,
+        name="low_temp_euler_sde"
+    )
+    diffeq_store(
+        ChromaEulerSDEStep,
+        name="chroma_euler_sde"
+    )
+    diffeq_store(
+        EDMEulerSDEStep,
+        name="edm_euler_sde"
+    )
+    diffeq_store(
+        EDMChromaSDEStep,
+        name="edm_chroma_sde"
+    )
+    diffeq_store(
+        EulerSDEStepWithGradientLangevinChurn,
+        name="euler_sde_with_gradient_langevin_churn"
+    )
+    diffeq_store(
+        GradientGuidedEulerSDEStepWithGradientLangevinChurn,
+        name="gradient_guided_euler_sde_with_gradient_langevin_churn"
+    )
+    diffeq_store(
+        LangevinSDEStep,
+        name="langevin_sde"
+    )
+    diffeq_store(
+        PiecewiseSDEStep,
+        name="piecewise_euler_sde"
+    )
+    diffeq_store(
+        SweepLowTemperatureSDEStep,
+        name="sweep_low_temp_euler_sde"
     )
 
     SamplingConfig = make_config(
@@ -205,12 +335,15 @@ def config_sampling_hydra_store():
         out_dir="samples",
         save_traj=False,
         output_motif_chains=False,
+        use_task_name_labels=True,
+        inference_mode=True,
         checkpoint_idx=-1,
-        identity_rot_noise=False,
-        no_rot_sampling=False,
+        num_timesteps=400,
         hydra_defaults=[
             {"sampler": "default"},
-            {"corrupter": "default"},
+            {"integrator": "euler"},
+            {"model_wrapper": "base"},
+            {"diffeq": "base_euler_sde"},
             '_self_'
         ],
     )

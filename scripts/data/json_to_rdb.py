@@ -23,8 +23,8 @@ if __name__ == "__main__":
     if ext == 'pkl':
         with open(args.dict, 'rb') as fp:
             data = pickle.load(fp)
-    elif ext == 'json'
-        with open(args.json) as fp:
+    elif ext == 'json':
+        with open(args.dict) as fp:
             data = json.load(fp)
     else:
         raise ValueError("we only support input dictionaries in .pkl or .json format")

@@ -1,0 +1,1 @@
+adapted from Proteina-Complexa: https://github.com/NVIDIA-Digital-Bio/Proteina-Complexa/blob/dev/src/proteinfoundation/rewards/

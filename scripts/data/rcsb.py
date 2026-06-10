@@ -16,6 +16,7 @@ from typing import Any, Optional, Callable
 import numpy as np
 import rdkit
 from mmcif import parse_mmcif
+from hbond import get_hbond_atom_dict_from_cif_file
 from p_tqdm import p_umap
 from redis import Redis
 from tqdm import tqdm
@@ -89,19 +90,35 @@ def fetch(datadir: Path, max_file_size: Optional[int] = None) -> list[PDB]:
     """Fetch the PDB files."""
     data = []
     excluded = 0
-    for file in tqdm(datadir.rglob("*.cif*")):
-        # The clustering file is annotated by pdb_entity id
-        pdb_id = str(file.stem)
-        pdb_id = pdb_id.lower()
 
-        # Check file size and skip if too large
-        if max_file_size is not None and (file.stat().st_size > max_file_size):
-            excluded += 1
-            continue
+    # for file in tqdm(datadir.rglob("*.cif*")):
+    #     # The clustering file is annotated by pdb_entity id
+    #     pdb_id = str(file.stem)
+    #     pdb_id = pdb_id.lower()
 
-        # Create the target
-        target = PDB(id=pdb_id, path=str(file))
-        data.append(target)
+    #     # Check file size and skip if too large
+    #     if max_file_size is not None and (file.stat().st_size > max_file_size):
+    #         excluded += 1
+    #         continue
+
+    #     # Create the target
+    #     target = PDB(id=pdb_id, path=str(file))
+    #     data.append(target)
+
+    for folder in tqdm(datadir.glob("*")):
+        for file in folder.glob("*.cif"):
+            # The clustering file is annotated by pdb_entity id
+            pdb_id = str(file.stem)
+            pdb_id = pdb_id.lower()
+
+            # Check file size and skip if too large
+            if max_file_size is not None and (file.stat().st_size > max_file_size):
+                excluded += 1
+                continue
+
+            # Create the target
+            target = PDB(id=pdb_id, path=str(file))
+            data.append(target)
 
     print(f"Excluded {excluded} files due to size.")  # noqa: T201
     return data
@@ -140,7 +157,7 @@ def finalize(outdir: Path) -> None:
         json.dump(records, f)
 
 
-def parse(data: PDB, ccd_resource: CCDResource, clusters: ClusterResource) -> Target:
+def parse(data: PDB, ccd_resource: CCDResource, clusters: ClusterResource, compute_hbond_dict: bool) -> Target:
     """Process a structure.
 
     Parameters
@@ -168,6 +185,10 @@ def parse(data: PDB, ccd_resource: CCDResource, clusters: ClusterResource) -> Ta
     chain_info = []
     for i, chain in enumerate(structure.chains):
         key = f"{pdb_id}_{chain['entity_id'] + 1}"  # TODO: this is if we 1-index entities as the PDB but the parsing script doesn't
+
+        res_start = chain['res_idx']
+        res_end = res_start + chain['res_num']
+        num_resolved_residues = structure.residues[res_start:res_end]['is_present'].sum()
         # print(key, int(chain["res_num"]))
         chain_info.append(
             ChainInfo(
@@ -177,6 +198,7 @@ def parse(data: PDB, ccd_resource: CCDResource, clusters: ClusterResource) -> Ta
                 mol_type=int(chain["mol_type"]),
                 cluster_id=clusters.get(key, -1),
                 num_residues=int(chain["res_num"]),
+                num_resolved_residues=int(num_resolved_residues),
                 entity_id=int(chain['entity_id']),
             )
         )
@@ -186,20 +208,34 @@ def parse(data: PDB, ccd_resource: CCDResource, clusters: ClusterResource) -> Ta
     for interface in structure.interfaces:
         chain_1 = int(interface["chain_1"])
         chain_2 = int(interface["chain_2"])
+        chain_1_num_res = int(interface["chain_1_num_res"])
+        chain_2_num_res = int(interface["chain_2_num_res"])
         interface_info.append(
             InterfaceInfo(
                 chain_1=chain_1,
                 chain_2=chain_2,
+                chain_1_num_res=chain_1_num_res,
+                chain_2_num_res=chain_2_num_res,
             )
         )
 
-    # Create record
-    record = Record(
-        id=data.id,
-        structure=structure_info,
-        chains=chain_info,
-        interfaces=interface_info,
-    )
+    if compute_hbond_dict:
+        # Create record
+        record = Record(
+            id=data.id,
+            structure=structure_info,
+            chains=chain_info,
+            interfaces=interface_info,
+            hbond_dict=get_hbond_atom_dict_from_cif_file(data.path)
+        )
+    else:
+        # Create record
+        record = Record(
+            id=data.id,
+            structure=structure_info,
+            chains=chain_info,
+            interfaces=interface_info,
+        )
 
     return Target(structure=structure, record=record)
 
@@ -210,6 +246,7 @@ def process_structure(
     outdir: Path,
     filters: list[StaticFilter],
     get_clusters_resource: Callable[[], ClusterResource],
+    compute_hbond_dict: bool
 ) -> None:
     """Process a target.
 
@@ -248,7 +285,10 @@ def process_structure(
 
     try:
         # Parse the target
-        target: Target = parse(data, ccd, clusters)
+        target: Target = parse(
+            data, ccd, clusters,
+            compute_hbond_dict=compute_hbond_dict
+        )
         structure = target.structure
 
         # Apply the filters
@@ -332,10 +372,11 @@ def process(args) -> None:
         # Create processing function
         fn = partial(
             process_structure,
-            get_resource=get_ccd_resource,
+            get_ccd_resource=get_ccd_resource,
             outdir=args.outdir,
-            get_clusters=get_cluster_resource,
+            get_clusters_resource=get_cluster_resource,
             filters=filters,
+            compute_hbond_dict=args.compute_hbond_dict
         )
         # Run processing in parallel
         p_umap(fn, data, num_cpus=num_processes)
@@ -347,6 +388,7 @@ def process(args) -> None:
                 outdir=args.outdir,
                 get_clusters_resource=get_cluster_resource,
                 filters=filters,
+                compute_hbond_dict=args.compute_hbond_dict
             )
 
     # Finalize
@@ -410,6 +452,11 @@ if __name__ == "__main__":
         "--max-file-size",
         type=int,
         default=None,
+    )
+    parser.add_argument(
+        '--compute-hbond-dict',
+        action='store_true',
+        default=False,
     )
     args = parser.parse_args()
     process(args)

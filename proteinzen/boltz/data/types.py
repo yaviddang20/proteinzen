@@ -166,6 +166,8 @@ Connection = [
 Interface = [
     ("chain_1", np.dtype("i4")),
     ("chain_2", np.dtype("i4")),
+    ("chain_1_num_res", np.dtype("i4")),
+    ("chain_2_num_res", np.dtype("i4")),
 ]
 
 Coords = [
@@ -517,6 +519,7 @@ class ChainInfo:
     cluster_id: Union[str, int]
     msa_id: Union[str, int]
     num_residues: int
+    num_resolved_residues: int
     valid: bool = True
     entity_id: Optional[Union[str, int]] = None
 
@@ -527,6 +530,8 @@ class InterfaceInfo:
 
     chain_1: int
     chain_2: int
+    chain_1_num_res: int
+    chain_2_num_res: int
     valid: bool = True
 
 
@@ -602,6 +607,7 @@ class ConformerRecord(JSONSerializable):
     md: Optional[MDInfo] = None
     affinity: Optional[AffinityInfo] = None
     e_min: Optional[float] = None
+    hbond_dict: Optional[dict] = None
 
 
 ####################################################################################################

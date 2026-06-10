@@ -93,6 +93,8 @@ def to_pdb(
                 if chain["mol_type"] != const.chain_type_ids["NONPOLYMER"]
                 else "HETATM"
             )
+            if not residue['is_present']:
+                continue
 
             for i, atom in enumerate(atoms):
                 # This should not happen on predictions, but just in case.

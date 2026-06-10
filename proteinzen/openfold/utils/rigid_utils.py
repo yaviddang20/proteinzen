@@ -1341,6 +1341,15 @@ class Rigid:
         fn = lambda r: r.detach()
         return self.apply_rot_fn(fn)
 
+    def detach(self) -> Rigid:
+        """
+            Detaches gradients from underlying tensors
+
+            Returns:
+                A transformation object with detached tensors
+        """
+        return Rigid(self._rots.detach(), self._trans.detach())
+
     @staticmethod
     def make_transform_from_reference(n_xyz, ca_xyz, c_xyz, eps=1e-20):
         """

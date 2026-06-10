@@ -12,16 +12,17 @@ from scipy.spatial.transform import Rotation
 
 from proteinzen.boltz.data import const
 from proteinzen.boltz.data.types import (
-    Residue, Atom, Chain, Structure, SamplingResidue
+    Residue, Atom, Bond, Chain, Structure, SamplingResidue
 )
 
-from proteinzen.data.featurize.tokenize import RES_TO_AA, Tokenized, convert_atom_str_to_tuple
+from proteinzen.data.featurize.tokenize import RES_TO_AA, Tokenized, convert_atom_str_to_tuple, arbitrary_atom_to_frame
 from proteinzen.openfold.data import residue_constants as rc
 from proteinzen.data.constants import coarse_grain as cg
 from proteinzen.utils import coarse_grain as cg_utils
 from proteinzen.openfold.utils import rigid_utils as ru
-
 from proteinzen.stoch_interp import so3_utils
+
+from proteinzen.model.utils import gather_helper
 
 from .tokenize import Token, Rigid, TokenBond, TokenData, RigidData, Tokenized, standard_residue_to_frames
 
@@ -147,8 +148,8 @@ def generate_protein_structure_template(  # noqa: C901, PLR0915
     residues = np.array(residue_data, dtype=SamplingResidue)
     chain_data = [astuple(ChainData(**d)) for d in chain_data.values()]
     chains = np.array(chain_data, dtype=Chain)
-    atoms = np.array([])
-    bonds = np.array([])
+    atoms = np.array([], dtype=Atom)
+    bonds = np.array([], dtype=Bond)
 
     if extra_mols is not None:
         assert extra_mols_residue_is_unindexed_mask is not None
@@ -179,12 +180,420 @@ def generate_protein_structure_template(  # noqa: C901, PLR0915
     return struct
 
 
+class SampleTemplateTokenizer:
+    def __init__(
+        self,
+        struct,
+        task_masks,
+        trans_std=16
+    ):
+        self.struct = struct
+        self.task_masks = task_masks
+        self.trans_std = trans_std
+
+        self.bond_graph = nx.Graph([(bond["atom_1"], bond["atom_2"]) for bond in self.struct.bonds])
+
+        # Create token data and rigid data
+        self.token_data = []
+        self.rigid_data = []
+        # Keep track of atom_idx, rigid_idx to token_idx
+        self.atom_to_rigid = {}
+        self.rigid_to_token = {}
+
+        self.token_idx = 0
+        self.rigid_idx = 0
+
+        sigma_grid = torch.linspace(0.1, 1.5, 1000)
+        self.igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=".cache")
+
+    def brownian_sigma_t(self, t):
+        sigma_max = 1.5
+        return torch.sqrt((0.1 ** 2) * t**2  + (sigma_max ** 2) * (1 - t) **2)
+
+    def brownian_g_t(self, t):
+        g_t = torch.sqrt(
+            torch.clip(4.5-4.52 * t, min=0)
+        )
+        return g_t
+
+    def _generate_designed_residue(
+        self,
+        chain,
+        res,
+        entity_id
+    ):
+        # Token is present if centers are
+        is_present = res["is_present"]
+
+        # this will be noised later
+        rigid_tensor7 = np.zeros((3, 7))
+
+        # Create token
+        token = TokenData(
+            token_idx=self.token_idx,
+            rigid_idx=self.rigid_idx,
+            rigid_num=3,
+            res_idx=res["res_idx"],
+            res_type=res["res_type"],
+            res_name=res["name"],
+            sym_id=chain["sym_id"],
+            asym_id=chain["asym_id"],
+            entity_id=entity_id,
+            mol_type=chain["mol_type"],
+            resolved_mask=is_present,
+            center_coords=rigid_tensor7[0, 4:],
+            is_copy=False,
+            is_unindexed=False,
+            is_atomized=False,
+            seq_noising_mask=True,
+            hotspot_type=0  # TODO: fix this
+        )
+        self.token_data.append(astuple(token))
+
+        # Update rigid_idx to token_idx
+        for j in range(3):
+            rigid = RigidData(
+                rigid_idx=self.rigid_idx,
+                token_idx=self.token_idx,
+                sidechain_idx=j,
+                is_atomized=False,
+                element=-1,
+                charge=0,
+                tensor7=rigid_tensor7[j],
+                is_present=True,
+                rigids_noising_mask=True,
+                num_real_input_axes=2
+            )
+            self.rigid_data.append(astuple(rigid))
+            self.rigid_to_token[self.rigid_idx] = self.token_idx
+
+            self.rigid_idx += 1
+        self.token_idx += 1
+
+    def _generate_reference_residue(
+        self,
+        chain,
+        res,
+        entity_id,
+        res_arr_ptr,
+        atom_start_ptr,
+        atom_end_ptr,
+    ):
+        # Token is present if centers are
+        is_present = res["is_present"]
+
+        # Get frame atoms
+        atom_noising_mask = self.task_masks['atom_noising_mask']
+        res_type_noising_mask = self.task_masks['res_type_noising_mask']
+        residue_is_unindexed_mask = self.task_masks['residue_is_unindexed_mask']
+        res_hotspot_type = self.task_masks['res_hotspot_type']
+
+        is_unindexed = residue_is_unindexed_mask[res_arr_ptr]
+        noise_seq = res_type_noising_mask[res_arr_ptr]
+        hotspot_type = res_hotspot_type[res_arr_ptr]
+
+        atoms = self.struct.atoms[atom_start_ptr:atom_end_ptr]
+        rigid_tensor7, rigid_mask, dummy_rigid_idx = standard_residue_to_frames(
+            res, atoms
+        )
+
+        # Create token
+        token = TokenData(
+            token_idx=self.token_idx,
+            rigid_idx=self.rigid_idx,
+            rigid_num=3,
+            res_idx=res["res_idx"],
+            res_type=res["res_type"],
+            res_name=res["name"],
+            sym_id=chain["sym_id"],
+            asym_id=chain["asym_id"],
+            # entity_id=chain["entity_id"],
+            entity_id=entity_id,
+            mol_type=chain["mol_type"],
+            resolved_mask=is_present,
+            center_coords=rigid_tensor7[0, 4:],
+            is_copy=res['is_copy'],
+            is_unindexed=bool(is_unindexed),
+            is_atomized=False,
+            seq_noising_mask=bool(noise_seq),
+            hotspot_type=int(hotspot_type)
+        )
+        self.token_data.append(astuple(token))
+
+        # figure out the mapping from atom to cg group
+        atom_name_to_cg_idx = {}
+        cg_idx_to_atom_idx = {0: [], 1: [], 2: []}
+        atom_order = rc.restype_name_to_atom14_names[res["name"]]
+
+        for atom_name in ['N', 'CA', 'C', 'O', 'CB']:
+            atom_name_to_cg_idx[atom_name] = 0
+            if atom_name == 'CB' and res["name"] == "GLY":
+                continue
+            cg_idx_to_atom_idx[0].append(atom_order.index(atom_name))
+
+        for atom_name in cg.coarse_grain_sidechain_groups[res["name"]][2]:
+            atom_name_to_cg_idx[atom_name] = 1
+            cg_idx_to_atom_idx[1].append(atom_order.index(atom_name))
+        for atom_name in cg.coarse_grain_sidechain_groups[res["name"]][3]:
+            atom_name_to_cg_idx[atom_name] = 2
+            cg_idx_to_atom_idx[2].append(atom_order.index(atom_name))
+
+        for j, atom in enumerate(atoms):
+            atom_name = atom['name']
+            atom_name = [chr(c + 32) for c in atom_name if c != 0]
+            atom_name = "".join(atom_name)
+            self.atom_to_rigid[atom_start_ptr + j] = self.rigid_idx + atom_name_to_cg_idx[atom_name]
+
+        # use cg_to_atom mapping to figure out whether we should noise the rigid
+        noise_atoms = atom_noising_mask[atom_start_ptr:atom_end_ptr]
+        _noise_rigid = []
+        # Update rigid_idx to token_idx
+        for j in range(3):
+            cg_atom_idxs = cg_idx_to_atom_idx[j]
+            # we figure out if we're noising the rigid
+            # by checking if any of its component atoms are being noised
+            # we also need to check if its a dummy rigid
+            # and if so, copy the noising status of its corresponding non-dummy rigid
+            if len(cg_atom_idxs) > 0:
+                noise_rigid = noise_atoms[cg_atom_idxs].any()
+            else:
+                noise_rigid = _noise_rigid[dummy_rigid_idx[j]]
+            _noise_rigid.append(noise_rigid)
+
+            noise_rigid_tensor7 = np.zeros(7)
+
+            rigid = RigidData(
+                rigid_idx=self.rigid_idx,
+                token_idx=self.token_idx,
+                sidechain_idx=j,
+                is_atomized=False,
+                element=-1,
+                charge=0,
+                # tensor7=noise_rigid_tensor7 if noise_rigid else rigid_tensor7[j],
+                tensor7=rigid_tensor7[j],
+                is_present=True,
+                rigids_noising_mask=bool(noise_rigid),
+                num_real_input_axes=2
+            )
+            self.rigid_data.append(astuple(rigid))
+            self.rigid_to_token[self.rigid_idx] = self.token_idx
+
+            self.rigid_idx += 1
+
+        self.token_idx += 1
+
+    def _generate_atomized_residue(
+        self,
+        chain,
+        res,
+        entity_id,
+        atom_start_ptr,
+        atom_end_ptr
+    ):
+        # We use the unk protein token as res_type
+        unk_token = const.unk_token["PROTEIN"]
+        unk_id = const.token_ids[unk_token]
+
+        # Get atom coordinates
+        atom_data = self.struct.atoms[atom_start_ptr:atom_end_ptr]
+        atom_coords = atom_data["coords"]
+
+        valid_neighbors = [i for i in range(res["atom_num"]) if atom_data[i]["is_present"]]
+        valid_neighbor_coords = atom_coords[np.array(valid_neighbors, dtype=int)]
+
+        # Tokenize each atom
+        for j, atom in enumerate(atom_data):
+            # Token is present if atom is
+            is_present = res["is_present"] & atom["is_present"]
+            atom_idx = atom_start_ptr + j
+            noise_atom = self.task_masks['atom_noising_mask'][atom_idx]
+
+            # Create token
+            token = TokenData(
+                token_idx=self.token_idx,
+                rigid_idx=self.rigid_idx,
+                rigid_num=1,
+                res_idx=res["res_idx"],
+                res_type=unk_id,
+                res_name=res["name"],
+                sym_id=chain["sym_id"],
+                asym_id=chain["asym_id"],
+                entity_id=entity_id,
+                mol_type=chain["mol_type"],
+                resolved_mask=is_present,
+                center_coords=np.zeros(3),  # not used
+                is_copy=False,
+                is_unindexed=False,
+                is_atomized=True,
+                seq_noising_mask=False,
+                hotspot_type=0  # TODO: fix this
+            )
+            self.token_data.append(astuple(token))
+
+            if noise_atom:
+                atom_tensor7 = np.zeros(7)
+                num_real_input_axes = len(list(self.bond_graph.neighbors(atom_idx)))
+            else:
+                atom_tensor7, num_real_input_axes = arbitrary_atom_to_frame(
+                    atom,
+                    atom_idx,
+                    valid_neighbors,
+                    valid_neighbor_coords,
+                    self.bond_graph
+                )
+
+            # Update atom_idx to token_idx
+            self.atom_to_rigid[atom_idx] = self.rigid_idx
+            rigid = RigidData(
+                rigid_idx=self.rigid_idx,
+                token_idx=self.token_idx,
+                sidechain_idx=0,
+                is_atomized=True,
+                element=atom["element"],
+                charge=atom["charge"],
+                tensor7=atom_tensor7,
+                is_present=atom["is_present"],
+                rigids_noising_mask=noise_atom,
+                num_real_input_axes=2 if num_real_input_axes > 2 else num_real_input_axes
+            )
+            self.rigid_data.append(astuple(rigid))
+            self.rigid_to_token[self.rigid_idx] = self.token_idx
+
+            self.rigid_idx += 1
+            self.token_idx += 1
+
+    def tokenize(self):
+        # Filter to valid chains only
+        chains = self.struct.chains[self.struct.mask]
+
+        for chain in chains:
+            # Get residue indices
+            res_start = chain["res_idx"]
+            res_end = chain["res_idx"] + chain["res_num"]
+            is_protein = chain["mol_type"] == const.chain_type_ids["PROTEIN"]
+
+            for i, res in enumerate(self.struct.residues[res_start:res_end]):
+                # Get atom indices
+                atom_start = res["atom_idx"]
+                atom_end = res["atom_idx"] + res["atom_num"]
+                entity_id = self.task_masks['residue_entity_ids'][res_start + i]
+
+                # Standard residues with unknown sequence are completely designed
+                if res["is_standard"] and (res['name'] == 'UNK') and is_protein:
+                    self._generate_designed_residue(chain, res, entity_id)
+
+                # Standard residues with known sequence are read in and optionally (partially) redesigned
+                elif res["is_standard"] and (res['name'] != 'UNK') and is_protein:
+                    self._generate_reference_residue(
+                        chain, res,
+                        entity_id,
+                        res_start + i,
+                        atom_start, atom_end,
+                    )
+
+                # Non-standard are tokenized per atom
+                else:
+                    self._generate_atomized_residue(
+                        chain, res, entity_id,
+                        atom_start, atom_end,
+                    )
+
+        # Create token bonds
+        token_bonds = []
+
+        # Add atom-atom bonds from ligands
+        for bond in self.struct.bonds:
+            atom1 = bond["atom_1"]
+            atom2 = bond["atom_2"]
+            if atom1 not in self.atom_to_rigid or atom2 not in self.atom_to_rigid:
+                continue
+            rigid1 = self.atom_to_rigid[atom1]
+            rigid2 = self.atom_to_rigid[atom2]
+            if rigid1 not in self.rigid_to_token or rigid2 not in self.rigid_to_token:
+                continue
+            token_bond = (
+                self.rigid_to_token[rigid1],
+                self.rigid_to_token[rigid2],
+                bond["type"] + 1,
+            )
+            token_bonds.append(token_bond)
+
+        token_data = np.array(self.token_data, dtype=Token)
+        token_bonds = np.array(token_bonds, dtype=TokenBond)
+        rigid_data = np.array(self.rigid_data, dtype=Rigid)
+
+        # center the fixed region at the origin
+        fixed_rigids_mask = ~rigid_data['rigids_noising_mask'] & rigid_data['is_present']
+        if fixed_rigids_mask.any():
+            fixed_rigids = rigid_data[fixed_rigids_mask]
+            fixed_rigids_com = fixed_rigids['tensor7'][:, 4:].mean(axis=0)
+            tensor7_edit = np.zeros((rigid_data.shape[0], 7))
+            tensor7_edit[fixed_rigids_mask, 4:] = fixed_rigids_com[None]
+            rigid_data['tensor7'] -= tensor7_edit
+        else:
+            fixed_rigids_com = np.zeros(3)
+
+        # compute the hotspot_rigids_com if it exists
+        token_hotspot_type = token_data['hotspot_type']
+        hotspot_center_exists = (token_hotspot_type == 1).any()
+        if hotspot_center_exists:
+            rigid_hotspot_type = token_data['hotspot_type'][rigid_data['token_idx']]
+            hotspot_bb_rigids_mask = (rigid_hotspot_type == 1) & (rigid_data['sidechain_idx'] == 0)
+            hotspot_rigids = rigid_data[hotspot_bb_rigids_mask]
+            hotspot_rigids_com = hotspot_rigids['tensor7'][:, 4:].mean(axis=0)
+
+            tensor7_edit = np.zeros((rigid_data.shape[0], 7))
+            tensor7_edit[fixed_rigids_mask, 4:] = hotspot_rigids_com[None]
+            rigid_data['tensor7'] -= tensor7_edit
+        else:
+            hotspot_rigids_com = np.zeros(3)
+
+        # noise the rigids which should be noised
+        if np.isclose(self.task_masks['t'], 0):
+            num_noise_rigids = rigid_data['rigids_noising_mask'].sum()
+            noise_trans = np.random.randn(num_noise_rigids, 3) * self.trans_std
+            noise_quat = Rotation.random(num_noise_rigids).as_quat(canonical=True, scalar_first=True)
+            noise_tensor7 = np.concatenate([noise_quat, noise_trans], axis=-1)
+            rigid_data['tensor7'][rigid_data['rigids_noising_mask']] = noise_tensor7
+        else:
+            init_tensor7 = rigid_data['tensor7'][
+                rigid_data['rigids_noising_mask']
+            ]
+            init_trans = init_tensor7[..., 4:]
+            init_quat = init_tensor7[..., :4]
+            init_rotmats = Rotation.from_quat(init_quat, scalar_first=True).as_matrix()
+
+            t = self.task_masks['t']
+            num_noise_rigids = rigid_data['rigids_noising_mask'].sum()
+            noise_trans = np.random.randn(num_noise_rigids, 3) * self.trans_std
+            trans_t = (1-t) * noise_trans + t * init_trans
+
+            t = torch.as_tensor(t)
+            self.igso3.to(t.device)
+            sigma = self.brownian_sigma_t(t)
+            noisy_rotmats = self.igso3.sample(
+                sigma[None],
+                num_noise_rigids
+            ).to(t.device).squeeze(0)
+            rotmats_t = torch.einsum(
+                "...ij,...jk->...ik",
+                torch.as_tensor(init_rotmats).float(),
+                noisy_rotmats
+            )
+            rotmats_t = rotmats_t.numpy(force=True)
+            rotquats_t = Rotation.from_matrix(rotmats_t).as_quat(canonical=True, scalar_first=True)
+
+            tensor7_t = np.concatenate([rotquats_t, trans_t], axis=-1)
+            rigid_data['tensor7'][rigid_data['rigids_noising_mask']] = tensor7_t
+
+        return token_data, rigid_data, token_bonds, fixed_rigids_com, hotspot_rigids_com
+
+
 def sample_noise_from_struct_template(  # noqa: C901, PLR0915
     struct: Structure,
-    igso3: Optional[so3_utils.SampleIGSO3] = None,
     task_masks: Optional[dict[str, np.ndarray]] = None,
     trans_std=16,
-) -> Tuple[np.ndarray, np.array, np.ndarray, np.ndarray]:
+):
     """ Sample a t=0 initial datapoint from a structure template.
 
     Parameters
@@ -202,302 +611,10 @@ def sample_noise_from_struct_template(  # noqa: C901, PLR0915
     Returns:
         Tuple[np.ndarray, np.array, np.ndarray, np.ndarray]: _description_
     """
-    bond_graph = nx.Graph([(bond["atom_1"], bond["atom_2"]) for bond in struct.bonds])
-
-    # Create token data and rigid data
-    token_data = []
-    rigid_data = []
-
-    # Keep track of atom_idx, rigid_idx to token_idx
-    token_idx = 0
-    rigid_idx = 0
-    atom_to_rigid = {}
-    rigid_to_token = {}
-
-    # Filter to valid chains only
-    chains = struct.chains[struct.mask]
-
-    for chain in chains:
-        # Get residue indices
-        res_start = chain["res_idx"]
-        res_end = chain["res_idx"] + chain["res_num"]
-        is_protein = chain["mol_type"] == const.chain_type_ids["PROTEIN"]
-
-        for i, res in enumerate(struct.residues[res_start:res_end]):
-            # Get atom indices
-            atom_start = res["atom_idx"]
-            atom_end = res["atom_idx"] + res["atom_num"]
-
-            # Standard residues with unknown sequence are completely designed
-            if res["is_standard"] and (res['name'] == 'UNK') and is_protein:
-                # Token is present if centers are
-                is_present = res["is_present"]
-
-                rigid_trans = np.random.randn(3, 3) * trans_std
-                rigid_quat = Rotation.random(3).as_quat(canonical=True)
-                rigid_tensor7 = np.concatenate([rigid_quat, rigid_trans], axis=-1)
-                rigid_mask = np.ones(3, dtype=bool)
-
-                # Create token
-                token = TokenData(
-                    token_idx=token_idx,
-                    rigid_idx=rigid_idx,
-                    rigid_num=3,
-                    res_idx=res["res_idx"],
-                    res_type=res["res_type"],
-                    res_name=res["name"],
-                    sym_id=chain["sym_id"],
-                    asym_id=chain["asym_id"],
-                    entity_id=chain["entity_id"],
-                    mol_type=chain["mol_type"],
-                    resolved_mask=is_present,
-                    center_coords=rigid_tensor7[0, 4:],
-                    is_copy=False,
-                    is_unindexed=False,
-                    is_atomized=False,
-                    seq_noising_mask=True
-                )
-                token_data.append(astuple(token))
-
-                # Update rigid_idx to token_idx
-                for j in range(3):
-                    rigid = RigidData(
-                        rigid_idx=rigid_idx,
-                        token_idx=token_idx,
-                        sidechain_idx=j,
-                        is_atomized=False,
-                        element=-1,
-                        charge=0,
-                        chirality=0,
-                        tensor7=rigid_tensor7[j],
-                        is_present=rigid_mask[j],
-                        rigids_noising_mask=True,
-                        num_real_input_axes=2
-                    )
-                    rigid_data.append(astuple(rigid))
-                    rigid_to_token[rigid_idx] = token_idx
-
-                    rigid_idx += 1
-
-                token_idx += 1
-
-            # Standard residues with known sequence are read in and optionally (partially) redesigned
-            elif res["is_standard"] and (res['name'] != 'UNK') and is_protein:
-                # If we're provided a standard token, we're currently assuming its a copy
-                # since we're not doing multi-chain sampling
-                # TODO: we should have a separate mask for this at some point
-
-                # Token is present if centers are
-                is_present = res["is_present"]
-
-                # Get frame atoms
-                atoms = struct.atoms[atom_start:atom_end]
-                assert task_masks is not None
-                atom_noising_mask = task_masks['atom_noising_mask']
-                res_type_noising_mask = task_masks['res_type_noising_mask']
-                residue_is_unindexed_mask = task_masks['residue_is_unindexed_mask']
-
-                is_unindexed = residue_is_unindexed_mask[res_start+i]
-                noise_seq = res_type_noising_mask[res_start + i]
-
-                rigid_tensor7, rigid_mask, dummy_rigid_idx = standard_residue_to_frames(
-                    res, atoms
-                )
-
-                # Create token
-                token = TokenData(
-                    token_idx=token_idx,
-                    rigid_idx=rigid_idx,
-                    rigid_num=3,
-                    res_idx=res["res_idx"],
-                    res_type=res["res_type"],
-                    res_name=res["name"],
-                    sym_id=chain["sym_id"],
-                    asym_id=chain["asym_id"],
-                    entity_id=chain["entity_id"],
-                    mol_type=chain["mol_type"],
-                    resolved_mask=is_present,
-                    center_coords=rigid_tensor7[0, 4:],
-                    is_copy=True,
-                    is_unindexed=bool(is_unindexed),
-                    is_atomized=False,
-                    seq_noising_mask=bool(noise_seq),
-                )
-                token_data.append(astuple(token))
-
-                noise_atoms = atom_noising_mask[atom_start:atom_end]
-
-                atom_name_to_cg_idx = {}
-                cg_idx_to_atom_idx = {0: [], 1: [], 2: []}
-                atom_order = rc.restype_name_to_atom14_names[res["name"]]
-
-                for atom_name in ['N', 'CA', 'C', 'O', 'CB']:
-                    atom_name_to_cg_idx[atom_name] = 0
-                    if atom_name == 'CB' and res["name"] == "GLY":
-                        continue
-                    cg_idx_to_atom_idx[0].append(atom_order.index(atom_name))
-
-                for atom_name in cg.coarse_grain_sidechain_groups[res["name"]][2]:
-                    atom_name_to_cg_idx[atom_name] = 1
-                    cg_idx_to_atom_idx[1].append(atom_order.index(atom_name))
-                for atom_name in cg.coarse_grain_sidechain_groups[res["name"]][3]:
-                    atom_name_to_cg_idx[atom_name] = 2
-                    cg_idx_to_atom_idx[2].append(atom_order.index(atom_name))
-
-                for j, atom in enumerate(atoms):
-                    atom_name = atom['name']
-                    atom_name = [chr(c + 32) for c in atom_name if c != 0]
-                    atom_name = "".join(atom_name)
-                    atom_to_rigid[atom_start + j] = rigid_idx + atom_name_to_cg_idx[atom_name]
-
-                _noise_rigid = []
-                # Update rigid_idx to token_idx
-                for j in range(3):
-                    cg_atom_idxs = cg_idx_to_atom_idx[j]
-                    # we figure out if we're noising the rigid
-                    # by checking if any of its component atoms are being noised
-                    # we also need to check if its a dummy rigid
-                    # and if so, copy the noising status of its corresponding non-dummy rigid
-                    if len(cg_atom_idxs) > 0:
-                        noise_rigid = noise_atoms[cg_atom_idxs].any()
-                    else:
-                        noise_rigid = _noise_rigid[dummy_rigid_idx[j]]
-                    _noise_rigid.append(noise_rigid)
-
-                    noise_rigid_trans = np.random.randn(3) * trans_std
-                    noise_rigid_quat = Rotation.random().as_quat(canonical=True)
-                    noise_rigid_tensor7 = np.concatenate([noise_rigid_quat, noise_rigid_trans], axis=-1)
-
-                    rigid = RigidData(
-                        rigid_idx=rigid_idx,
-                        token_idx=token_idx,
-                        sidechain_idx=j,
-                        is_atomized=False,
-                        element=-1,
-                        charge=0,
-                        chirality=0,
-                        tensor7=noise_rigid_tensor7 if noise_rigid else rigid_tensor7[j],
-                        is_present=True if noise_rigid else rigid_mask[j],
-                        rigids_noising_mask=bool(noise_rigid),
-                        num_real_input_axes=2
-                    )
-                    rigid_data.append(astuple(rigid))
-                    rigid_to_token[rigid_idx] = token_idx
-
-                    rigid_idx += 1
-
-                token_idx += 1
-
-            # Non-standard are tokenized per atom
-            else:
-                # We use the unk protein token as res_type
-                unk_token = const.unk_token["PROTEIN"]
-                unk_id = const.token_ids[unk_token]
-
-                # Get atom coordinates
-                atom_data = struct.atoms[atom_start:atom_end]
-                atom_coords = atom_data["coords"]
-
-                valid_neighbors = [i for i in range(res["atom_num"]) if atom_data[i]["is_present"]]
-                valid_neighbor_coords = atom_coords[np.array(valid_neighbors, dtype=int)]
-
-                # Tokenize each atom
-                for j, atom in enumerate(atom_data):
-                    # Token is present if atom is
-                    is_present = res["is_present"] & atom["is_present"]
-                    atom_idx = atom_start + j
-
-                    atom_trans = torch.randn(3).numpy() * trans_std
-                    atom_quat = Rotation.random().as_quat(canonical=True)
-                    # atom_rotmat = igso3.sample(torch.tensor([1.5]), 1).view(3, 3).numpy()
-                    # atom_quat = Rotation.from_matrix(atom_rotmat).as_quat(canonical=True)
-                    # atom_quat = Rotation.identity().as_quat(canonical=True)
-                    atom_tensor7 = np.concatenate([atom_quat, atom_trans], axis=-1)
-
-                    # Create token
-                    token = TokenData(
-                        token_idx=token_idx,
-                        rigid_idx=rigid_idx,
-                        rigid_num=1,
-                        res_idx=res["res_idx"],
-                        res_type=unk_id,
-                        res_name=res["name"],
-                        sym_id=chain["sym_id"],
-                        asym_id=chain["asym_id"],
-                        entity_id=chain["entity_id"],
-                        mol_type=chain["mol_type"],
-                        resolved_mask=is_present,
-                        center_coords=atom_tensor7[4:],
-                        is_copy=False,
-                        is_unindexed=False,
-                        is_atomized=True,
-                        seq_noising_mask=False
-                    )
-                    token_data.append(astuple(token))
-
-                    num_real_input_axes = len(list(bond_graph.neighbors(atom_idx)))
-
-                    # Update atom_idx to token_idx
-                    atom_to_rigid[atom_start + j] = rigid_idx
-                    rigid = RigidData(
-                        rigid_idx=rigid_idx,
-                        token_idx=token_idx,
-                        sidechain_idx=0,
-                        is_atomized=True,
-                        element=atom["element"],
-                        charge=atom["charge"],
-                        chirality=atom["chirality"],
-                        tensor7=atom_tensor7,
-                        is_present=atom["is_present"],
-                        rigids_noising_mask=True,
-                        num_real_input_axes=2 if num_real_input_axes > 2 else num_real_input_axes
-                    )
-                    rigid_data.append(astuple(rigid))
-                    rigid_to_token[rigid_idx] = token_idx
-
-                    rigid_idx += 1
-                    token_idx += 1
-
-    # Create token bonds
-    token_bonds = []
-
-    # Add atom-atom bonds from ligands
-    for bond in struct.bonds:
-        atom1 = bond["atom_1"]
-        atom2 = bond["atom_2"]
-        if atom1 not in atom_to_rigid or atom2 not in atom_to_rigid:
-            continue
-        rigid1 = atom_to_rigid[atom1]
-        rigid2 = atom_to_rigid[atom2]
-        if rigid1 not in rigid_to_token or rigid2 not in rigid_to_token:
-            continue
-        token_bond = (
-            rigid_to_token[rigid1],
-            rigid_to_token[rigid2],
-            bond["type"] + 1,
-        )
-        token_bonds.append(token_bond)
-
-    token_data = np.array(token_data, dtype=Token)
-    token_bonds = np.array(token_bonds, dtype=TokenBond)
-    rigid_data = np.array(rigid_data, dtype=Rigid)
-
-
-    # rigid_data_trans_center = rigid_data['tensor7'][:, 4:].mean(axis=0)
-    # rigid_data['tensor7'][:, 4:] -= rigid_data_trans_center
-
-    # center the motifs on the COM of the fixed rigids
-    fixed_rigids_mask = ~rigid_data['rigids_noising_mask']
-    if fixed_rigids_mask.any():
-        fixed_rigids = rigid_data[fixed_rigids_mask]
-        fixed_rigids_com = fixed_rigids['tensor7'][:, 4:].mean(axis=0)
-        tensor7_edit = np.zeros((rigid_data.shape[0], 7))
-        tensor7_edit[fixed_rigids_mask, 4:] = fixed_rigids_com[None]
-        rigid_data['tensor7'] -= tensor7_edit
-    else:
-        fixed_rigids_com = np.zeros(3)
-    # fixed_rigids_com = np.zeros(3)
-    return token_data, rigid_data, token_bonds, fixed_rigids_com
+    tokenizer = SampleTemplateTokenizer(
+        struct, task_masks, trans_std
+    )
+    return tokenizer.tokenize()
 
 
 def construct_atoms(
@@ -541,10 +658,13 @@ def construct_atoms(
     # res_idx = 1
     atom_idx = 0
 
-    unindexed_to_motif_idx = {}
+    design_residue_to_unindexed_motif_residue = {}
 
     for token in token_data:
         res_idx = token['res_idx']
+        asym_id = token['asym_id']
+        res_key = (asym_id, res_idx)
+
         if token['is_copy']:
             record_dict = copy_tokens_to_residues
 
@@ -552,154 +672,143 @@ def construct_atoms(
             # if the motif residue is unindexed, we need to record the which residue has been assigned to represent the residue
             # so we can determine whether the resultant residue needs to copy the motif coords
             if token['is_unindexed']:
-                unindexed_to_motif_idx[token['token_idx']] = res_idx
+                associated_token = token_data[token['token_idx']]
+                associated_res_key = (associated_token['asym_id'], associated_token['res_idx'])
+                design_residue_to_unindexed_motif_residue[associated_res_key] = res_key
 
         else:
             record_dict = tokens_to_residues
 
-        if res_idx not in record_dict:
-            record_dict[res_idx] = [token]
+        if res_key not in record_dict:
+            record_dict[res_key] = [token]
         else:
-            record_dict[res_idx].append(token)
+            record_dict[res_key].append(token)
 
     # print(unindexed_to_motif_idx)
-    for residue in struct.residues:
-        res_idx = residue['res_idx']
-        if residue['is_copy']:
-            token_set = copy_tokens_to_residues[res_idx]
-        elif take_copy_structure:
-            # use the copy's data instead of the denoiser's data for residues which have been copied
-            if res_idx in unindexed_to_motif_idx:
-                # we check if an unindexed motif residue to be scaffolded maps to the current residue
-                token_set = copy_tokens_to_residues[unindexed_to_motif_idx[res_idx]]
-                # print(residue, token_set)
-            elif res_idx in copy_tokens_to_residues and residue['is_standard']:
-                # otherwise we just assume that the mapping is indexed
-                # only apply to standard residues — ligands reuse res_idx=0 per chain
-                # and would otherwise collide with protein copy tokens
-                token_set = copy_tokens_to_residues[res_idx]
-                # print(residue, token_set)
+
+    for chain in struct.chains:
+        res_start = chain['res_idx']
+        res_end = res_start + chain['res_num']
+
+        for residue in struct.residues[res_start:res_end]:
+            res_idx = residue['res_idx']
+            res_key = (chain['asym_id'], res_idx)
+
+            if residue['is_copy']:
+                token_set = copy_tokens_to_residues[res_key]
+            elif take_copy_structure:
+                # use the copy's data instead of the denoiser's data for residues which have been copied
+                if res_idx in design_residue_to_unindexed_motif_residue:
+                    # we check if an unindexed motif residue to be scaffolded maps to the current residue
+                    token_set = copy_tokens_to_residues[design_residue_to_unindexed_motif_residue[res_key]]
+                    # print(residue, token_set)
+                elif res_idx in copy_tokens_to_residues:
+                    # otherwise we just assume that the mapping is indexed
+                    token_set = copy_tokens_to_residues[res_key]
+                    # print(residue, token_set)
+                else:
+                    token_set = tokens_to_residues[res_key]
             else:
-                token_set = tokens_to_residues[res_idx]
-        else:
-            token_set = tokens_to_residues[res_idx]
+                token_set = tokens_to_residues[res_key]
 
 
-        if len(token_set) == 1:
-            token = token_set[0]
-            token_is_standard_protein = (
-                token['mol_type'] == const.chain_type_ids["PROTEIN"]
-                and
-                token['rigid_num'] == 3  ## TODO: we should probably use an is_atomized field instead
-            )
-            assert token_is_standard_protein
-
-            if res_idx in unindexed_to_motif_idx:
-                copy_token = copy_tokens_to_residues[unindexed_to_motif_idx[res_idx]][0]
-                res_type = copy_token['res_type']
-                res_name = const.tokens[res_type]
-            elif res_idx in copy_tokens_to_residues:
-                copy_token = copy_tokens_to_residues[res_idx][0]
-                res_type = copy_token['res_type']
-                res_name = const.tokens[res_type]
-            elif token['seq_noising_mask']:
-                res_type = token['res_type']
-                res_name = const.tokens[res_type]
-            else:
-                res_type = residue['res_type']
-                res_name = residue['name']
-            # print(residue, token['res_type'], const.tokens[token['res_type']], residue['res_type'], residue['name'], token['seq_noising_mask'])
-            atom_num = len(rc.residue_atoms[res_name])
-
-
-            res = ResidueData(
-                name=res_name,
-                res_type=res_type,
-                res_idx=res_idx,
-                atom_idx=atom_idx,
-                atom_num=atom_num,
-                atom_center=1,
-                atom_disto=1,
-                is_standard=True,
-                is_present=True,
-                is_copy=token['is_copy']
-            )
-            new_residues.append(astuple(res))
-
-            # grab proper rigids
-            rigid_start = token['rigid_idx']
-            rigid_end = rigid_start + token['rigid_num']
-            tensor7 = rigids_data['tensor7'][rigid_start:rigid_end].copy()
-            tensor7 = torch.as_tensor(tensor7)
-            rigids_for_atom14 = ru.Rigid.from_tensor_7(tensor7)
-            # compute atom14
-            tensor7_seq = torch.as_tensor([RES_TO_AA[token['res_type']]])
-            dummy_mask = torch.ones_like(tensor7_seq, dtype=torch.bool)
-            atom14, atom14_mask = cg_utils.compute_atom14_from_cg_frames(rigids_for_atom14, dummy_mask, tensor7_seq, return_atom_mask=True)
-
-            # keep the atoms which are not null in the residue
-            num_atoms = len(rc.residue_atoms[res_name])
-            atom14 = atom14.squeeze()
-            atom14_mask = atom14_mask.squeeze().bool()
-            res_atom14, res_atom14_mask = atom14, atom14_mask
-            # atom_coords = res_atom14[res_atom14_mask].numpy(force=True)
-            # atom_is_present = res_atom14_mask[res_atom14_mask].numpy(force=True)
-            atom_coords = res_atom14[:num_atoms].numpy(force=True)
-            atom_is_present = res_atom14_mask[:num_atoms].numpy(force=True)
-
-
-            # construct the rest of the atom data
-            res_atom_names = [i for i in rc.restype_name_to_atom14_names[res_name] if len(i) > 0]
-            for i, res_atom_name in enumerate(res_atom_names):
-                atom_name = np.array(convert_atom_str_to_tuple(res_atom_name))
-                atom_element = res_atom_name[0]  # TODO: im pretty sure this works but might be good to have smth less error prone
-                atom_element = periodic_table.GetAtomicNumber(atom_element)
-                atom_charge = 0
-                atom_conformer = np.zeros_like(atom_coords)
-                atom_chirality = 0
-                coords = atom_coords[i]
-                is_present = atom_is_present[i]
-                atom_conformer = np.zeros_like(coords)
-
-                atom = AtomData(
-                    name=atom_name,
-                    element=atom_element,
-                    charge=atom_charge,
-                    coords=coords,
-                    conformer=atom_conformer,
-                    is_present=is_present,
-                    chirality=atom_chirality
+            if len(token_set) == 1:
+                token = token_set[0]
+                token_is_standard_protein = (
+                    token['mol_type'] == const.chain_type_ids["PROTEIN"]
+                    and
+                    token['rigid_num'] == 3  ## TODO: we should probably use an is_atomized field instead
                 )
-                atom_data.append(astuple(atom))
-                atom_idx += 1
+                assert token_is_standard_protein
 
-        else:
-            res = ResidueData(
-                name=residue['name'],
-                res_type=residue['res_type'],
-                res_idx=res_idx,
-                atom_idx=atom_idx,
-                atom_num=residue['atom_num'],
-                atom_center=0,
-                atom_disto=0,
-                is_standard=False,
-                is_present=True,
-                is_copy=False
-            )
-            new_residues.append(astuple(res))
-            atom_num = len(token_set)
+                if res_key in design_residue_to_unindexed_motif_residue:
+                    copy_token = copy_tokens_to_residues[design_residue_to_unindexed_motif_residue[res_key]][0]
+                    res_type = copy_token['res_type']
+                    res_name = const.tokens[res_type]
+                elif res_key in copy_tokens_to_residues:
+                    copy_token = copy_tokens_to_residues[res_key][0]
+                    res_type = copy_token['res_type']
+                    res_name = const.tokens[res_type]
+                elif token['seq_noising_mask']:
+                    res_type = token['res_type']
+                    res_name = const.tokens[res_type]
+                else:
+                    res_type = residue['res_type']
+                    res_name = residue['name']
+                # print(residue, token['res_type'], const.tokens[token['res_type']], residue['res_type'], residue['name'], token['seq_noising_mask'])
+                atom_num = len(rc.residue_atoms[res_name])
 
-            atom_start = residue['atom_idx']
-            atom_end = residue['atom_idx'] + residue['atom_num']
-            atoms = struct.atoms[atom_start:atom_end]
 
-            # construct the rest of the atom data
-            for i, token in enumerate(token_set):
-                rigid = rigids_data[token['rigid_idx']]
-                new_atom = atoms[i].copy()
-                new_atom['coords'] = rigid['tensor7'][4:]
-                atom_data.append(tuple(new_atom.tolist()))
-                atom_idx += 1
+                res = ResidueData(
+                    name=res_name,
+                    res_type=res_type,
+                    res_idx=res_idx,
+                    atom_idx=atom_idx,
+                    atom_num=atom_num,
+                    atom_center=1,
+                    atom_disto=1,
+                    is_standard=True,
+                    is_present=True,
+                    is_copy=token['is_copy']
+                )
+                new_residues.append(astuple(res))
+
+                res_atom_names = [i for i in rc.restype_name_to_atom14_names[res_name] if len(i) > 0]
+                atom_coords = np.zeros(len(res_atom_names))
+                atom_is_present = np.ones(len(res_atom_names), dtype=bool)
+
+                # construct the rest of the atom data
+                res_atom_names = [i for i in rc.restype_name_to_atom14_names[res_name] if len(i) > 0]
+                for i, res_atom_name in enumerate(res_atom_names):
+                    atom_name = np.array(convert_atom_str_to_tuple(res_atom_name))
+                    atom_element = res_atom_name[0]  # TODO: im pretty sure this works but might be good to have smth less error prone
+                    atom_element = periodic_table.GetAtomicNumber(atom_element)
+                    atom_charge = 0
+                    atom_conformer = np.zeros_like(atom_coords)
+                    atom_chirality = 0
+                    coords = atom_coords[i]
+                    is_present = atom_is_present[i]
+                    atom_conformer = np.zeros_like(coords)
+
+                    atom = AtomData(
+                        name=atom_name,
+                        element=atom_element,
+                        charge=atom_charge,
+                        coords=coords,
+                        conformer=atom_conformer,
+                        is_present=is_present,
+                        chirality=atom_chirality
+                    )
+                    atom_data.append(astuple(atom))
+                    atom_idx += 1
+
+            else:
+                res = ResidueData(
+                    name=residue['name'],
+                    res_type=residue['res_type'],
+                    res_idx=res_idx,
+                    atom_idx=atom_idx,
+                    atom_num=residue['atom_num'],
+                    atom_center=0,
+                    atom_disto=0,
+                    is_standard=False,
+                    is_present=True,
+                    is_copy=False
+                )
+                new_residues.append(astuple(res))
+                atom_num = len(token_set)
+
+                atom_start = residue['atom_idx']
+                atom_end = residue['atom_idx'] + residue['atom_num']
+                atoms = struct.atoms[atom_start:atom_end]
+
+                # construct the rest of the atom data
+                for i, token in enumerate(token_set):
+                    rigid = rigids_data[token['rigid_idx']]
+                    new_atom = atoms[i].copy()
+                    new_atom['coords'] = rigid['tensor7'][4:]
+                    atom_data.append(tuple(new_atom.tolist()))
+                    atom_idx += 1
 
 
     new_struct = Structure(
@@ -763,20 +872,21 @@ def update_structure(
         _token_idx = token_idx
         for i, res in enumerate(struct.residues[res_start:res_end]):
             if res["is_standard"] and is_protein:
-                # if res['res_idx'] in res_idx_to_copy_res_mapping:
-                #     res_idx = res['res_idx']
-                #     rigid_start = res_idx_to_copy_res_mapping[res_idx]['rigid_idx']
-                # else:
-                #     rigid_start = _rigid_idx
-                rigid_start = _rigid_idx
-                rigid_end = rigid_start + 3 #_rigid_idx + 3
-                tensor7 = rigid_tensor7[rigid_start:rigid_end].copy()
-                tensor7_for_atom14.append(tensor7)
-                tensor7_idx.append(i)
+                if res['is_present']:
+                    # if res['res_idx'] in res_idx_to_copy_res_mapping:
+                    #     res_idx = res['res_idx']
+                    #     rigid_start = res_idx_to_copy_res_mapping[res_idx]['rigid_idx']
+                    # else:
+                    #     rigid_start = _rigid_idx
+                    rigid_start = _rigid_idx
+                    rigid_end = rigid_start + 3 #_rigid_idx + 3
+                    tensor7 = rigid_tensor7[rigid_start:rigid_end].copy()
+                    tensor7_for_atom14.append(tensor7)
+                    tensor7_idx.append(i)
 
-                res_type = res["res_type"]
-                aa_type = RES_TO_AA[int(res_type)]
-                tensor7_seq.append(aa_type)
+                    res_type = res["res_type"]
+                    aa_type = RES_TO_AA[int(res_type)]
+                    tensor7_seq.append(aa_type)
 
                 _rigid_idx += 3
                 _token_idx += 1
@@ -785,7 +895,12 @@ def update_structure(
                 _token_idx += res["atom_num"]
 
         if len(tensor7_idx) > 0:
-            tensor7_for_atom14 = np.stack(tensor7_for_atom14, axis=0)
+            try:
+                tensor7_for_atom14 = np.stack(tensor7_for_atom14, axis=0)
+            except Exception as e:
+                print([t.shape for t in tensor7_for_atom14])
+                raise e
+
             tensor7_for_atom14 = torch.as_tensor(tensor7_for_atom14)
             rigids_for_atom14 = ru.Rigid.from_tensor_7(tensor7_for_atom14)
             tensor7_seq = torch.as_tensor(tensor7_seq)
@@ -811,26 +926,14 @@ def update_structure(
             if res["is_standard"] and is_protein:
                 assert atom14 is not None
                 assert atom14_mask is not None
-                # Token is present if centers are
-                is_present = res["is_present"]
+                if res['is_present']:
+                    # Get frame atoms
+                    atoms = struct.atoms[atom_start:atom_end]
 
-                # Get frame atoms
-                atoms = struct.atoms[atom_start:atom_end]
-
-                # rigid_start = rigid_idx
-                # rigid_end = rigid_idx + 3
-                # res_tensor7 = rigid_tensor7[rigid_start:rigid_end].copy()
-                # atom14, atom14_mask = frames_to_atom14(res, res_tensor7)
-                # atom14 = atom14.squeeze()
-                # atom14_mask = atom14_mask.squeeze()
-                # atom14_mask = atom14_mask.bool()
-                _idx = tensor7_idx.index(i)
-                res_atom14, res_atom14_mask = atom14[_idx], atom14_mask[_idx]
-                # atoms["coords"] = res_atom14[res_atom14_mask].numpy(force=True)
-                # we're only replacing the bb oxy...
-                atoms["coords"][3] = res_atom14[res_atom14_mask].numpy(force=True)[3]
-
-                atoms["is_present"] = res_atom14_mask[res_atom14_mask].numpy(force=True)
+                    _idx = tensor7_idx.index(i)
+                    res_atom14, res_atom14_mask = atom14[_idx], atom14_mask[_idx]
+                    atoms["coords"] = res_atom14[res_atom14_mask].numpy(force=True)
+                    atoms["is_present"] = res_atom14_mask[res_atom14_mask].numpy(force=True)
 
                 token_idx += 1
                 rigid_idx += 3

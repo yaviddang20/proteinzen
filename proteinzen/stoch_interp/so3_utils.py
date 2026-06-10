@@ -753,7 +753,11 @@ class BaseSampleSO3(nn.Module):
         raise NotImplementedError
 
     @torch.no_grad()
-    def _generate_lookup(self, sigma_grid: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _generate_lookup(
+        self,
+        sigma_grid: torch.Tensor,
+        return_pdf: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate the lookup table for sampling from the target SO(3) CDF. The table is 2D, with the
         rows corresponding to different sigma values and the columns with angles computed on a grid.
@@ -808,7 +812,10 @@ class BaseSampleSO3(nn.Module):
         cdf_igso3 = cdf_igso3.to(device=current_device)
         omega_grid = omega_grid.to(device=current_device)
 
-        return omega_grid[1:].to(sigma_grid.dtype), cdf_igso3.to(sigma_grid.dtype)
+        if return_pdf:
+            return omega_grid[1:].to(sigma_grid.dtype), cdf_igso3.to(sigma_grid.dtype), pdf_igso3.to(sigma_grid.dtype)
+        else:
+            return omega_grid[1:].to(sigma_grid.dtype), cdf_igso3.to(sigma_grid.dtype)
 
     def sample(self, sigma: torch.Tensor, num_samples: int) -> torch.Tensor:
         """
@@ -910,6 +917,120 @@ class BaseSampleSO3(nn.Module):
         return omega
 
 
+# class SampleIGSO3(BaseSampleSO3):
+#     so3_type = "igso3"  # cache basename
+#
+#     def __init__(
+#         self,
+#         num_omega: int,
+#         sigma_grid: torch.Tensor,
+#         omega_exponent: int = 3,
+#         tol: float = 1e-7,
+#         interpolate: bool = True,
+#         l_max: int = 1000,
+#         cache_dir: Optional[str] = None,
+#         overwrite_cache: bool = False,
+#         device: str = 'cpu',
+#     ) -> None:
+#         """
+#         Module for sampling rotations from the IGSO(3) distribution using the explicit series
+#         expansion.  Samples are created using inverse transform sampling based on the associated
+#         cumulative probability distribution function (CDF) and a uniform distribution [0,1] as
+#         described in [#leach2022_2]_. CDF values are obtained by numerically integrating the
+#         probability distribution evaluated on a grid of angles and noise levels and stored in a
+#         lookup table.  Linear interpolation is used to approximate continuos sampling of the
+#         function. Angles are discretized in an interval [0,pi] and the grid can be squashed to have
+#         higher resolutions at low angles by taking different powers.
+#         Since sampling relies on tabulated values of the CDF and indexing in the form of
+#         `torch.bucketize`, gradients are not supported.
+#
+#         Args:
+#             num_omega (int): Number of discrete angles used for generating the lookup table.
+#             sigma_grid (torch.Tensor): Grid of IGSO3 std devs.
+#             omega_exponent (int, optional): Make the angle grid denser for smaller angles by taking
+#               its power with the provided number. Defaults to 3.
+#             tol (float, optional): Small value for numerical stability. Defaults to 1e-7.
+#             interpolate (bool, optional): If enables, perform linear interpolation of the angle CDF
+#               to sample angles. Otherwise the closest tabulated point is returned. Defaults to True.
+#             l_max (int, optional): Maximum number of terms used in the series expansion.
+#             cache_dir: Path to an optional cache directory. If set to None, lookup tables are
+#               computed on the fly.
+#             overwrite_cache: If set to true, existing cache files are overwritten. Can be used for
+#               updating stale caches.
+#
+#         References
+#         ----------
+#         .. [#leach2022_2] Leach, Schmon, Degiacomi, Willcocks:
+#            Denoising diffusion probabilistic models on so (3) for rotational alignment.
+#            ICLR 2022 Workshop on Geometrical and Topological Representation Learning. 2022.
+#         """
+#         self.l_max = l_max
+#         super().__init__(
+#             num_omega=num_omega,
+#             sigma_grid=sigma_grid,
+#             omega_exponent=omega_exponent,
+#             tol=tol,
+#             interpolate=interpolate,
+#             cache_dir=cache_dir,
+#             overwrite_cache=overwrite_cache,
+#             device=device,
+#         )
+#
+#     def _get_cache_name(self) -> str:
+#         """
+#         Auxiliary function for determining the cache file name based on the parameters (sigma,
+#         omega, l, etc.) used for generating the lookup tables.
+#
+#         Returns:
+#             Base name of the cache file.
+#         """
+#         cache_name = "cache_{:s}_s{:04.3f}-{:04.3f}-{:d}_l{:d}_o{:d}-{:d}.npz".format(
+#             self.so3_type,
+#             torch.min(self.sigma_grid).cpu().item(),
+#             torch.max(self.sigma_grid).cpu().item(),
+#             self.sigma_grid.shape[0],
+#             self.l_max,
+#             self.num_omega,
+#             self.omega_exponent,
+#         )
+#         return cache_name
+#
+#     def expansion_function(
+#         self,
+#         omega_grid: torch.Tensor,
+#         sigma_grid: torch.Tensor,
+#     ) -> torch.Tensor:
+#         """
+#         Use the truncated expansion of the IGSO(3) probability function to generate the lookup table.
+#
+#         Args:
+#             omega_grid (torch.Tensor): Grid of angle values.
+#             sigma_grid (torch.Tensor): Grid of IGSO3 std devs.
+#
+#         Returns:
+#             torch.Tensor: IGSO(3) distribution for angles discretized on a 2D grid.
+#         """
+#         return generate_igso3_lookup_table(omega_grid, sigma_grid, l_max=self.l_max, tol=self.tol)
+#
+#     def _process_angles(self, sigma: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
+#         """
+#         Ensure sampled angles are 0 for small noise levels in IGSO(3). (Series expansion gives
+#         uniform probability distribution.)
+#
+#         Args:
+#             sigma (torch.Tensor): Current values of sigma.
+#             angles (torch.Tensor): Sampled angles.
+#
+#         Returns:
+#             torch.Tensor: Processed sampled angles.
+#         """
+#         angles = torch.where(
+#             sigma[..., None] < self.tol,
+#             torch.zeros_like(angles),
+#             angles,
+#         )
+#         return angles
+
 class SampleIGSO3(BaseSampleSO3):
     so3_type = "igso3"  # cache basename
 
@@ -957,17 +1078,81 @@ class SampleIGSO3(BaseSampleSO3):
            Denoising diffusion probabilistic models on so (3) for rotational alignment.
            ICLR 2022 Workshop on Geometrical and Topological Representation Learning. 2022.
         """
+        # this is kinda jenk but we're just prototyping rn anyway
+        nn.Module.__init__(self)
+
         self.l_max = l_max
-        super().__init__(
-            num_omega=num_omega,
-            sigma_grid=sigma_grid,
-            omega_exponent=omega_exponent,
-            tol=tol,
-            interpolate=interpolate,
-            cache_dir=cache_dir,
-            overwrite_cache=overwrite_cache,
-            device=device,
-        )
+        self.num_omega = num_omega
+        self.omega_exponent = omega_exponent
+        self.tol = tol
+        self.interpolate = interpolate
+        self.device = device
+        self.register_buffer("sigma_grid", sigma_grid, persistent=False)
+
+        # Generate / load lookups and store in non-persistent buffers.
+        omega_grid, pdf_igso3, cdf_igso3, dlog_igso3 = self._setup_lookup(sigma_grid, cache_dir, overwrite_cache)
+        self.register_buffer("omega_grid", omega_grid, persistent=False)
+        self.register_buffer("pdf_igso3", pdf_igso3, persistent=False)
+        self.register_buffer("cdf_igso3", cdf_igso3, persistent=False)
+        self.register_buffer("dlog_igso3", dlog_igso3, persistent=False)
+
+        # second term is bc pdf is density but we need probability per discritized chunk
+        E_dlog_igso3 = torch.sum(pdf_igso3 * dlog_igso3, dim=-1) * (torch.pi / self.num_omega)
+        self.register_buffer("E_dlog_igso3", E_dlog_igso3, persistent=False)
+        E_dlog_igso3_sq = torch.sum(pdf_igso3 * dlog_igso3.square(), dim=-1) * (torch.pi / self.num_omega)
+        self.register_buffer("E_dlog_igso3_sq", E_dlog_igso3_sq, persistent=False)
+
+    def _setup_lookup(
+        self,
+        sigma_grid: torch.Tensor,
+        cache_dir: Optional[str] = None,
+        overwrite_cache: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Master function for setting up the lookup tables. These can either be loaded from a npz
+        cache file or computed on the fly. Lookup tables will always be created and stored in double
+        precision. Casting to the target dtype is done at the end of the function.
+
+        Args:
+            sigma_grid: Grid of sigma values used for computing the lookup tables.
+            cache_dir: Path to the cache directory.
+            overwrite_cache: If set to true, an existing cache is overwritten. Can be used for
+              updating stale caches.
+
+        Returns:
+            Grid of angle values and SO(3) cumulative distribution function.
+        """
+        if cache_dir is not None:
+            cache_name = self._get_cache_name()
+            cache = SO3LookupCache(cache_dir, cache_name, overwrite=True)
+
+            # If cache dir is provided, check whether the necessary cache exists and whether it
+            # should be overwritten.
+            if cache.path_exists and not overwrite_cache:
+                # Load data from cache.
+                cache_data = cache.load_cache()
+                omega_grid = cache_data["omega_grid"]
+                pdf_igso3 = cache_data["pdf_igso3"]
+                cdf_igso3 = cache_data["cdf_igso3"]
+                dlog_igso3 = cache_data["dlog_igso3"]
+            else:
+                # Store data in cache (overwrite if requested).
+                omega_grid, cdf_igso3, pdf_igso3 = self._generate_lookup(sigma_grid, return_pdf=True)
+
+                # Set up grid for angle resolution. Convert to double precision for better handling of numerics.
+                dlog_igso3_omega_grid = torch.linspace(0.0, 1, self.num_omega + 1)
+                # If requested, increase sample density for lower values
+                dlog_igso3_omega_grid = dlog_igso3_omega_grid**self.omega_exponent
+
+                dlog_igso3_omega_grid = dlog_igso3_omega_grid * np.pi
+                dlog_igso3 = generate_dlog_igso3_lookup_table(dlog_igso3_omega_grid, sigma_grid)
+                cache.save_cache({"omega_grid": omega_grid, "pdf_igso3": pdf_igso3, "cdf_igso3": cdf_igso3, "dlog_igso3": dlog_igso3})
+        else:
+            # Other wise just generate the tables.
+            omega_grid, cdf_igso3, pdf_igso3 = self._generate_lookup(sigma_grid, return_pdf=True)
+            dlog_igso3 = generate_dlog_igso3_lookup_table(omega_grid, sigma_grid)
+
+        return omega_grid.to(sigma_grid.dtype), pdf_igso3.to(sigma_grid.dtype), cdf_igso3.to(sigma_grid.dtype), dlog_igso3.to(sigma_grid.dtype)
 
     def _get_cache_name(self) -> str:
         """
@@ -1024,6 +1209,122 @@ class SampleIGSO3(BaseSampleSO3):
         )
         return angles
 
+    def get_E_dlog_igso3(self, sigma: torch.Tensor) -> torch.Tensor:
+        """
+        Query the cache for the value dlogf d_omega
+
+        Args:
+            sigma_indices (torch.Tensor): Indices of the IGSO3 std deves for which to
+              take samples.
+            num_samples (int): Number of angle samples to take for each std dev.
+
+        Returns:
+            torch.Tensor: Collected samples, will have the dimension [num_sigma x num_samples].
+        """
+        device = self.sigma_grid.device
+        source_device = sigma.device
+        sigma = sigma.to(device)
+        # Convert sigmas to respective indices for lookup table.
+        sigma_indices = self.get_sigma_idx(sigma)
+
+        if self.interpolate:
+            sigma_end_indices = torch.clamp(sigma_indices + 1, max=self.sigma_grid.shape[-1]-1)
+            mask = sigma_end_indices == sigma_indices
+            discritized_sigma = self.sigma_grid[sigma_indices]
+
+            E_d_logf_d_omega_start = self.E_dlog_igso3[sigma_indices]
+            E_d_logf_d_omega_end = self.E_dlog_igso3[sigma_end_indices]
+            weight = (sigma - discritized_sigma) / (self.sigma_grid[sigma_end_indices] - discritized_sigma + 1e-8)
+            # in case of div by 0
+            weight[mask] = 0
+            E_d_logf_d_omega = torch.lerp(E_d_logf_d_omega_start, E_d_logf_d_omega_end, weight=weight)
+        else:
+            E_d_logf_d_omega_start = self.E_dlog_igso3[sigma_indices]
+
+        return E_d_logf_d_omega.to(source_device)
+
+    def get_E_dlog_igso3_sq(self, sigma: torch.Tensor) -> torch.Tensor:
+        """
+        Query the cache for the value dlogf d_omega
+
+        Args:
+            sigma_indices (torch.Tensor): Indices of the IGSO3 std deves for which to
+              take samples.
+            num_samples (int): Number of angle samples to take for each std dev.
+
+        Returns:
+            torch.Tensor: Collected samples, will have the dimension [num_sigma x num_samples].
+        """
+        device = self.sigma_grid.device
+        source_device = sigma.device
+        sigma = sigma.to(device)
+        # Convert sigmas to respective indices for lookup table.
+        sigma_indices = self.get_sigma_idx(sigma)
+
+        if self.interpolate:
+            sigma_end_indices = torch.clamp(sigma_indices + 1, max=self.sigma_grid.shape[-1]-1)
+            mask = sigma_end_indices == sigma_indices
+            discritized_sigma = self.sigma_grid[sigma_indices]
+
+            E_d_logf_d_omega_sq_start = self.E_dlog_igso3_sq[sigma_indices]
+            E_d_logf_d_omega_sq_end = self.E_dlog_igso3_sq[sigma_end_indices]
+            weight = (sigma - discritized_sigma) / (self.sigma_grid[sigma_end_indices] - discritized_sigma + 1e-8)
+            # in case of div by 0
+            weight[mask] = 0
+            E_d_logf_d_omega_sq = torch.lerp(E_d_logf_d_omega_sq_start, E_d_logf_d_omega_sq_end, weight=weight)
+        else:
+            E_d_logf_d_omega_sq = self.E_dlog_igso3_sq[sigma_indices]
+
+        return E_d_logf_d_omega_sq.to(source_device)
+
+    def get_dlog_igso3(self, omega: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        """
+        Query the cache for the value dlogf d_omega
+
+        Args:
+            sigma_indices (torch.Tensor): Indices of the IGSO3 std deves for which to
+              take samples.
+            num_samples (int): Number of angle samples to take for each std dev.
+
+        Returns:
+            torch.Tensor: Collected samples, will have the dimension [num_sigma x num_samples].
+        """
+        device = self.sigma_grid.device
+        source_device = omega.device
+        sigma = sigma.to(device)
+        omega = omega.to(device)
+        # Convert sigmas to respective indices for lookup table.
+        sigma_indices = self.get_sigma_idx(sigma)
+        # Get relevant omega indices from stored CDFs.
+        omega_indices = torch.bucketize(omega, self.omega_grid)
+
+        if sigma_indices.shape != omega_indices:
+            if len(sigma_indices.shape) == 0:
+                sigma_indices = sigma_indices[None, None].expand(omega_indices.shape)
+            elif len(sigma_indices.shape) == 1:
+                sigma_indices = sigma_indices[:, None].expand(omega_indices.shape)
+            else:
+                sigma_indices = sigma_indices.expand(omega_indices.shape)
+
+        if self.interpolate:
+            omega_end = torch.clamp(omega_indices + 1, max=self.omega_grid.shape[-1]-1)
+            mask = omega_end == omega_indices
+
+            discritized_omega = self.omega_grid[omega_indices]
+
+            d_logf_d_omega_start = self.dlog_igso3[sigma_indices, omega_indices]
+            d_logf_d_omega_end = self.dlog_igso3[sigma_indices, omega_end]
+            weight = (omega - discritized_omega) / (self.omega_grid[omega_end] - discritized_omega + 1e-8)
+            # in case of div by 0
+            weight[mask] = 0
+
+            d_logf_d_omega = torch.lerp(d_logf_d_omega_start, d_logf_d_omega_end, weight=weight)
+        else:
+            d_logf_d_omega = self.dlog_igso3[sigma_indices, omega_indices]
+
+        # print(d_logf_d_omega.shape)
+
+        return d_logf_d_omega.to(source_device)
 
 class SampleUSO3(BaseSampleSO3):
     so3_type = "uso3"  # cache basename
@@ -1283,6 +1584,148 @@ def dlog_igso3_expansion(
 
     return df_igso3 / (f_igso3 + tol)
 
+def batched_igso3_expansion(
+    omega: torch.Tensor, sigma: torch.Tensor, l_grid: torch.Tensor, tol=1e-7
+) -> torch.Tensor:
+    """
+    Compute the IGSO(3) angle probability distribution function for pairs of angles and std dev
+    levels. The expansion is computed using a grid of expansion orders ranging from 0 to l_max.
+
+    This function approximates the power series in equation 5 of [#yim2023_3]_. With this
+    parameterization, IGSO(3) agrees with the Brownian motion on SO(3) with t=sigma^2.
+
+    Args:
+        omega: Values of angles (1D tensor).
+        sigma: Values of std dev of IGSO3 distribution (1D tensor of same shape as `omega`).
+        l_grid: Tensor containing expansion orders (0 to l_max).
+        tol: Small offset for numerical stability.
+
+    Returns:
+        IGSO(3) angle distribution function (without pre-factor for uniform SO(3) distribution).
+
+    References
+    ----------
+    .. [#yim2023_3] Yim, Trippe, De Bortoli, Mathieu, Doucet, Barzilay, Jaakkola:
+        SE(3) diffusion model with application to protein backbone generation.
+        arXiv preprint arXiv:2302.02277. 2023.
+    """
+    # Pre-compute sine in denominator and clamp for stability.
+    denom_sin = torch.sin(0.5 * omega)
+
+    # Pre-compute terms that rely only on expansion orders.
+    l_fac_1 = 2.0 * l_grid + 1.0
+    l_fac_2 = -l_grid * (l_grid + 1.0)
+
+    # Pre-compute numerator of expansion which only depends on angles.
+    numerator_sin = torch.sin((l_grid[None, None, :] + 1 / 2) * omega[:, :, None])
+
+    # Pre-compute exponential term with (2l+1) prefactor.
+    exponential_term = l_fac_1[None, None, :] * torch.exp(l_fac_2[None, None, :] * sigma[:, :, None] ** 2 / 2)
+
+    # Compute series expansion
+    f_igso = torch.sum(exponential_term * numerator_sin, dim=-1)
+    # For small omega, accumulate limit of sine fraction instead:
+    # lim[x->0] sin((l+1/2)x) / sin(x/2) = 2l + 1
+    f_limw = torch.sum(exponential_term * l_fac_1[None, None, :], dim=-1)
+
+    # Finalize expansion. Offset for stability can be added since omega is [0,pi] and sin(omega/2)
+    # is positive in this interval.
+    f_igso = f_igso / (denom_sin + tol)
+
+    # Replace values at small omega with limit.
+    f_igso = torch.where(omega <= tol, f_limw, f_igso)
+
+    # Remove remaining numerical problems
+    f_igso = torch.where(
+        torch.logical_or(torch.isinf(f_igso), torch.isnan(f_igso)), torch.zeros_like(f_igso), f_igso
+    )
+
+    return f_igso
+
+
+def batched_digso3_expansion(
+    omega: torch.Tensor, sigma: torch.Tensor, l_grid: torch.Tensor, tol=1e-7
+) -> torch.Tensor:
+    """
+    Compute the derivative of the IGSO(3) angle probability distribution function with respect to
+    the angles for pairs of angles and std dev levels. As in `igso3_expansion` a grid is used for the
+    expansion levels. Evaluates the derivative directly in order to avoid second derivatives during
+    backpropagation.
+
+    The derivative of the angle-dependent part is computed as:
+
+    .. math ::
+        \frac{\partial}{\partial \omega} \frac{\sin((l+\tfrac{1}{2})\omega)}{\sin(\tfrac{1}{2}\omega)} = \frac{l\sin((l+1)\omega) - (l+1)\sin(l\omega)}{1 - \cos(\omega)}
+
+    (obtained via quotient rule + different trigonometric identities).
+
+    Args:
+        omega: Values of angles (1D tensor).
+        sigma: Values of IGSO3 distribution std devs (1D tensor of same shape as `omega`).
+        l_grid: Tensor containing expansion orders (0 to l_max).
+        tol: Small offset for numerical stability.
+
+    Returns:
+        IGSO(3) angle distribution derivative (without pre-factor for uniform SO(3) distribution).
+    """
+    denom_cos = 1.0 - torch.cos(omega)
+
+    l_fac_1 = 2.0 * l_grid + 1.0
+    l_fac_2 = l_grid + 1.0
+    l_fac_3 = -l_grid * l_fac_2
+
+    # Pre-compute numerator of expansion which only depends on angles.
+    numerator_sin = l_grid[None, None, :] * torch.sin(l_fac_2[None, None, :] * omega[:, :, None]) - l_fac_2[
+        None, None, :
+    ] * torch.sin(l_grid[None, None, :] * omega[:, :, None])
+
+    # Compute series expansion
+    df_igso = torch.sum(
+        l_fac_1[None, None, :] * torch.exp(l_fac_3[None, None, :] * sigma[:, :, None] ** 2 / 2) * numerator_sin,
+        dim=-1,
+    )
+
+    # Finalize expansion. Offset for stability can be added since omega is [0,pi] and cosine term
+    # is positive in this interval.
+    df_igso = df_igso / (denom_cos + tol)
+
+    # Replace values at small omega with limit (=0).
+    df_igso = torch.where(omega <= tol, torch.zeros_like(df_igso), df_igso)
+
+    # Remove remaining numerical problems
+    df_igso = torch.where(
+        torch.logical_or(torch.isinf(df_igso), torch.isnan(df_igso)),
+        torch.zeros_like(df_igso),
+        df_igso,
+    )
+
+    return df_igso
+
+def batched_dlog_igso3_expansion(
+    omega: torch.Tensor, sigma: torch.Tensor, l_grid: torch.Tensor, tol=1e-7
+) -> torch.Tensor:
+    """
+    Compute the derivative of the logarithm of the IGSO(3) angle distribution function for pairs of
+    angles and std dev levels:
+
+    .. math ::
+        \frac{\partial}{\partial \omega} \log f(\omega) = \frac{\tfrac{\partial}{\partial \omega} f(\omega)}{f(\omega)}
+
+    Required for SO(3) score computation.
+
+    Args:
+        omega: Values of angles (1D tensor).
+        sigma: Values of IGSO3 std devs (1D tensor of same shape as `omega`).
+        l_grid: Tensor containing expansion orders (0 to l_max).
+        tol: Small offset for numerical stability.
+
+    Returns:
+        IGSO(3) angle distribution derivative (without pre-factor for uniform SO(3) distribution).
+    """
+    f_igso3 = batched_igso3_expansion(omega, sigma, l_grid, tol=tol)
+    df_igso3 = batched_digso3_expansion(omega, sigma, l_grid, tol=tol)
+
+    return df_igso3 / (f_igso3 + tol)
 
 @torch.no_grad()
 def generate_lookup_table(
@@ -1385,194 +1828,53 @@ def generate_dlog_igso3_lookup_table(
     )
     return dlog_igso
 
-### From QFlow / ReQFlow
-# quaternion utilities
-def quaternion_conjugate(q):
+# -------------------------
+# Quaternion utilities
+# Convention: q = [w, x, y, z] (scalar-first), Hamilton product.
+# -------------------------
+
+def quat_normalize(q, eps=1e-8):
+    return q / (q + eps).norm(dim=-1, keepdim=True)
+
+def quat_conj(q):
+    # [..., 4] -> [..., 4]
+    return torch.cat([q[..., :1], -q[..., 1:]], dim=-1)
+
+def quat_mul(q, p):
+    # Hamilton product, scalar-first.
+    # q, p: [..., 4]
+    qw, qx, qy, qz = q.unbind(dim=-1)
+    pw, px, py, pz = p.unbind(dim=-1)
+    return torch.stack([
+        qw*pw - qx*px - qy*py - qz*pz,
+        qw*px + qx*pw + qy*pz - qz*py,
+        qw*py - qx*pz + qy*pw + qz*px,
+        qw*pz + qx*py - qy*px + qz*pw,
+    ], dim=-1)
+
+def project_to_tangent_S3(q, g):
+    # Project g onto tangent space at q on S^3: g - (q·g) q
+    return g - (q * g).sum(dim=-1, keepdim=True) * q
+
+def quat_grad_to_so3(q_unit, grad_q, frame="body", project=True):
     """
-    Compute the conjugate of a quaternion.
-
-    Args:
-    - q: [N, 4], (w, x, y, z), the input quaternion.
-
-    Returns:
-    - q_conj: [N, 4], the conjugate of the input quaternion.
+    Map gradient wrt unit quaternion (R^4) -> gradient in so(3) (R^3).
+    q_unit: [..., 4], assumed unit (will be normalized anyway)
+    grad_q: [..., 4] = d f / d q_unit
+    frame: "body" (right-trivialized) or "space" (left-trivialized)
     """
-    q_conj = q.clone()
-    q_conj[:, 1:] = -q_conj[:, 1:]
-    return q_conj
+    q = quat_normalize(q_unit)
+    g = grad_q
+    if project:
+        g = project_to_tangent_S3(q, g)
 
-def quaternion_conjugate_batch(q):
-    """
-    Conjugate for shape [..., 4].
-    """
-    qc = q.clone()
-    qc[..., 1:] = -qc[..., 1:]
-    return qc
+    qc = quat_conj(q)
 
-def quaternion_mul(q1, q2):
-    """
-    Multiply two quaternions.
-
-    Args:
-    - q1: [N, 4], (w, x, y, z), the first quaternion.
-    - q2: [N, 4], (w, x, y, z), the second quaternion.
-
-    Returns:
-    - q_mult: [N, 4], the product of q1 and q2.
-    """
-    w1, x1, y1, z1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
-    w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
-
-    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
-    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
-    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
-    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
-
-    q_mult = torch.stack([w, x, y, z], dim=1)
-    return q_mult
-
-def quaternion_mul_batch(q1, q2):
-    """
-    Multiply two batches of quaternions.
-
-    Args:
-    - q1: [B, N, 4], (w, x, y, z), the first batch of quaternions.
-    - q2: [B, N, 4], (w, x, y, z), the second batch of quaternions.
-
-    Returns:
-    - q_mult: [B, N, 4], the product of q1 and q2.
-    """
-    # Extract individual components
-    w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
-    w2, x2, y2, z2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
-
-    # Compute the product
-    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
-    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
-    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
-    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
-
-    # Stack the results
-    q_mult = torch.stack([w, x, y, z], dim=-1)
-    return q_mult
-
-def ensure_shortest_path(qA, qB):
-    """
-    Ensure qA->qB slerp uses the shortest path by flipping qB if dot(qA, qB)<0.
-
-    Args:
-      qA: [N, 4] (or any batch shape [...,4])
-      qB: [N, 4] (or same batch shape [...,4])
-
-    Returns:
-      qB_fixed: [N,4], possibly flipped so dot(qA, qB_fixed) >= 0
-    """
-    # Remove keepdim=True here
-    cos_theta = torch.sum(qA * qB, dim=-1)  # shape [N]
-    mask = cos_theta < 0  # shape [N]
-
-    qB_fixed = qB.clone()
-    qB_fixed[mask] = -qB_fixed[mask]  # now works because mask is [N]
-    return qB_fixed
-
-def quaternion_slerp_exp(t: torch.Tensor, q1: torch.Tensor, q0: torch.Tensor):
-    """
-    Compute the SLERP angular velocity field wt and the corresponding interpolated quaternion qt
-    for the given quaternions q0 and q1 using exponential and logarithmic mapping in batch.
-
-    Args:
-    - q0: [B, N, 4], (w, x, y, z), the start quaternion.
-    - q1: [B, N, 4], (w, x, y, z), the end quaternion.
-    - t: [B, N], the interpolation parameter for each element.
-
-    Returns:
-    - qt: [B, N, 4], (w, x, y, z), the interpolated quaternion at the corresponding time t.
-    """
-    # Ensure the input quaternions are unit quaternions.
-    q0 = q0 / q0.norm(dim=-1, keepdim=True)
-    q1 = q1 / q1.norm(dim=-1, keepdim=True)
-
-    # Compute the dot product to obtain cos(theta).
-    cos_theta = torch.sum(q0 * q1, dim=-1)  # Shape: [B, N]
-
-    # Check for cos_theta < 0 and adjust the quaternions to select the shortest path.
-    mask = cos_theta < 0
-    q1_adjusted = q1.clone()
-    q1_adjusted[mask] = -q1_adjusted[mask]
-
-    # Compute the relative quaternion q_rel = q0^(-1) * q1_adjusted.
-    q0_conj = quaternion_conjugate_batch(q0)  # Shape: [B, N, 4]
-    q_rel = quaternion_mul_batch(q0_conj, q1_adjusted)  # Shape: [B, N, 4]
-
-    # Compute the logarithm of the relative quaternion.
-    epsilon = 1e-6
-    q_rel_w = torch.clamp(q_rel[..., 0], -1.0 + epsilon, 1.0 - epsilon)  # Shape: [B, N]
-    phi = 2 * torch.acos(q_rel_w)  # Shape: [B, N]
-    sin_phi_over_2 = torch.sin(phi / 2)  # Shape: [B, N]
-    sin_phi_over_2_clamped = sin_phi_over_2.clone()
-    sin_phi_over_2_clamped[sin_phi_over_2_clamped.abs() < epsilon] = epsilon  # Shape: [B, N]
-
-    # Compute the rotation axis u.
-    u = q_rel[..., 1:] / sin_phi_over_2_clamped.unsqueeze(-1)  # Shape: [B, N, 3]
-
-    # Compute the exponential to get the interpolated quaternion qt.
-    phi_t = t * phi  # Shape: [B, N]
-    sin_phi_t_over_2 = torch.sin(phi_t / 2).unsqueeze(-1)  # Shape: [B, N, 1]
-    sin_phi_t_over_2_clamped = sin_phi_t_over_2.clone()
-    sin_phi_t_over_2_clamped[sin_phi_t_over_2_clamped.abs() < epsilon] = epsilon  # Shape: [B, N, 1]
-    qt_der = torch.cos(phi_t / 2).unsqueeze(-1)  # Shape: [B, N, 1]
-    qt_xyz = sin_phi_t_over_2_clamped * u  # Shape: [B, N, 3]
-    qt_rel = torch.cat([qt_der, qt_xyz], dim=-1)  # Shape: [B, N, 4]
-    qt_rel = qt_rel / qt_rel.norm(dim=-1, keepdim=True)  # Normalize to ensure unit quaternion
-
-    # Compute the interpolated quaternion qt = q0 * qt_rel
-    qt = quaternion_mul_batch(q0, qt_rel)  # Shape: [B, N, 4]
-
-    # Compute angular velocity w.
-    w = u * phi.unsqueeze(-1)  # Shape: [B, N, 3]
-
-    # Ensure the interpolated quaternion is unit.
-    qt = qt / qt.norm(dim=-1, keepdim=True)  # Shape: [B, N, 4]
-
-    return qt
-
-def calc_quat_wt_qt_q1(qt: torch.Tensor, q1: torch.Tensor, epsilon: float = 1e-6) -> torch.Tensor:
-    """
-    Calculate the rotation change vector wt given the current quaternion qt and the end quaternion q1.
-
-    Args:
-        qt (torch.Tensor): the current quaternion, shape [B, N, 4], in [w, x, y, z] format.
-        q1 (torch.Tensor): the end quaternion, shape [B, N, 4], in [w, x, y, z] format.
-        epsilon (float, optional): Small value for numerical stability. Defaults to 1e-6.
-
-    Returns:
-        torch.Tensor: Rotation change vectors, shape [B, N, 3].
-    """
-    # Normalize the input quaternions to ensure they are unit quaternions
-    qt = qt / qt.norm(dim=-1, keepdim=True)
-    q1 = q1 / q1.norm(dim=-1, keepdim=True)
-
-    # Ensure the interpolation takes the shortest path
-    q1 = ensure_shortest_path(qt, q1)  # Shape: [B, N, 4]
-
-    # Compute the relative quaternion: q_rel = qt^{-1} * q1
-    q_rel = quaternion_mul_batch(quaternion_conjugate_batch(qt), q1)  # Shape: [B, N, 4]
-
-    # Extract the scalar part of the relative quaternion and compute the rotation angle phi_t
-    q_rel_w = torch.clamp(q_rel[..., 0], -1.0 + epsilon, 1.0 - epsilon)  # Shape: [B, N]
-    phi_t = 2 * torch.acos(q_rel_w)  # Shape: [B, N]
-
-    # Compute sin(phi_t / 2) and clamp for numerical stability
-    sin_phi_t_over_2 = torch.sin(phi_t / 2)  # Shape: [B, N]
-    sin_phi_t_over_2_clamped = sin_phi_t_over_2.clamp(min=epsilon)  # Shape: [B, N]
-
-    # Expand dimensions to match for broadcasting
-    sin_phi_t_over_2_clamped = sin_phi_t_over_2_clamped[..., None]  # Shape: [B, N, 1]
-
-    # Compute the rotation axis u by normalizing the vector part of q_rel
-    u = q_rel[..., 1:] / sin_phi_t_over_2_clamped  # Shape: [B, N, 3]
-
-    # Compute the rotation change vector wt = u * phi_t
-    wt = u * phi_t[..., None]  # Shape: [B, N, 3]
-
-    return wt
+    if frame == "body":
+        # g_omega = 0.5 * vec( qc ⊗ g )
+        return 0.5 * quat_mul(qc, g)[..., 1:]
+    elif frame == "space":
+        # g_omega = 0.5 * vec( g ⊗ qc )
+        return 0.5 * quat_mul(g, qc)[..., 1:]
+    else:
+        raise ValueError("frame must be 'body' or 'space'")

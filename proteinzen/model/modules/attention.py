@@ -15,6 +15,11 @@ from proteinzen.openfold.utils.rigid_utils import Rigid
 
 from proteinzen.openfold.utils import rigid_utils as ru
 
+from flash_attn import flash_attn_varlen_qkvpacked_func, flash_attn_varlen_func
+from proteinzen.model.modules.flash_ipa import unpad_input, pad_input
+
+from .common import compile_supported
+
 
 class FlashTransformerEncoderLayer(nn.Module):
     def __init__(self,
@@ -59,22 +64,46 @@ class FlashTransformerEncoderLayer(nn.Module):
         q = self.lin_q(_x)
         kv = self.lin_kv(_x)
         k, v = kv.split(self.h_head * self.no_heads, dim=-1)
-        q = q.view(*q.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
-        k = k.view(*k.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
-        v = v.view(*v.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
+        q = q.view(*q.shape[:-1], self.no_heads, self.h_head).transpose(-2, -3)
+        k = k.view(*k.shape[:-1], self.no_heads, self.h_head).transpose(-2, -3)
+        v = v.view(*v.shape[:-1], self.no_heads, self.h_head).transpose(-2, -3)
         if self.dtype is not None:
             q = q.type(self.dtype)
             k = k.type(self.dtype)
             v = v.type(self.dtype)
+
+        q = F.rms_norm(q, [self.h_head])
+        k = F.rms_norm(k, [self.h_head])
+
+        raise NotImplementedError
+
+        qkv = torch.cat([q.unsqueeze(2), k.unsqueeze(2), v.unsqueeze(2)], dim=2)
+        (
+            qkv,
+            indices,
+            cu_seqlens,
+            max_seqlen,
+            _,
+        ) = unpad_input(qkv.flatten(0, 1), x_mask.flatten(0, 1))
+
+        attn_res = flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, softmax_scale=1)
+
+        update = pad_input(
+            attn_res,
+            indices=indices,
+            batch=q.shape[0],
+            seqlen=q.shape[1],
+        )
+
         # with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
         #     update = F.scaled_dot_product_attention(
         #         q, k, v, attn_mask=x_mask
         #     )
-        print(q.is_contiguous(), k.is_contiguous(), v.is_contiguous(), x_mask.is_contiguous())
-        update = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=x_mask[..., None, :, None]
-        )
-        update = update.transpose(-2, -3).flatten(-2, -1)
+        # print(q.is_contiguous(), k.is_contiguous(), v.is_contiguous(), x_mask.is_contiguous())
+        # update = F.scaled_dot_product_attention(
+        #     q, k, v, attn_mask=x_mask[..., None, :, None]
+        # )
+        # update = update.transpose(-2, -3).flatten(-2, -1)
         if self.dtype is not None:
             update = update.to(dtype)
         x = x + self.dropout(update)
@@ -265,7 +294,47 @@ class ConditionedTransformerPairBiasLayer(nn.Module):
 
         self.ffn = Transition(c_s, n=2)
 
-    def forward(self, x, cond, z, x_mask):
+    @torch.compile(disable=not compile_supported)
+    def _gen_pair_bias(
+        self,
+        z,
+        x_mask,
+    ):
+        _z = self.ln_z(z)
+        b = self.lin_b(_z)
+        # edge_mask = x_mask[..., None, :, None] & x_mask[..., None, None]
+        # b = b + self.inf * (edge_mask.float() - 1)
+        b += self.inf * (x_mask[..., None, :, None].float() - 1)
+        b += self.inf * (x_mask[..., None, None].float() - 1)
+        return permute_final_dims(b, (2, 0, 1)).contiguous()
+
+    @torch.compile(disable=not compile_supported)
+    def _gen_attn_tensors(
+        self,
+        x,
+        cond,
+    ):
+        _x = self.ln_s(x, cond)
+
+        q = self.lin_q(_x)
+        kv = self.lin_kv(_x)
+        k, v = kv.split(self.h_head * self.no_heads, dim=-1)
+
+        q = q.view(*q.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
+        k = k.view(*k.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
+        v = v.view(*v.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        out_gate = self.out_gate(_x)
+        cond_gate = self.cond_gate(cond)
+
+        return q, k, v, out_gate, cond_gate
+
+    def _eager_forward(
+        self, x, cond, z, x_mask
+    ):
         x_mask = x_mask.bool()
 
         _x = self.ln_s(x, cond)
@@ -279,14 +348,9 @@ class ConditionedTransformerPairBiasLayer(nn.Module):
         b += self.inf * (x_mask[..., None, :, None].float() - 1)
         b += self.inf * (x_mask[..., None, None].float() - 1)
 
-        if True or self.training:
-            q = q.view(*q.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
-            k = k.view(*k.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
-            v = v.view(*v.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
-        else:
-            q = q.view(*q.shape[:2], self.no_heads, self.h_head)#.transpose(-2, -3)
-            k = k.view(*k.shape[:2], self.no_heads, self.h_head)#.transpose(-2, -3)
-            v = v.view(*v.shape[:2], self.no_heads, self.h_head)#.transpose(-2, -3)
+        q = q.view(*q.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
+        k = k.view(*k.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
+        v = v.view(*v.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
 
         if self.use_qk_norm:
             q = self.q_norm(q)
@@ -304,6 +368,42 @@ class ConditionedTransformerPairBiasLayer(nn.Module):
         x = x + self.row_dropout(self.dropout(update))
 
         x = x + self.ffn(x) * x_mask[..., None]
+
+        return x
+
+    def _wrapup(self, x, update, out_gate, cond_gate, x_mask):
+        update = update.transpose(-2, -3).flatten(-2, -1)
+
+        update = self.lin_out(update * torch.sigmoid(out_gate))
+        update = update * torch.sigmoid(cond_gate)
+        x = x + self.row_dropout(self.dropout(update))
+
+        x = x + self.ffn(x) * x_mask[..., None]
+        return x
+
+
+    @torch.compile(disable=not compile_supported)
+    def forward(self, x, cond, z, x_mask):
+        x_mask = x_mask.bool()
+
+        q, k, v, out_gate, cond_gate = self._gen_attn_tensors(
+            x,
+            cond,
+        )
+
+        b = self._gen_pair_bias(z, x_mask)
+
+        with torch.nn.attention.sdpa_kernel(
+            backends=[
+                torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+            ],
+        ):
+            update = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=b
+            )
+        x = self._wrapup(
+            x, update, out_gate, cond_gate, x_mask
+        )
 
         return x
 
@@ -335,10 +435,81 @@ class ConditionedTransformerPairBias(nn.Module):
             ]
         )
 
+    @torch.compile(disable=not compile_supported)
     def forward(self, x, cond, z, x_mask):
         for layer in self.layers:
             x = layer(x, cond, z, x_mask)
         return x
 
 
+class CrossAttentionPairBiasLayer(nn.Module):
+    def __init__(self,
+                 c_s,
+                 c_z,
+                 no_heads,
+                 dropout=0.1,
+                 row_dropout=0.0,
+                 inf=1e8,
+                 use_qk_norm=False
 
+    ):
+        super().__init__()
+        self.h_head = c_s // no_heads
+        self.no_heads = no_heads
+        self.inf = inf
+        self.use_qk_norm = use_qk_norm
+
+        if self.use_qk_norm:
+            self.q_norm = LayerNorm(self.h_head)
+            self.k_norm = LayerNorm(self.h_head)
+
+        self.lin_q = Linear(c_s, self.h_head * no_heads, bias=False)
+        self.lin_kv = Linear(c_s, 2 * self.h_head * no_heads, bias=False)
+        self.lin_b = Linear(c_z, no_heads, bias=False)
+        self.out_gate = Linear(c_s, c_s, bias=False)
+        self.lin_out = Linear(c_s, c_s, bias=False)
+
+        self.ln_s_q = LayerNorm(c_s)
+        self.ln_s_kv = LayerNorm(c_s)
+        self.ln_z = LayerNorm(c_z)
+        self.dropout = nn.Dropout(dropout)
+        self.row_dropout = Dropout(row_dropout, -2)
+
+        self.ffn = Transition(c_s, n=2)
+
+    def forward(self, x_q, x_kv, z, x_mask):
+        x_mask = x_mask.bool()
+
+        _x_q = self.ln_s_q(x_q)
+        _x_kv = self.ln_s_kv(x_kv)
+        _z = self.ln_z(z)
+
+        q = self.lin_q(_x_q)
+        kv = self.lin_kv(_x_kv)
+        b = self.lin_b(_z)
+        k, v = kv.split(self.h_head * self.no_heads, dim=-1)
+
+        b += self.inf * (x_mask[..., None, :, None].float() - 1)
+        b += self.inf * (x_mask[..., None, None].float() - 1)
+
+        q = q.view(*q.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
+        k = k.view(*k.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
+        v = v.view(*v.shape[:2], self.no_heads, self.h_head).transpose(-2, -3)
+
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
+        # print(q.shape, k.shape, v.shape, b.shape)
+        update = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=permute_final_dims(b, (2, 0, 1))
+        )
+        update = update.transpose(-2, -3).flatten(-2, -1)
+
+        out_gate = self.out_gate(_x_q)
+        update = self.lin_out(update * torch.sigmoid(out_gate))
+        x_q = x_q + self.row_dropout(self.dropout(update))
+
+        x_q = x_q + self.ffn(x_q) * x_mask[..., None]
+
+        return x_q
