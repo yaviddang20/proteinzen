@@ -707,6 +707,7 @@ def multiframe_fm_loss_dense_batch(
         "unscaled_rot_vf_loss": unscaled_rot_vf_loss,
         "unscaled_trans_vf_loss": unscaled_trans_vf_loss,
         "pred_trans_mse": pred_frame_trans_mse,
+        "pred_heavy_atoms_trans_mse": pred_heavy_trans_mse,
         "ref_trans_mse": ref_frame_trans_mse,
         "fafe": fafe,
         "scaled_fafe": scaled_fafe,

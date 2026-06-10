@@ -107,18 +107,18 @@ class _ChainConditioningBase(TrainingTask):
         return 0
 
 
-class ProteinConditioned(_ChainConditioningBase):
+class ProteinConditionedGenerateLigand(_ChainConditioningBase):
     """Fix protein pocket, generate ligand."""
-    name: str = "protein_conditioned"
+    name: str = "protein_conditioned_generate_ligand"
 
     def __init__(self, **kwargs):
         kwargs.setdefault("condition_mol_type", "PROTEIN")
         super().__init__(**kwargs)
 
 
-class LigandConditioned(_ChainConditioningBase):
+class LigandConditionedGenerateProtein(_ChainConditioningBase):
     """Fix ligand, generate protein pocket."""
-    name: str = "ligand_conditioned"
+    name: str = "ligand_conditioned_generate_protein"
 
     def __init__(self, **kwargs):
         kwargs.setdefault("condition_mol_type", "NONPOLYMER")

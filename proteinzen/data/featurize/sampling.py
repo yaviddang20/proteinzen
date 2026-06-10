@@ -259,6 +259,7 @@ class SampleTemplateTokenizer:
                 is_atomized=False,
                 element=-1,
                 charge=0,
+                chirality=0,
                 tensor7=rigid_tensor7[j],
                 is_present=True,
                 rigids_noising_mask=True,
@@ -373,7 +374,8 @@ class SampleTemplateTokenizer:
                 tensor7=rigid_tensor7[j],
                 is_present=True,
                 rigids_noising_mask=bool(noise_rigid),
-                num_real_input_axes=2
+                num_real_input_axes=2,
+                chirality=0
             )
             self.rigid_data.append(astuple(rigid))
             self.rigid_to_token[self.rigid_idx] = self.token_idx
@@ -454,7 +456,8 @@ class SampleTemplateTokenizer:
                 tensor7=atom_tensor7,
                 is_present=atom["is_present"],
                 rigids_noising_mask=noise_atom,
-                num_real_input_axes=2 if num_real_input_axes > 2 else num_real_input_axes
+                num_real_input_axes=2 if num_real_input_axes > 2 else num_real_input_axes,
+                chirality=0
             )
             self.rigid_data.append(astuple(rigid))
             self.rigid_to_token[self.rigid_idx] = self.token_idx

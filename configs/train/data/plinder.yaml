@@ -22,14 +22,14 @@ datasets:
           shift_time_scale: false
           t_min: 0.01
           t_max: 0.99
-        - _target_: proteinzen.runtime.training.chain_conditioning.ProteinConditioned
+        - _target_: proteinzen.runtime.training.chain_conditioning.ProteinConditionedGenerateLigand
           prob: 0.25
           t_sched: lognorm
           lognorm_mu: 0.0
           lognorm_sig: 1.0
           t_min: 0.01
           t_max: 0.99
-        - _target_: proteinzen.runtime.training.chain_conditioning.LigandConditioned
+        - _target_: proteinzen.runtime.training.chain_conditioning.LigandConditionedGenerateProtein
           prob: 0.25
           t_sched: lognorm
           lognorm_mu: 0.0

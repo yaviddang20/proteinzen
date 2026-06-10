@@ -2,7 +2,6 @@
 
 Loads a protein-ligand complex from a proteinzen npz file (e.g. from the Plinder
 dataset), fixes all protein chain atoms, and generates the ligand from pure noise.
-This is the inference counterpart to the ProteinConditioned training task.
 """
 import numpy as np
 from dataclasses import replace
@@ -54,7 +53,7 @@ def _strip_h(struct: Structure) -> Structure:
 
 
 def _crop_protein_to_pocket(struct: Structure, max_protein_residues: int) -> Structure:
-    """Keep all ligand (NONPOLYMER) residues + the closest protein residues to the ligand.
+    """Keep all ligand residues + the closest protein residues to the ligand.
 
     Protein residues are ranked by their minimum heavy-atom distance to any
     ligand atom and kept greedily nearest-first up to max_protein_residues.

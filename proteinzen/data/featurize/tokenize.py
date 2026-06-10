@@ -779,7 +779,7 @@ class StructureTokenizer:
             is_copy=False,
             is_unindexed=False,
             is_atomized=False,
-            seq_noising_mask=noise_seq
+            seq_noising_mask=noise_seq,
             hotspot_type=hotspot_type
         )
 

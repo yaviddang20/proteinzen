@@ -25,8 +25,8 @@ from proteinzen.data.featurize.tokenize import tokenize_structure, Tokenized
 # from proteinzen.data.featurize.assembler import featurize_training, collate
 from proteinzen.data.featurize.assembler import featurize, collate
 
-from proteinzen.runtime.sampling.dispatcher import BiomoleculeTaskDispatcher
-
+from proteinzen.runtime.sampling.dispatcher import BiomoleculeTaskDispatcher, TaskBatchSampler
+from typing import Optional
 
 def compute_lap_pe(adj: np.ndarray, k: int) -> np.ndarray:
     """k smallest non-trivial eigenvectors of normalized graph Laplacian.
@@ -671,6 +671,7 @@ class BiomoleculeDataModule(L.LightningDataModule):
                  train_dataset: TrainingDataset,
                  batch_size,  # this is PER GPU
                  num_workers,
+                 val_dataset: Optional[ValidationDataset] = None,
                  ):
         super().__init__()
         self.batch_size = batch_size
@@ -704,7 +705,6 @@ class BiomoleculeSamplingDataModule(L.LightningDataModule):
                  trans_std: float = 3,
                  include_h: bool = False,
                  batch_same_task_only=False,
-                 use_collate_for_pad=False
     ):
         super().__init__()
         self.batching_mode = batching_mode
@@ -719,13 +719,6 @@ class BiomoleculeSamplingDataModule(L.LightningDataModule):
             include_h=include_h,
         )
 
-    def predict_dataloader(self):
-        dataloader = DataLoader(
-            self.task_dispatcher,
-            batch_size=self.batch_size,
-            collate_fn=collate,
-            shuffle=False
-        )
 
         if batch_same_task_only:
             self.batch_sampler = TaskBatchSampler(
