@@ -1,0 +1,57 @@
+_target_: proteinzen.data.datasets.datamodule.TrainingDataset
+max_crop_residues: 160
+max_crop_rigids: 512
+use_cropper: true
+datasets:
+  - _target_: proteinzen.data.datasets.dataset.MMCIFDataset
+    mode: train
+    data_dir: ${oc.env:REPO_ROOT}/plinder_processed
+    use_conformer_record: false
+    data_sampler:
+      _target_: proteinzen.boltz.data.sample.cluster.ClusterSampler
+    task_sampler:
+      _target_: proteinzen.runtime.training.task.TaskSampler
+      task_list:
+        - _target_: proteinzen.runtime.training.chain_conditioning.ProteinConditionedGenerateLigand
+          prob: 0.25
+          t_sched: lognorm
+          lognorm_mu: 0.0
+          lognorm_sig: 1.0
+          beta_p1: 1.9
+          beta_p2: 1.0
+          t_min: 0.01
+          t_max: 0.99
+        - _target_: proteinzen.runtime.training.chain_conditioning.LigandConditionedGenerateProtein
+          prob: 0.25
+          t_sched: lognorm
+          lognorm_mu: 0.0
+          lognorm_sig: 1.0
+          beta_p1: 1.9
+          beta_p2: 1.0
+          t_min: 0.01
+          t_max: 0.99
+        - _target_: proteinzen.runtime.training.ligand_motif_scaffold.JointProteinLigandGeneration
+          prob: 0.25
+          t_sched: lognorm
+          lognorm_mu: 0.0
+          lognorm_sig: 1.0
+          beta_p1: 1.9
+          beta_p2: 1.0
+          t_min: 0.01
+          t_max: 0.99
+        - _target_: proteinzen.runtime.training.ligand_motif_scaffold.LigandConditionedMotifScaffolding
+          prob: 0.25
+          t_sched: lognorm
+          lognorm_mu: 0.0
+          lognorm_sig: 1.0
+          beta_p1: 1.9
+          beta_p2: 1.0
+          t_min: 0.01
+          t_max: 0.99
+          binding_site_radius: 6.0
+          max_num_motif_res: 20
+          p_is_unindexed: 0.8
+    exclude_mol_types:
+      - "DNA"
+      - "RNA"
+    interface_crop: true
