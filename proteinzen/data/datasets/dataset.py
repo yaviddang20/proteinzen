@@ -97,6 +97,8 @@ class MMCIFDataset(data.Dataset):
         self.manifest = []
         num_records = 0
         for record in self.raw_manifest:
+            if 'id' not in record:
+                record['id'] = record['ids'][0]
             # remove records which contain mol types we're excluding
             _exclude_record = False
             for chain in record['chains']:
@@ -165,8 +167,8 @@ class MMCIFDataset(data.Dataset):
 
             # ensure a minimum protein content
             if self.min_percent_protein:
-                num_protein_res = sum(chain['num_resolved_residues'] for chain in record['chains'] if chain['mol_type'] == const.chain_type_ids["PROTEIN"])
-                num_res = sum(chain['num_resolved_residues'] for chain in record['chains'])
+                num_protein_res = sum(chain.get('num_resolved_residues', chain['num_residues']) for chain in record['chains'] if chain['mol_type'] == const.chain_type_ids["PROTEIN"])
+                num_res = sum(chain.get('num_resolved_residues', chain['num_residues']) for chain in record['chains'])
                 if num_protein_res / num_res < self.min_percent_protein:
                     continue
 
@@ -190,12 +192,15 @@ class MMCIFDataset(data.Dataset):
 
             # apply some filtering critera that we might change at train time
             if self.count_on_protein_res:
-                num_res = sum(chain['num_resolved_residues'] for chain in record['chains'] if chain['mol_type'] == const.chain_type_ids['PROTEIN'])
+                num_res = sum(chain.get('num_resolved_residues', chain['num_residues']) for chain in record['chains'] if chain['mol_type'] == const.chain_type_ids['PROTEIN'])
             else:
-                num_res = sum(chain['num_resolved_residues'] for chain in record['chains'])
+                num_res = sum(chain.get('num_resolved_residues', chain['num_residues']) for chain in record['chains'])
             if num_res > self.max_num_res or num_res < self.min_num_res:
                 continue
-            resolution = record['structure']['resolution']
+            if 'structure' in record:
+                resolution = record['structure']['resolution']
+            else:
+                resolution = record['structures'][0]['resolution']
             if resolution is not None and resolution > self.max_resolution:
                 continue
             if self.split is not None and record['id'] not in self.split:

@@ -844,7 +844,7 @@ class StructureTokenizer:
         chain,
         res,
         hotspot_type,
-        entity_id
+        entity_id,
     ):
         token_idx = self.token_idx
         rigid_idx = self.rigid_idx
@@ -878,10 +878,10 @@ class StructureTokenizer:
 
             atom_tensor7, num_real_input_axes = arbitrary_atom_to_frame(
                 atom,
-                atom_idx if not process_isolated else i,
+                atom_idx,
                 valid_neighbors,
                 valid_neighbor_coords,
-                self.bond_graph
+                self.bond_graph,
                 use_identity_rot=self.use_identity_rot,
             )
 

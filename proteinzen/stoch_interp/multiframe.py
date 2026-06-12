@@ -338,21 +338,22 @@ class MultiSE3Interpolant:
         # [N]
         rigids_mask = rigids_data["rigids_mask"]
         rigids_noising_mask = rigids_data["rigids_noising_mask"]
-        if identity_rot_noise:
-            rotmats_0 = torch.eye(
-                3,
-                device=rotmats_1.device,
-                dtype=torch.float32
-            ).expand(*rotmats_1.shape[:-2], 3, 3)
+    
+        if "rigids_0" in rigids_data:
+            rigids_0 = ru.Rigid.from_tensor_7(rigids_data["rigids_0"])
+            trans_0 = rigids_0.get_trans()
+            rotmats_0 = rigids_0.get_rots().get_rot_mats()
         else:
-            if "rigids_0" in rigids_data:
-                rigids_0 = ru.Rigid.from_tensor_7(rigids_data["rigids_0"])
-                trans_0 = rigids_0.get_trans()
-                rotmats_0 = rigids_0.get_rots().get_rot_mats()
+            if identity_rot_noise:
+                rotmats_0 = torch.eye(
+                    3,
+                    device=rotmats_1.device,
+                    dtype=torch.float32
+                ).expand(*rotmats_1.shape[:-2], 3, 3)
             else:
                 rotmats_0 = self._sample_rotmats_0(rotmats_1)
-                trans_0 = torch.randn_like(trans_1) * self.trans_prior_std
-                trans_0 = trans_0 - trans_0.mean(dim=1)[..., None, :]
+            trans_0 = torch.randn_like(trans_1) * self.trans_prior_std
+            trans_0 = trans_0 - trans_0.mean(dim=1)[..., None, :]
 
         global_center = (trans_1 * rigids_mask[..., None]).sum(dim=1) / rigids_mask.long().sum(dim=1)[..., None].clip(min=1)
 

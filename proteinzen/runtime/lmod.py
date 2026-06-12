@@ -36,6 +36,7 @@ from proteinzen.data.write.pdb import to_pdb
 from proteinzen.model.utils import gather_helper
 from proteinzen.model.denoiser_v2 import MonotonicIncreasingFn
 from proteinzen.stoch_interp.integration import Integrator
+from proteinzen.stoch_interp import so3_utils
 
 from .utils import gen_pbar_str
 from .ema import EMAModel
@@ -414,6 +415,42 @@ def write_val_pdb(gt_rigid7, pred_rigid7, rigids_mask, ref_elements, is_atom_mas
         f.write("END\n")
 
 
+def _detach_cpu_batch(obj):
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu()
+    elif isinstance(obj, dict):
+        return {k: _detach_cpu_batch(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_detach_cpu_batch(v) for v in obj]
+    elif isinstance(obj, tuple):
+        return tuple(_detach_cpu_batch(v) for v in obj)
+    return obj
+
+
+def _move_to_device(obj, device):
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device)
+    elif isinstance(obj, dict):
+        return {k: _move_to_device(v, device) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_move_to_device(v, device) for v in obj]
+    elif isinstance(obj, tuple):
+        return tuple(_move_to_device(v, device) for v in obj)
+    return obj
+
+
+def _slice_batch(obj, i):
+    if isinstance(obj, torch.Tensor):
+        return obj[i:i+1]
+    elif isinstance(obj, dict):
+        return {k: _slice_batch(v, i) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return obj[i:i+1]
+    elif isinstance(obj, tuple):
+        return tuple(_slice_batch(v, i) for v in obj)
+    return obj
+
+
 class BiomoleculeModule(L.LightningModule):
     def __init__(self,
                  model,
@@ -462,6 +499,8 @@ class BiomoleculeModule(L.LightningModule):
                  use_interface_fafe_loss=False,
                  use_interchain_fafe_loss=False,
                  use_brownian_rot_path_loss=False,
+                 epoch_sample_every_n_epochs=5,
+                 epoch_sample_num_steps=100,
                  # use_stabilized_high_t_loss=False
     ):
         super().__init__()
@@ -537,7 +576,10 @@ class BiomoleculeModule(L.LightningModule):
         self.scale_trans_mse_loss = scale_trans_mse_loss
         self.use_min_conformer_head = use_min_conformer_head
         self.accumulate_grad_batches = accumulate_grad_batches
-
+        self.epoch_sample_every_n_epochs = epoch_sample_every_n_epochs
+        self.epoch_sample_num_steps = epoch_sample_num_steps
+        self._epoch_sample_train_batch = None
+        self._epoch_sample_val_batch = None
 
         self.aatype_to_restype_tensor = torch.zeros(const.num_tokens)
         for aatype, restype in AA_TO_RES.items():
@@ -765,6 +807,9 @@ class BiomoleculeModule(L.LightningModule):
             if self.ema_short is not None:
                 self.ema_short.update_parameters(self.model, self.global_step - 1)
 
+        if batch_idx == 0:
+            self._epoch_sample_train_batch = _detach_cpu_batch(batch)
+
         has_sequential = any(t.name == 'mol_sequential_scaffolding' for t in batch['task'])
 
         if not has_sequential:
@@ -844,6 +889,9 @@ class BiomoleculeModule(L.LightningModule):
     def validation_step(self, batch, batch_idx):
         device = batch["t"].device
         B = batch["t"].shape[0]
+
+        if batch_idx == 0:
+            self._epoch_sample_val_batch = _detach_cpu_batch(batch)
 
         num_gpus = max(1, self.trainer.world_size)
         n_samples = max(5, num_gpus) // num_gpus
@@ -955,7 +1003,7 @@ class BiomoleculeModule(L.LightningModule):
                     token_residue_idx=data['token_residue_idx'][i],
                 )
             except Exception as e:
-                log.warning(f"val PDB write failed for sample {i}: {e}", exc_info=True)
+                self._log.warning(f"val PDB write failed for sample {i}: {e}", exc_info=True)
 
     def on_validation_epoch_end(self):
         metrics = self.trainer.callback_metrics
@@ -972,6 +1020,132 @@ class BiomoleculeModule(L.LightningModule):
                 prog_bar=True,
                 sync_dist=False,
             )
+
+    def on_train_epoch_end(self):
+        epoch = self.trainer.current_epoch
+        if epoch % self.epoch_sample_every_n_epochs != 0:
+            return
+        if self._epoch_sample_train_batch is not None:
+            self._run_epoch_sample(self._epoch_sample_train_batch, "train")
+        if self._epoch_sample_val_batch is not None:
+            self._run_epoch_sample(self._epoch_sample_val_batch, "val")
+
+    @torch.no_grad()
+    def _run_epoch_sample(self, batch_cpu, split):
+        """Run full ODE integration from t=0 on a stashed batch and write a PDB."""
+        epoch = self.trainer.current_epoch
+        rank = self.trainer.global_rank
+        device = self.device
+
+        model = self.ema.module if (self.use_ema and self.ema is not None) else self.model
+        model.eval()
+
+        try:
+            batch = _move_to_device(_slice_batch(batch_cpu, 0), device)
+            B = 1
+
+            # Set t=0 for pure-noise initialization, then corrupt to get centered GT + noise
+            batch['t'] = torch.zeros(B, 1, device=device)
+            batch['trans_t'] = batch['t']
+            batch['rot_t'] = batch['t']
+            batch = self.corrupter.corrupt_dense_batch(batch, self.identity_rot_noise)
+
+            rigids_data = batch['rigids']
+            rigids_mask = rigids_data['rigids_mask']          # [1, N]
+            rigids_noising_mask = rigids_data['rigids_noising_mask']  # [1, N]
+
+            # Initial noise state (rigids_t at t=0 is pure noise)
+            trans_t = rigids_data['trans_t'].clone()          # [1, N, 3]
+            rotmats_t = rigids_data['rotmats_t'].clone()      # [1, N, 3, 3]
+
+            n_steps = self.epoch_sample_num_steps
+            ts = torch.linspace(0.0, 1.0, n_steps + 1)
+            t_1 = ts[0]
+            denoiser_out = None
+
+            for t_2 in ts[1:]:
+                dt = float(t_2 - t_1)
+                denom = max(1.0 - float(t_1), 1e-4)
+
+                rigids_data['trans_t'] = trans_t
+                rigids_data['rotmats_t'] = rotmats_t
+                rigids_data['rigids_t'] = ru.Rigid(
+                    rots=ru.Rotation(rot_mats=rotmats_t), trans=trans_t
+                ).to_tensor_7()
+                batch['t'] = torch.full((B, 1), float(t_1), device=device)
+
+                denoiser_out = model(batch, self_condition=denoiser_out)
+
+                pred_rigids = denoiser_out['denoised_rigids']
+                pred_trans_1 = pred_rigids.get_trans()
+                pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
+
+                # Translation Euler step (flow-matching VF = (x1_pred - xt) / (1 - t))
+                trans_vf = (pred_trans_1 - trans_t) / denom
+                trans_t_next = trans_t + dt * trans_vf
+                trans_t_next = torch.where(rigids_noising_mask[..., None], trans_t_next, trans_t)
+
+                # Rotation Euler step (SO3 geodesic VF)
+                rot_vf = so3_utils.calc_rot_vf(rotmats_t, pred_rotmats_1) / denom
+                rot_update = so3_utils.rotvec_to_rotmat(rot_vf * dt)
+                rotmats_t_next = torch.einsum("...ij,...jk->...ik", rotmats_t, rot_update)
+                rotmats_t_next = torch.where(
+                    rigids_noising_mask[..., None, None], rotmats_t_next, rotmats_t
+                )
+
+                trans_t = trans_t_next
+                rotmats_t = rotmats_t_next
+                t_1 = t_2
+
+                if not model.self_conditioning:
+                    denoiser_out = None
+
+            # Final model call at t=1
+            rigids_data['trans_t'] = trans_t
+            rigids_data['rotmats_t'] = rotmats_t
+            rigids_data['rigids_t'] = ru.Rigid(
+                rots=ru.Rotation(rot_mats=rotmats_t), trans=trans_t
+            ).to_tensor_7()
+            batch['t'] = torch.ones(B, 1, device=device)
+            denoiser_out = model(batch, self_condition=denoiser_out)
+            final_rigids = denoiser_out['denoised_rigids']
+
+            out_dir = os.path.join(self.trainer.log_dir, f"epoch_samples/epoch_{epoch:04d}/{split}")
+            os.makedirs(out_dir, exist_ok=True)
+
+            gt_rigid7 = rigids_data['rigids_1'].cpu().numpy()
+            pred_rigid7 = final_rigids.to_tensor_7().cpu().numpy()
+            rigids_mask_np = rigids_mask.cpu().numpy().astype(bool)
+            noising_mask_np = rigids_noising_mask.cpu().numpy().astype(bool)
+            ref_elements = rigids_data['rigids_ref_element'].cpu().numpy()
+            is_atom_mask = rigids_data['rigids_is_atom_mask'].cpu().numpy().astype(bool)
+
+            pred_rigid7_display = np.where(noising_mask_np[:, :, None], pred_rigid7, gt_rigid7)
+
+            record_id = batch.get('record_id', [None])[0]
+            rid = (record_id if record_id is not None else "sample_0")
+            rid = rid.replace("/", "_").replace(" ", "_")
+            path = os.path.join(out_dir, f"{rid}_rank{rank}.pdb")
+
+            write_val_pdb(
+                gt_rigid7[0],
+                pred_rigid7_display[0],
+                rigids_mask_np[0],
+                ref_elements[0],
+                is_atom_mask[0],
+                rigids_data['rigids_sidechain_idx'].cpu().numpy()[0],
+                rigids_data['rigids_to_token'].cpu().numpy()[0],
+                rigids_data['rigids_seq_idx'].cpu().numpy()[0],
+                batch['token']['res_type'].cpu().numpy()[0],
+                batch['token']['asym_id'].cpu().numpy()[0],
+                path,
+                token_residue_idx=batch['token']['residue_idx'].cpu().numpy()[0],
+            )
+            self._log.info(f"Epoch {epoch} integration sample ({split}) written: {path}")
+        except Exception as e:
+            self._log.warning(f"Epoch sample integration failed ({split}, epoch {epoch}): {e}", exc_info=True)
+        finally:
+            model.train()
 
     #     return loss_dict
     # def training_step(self, batch, batch_idx):
@@ -1175,8 +1349,8 @@ class BiomoleculeModule(L.LightningModule):
         )
 
         frame_vf_loss = (
-            frame_fm_loss_dict["trans_vf_loss"] +
-            frame_fm_loss_dict["rot_vf_loss"]
+            frame_fm_loss_dict["raw_trans_vf_loss"] +
+            frame_fm_loss_dict["raw_rot_vf_loss"]
         )
         unscaled_frame_vf_loss = (
             frame_fm_loss_dict["unscaled_trans_vf_loss"] +
@@ -1259,12 +1433,6 @@ class BiomoleculeModule(L.LightningModule):
             min_conformer_heavy_trans_mse = (se_mc * heavy_mask).sum(-1) / num_heavy
             loss = loss + min_conformer_trans_mse.mean()
 
-        loss_dict = {"loss": loss.mean(), "frame_vf_loss": frame_vf_loss, "frame_vf_loss_unscaled": unscaled_frame_vf_loss}
-        loss_dict['loss_per_batch'] = loss
-        if min_conformer_active:
-            loss_dict['min_conformer_trans_mse'] = min_conformer_trans_mse
-            loss_dict['min_conformer_heavy_trans_mse'] = min_conformer_heavy_trans_mse
-
         if self.use_interface_fafe_loss:
             loss = loss + 0.5 * frame_fm_loss_dict['scaled_interface_fafe']
 
@@ -1282,6 +1450,9 @@ class BiomoleculeModule(L.LightningModule):
 
         loss_dict = {"loss": loss.mean(), "frame_vf_loss": frame_vf_loss, "frame_vf_loss_unscaled": unscaled_frame_vf_loss}
         loss_dict['loss_per_batch'] = loss
+        if min_conformer_active:
+            loss_dict['min_conformer_trans_mse'] = min_conformer_trans_mse
+            loss_dict['min_conformer_heavy_trans_mse'] = min_conformer_heavy_trans_mse
 
         # if self.t_sched is not None:
         #     self.

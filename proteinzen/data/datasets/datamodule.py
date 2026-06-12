@@ -14,6 +14,7 @@ import pandas as pd
 from proteinzen.boltz.data.types import (
     Structure,
     Connection,
+    Interface,
     Record,
     ConformerRecord,
 )
@@ -167,13 +168,17 @@ def load_input(record: Record, data_dir, include_h: bool = False):
         new_atoms["chirality"] = 0
         atoms = new_atoms
 
+    interfaces = structure["interfaces"]
+    if interfaces.dtype.names is None or 'chain_1' not in interfaces.dtype.names:
+        interfaces = np.array([], dtype=np.dtype(Interface))
+
     struct = Structure(
         atoms=atoms,
         bonds=structure["bonds"],
         residues=structure["residues"],
         chains=chains, # chains var accounting for missing cyclic_period
         connections=structure["connections"].astype(Connection),
-        interfaces=structure["interfaces"],
+        interfaces=interfaces,
         mask=structure["mask"],
     )
 

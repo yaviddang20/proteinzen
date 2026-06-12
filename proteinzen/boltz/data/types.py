@@ -519,7 +519,7 @@ class ChainInfo:
     cluster_id: Union[str, int]
     msa_id: Union[str, int]
     num_residues: int
-    num_resolved_residues: int
+    num_resolved_residues: Optional[int] = None
     valid: bool = True
     entity_id: Optional[Union[str, int]] = None
 
