@@ -987,23 +987,20 @@ class BiomoleculeModule(L.LightningModule):
             rid = record_ids[i] if record_ids[i] is not None else f"sample_{i:02d}"
             rid = rid.replace("/", "_").replace(" ", "_")
             path = os.path.join(out_dir, f"{rid}_rank{rank}_mse={mse_val:.3f}.pdb")
-            try:
-                write_val_pdb(
-                    gt_rigid7[i],
-                    pred_rigid7_display[i],
-                    rigids_mask[i],
-                    ref_elements[i],
-                    is_atom_mask[i],
-                    data['rigids_sc_idx'][i],
-                    data['rigids_to_token'][i],
-                    data['rigids_seq_idx'][i],
-                    data['res_types_tok'][i],
-                    data['asym_ids_tok'][i],
-                    path,
-                    token_residue_idx=data['token_residue_idx'][i],
-                )
-            except Exception as e:
-                self._log.warning(f"val PDB write failed for sample {i}: {e}", exc_info=True)
+            write_val_pdb(
+                gt_rigid7[i],
+                pred_rigid7_display[i],
+                rigids_mask[i],
+                ref_elements[i],
+                is_atom_mask[i],
+                data['rigids_sc_idx'][i],
+                data['rigids_to_token'][i],
+                data['rigids_seq_idx'][i],
+                data['res_types_tok'][i],
+                data['asym_ids_tok'][i],
+                path,
+                token_residue_idx=data['token_residue_idx'][i],
+            )
 
     def on_validation_epoch_end(self):
         metrics = self.trainer.callback_metrics
@@ -1040,8 +1037,7 @@ class BiomoleculeModule(L.LightningModule):
         model = self.ema.module if (self.use_ema and self.ema is not None) else self.model
         model.eval()
 
-        try:
-            batch = _move_to_device(_slice_batch(batch_cpu, 0), device)
+        batch = _move_to_device(_slice_batch(batch_cpu, 0), device)
             B = 1
 
             # Set t=0 for pure-noise initialization, then corrupt to get centered GT + noise
@@ -1142,8 +1138,6 @@ class BiomoleculeModule(L.LightningModule):
                 token_residue_idx=batch['token']['residue_idx'].cpu().numpy()[0],
             )
             self._log.info(f"Epoch {epoch} integration sample ({split}) written: {path}")
-        except Exception as e:
-            self._log.warning(f"Epoch sample integration failed ({split}, epoch {epoch}): {e}", exc_info=True)
         finally:
             model.train()
 
