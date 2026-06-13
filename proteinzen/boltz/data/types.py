@@ -530,8 +530,8 @@ class InterfaceInfo:
 
     chain_1: int
     chain_2: int
-    chain_1_num_res: int
-    chain_2_num_res: int
+    chain_1_num_res: Optional[int] = None
+    chain_2_num_res: Optional[int] = None
     valid: bool = True
 
 

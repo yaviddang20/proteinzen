@@ -176,6 +176,8 @@ class MMCIFDataset(data.Dataset):
             if self.min_interface_size:
                 # TODO: there's probably a smarter way of dealing with this wrt making sure we dont exclude small molecule interfaces
                 for interface in record['interfaces']:
+                    if interface.get('chain_1_num_res') is None or interface.get('chain_2_num_res') is None:
+                        continue
                     interface_size = min(interface['chain_1_num_res'], interface['chain_2_num_res'])
                     if interface_size < self.min_interface_size:
                         interface['valid'] = False
