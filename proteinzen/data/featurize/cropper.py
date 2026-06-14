@@ -378,6 +378,16 @@ class Cropper:
         
         total_rigids = 0
 
+        # Always seed non-protein chains (ligands) in full before the greedy loop
+        protein_type = const.chain_type_ids["PROTEIN"]
+        for chain in valid_chains:
+            if int(chain["mol_type"]) == protein_type:
+                continue
+            chain_tokens = token_data[token_data["asym_id"] == chain["asym_id"]]
+            new_indices = set(chain_tokens["token_idx"]) - cropped
+            cropped.update(new_indices)
+            total_rigids += int(np.sum(token_data[list(new_indices)]["rigid_num"]))
+
         if self.attempt_to_keep_full_binder_chain and interface is not None:
             chain_1_tokens = token_data[token_data["asym_id"] == interface[0]]
             chain_1_tokens = chain_1_tokens[chain_1_tokens['is_resolved']]

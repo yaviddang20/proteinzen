@@ -1038,108 +1038,104 @@ class BiomoleculeModule(L.LightningModule):
         model.eval()
 
         batch = _move_to_device(_slice_batch(batch_cpu, 0), device)
-            B = 1
+        B = 1
 
-            # Set t=0 for pure-noise initialization, then corrupt to get centered GT + noise
-            batch['t'] = torch.zeros(B, 1, device=device)
-            batch['trans_t'] = batch['t']
-            batch['rot_t'] = batch['t']
-            batch = self.corrupter.corrupt_dense_batch(batch, self.identity_rot_noise)
+        # Set t=0 for pure-noise initialization, then corrupt to get centered GT + noise
+        batch['t'] = torch.zeros(B, 1, device=device)
+        batch['trans_t'] = batch['t']
+        batch['rot_t'] = batch['t']
+        batch = self.corrupter.corrupt_dense_batch(batch, self.identity_rot_noise)
 
-            rigids_data = batch['rigids']
-            rigids_mask = rigids_data['rigids_mask']          # [1, N]
-            rigids_noising_mask = rigids_data['rigids_noising_mask']  # [1, N]
+        rigids_data = batch['rigids']
+        rigids_mask = rigids_data['rigids_mask']
+        rigids_noising_mask = rigids_data['rigids_noising_mask']
 
-            # Initial noise state (rigids_t at t=0 is pure noise)
-            trans_t = rigids_data['trans_t'].clone()          # [1, N, 3]
-            rotmats_t = rigids_data['rotmats_t'].clone()      # [1, N, 3, 3]
+        trans_t = rigids_data['trans_t'].clone()
+        rotmats_t = rigids_data['rotmats_t'].clone()
 
-            n_steps = self.epoch_sample_num_steps
-            ts = torch.linspace(0.0, 1.0, n_steps + 1)
-            t_1 = ts[0]
-            denoiser_out = None
+        n_steps = self.epoch_sample_num_steps
+        ts = torch.linspace(0.0, 1.0, n_steps + 1)
+        t_1 = ts[0]
+        denoiser_out = None
 
-            for t_2 in ts[1:]:
-                dt = float(t_2 - t_1)
-                denom = max(1.0 - float(t_1), 1e-4)
+        for t_2 in ts[1:]:
+            dt = float(t_2 - t_1)
+            denom = max(1.0 - float(t_1), 1e-4)
 
-                rigids_data['trans_t'] = trans_t
-                rigids_data['rotmats_t'] = rotmats_t
-                rigids_data['rigids_t'] = ru.Rigid(
-                    rots=ru.Rotation(rot_mats=rotmats_t), trans=trans_t
-                ).to_tensor_7()
-                batch['t'] = torch.full((B, 1), float(t_1), device=device)
-
-                denoiser_out = model(batch, self_condition=denoiser_out)
-
-                pred_rigids = denoiser_out['denoised_rigids']
-                pred_trans_1 = pred_rigids.get_trans()
-                pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
-
-                # Translation Euler step (flow-matching VF = (x1_pred - xt) / (1 - t))
-                trans_vf = (pred_trans_1 - trans_t) / denom
-                trans_t_next = trans_t + dt * trans_vf
-                trans_t_next = torch.where(rigids_noising_mask[..., None], trans_t_next, trans_t)
-
-                # Rotation Euler step (SO3 geodesic VF)
-                rot_vf = so3_utils.calc_rot_vf(rotmats_t, pred_rotmats_1) / denom
-                rot_update = so3_utils.rotvec_to_rotmat(rot_vf * dt)
-                rotmats_t_next = torch.einsum("...ij,...jk->...ik", rotmats_t, rot_update)
-                rotmats_t_next = torch.where(
-                    rigids_noising_mask[..., None, None], rotmats_t_next, rotmats_t
-                )
-
-                trans_t = trans_t_next
-                rotmats_t = rotmats_t_next
-                t_1 = t_2
-
-                if not model.self_conditioning:
-                    denoiser_out = None
-
-            # Final model call at t=1
             rigids_data['trans_t'] = trans_t
             rigids_data['rotmats_t'] = rotmats_t
             rigids_data['rigids_t'] = ru.Rigid(
                 rots=ru.Rotation(rot_mats=rotmats_t), trans=trans_t
             ).to_tensor_7()
-            batch['t'] = torch.ones(B, 1, device=device)
+            batch['t'] = torch.full((B, 1), float(t_1), device=device)
+
             denoiser_out = model(batch, self_condition=denoiser_out)
-            final_rigids = denoiser_out['denoised_rigids']
 
-            out_dir = os.path.join(self.trainer.log_dir, f"epoch_samples/epoch_{epoch:04d}/{split}")
-            os.makedirs(out_dir, exist_ok=True)
+            pred_rigids = denoiser_out['denoised_rigids']
+            pred_trans_1 = pred_rigids.get_trans()
+            pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
 
-            gt_rigid7 = rigids_data['rigids_1'].cpu().numpy()
-            pred_rigid7 = final_rigids.to_tensor_7().cpu().numpy()
-            rigids_mask_np = rigids_mask.cpu().numpy().astype(bool)
-            noising_mask_np = rigids_noising_mask.cpu().numpy().astype(bool)
-            ref_elements = rigids_data['rigids_ref_element'].cpu().numpy()
-            is_atom_mask = rigids_data['rigids_is_atom_mask'].cpu().numpy().astype(bool)
+            trans_vf = (pred_trans_1 - trans_t) / denom
+            trans_t_next = trans_t + dt * trans_vf
+            trans_t_next = torch.where(rigids_noising_mask[..., None], trans_t_next, trans_t)
 
-            pred_rigid7_display = np.where(noising_mask_np[:, :, None], pred_rigid7, gt_rigid7)
-
-            record_id = batch.get('record_id', [None])[0]
-            rid = (record_id if record_id is not None else "sample_0")
-            rid = rid.replace("/", "_").replace(" ", "_")
-            path = os.path.join(out_dir, f"{rid}_rank{rank}.pdb")
-
-            write_val_pdb(
-                gt_rigid7[0],
-                pred_rigid7_display[0],
-                rigids_mask_np[0],
-                ref_elements[0],
-                is_atom_mask[0],
-                rigids_data['rigids_sidechain_idx'].cpu().numpy()[0],
-                rigids_data['rigids_to_token'].cpu().numpy()[0],
-                rigids_data['rigids_seq_idx'].cpu().numpy()[0],
-                batch['token']['res_type'].cpu().numpy()[0],
-                batch['token']['asym_id'].cpu().numpy()[0],
-                path,
-                token_residue_idx=batch['token']['residue_idx'].cpu().numpy()[0],
+            rot_vf = so3_utils.calc_rot_vf(rotmats_t, pred_rotmats_1) / denom
+            rot_update = so3_utils.rotvec_to_rotmat(rot_vf * dt)
+            rotmats_t_next = torch.einsum("...ij,...jk->...ik", rotmats_t, rot_update)
+            rotmats_t_next = torch.where(
+                rigids_noising_mask[..., None, None], rotmats_t_next, rotmats_t
             )
-            self._log.info(f"Epoch {epoch} integration sample ({split}) written: {path}")
-        finally:
-            model.train()
+
+            trans_t = trans_t_next
+            rotmats_t = rotmats_t_next
+            t_1 = t_2
+
+            if not model.self_conditioning:
+                denoiser_out = None
+
+        # Final model call at t=1
+        rigids_data['trans_t'] = trans_t
+        rigids_data['rotmats_t'] = rotmats_t
+        rigids_data['rigids_t'] = ru.Rigid(
+            rots=ru.Rotation(rot_mats=rotmats_t), trans=trans_t
+        ).to_tensor_7()
+        batch['t'] = torch.ones(B, 1, device=device)
+        denoiser_out = model(batch, self_condition=denoiser_out)
+        final_rigids = denoiser_out['denoised_rigids']
+
+        out_dir = os.path.join(self.trainer.log_dir, f"epoch_samples/epoch_{epoch:04d}/{split}")
+        os.makedirs(out_dir, exist_ok=True)
+
+        gt_rigid7 = rigids_data['rigids_1'].cpu().numpy()
+        pred_rigid7 = final_rigids.to_tensor_7().cpu().numpy()
+        rigids_mask_np = rigids_mask.cpu().numpy().astype(bool)
+        noising_mask_np = rigids_noising_mask.cpu().numpy().astype(bool)
+        ref_elements = rigids_data['rigids_ref_element'].cpu().numpy()
+        is_atom_mask = rigids_data['rigids_is_atom_mask'].cpu().numpy().astype(bool)
+
+        pred_rigid7_display = np.where(noising_mask_np[:, :, None], pred_rigid7, gt_rigid7)
+
+        record_id = batch.get('record_id', [None])[0]
+        rid = (record_id if record_id is not None else "sample_0")
+        rid = rid.replace("/", "_").replace(" ", "_")
+        path = os.path.join(out_dir, f"{rid}_rank{rank}.pdb")
+
+        write_val_pdb(
+            gt_rigid7[0],
+            pred_rigid7_display[0],
+            rigids_mask_np[0],
+            ref_elements[0],
+            is_atom_mask[0],
+            rigids_data['rigids_sidechain_idx'].cpu().numpy()[0],
+            rigids_data['rigids_to_token'].cpu().numpy()[0],
+            rigids_data['rigids_seq_idx'].cpu().numpy()[0],
+            batch['token']['res_type'].cpu().numpy()[0],
+            batch['token']['asym_id'].cpu().numpy()[0],
+            path,
+            token_residue_idx=batch['token']['residue_idx'].cpu().numpy()[0],
+        )
+        self._log.info(f"Epoch {epoch} integration sample ({split}) written: {path}")
+        model.train()
 
     #     return loss_dict
     # def training_step(self, batch, batch_idx):
