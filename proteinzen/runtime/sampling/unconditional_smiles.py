@@ -99,7 +99,6 @@ class UnconditionalSamplingFromSMILES(SamplingTask):
         for _ in range(self.num_samples):
             token_data, rigid_data, token_bonds, _ = sample_noise_from_struct_template(
                 struct,
-                igso3=igso3,
                 trans_std=self.trans_std
             )
             data = Tokenized(
@@ -165,7 +164,6 @@ class UnconditionalSamplingFromMol(SamplingTask):
         for _ in range(self.num_samples):
             token_data, rigid_data, token_bonds, _ = sample_noise_from_struct_template(
                 struct,
-                igso3=igso3,
                 trans_std=self.trans_std
             )
 
