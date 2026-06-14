@@ -1026,6 +1026,8 @@ class BiomoleculeModule(L.LightningModule):
             self._run_epoch_sample(self._epoch_sample_train_batch, "train")
         if self._epoch_sample_val_batch is not None:
             self._run_epoch_sample(self._epoch_sample_val_batch, "val")
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
 
     @torch.no_grad()
     def _run_epoch_sample(self, batch_cpu, split):
