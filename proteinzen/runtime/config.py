@@ -245,6 +245,10 @@ def config_sampling_hydra_store():
         name="euler"
     )
     integrator_store(
+        pbuilds(EulerIntegrator, no_rot_sampling=True),
+        name="euler_no_rot"
+    )
+    integrator_store(
         pbuilds(
             SteeredIntegrator,
             reward_model=builds(
@@ -339,6 +343,7 @@ def config_sampling_hydra_store():
         inference_mode=True,
         checkpoint_idx=-1,
         num_timesteps=400,
+        identity_rot_noise=False,
         hydra_defaults=[
             {"sampler": "default"},
             {"integrator": "euler"},

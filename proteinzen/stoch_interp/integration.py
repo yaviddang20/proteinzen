@@ -182,6 +182,10 @@ class EDMIntegrator(Integrator):
 
 
 class EulerIntegrator(Integrator):
+    def __init__(self, *, wrapped_model, diffeq, no_rot_sampling=False, **kwargs):
+        super().__init__(wrapped_model=wrapped_model, diffeq=diffeq, **kwargs)
+        self.no_rot_sampling = no_rot_sampling
+
     def integration_step(
         self,
         batch,
@@ -236,13 +240,16 @@ class EulerIntegrator(Integrator):
             scores_and_vfs,
             rigids_noising_mask
         )
-        rotmats_t_2 = self.diffeq.rot_step(
-            rotmats_t_1,
-            t,
-            d_t,
-            scores_and_vfs,
-            rigids_noising_mask
-        )
+        if self.no_rot_sampling:
+            rotmats_t_2 = rotmats_t_1
+        else:
+            rotmats_t_2 = self.diffeq.rot_step(
+                rotmats_t_1,
+                t,
+                d_t,
+                scores_and_vfs,
+                rigids_noising_mask
+            )
 
         prot_traj_point = (
             trans_t_2,

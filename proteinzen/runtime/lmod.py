@@ -1912,6 +1912,12 @@ class BiomoleculeSamplingModule(L.LightningModule):
             self.run_cfg['num_timesteps']
         )
 
+        if self.run_cfg.get('identity_rot_noise', False):
+            B, N = batch['rigids']['rigids_1'].shape[:2]
+            eye = torch.eye(3, device=batch['rigids']['rigids_1'].device)
+            identity_quat = ru.Rotation(rot_mats=eye.expand(B, N, 3, 3)).get_quats()
+            batch['rigids']['rigids_1'][..., :4] = identity_quat
+
         clean_traj, prot_traj, final_denoiser_out = self.integrator.sample(
             batch,
             ts
