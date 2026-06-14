@@ -100,13 +100,13 @@ def write_smiles_yaml(smiles_sample, conformer_counts, output_yaml_path):
     tasks = []
     for smiles, k in zip(smiles_to_use, conformer_counts):
         tasks.append({
-            "task": "unconditional_smiles",
+            "_target_": "proteinzen.runtime.sampling.unconditional_smiles.UnconditionalSamplingFromSMILES",
             "smiles": smiles,
             "num_samples": min(2 * k, 32),
             "name": hashlib.sha256(smiles.encode()).hexdigest()
         })
 
-    yaml_data = {"tasks": tasks}
+    yaml_data = tasks
 
     output_yaml_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_yaml_path, 'w') as f:
@@ -227,13 +227,13 @@ def write_mol_yaml(first_conformer_output_pdb_paths, conformer_counts, output_ya
         name = Path(pdb_path).stem
         name = name[:name.index("_")]
         tasks.append({
-            "task": "unconditional_mol",
+            "_target_": "proteinzen.runtime.sampling.unconditional_smiles.UnconditionalSamplingFromMol",
             "mol_pdb_path": str(pdb_path),
             "num_samples": min(2 * k, 32),
             "name": name
         })
 
-    yaml_data = {"tasks": tasks}
+    yaml_data = tasks
 
     output_yaml.parent.mkdir(parents=True, exist_ok=True)
     with open(output_yaml, 'w') as f:
