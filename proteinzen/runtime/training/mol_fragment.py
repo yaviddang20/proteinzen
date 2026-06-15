@@ -18,6 +18,7 @@ class MolFragmentScaffolding(TrainingTask):
     multiframe.py already gates on rigids_noising_mask.
     """
     name: str = "mol_fragment_scaffolding"
+    prealign_noise: bool = False
 
     def __init__(
         self,

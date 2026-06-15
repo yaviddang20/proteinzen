@@ -1,3 +1,4 @@
+
 #!/usr/bin/env bash
 # Usage:
 #   bash _scripts/run_eval.sh conformer <model_name> [extra eval.py args...]
@@ -16,7 +17,7 @@ shift 2
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-for SPLIT in train val test; do
+for SPLIT in train test; do
     echo "=== ${TASK} / ${SPLIT} ==="
     if [[ "${TASK}" == "conformer" ]]; then
         python "${DIR}/_scripts/eval.py" \

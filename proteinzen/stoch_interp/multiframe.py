@@ -425,7 +425,12 @@ class MultiSE3Interpolant:
             atom_data['atom14_alt_gt_positions'] *= atom_data['atom14_mask'][..., None]
 
 
-        if self.prealign_noise:
+        do_prealign = torch.tensor(
+            [getattr(t, "prealign_noise", self.prealign_noise) for t in batch["task"]],
+            dtype=torch.bool, device=trans_0.device,
+        )
+
+        if do_prealign.any():
             # rotate each structure to align as best as possible with noise
             align_mask = (rigids_mask * rigids_noising_mask).bool()
             align_batch = torch.tile(
@@ -450,6 +455,14 @@ class MultiSE3Interpolant:
                 ], dim=0)
             else:
                 align_rot_mats_safe = align_rot_mats
+
+            if not do_prealign.all():
+                eye = torch.eye(3, device=trans_0.device, dtype=trans_0.dtype)
+                align_rot_mats_safe = torch.where(
+                    do_prealign[:, None, None],
+                    align_rot_mats_safe,
+                    eye[None].expand(num_batch, -1, -1),
+                )
 
             trans_0 = torch.einsum("bni,bij->bnj", trans_0, align_rot_mats_safe)
 

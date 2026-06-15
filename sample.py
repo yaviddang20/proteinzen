@@ -103,20 +103,22 @@ def main(sampler,
     best_ckpt_path = None
     for ckpt_path in ckpt_list:
         fname = ckpt_path.split("/")[-1]
-        if fname == "best.ckpt":
-            has_best = True
-            best_ckpt_path = ckpt_path
-        elif fname == "last.ckpt":
+        # if fname == "best.ckpt":
+        #     has_best = True
+        #     best_ckpt_path = ckpt_path
+        if fname == "last.ckpt":
             epoch_list.append((ckpt_path, 1e6))
-        else:
+        elif '=' in ckpt_path:
             epoch = ckpt_path.split("=")[1].split("-")[0]
             epoch_list.append((ckpt_path, int(epoch)))
+        else:
+            continue
 
     epoch_list = sorted(epoch_list, key=lambda x: x[1])
     epoch_list, _ = zip(*epoch_list)
     ckpt_path = epoch_list[zen_cfg["checkpoint_idx"]]
-    if has_best:
-        ckpt_path = best_ckpt_path
+    # if has_best:
+    #     ckpt_path = best_ckpt_path
     print(ckpt_path)
     zen_cfg['ckpt_path'] = ckpt_path
 
