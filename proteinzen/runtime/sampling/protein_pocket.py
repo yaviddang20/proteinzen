@@ -297,7 +297,7 @@ class ProteinPocketConditionedSampling(SamplingTask):
         task_name = self.kwargs.get("name", self.task_name)
 
         for _ in range(self.num_samples):
-            token_data, rigid_data, token_bonds, fixed_com = sample_noise_from_struct_template(
+            token_data, rigid_data, token_bonds, fixed_com, _ = sample_noise_from_struct_template(
                 struct,
                 task_masks=task_masks,
                 trans_std=self.trans_std,

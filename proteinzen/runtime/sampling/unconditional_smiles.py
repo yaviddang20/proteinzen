@@ -97,7 +97,7 @@ class UnconditionalSamplingFromSMILES(SamplingTask):
         # clean_task_data["res_type_noising_mask"] = res_type_noising_mask
         # clean_token_data, clean_rigid_data, clean_token_bonds = tokenize_structure(struct, clean_task_data)
         for _ in range(self.num_samples):
-            token_data, rigid_data, token_bonds, _ = sample_noise_from_struct_template(
+            token_data, rigid_data, token_bonds, *_ = sample_noise_from_struct_template(
                 struct,
                 trans_std=self.trans_std
             )
@@ -162,7 +162,7 @@ class UnconditionalSamplingFromMol(SamplingTask):
         # clean_task_data["res_type_noising_mask"] = res_type_noising_mask
         # clean_token_data, clean_rigid_data, clean_token_bonds = tokenize_structure(struct, clean_task_data)
         for _ in range(self.num_samples):
-            token_data, rigid_data, token_bonds, _ = sample_noise_from_struct_template(
+            token_data, rigid_data, token_bonds, *_ = sample_noise_from_struct_template(
                 struct,
                 trans_std=self.trans_std
             )

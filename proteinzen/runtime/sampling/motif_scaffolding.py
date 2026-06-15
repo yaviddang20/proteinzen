@@ -448,7 +448,7 @@ class MotifScaffoldingTask(SamplingTask):
                 "residue_is_unindexed_mask": residue_is_unindexed_mask
             }
 
-            token_data, rigid_data, token_bonds, fixed_rigids_com = sample_noise_from_struct_template(
+            token_data, rigid_data, token_bonds, fixed_rigids_com, _ = sample_noise_from_struct_template(
                 struct,
                 task_masks=task_data
             )

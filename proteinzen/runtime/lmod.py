@@ -890,15 +890,19 @@ class BiomoleculeModule(L.LightningModule):
         device = batch["t"].device
         B = batch["t"].shape[0]
 
-        if batch_idx == 0:
-            self._epoch_sample_val_batch = _detach_cpu_batch(batch)
-
         num_gpus = max(1, self.trainer.world_size)
         n_samples = max(5, num_gpus) // num_gpus
         write_pdbs = (
             self.trainer.current_epoch % 5 == 0
             and batch_idx == 0  # only first val batch
         )
+        run_epoch_sample = (
+            self.trainer.current_epoch % self.epoch_sample_every_n_epochs == 0
+            and batch_idx == 0
+        )
+
+        if batch_idx == 0:
+            self._epoch_sample_val_batch = _detach_cpu_batch(batch)
 
         for t_val in (0.0, 0.5):
             batch_t = batch.copy()
@@ -919,6 +923,11 @@ class BiomoleculeModule(L.LightningModule):
                 batch_t,
                 stage=f"val/t_{t_val}",
             )
+
+        if run_epoch_sample:
+            if self._epoch_sample_train_batch is not None:
+                self._run_epoch_sample(self._epoch_sample_train_batch, "train")
+            self._run_epoch_sample(_detach_cpu_batch(batch), "val")
 
     def _collect_val_pdb_data(self, batch, outputs, t_val: float, n_samples: int = 5):
         """Extract all GPU tensors to CPU numpy."""
@@ -1019,15 +1028,7 @@ class BiomoleculeModule(L.LightningModule):
             )
 
     def on_train_epoch_end(self):
-        epoch = self.trainer.current_epoch
-        if epoch % self.epoch_sample_every_n_epochs != 0:
-            return
-        if self._epoch_sample_train_batch is not None:
-            self._run_epoch_sample(self._epoch_sample_train_batch, "train")
-        if self._epoch_sample_val_batch is not None:
-            self._run_epoch_sample(self._epoch_sample_val_batch, "val")
-        if dist.is_available() and dist.is_initialized():
-            dist.barrier()
+        pass
 
     @torch.no_grad()
     def _run_epoch_sample(self, batch_cpu, split):

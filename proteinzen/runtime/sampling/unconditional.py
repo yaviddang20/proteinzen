@@ -71,7 +71,7 @@ class UnconditionalSampling(SamplingTask):
                 'A': self.sample_length,
             }
             struct = generate_protein_structure_template(chain_lens)
-            token_data, rigid_data, token_bonds, _ = sample_noise_from_struct_template(
+            token_data, rigid_data, token_bonds, *_ = sample_noise_from_struct_template(
                 struct
             )
             data = Tokenized(
