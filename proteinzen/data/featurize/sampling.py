@@ -614,6 +614,22 @@ def sample_noise_from_struct_template(  # noqa: C901, PLR0915
     Returns:
         Tuple[np.ndarray, np.array, np.ndarray, np.ndarray]: _description_
     """
+    if task_masks is None:
+        n_atoms = len(struct.atoms)
+        n_residues = len(struct.residues)
+        residue_entity_ids = np.zeros(n_residues, dtype=int)
+        for chain in struct.chains[struct.mask]:
+            res_start = int(chain["res_idx"])
+            res_end = res_start + int(chain["res_num"])
+            residue_entity_ids[res_start:res_end] = int(chain["entity_id"])
+        task_masks = {
+            "atom_noising_mask": np.ones(n_atoms, dtype=bool),
+            "res_type_noising_mask": np.ones(n_residues, dtype=bool),
+            "residue_is_unindexed_mask": np.zeros(n_residues, dtype=bool),
+            "res_hotspot_type": np.zeros(n_residues, dtype=int),
+            "residue_entity_ids": residue_entity_ids,
+            "t": 0.0,
+        }
     tokenizer = SampleTemplateTokenizer(
         struct, task_masks, trans_std
     )
