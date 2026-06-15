@@ -956,10 +956,10 @@ class BiomoleculeModule(L.LightningModule):
 
         pred_rigid7_display = np.where(rigids_noising_mask[:, :, None], pred_rigid7, gt_rigid7)
 
-        noised_atom_mask = rigids_mask & rigids_noising_mask & is_atom_mask & (ref_elements != 1)
-        n_noised = noised_atom_mask.sum(axis=-1).clip(min=1)
+        noised_heavy_mask = rigids_mask & rigids_noising_mask & (ref_elements != 1)
+        n_noised = noised_heavy_mask.sum(axis=-1).clip(min=1)
         se = np.square(pred_trans - gt_trans).sum(axis=-1)
-        per_sample_mse = (se * noised_atom_mask).sum(axis=-1) / n_noised
+        per_sample_mse = (se * noised_heavy_mask).sum(axis=-1) / n_noised
 
         return dict(
             out_dir=out_dir, B=B, n_samples=n_samples, rank=rank,
@@ -1118,10 +1118,17 @@ class BiomoleculeModule(L.LightningModule):
 
         pred_rigid7_display = np.where(noising_mask_np[:, :, None], pred_rigid7, gt_rigid7)
 
+        gt_trans = ru.Rigid.from_tensor_7(torch.from_numpy(gt_rigid7)).get_trans().numpy()
+        pred_trans = final_rigids.get_trans().cpu().numpy()
+        noised_heavy_mask = rigids_mask_np & noising_mask_np & (ref_elements != 1)
+        n_noised = noised_heavy_mask[0].sum().clip(min=1)
+        se = np.square(pred_trans[0] - gt_trans[0]).sum(axis=-1)
+        integration_mse = float((se * noised_heavy_mask[0]).sum() / n_noised)
+
         record_id = batch.get('record_id', [None])[0]
         rid = (record_id if record_id is not None else "sample_0")
         rid = rid.replace("/", "_").replace(" ", "_")
-        path = os.path.join(out_dir, f"{rid}_rank{rank}.pdb")
+        path = os.path.join(out_dir, f"{rid}_rank{rank}_mse={integration_mse:.3f}.pdb")
 
         write_val_pdb(
             gt_rigid7[0],
@@ -1137,7 +1144,8 @@ class BiomoleculeModule(L.LightningModule):
             path,
             token_residue_idx=batch['token']['residue_idx'].cpu().numpy()[0],
         )
-        self._log.info(f"Epoch {epoch} integration sample ({split}) written: {path}")
+        self.log(f"epoch_sample/{split}/integration_mse", integration_mse, prog_bar=False, sync_dist=False)
+        self._log.info(f"Epoch {epoch} integration sample ({split}) written: {path} (mse={integration_mse:.3f})")
         model.train()
 
     #     return loss_dict
