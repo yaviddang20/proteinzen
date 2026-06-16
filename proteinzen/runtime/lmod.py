@@ -1147,7 +1147,7 @@ class BiomoleculeModule(L.LightningModule):
             path,
             token_residue_idx=batch['token']['residue_idx'].cpu().numpy()[0],
         )
-        self.log(f"epoch_sample/{split}/integration_mse", integration_mse, prog_bar=False, sync_dist=False)
+        self.log(f"epoch_sample/{split}/{task_name}/integration_mse", integration_mse, prog_bar=False, sync_dist=False)
         self._log.info(f"Epoch {epoch} integration sample ({split}) written: {path} (mse={integration_mse:.3f})")
         model.train()
 

@@ -115,5 +115,5 @@ class MolFragmentScaffolding(TrainingTask):
             "copy_atomized_residue_mask": copy_atomized_residue_mask,
         }
 
-    def max_added_tokens(self, _):
-        return 0
+    def max_added_tokens(self, N):
+        return int(self.max_frac_atoms * N)
