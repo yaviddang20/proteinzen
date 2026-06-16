@@ -51,6 +51,8 @@ class _ChainConditioningBase(TrainingTask):
         t_max=0.99,
         shift_time_scale=False,
         condition_mol_type="PROTEIN",
+        p_is_unindexed=0.8,
+        max_num_res=40,
     ):
         assert t_sched in ["lognorm", "mixed_beta", "uniform"]
         self.prob = prob
@@ -62,6 +64,8 @@ class _ChainConditioningBase(TrainingTask):
         self.t_min = t_min
         self.t_max = t_max
         self.condition_mol_type = const.chain_type_ids[condition_mol_type]
+        self.p_is_unindexed = p_is_unindexed
+        self.max_num_res = max_num_res
 
     def sample_t_and_mask(self, data):
         t = _make_t(
@@ -80,19 +84,39 @@ class _ChainConditioningBase(TrainingTask):
         res_type_noising_mask = np.ones(n_residues, dtype=bool)
         copy_indexed_residue_mask = np.zeros(n_residues, dtype=bool)
         copy_unindexed_residue_mask = np.zeros(n_residues, dtype=bool)
+        copy_atomized_residue_mask = np.zeros(n_residues, dtype=bool)
 
+        is_unindexed = np.random.rand(n_residues) < self.p_is_unindexed
+        protein_mol_type = const.chain_type_ids["PROTEIN"]
+
+        # Collect all conditioning residue indices first, then subsample
+        conditioning_res_indices = []
         for chain in chains:
             if int(chain["mol_type"]) != self.condition_mol_type:
                 continue
-
-            # Fix all atoms belonging to this chain
             res_start = int(chain["res_idx"])
             res_end = res_start + int(chain["res_num"])
-            for res in residues[res_start:res_end]:
-                atom_idx = int(res["atom_idx"])
-                atom_num = int(res["atom_num"])
-                atom_noising_mask[atom_idx:atom_idx + atom_num] = False
-            res_type_noising_mask[res_start:res_end] = False
+            conditioning_res_indices.extend(range(res_start, res_end))
+
+        if len(conditioning_res_indices) > self.max_num_res:
+            conditioning_res_indices = np.random.choice(
+                conditioning_res_indices, size=self.max_num_res, replace=False
+            ).tolist()
+
+        conditioning_res_set = set(conditioning_res_indices)
+
+        for res_idx in conditioning_res_indices:
+            res = residues[res_idx]
+            atom_idx = int(res["atom_idx"])
+            atom_num = int(res["atom_num"])
+            atom_noising_mask[atom_idx:atom_idx + atom_num] = False
+            res_type_noising_mask[res_idx] = False
+
+            if self.condition_mol_type == protein_mol_type:
+                copy_indexed_residue_mask[res_idx] = ~is_unindexed[res_idx]
+                copy_unindexed_residue_mask[res_idx] = is_unindexed[res_idx]
+            else:
+                copy_atomized_residue_mask[res_idx] = True
 
         return {
             "t": t,
@@ -100,11 +124,11 @@ class _ChainConditioningBase(TrainingTask):
             "res_type_noising_mask": res_type_noising_mask,
             "copy_indexed_residue_mask": copy_indexed_residue_mask,
             "copy_unindexed_residue_mask": copy_unindexed_residue_mask,
-            "copy_atomized_residue_mask": np.zeros(n_residues, dtype=bool),
+            "copy_atomized_residue_mask": copy_atomized_residue_mask,
         }
 
     def max_added_tokens(self, _):
-        return 0
+        return self.max_num_res
 
 
 class ProteinConditionedGenerateLigand(_ChainConditioningBase):

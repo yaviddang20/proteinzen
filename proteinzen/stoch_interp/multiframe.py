@@ -345,13 +345,14 @@ class MultiSE3Interpolant:
             rotmats_0 = rigids_0.get_rots().get_rot_mats()
         else:
             if identity_rot_noise:
-                rotmats_0 = torch.eye(
-                    3,
-                    device=rotmats_1.device,
-                    dtype=torch.float32
-                ).expand(*rotmats_1.shape[:-2], 3, 3)
+                is_atom = rigids_data["rigids_is_atom_mask"].bool()
+                rotmats_0_sampled = self._sample_rotmats_0(rotmats_1)
+                eye = torch.eye(3, device=rotmats_1.device, dtype=torch.float32).expand(*rotmats_1.shape[:-2], 3, 3)
+                rotmats_0 = torch.where(is_atom[..., None, None], eye, rotmats_0_sampled)
+                rigids_data["rigids_identity_rot_mask"] = is_atom
             else:
                 rotmats_0 = self._sample_rotmats_0(rotmats_1)
+                rigids_data["rigids_identity_rot_mask"] = torch.zeros_like(rigids_mask, dtype=torch.bool)
             trans_0 = torch.randn_like(trans_1) * self.trans_prior_std
             trans_0 = trans_0 - trans_0.mean(dim=1)[..., None, :]
 

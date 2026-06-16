@@ -95,11 +95,16 @@ class MolFragmentScaffolding(TrainingTask):
         # but we set it correctly anyway
         res_type_noising_mask = np.zeros(n_res, dtype=bool)
 
-        # No copy tokens needed: fixed atoms are already visible at ground
-        # truth coords in the noisy input via atom_noising_mask=False
         copy_indexed_residue_mask = np.zeros(n_res, dtype=bool)
         copy_unindexed_residue_mask = np.zeros(n_res, dtype=bool)
+        # Mark scaffold residues as atomized copy tokens (same logic as protein motif scaffolding)
         copy_atomized_residue_mask = np.zeros(n_res, dtype=bool)
+        for res_idx in range(n_res):
+            res = residues[res_idx]
+            a_start = int(res["atom_idx"])
+            a_end = a_start + int(res["atom_num"])
+            if not atom_noising_mask[a_start:a_end].all():
+                copy_atomized_residue_mask[res_idx] = True
 
         return {
             "t": t.numpy(force=True),

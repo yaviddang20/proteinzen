@@ -456,7 +456,7 @@ def generate_copy_structure(
 
     copy_indexed_residue_mask = task_data['copy_indexed_residue_mask']
     copy_unindexed_residue_mask = task_data['copy_unindexed_residue_mask']
-    assert not task_data['copy_atomized_residue_mask'].any(), "generate_copy_structure currently doesn't support copying atomized residues"
+    copy_atomized_residue_mask = task_data['copy_atomized_residue_mask']
 
     res_copied_indices = []
     atom_copied_indices = []
@@ -480,57 +480,62 @@ def generate_copy_structure(
         is_protein = chain["mol_type"] == const.chain_type_ids["PROTEIN"]
 
         for i, res in enumerate(struct.residues[res_start:res_end]):
+            res_idx = res_start + i
+
             # Standard residues are tokens
             if res["is_standard"] and (res['name'] != 'UNK') and is_protein:
-                res_idx = res_start + i #res['res_idx']
                 is_indexed = copy_indexed_residue_mask[res_idx]
                 is_unindexed = copy_unindexed_residue_mask[res_idx]
                 assert not (is_indexed & is_unindexed), f"residue copy of {res_idx} cannot be both indexed and unindexed!"
-
                 if not (is_indexed | is_unindexed):
                     continue
+            elif copy_atomized_residue_mask[res_idx]:
+                # Non-standard (atomized) residues — ligand atoms etc.
+                pass
+            else:
+                continue
 
-                # add a new chain entry if it doesn't exist yet
-                chain_name = chain['name']
-                if chain_name not in copy_chains:
-                    chain_copy = chain.copy()
-                    chain_copy['atom_idx'] = max_atom_idx
-                    chain_copy['atom_num'] = 0
-                    chain_copy['res_idx'] = max_res_idx
-                    chain_copy['res_num'] = 0
-                    copy_chains[chain_name] = chain_copy
+            # add a new chain entry if it doesn't exist yet
+            chain_name = chain['name']
+            if chain_name not in copy_chains:
+                chain_copy = chain.copy()
+                chain_copy['atom_idx'] = max_atom_idx
+                chain_copy['atom_num'] = 0
+                chain_copy['res_idx'] = max_res_idx
+                chain_copy['res_num'] = 0
+                copy_chains[chain_name] = chain_copy
 
-                # update the chain entry associated with this copied residue
-                copy_chains[chain_name]['res_num'] += 1
-                copy_chains[chain_name]['atom_num'] += res['atom_num']
-                # copy the residue atoms
-                atom_start = res['atom_idx']
-                atom_end = atom_start + res['atom_num']
-                copy_atoms.append(struct.atoms[atom_start:atom_end].copy())
-                # update the residue-to-atoms mapping
-                res_copy = res.copy()
-                res_copy['atom_idx'] = max_atom_idx
-                copy_residues.append(res_copy)
+            # update the chain entry associated with this copied residue
+            copy_chains[chain_name]['res_num'] += 1
+            copy_chains[chain_name]['atom_num'] += res['atom_num']
+            # copy the residue atoms
+            atom_start = res['atom_idx']
+            atom_end = atom_start + res['atom_num']
+            copy_atoms.append(struct.atoms[atom_start:atom_end].copy())
+            # update the residue-to-atoms mapping
+            res_copy = res.copy()
+            res_copy['atom_idx'] = max_atom_idx
+            copy_residues.append(res_copy)
 
-                max_res_idx += 1
-                max_atom_idx += res['atom_num']
+            max_res_idx += 1
+            max_atom_idx += res['atom_num']
 
-                # mark which residue was copied
-                res_copied_indices.append(res_start + i)
-                atom_copied_indices.append(list(range(atom_start, atom_end)))
-                # mark what fragment this residue belongs to
-                if last_res_idx is None:
-                    last_res_idx = res['res_idx']
-                if last_chain_id is None:
-                    last_chain_id = chain['asym_id']
-                # if this residue is adjacent to the previous residue, we keep the frag idx the same
-                # else we increment to the next one
-                is_adj_to_last_res = (abs(last_res_idx - res['res_idx']) < 2 and last_chain_id == chain['asym_id'])
-                if not is_adj_to_last_res:
-                    curr_frag_id += 1
-                frag_ids.append(curr_frag_id)
+            # mark which residue was copied
+            res_copied_indices.append(res_idx)
+            atom_copied_indices.append(list(range(atom_start, atom_end)))
+            # mark what fragment this residue belongs to
+            if last_res_idx is None:
                 last_res_idx = res['res_idx']
+            if last_chain_id is None:
                 last_chain_id = chain['asym_id']
+            # if this residue is adjacent to the previous residue, we keep the frag idx the same
+            # else we increment to the next one
+            is_adj_to_last_res = (abs(last_res_idx - res['res_idx']) < 2 and last_chain_id == chain['asym_id'])
+            if not is_adj_to_last_res:
+                curr_frag_id += 1
+            frag_ids.append(curr_frag_id)
+            last_res_idx = res['res_idx']
+            last_chain_id = chain['asym_id']
 
     copy_chains = list(copy_chains.values())
 
@@ -1025,6 +1030,8 @@ class StructureTokenizer:
                         chain, res, hotspot_type=res_hotspot_type,
                         entity_id=entity_id
                     )
+                    if is_atomized:
+                        ret_tokens = [replace(t, is_copy=True) for t in ret_tokens]
                     token_data.extend([astuple(t) for t in ret_tokens])
                     rigid_data.extend([astuple(r) for r in ret_rigids])
 
@@ -1089,14 +1096,11 @@ def tokenize_structure(  # noqa: C901, PLR0915
     atomized_copy = (task_data['copy_atomized_residue_mask'] & struct.residues['is_present'] & chain_residue_mask)
 
     is_unk_standard = (struct.residues['name'] == 'UNK')
-    # prevent copying a nonstandard residues
-    # TODO: in theory we should allow copying of nonstandard residues if they are atomized
+    # prevent copying non-standard residues via indexed/unindexed (those use atomized copy instead)
     unindexed_copy[~struct.residues['is_standard']] = False
     unindexed_copy[is_unk_standard] = False
     indexed_copy[~struct.residues['is_standard']] = False
     indexed_copy[is_unk_standard] = False
-    # unindexed_copy[~struct.residues['is_standard']] &= atomized_copy[~struct.residues['is_standard']]
-    # indexed_copy[~struct.residues['is_standard']] &= atomized_copy[~struct.residues['is_standard']]
 
     perform_copy = (
         unindexed_copy.any()

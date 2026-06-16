@@ -491,6 +491,9 @@ def multiframe_fm_loss_dense_batch(
     if use_rot_vf_loss:
         raw_rot_vf_loss = None
         if brownian_rot_path:
+            identity_rot_mask = rigids_data.get("rigids_identity_rot_mask", torch.zeros_like(total_mask, dtype=torch.bool))
+            rot_total_mask = total_mask * (~identity_rot_mask)
+
             gt_rot_vf_axis = F.normalize(
                 so3_fm_utils.calc_rot_vf(rots_t, rots_1),
                 dim=-1
@@ -512,22 +515,16 @@ def multiframe_fm_loss_dense_batch(
             angle_loss = pred_rot_score_scaling - rigids_data['rot_brownian_score_scaling']
             score_scale_loss = angle_loss.square() / rigids_data['rot_E_dlog_igso3_sq']
             score_scale_loss = score_scale_loss.clip(max=3)
-            # # clip loss at 3 while still letting some gradients propogate
-            # score_scale_loss = score_scale_loss * torch.minimum(
-            #     3 / score_scale_loss,
-            #     torch.ones_like(score_scale_loss)
-            # ).detach()
 
-            # unscaled_rot_vf_error = (0.5 * rigids_data['rot_brownian_g_t']**2)[..., None] * (pred_rot_vf - gt_rot_vf)
             unscaled_rot_vf_axis_error = torch.square(pred_rot_vf_axis - gt_rot_vf_axis).sum(dim=-1)
             unscaled_rot_vf_loss = unscaled_rot_vf_axis_error + score_scale_loss
 
             rot_vf_loss = unscaled_rot_vf_loss * rot_rigidwise_weight * rigidwise_weight
-            rot_vf_loss = torch.sum(rot_vf_loss * total_mask, dim=-1) / total_mask.sum(dim=-1).clip(min=1)
+            rot_vf_loss = torch.sum(rot_vf_loss * rot_total_mask, dim=-1) / rot_total_mask.sum(dim=-1).clip(min=1)
             rot_vf_loss = rot_vf_loss * direct_rot_vf_loss_scale
             raw_rot_vf_loss = rot_vf_loss
             with torch.no_grad():
-                unscaled_rot_vf_loss = torch.sum(unscaled_rot_vf_loss * total_mask, dim=-1) / total_mask.sum(dim=-1).clip(min=1)
+                unscaled_rot_vf_loss = torch.sum(unscaled_rot_vf_loss * rot_total_mask, dim=-1) / rot_total_mask.sum(dim=-1).clip(min=1)
 
         elif direct_rot_vf_loss:
             pred_rot_vf = denoiser_outputs['pred_rot_vf']

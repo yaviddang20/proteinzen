@@ -163,6 +163,15 @@ class LigandConditionedMotifScaffolding(TrainingTask):
 
         copy_indexed_residue_mask = np.zeros(n_residues, dtype=bool)
         copy_unindexed_residue_mask = np.zeros(n_residues, dtype=bool)
+        copy_atomized_residue_mask = np.zeros(n_residues, dtype=bool)
+
+        # Fixed ligand residues are atomized copy tokens
+        for chain in chains:
+            if int(chain["mol_type"]) != ligand_mol_type:
+                continue
+            res_start = int(chain["res_idx"])
+            res_end = res_start + int(chain["res_num"])
+            copy_atomized_residue_mask[res_start:res_end] = True
 
         if num_potential > 0:
             num_motif = np.random.randint(1, min(num_potential, self.max_num_motif_res) + 1)
@@ -189,7 +198,7 @@ class LigandConditionedMotifScaffolding(TrainingTask):
             "res_type_noising_mask": res_type_noising_mask,
             "copy_indexed_residue_mask": copy_indexed_residue_mask,
             "copy_unindexed_residue_mask": copy_unindexed_residue_mask,
-            "copy_atomized_residue_mask": np.zeros(n_residues, dtype=bool),
+            "copy_atomized_residue_mask": copy_atomized_residue_mask,
         }
 
     def max_added_tokens(self, _):

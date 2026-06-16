@@ -971,6 +971,7 @@ class BiomoleculeModule(L.LightningModule):
             gt_rigid7=gt_rigid7,
             pred_rigid7_display=pred_rigid7_display, per_sample_mse=per_sample_mse,
             record_ids=batch.get('record_id', [None] * B),
+            task_name=batch['task'][0].name if batch.get('task') else "unknown",
         )
 
     def _write_val_pdbs(self, data: dict):
@@ -995,7 +996,8 @@ class BiomoleculeModule(L.LightningModule):
             mse_val = float(per_sample_mse[i])
             rid = record_ids[i] if record_ids[i] is not None else f"sample_{i:02d}"
             rid = rid.replace("/", "_").replace(" ", "_")
-            path = os.path.join(out_dir, f"{rid}_rank{rank}_mse={mse_val:.3f}.pdb")
+            task_name = data.get('task_name', 'unknown')
+            path = os.path.join(out_dir, f"{task_name}_{rid}_rank{rank}_mse={mse_val:.3f}.pdb")
             write_val_pdb(
                 gt_rigid7[i],
                 pred_rigid7_display[i],
@@ -1128,7 +1130,8 @@ class BiomoleculeModule(L.LightningModule):
         record_id = batch.get('record_id', [None])[0]
         rid = (record_id if record_id is not None else "sample_0")
         rid = rid.replace("/", "_").replace(" ", "_")
-        path = os.path.join(out_dir, f"{rid}_rank{rank}_mse={integration_mse:.3f}.pdb")
+        task_name = batch['task'][0].name if batch.get('task') else "unknown"
+        path = os.path.join(out_dir, f"{task_name}_{rid}_rank{rank}_mse={integration_mse:.3f}.pdb")
 
         write_val_pdb(
             gt_rigid7[0],
