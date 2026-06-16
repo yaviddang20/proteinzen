@@ -171,6 +171,11 @@ def load_input(record: Record, data_dir, include_h: bool = False):
     interfaces = structure["interfaces"]
     if interfaces.dtype.names is None or 'chain_1' not in interfaces.dtype.names:
         interfaces = np.array([], dtype=np.dtype(Interface))
+    elif 'chain_1_num_res' not in interfaces.dtype.names:
+        new_interfaces = np.zeros(len(interfaces), dtype=np.dtype(Interface))
+        for name in interfaces.dtype.names:
+            new_interfaces[name] = interfaces[name]
+        interfaces = new_interfaces
 
     struct = Structure(
         atoms=atoms,
