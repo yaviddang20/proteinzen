@@ -401,14 +401,21 @@ class MultiSE3Interpolant:
             hotspots_center_mask = (rigids_mask & ~rigids_noising_mask) * select_hotspots
             center_trans_1 = trans_1 * hotspots_center_mask[..., None]
             hotspots_center = center_trans_1.sum(dim=1) / hotspots_center_mask.long().sum(dim=1)[..., None].clip(min=1)
-            # print(hotspots_center, rigids_mask.dtype, rigids_noising_mask.dtype)
+
+            # fallback: if no copy or hotspot rigids, center on all fixed rigids
+            select_fixed_mask = rigids_mask * (~rigids_noising_mask)
+            fixed_center_available = select_fixed_mask.any(dim=-1) & ~(copy_center_available | hotspots_center_available)
+            fixed_trans_1 = trans_1 * select_fixed_mask[..., None]
+            fixed_center = fixed_trans_1.sum(dim=1) / select_fixed_mask.long().sum(dim=1)[..., None].clip(min=1)
 
             use_copy_center = copy_center_available
             use_hotspots_center = hotspots_center_available & (~use_copy_center)
-            use_global_center = ~(use_hotspots_center | use_copy_center)
+            use_fixed_center = fixed_center_available & ~(use_copy_center | use_hotspots_center)
+            use_global_center = ~(use_hotspots_center | use_copy_center | use_fixed_center)
             center = (
                 use_copy_center[..., None] * copy_center
                 + use_hotspots_center[..., None] * hotspots_center
+                + use_fixed_center[..., None] * fixed_center
                 + use_global_center[..., None] * global_center
             )
         else:
