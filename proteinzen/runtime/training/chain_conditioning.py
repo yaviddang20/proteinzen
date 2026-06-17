@@ -132,12 +132,52 @@ class _ChainConditioningBase(TrainingTask):
 
 
 class ProteinConditionedGenerateLigand(_ChainConditioningBase):
-    """Fix protein pocket, generate ligand."""
+    """Fix entire protein crop, generate ligand."""
     name: str = "protein_conditioned_generate_ligand"
 
     def __init__(self, **kwargs):
         kwargs.setdefault("condition_mol_type", "PROTEIN")
         super().__init__(**kwargs)
+
+    def sample_t_and_mask(self, data):
+        t = _make_t(
+            self.t_sched, self.lognorm_mu, self.lognorm_sig,
+            self.beta_p1, self.beta_p2, self.t_min, self.t_max,
+        )
+
+        residues = data.residues
+        atoms = data.atoms
+        chains = data.chains
+        n_atoms = atoms.shape[0]
+        n_residues = residues.shape[0]
+
+        atom_noising_mask = np.ones(n_atoms, dtype=bool)
+        res_type_noising_mask = np.ones(n_residues, dtype=bool)
+
+        protein_mol_type = const.chain_type_ids["PROTEIN"]
+        for chain in chains:
+            if int(chain["mol_type"]) != protein_mol_type:
+                continue
+            res_start = int(chain["res_idx"])
+            res_end = res_start + int(chain["res_num"])
+            for res_idx in range(res_start, res_end):
+                res = residues[res_idx]
+                atom_idx = int(res["atom_idx"])
+                atom_num = int(res["atom_num"])
+                atom_noising_mask[atom_idx:atom_idx + atom_num] = False
+                res_type_noising_mask[res_idx] = False
+
+        return {
+            "t": t,
+            "atom_noising_mask": atom_noising_mask,
+            "res_type_noising_mask": res_type_noising_mask,
+            "copy_indexed_residue_mask": np.zeros(n_residues, dtype=bool),
+            "copy_unindexed_residue_mask": np.zeros(n_residues, dtype=bool),
+            "copy_atomized_residue_mask": np.zeros(n_residues, dtype=bool),
+        }
+
+    def max_added_tokens(self, _):
+        return 0
 
 
 class LigandConditionedGenerateProtein(_ChainConditioningBase):
