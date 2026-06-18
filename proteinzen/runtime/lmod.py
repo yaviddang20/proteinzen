@@ -1908,6 +1908,7 @@ class BiomoleculeSamplingModule(L.LightningModule):
         model,
         integrator_init,
         run_cfg,
+        strict_weight_loading=True,
     ):
         super().__init__()
         self._log = logging.getLogger(__name__)
@@ -1916,6 +1917,8 @@ class BiomoleculeSamplingModule(L.LightningModule):
         self.ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(0.999))
         self.integrator: Integrator = integrator_init(self.ema.module)
         self.run_cfg = run_cfg
+        if not strict_weight_loading:
+            self.strict_loading = False
 
     def predict_step(self, batch, batch_idx):
         # Set-up time

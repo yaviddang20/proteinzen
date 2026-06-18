@@ -28,6 +28,7 @@ import pickle
 import numpy as np
 import pyarrow.parquet as pq
 import rdkit
+from scipy.spatial.distance import cdist
 from rdkit import Chem
 from rdkit.Chem import rdMolDescriptors
 from tqdm import tqdm
@@ -307,8 +308,9 @@ def process_system(
     mid = system_mid(system_id)
     struct_path = outdir / "structures" / mid / f"{system_id}.npz"
     record_path = outdir / "records" / mid / f"{system_id}.json"
+    auth_map_path = outdir / "auth_maps" / mid / f"{system_id}.json"
 
-    if struct_path.exists() and record_path.exists():
+    if struct_path.exists() and record_path.exists() and auth_map_path.exists():
         return
 
     system_dir = plinder_dir / "systems" / system_id
@@ -378,6 +380,37 @@ def process_system(
 
     rot_bond_data = merge_rot_bond_data(all_rot_bond_data)
 
+    # Compute interaction_residue_mask: protein residues within atom_interface_cutoff of any ligand atom
+    interaction_residue_mask = np.zeros(len(structure.residues), dtype=bool)
+    ligand_coords_list = []
+    for chain in structure.chains:
+        if int(chain["mol_type"]) != nonpolymer_id:
+            continue
+        a_start = int(chain["atom_idx"])
+        a_end = a_start + int(chain["atom_num"])
+        present = structure.atoms[a_start:a_end]["is_present"].astype(bool)
+        if present.any():
+            ligand_coords_list.append(structure.atoms[a_start:a_end]["coords"][present])
+    if ligand_coords_list:
+        lig_coords = np.concatenate(ligand_coords_list)
+        for chain in structure.chains:
+            if int(chain["mol_type"]) != protein_id:
+                continue
+            res_start = int(chain["res_idx"])
+            res_end = res_start + int(chain["res_num"])
+            for r in range(res_start, res_end):
+                res = structure.residues[r]
+                if not res["is_present"]:
+                    continue
+                a_start = int(res["atom_idx"])
+                a_end = a_start + int(res["atom_num"])
+                res_atoms = structure.atoms[a_start:a_end]
+                present_coords = res_atoms["coords"][res_atoms["is_present"].astype(bool)]
+                if len(present_coords) == 0:
+                    continue
+                if cdist(present_coords, lig_coords).min() < const.atom_interface_cutoff:
+                    interaction_residue_mask[r] = True
+
     # Build ChainInfo list
     cluster_id = clusters.get(system_id, -1)
     affinity_chain_id = None
@@ -385,6 +418,9 @@ def process_system(
     for i, chain in enumerate(structure.chains):
         mol_type = int(chain["mol_type"])
         c_cluster_id = cluster_id if mol_type == protein_id else -1
+        res_start = int(chain["res_idx"])
+        res_end = res_start + int(chain["res_num"])
+        num_resolved = int(structure.residues[res_start:res_end]["is_present"].sum())
         chain_infos.append(ChainInfo(
             chain_id=i,
             chain_name=chain["name"].strip(),
@@ -392,6 +428,7 @@ def process_system(
             cluster_id=c_cluster_id,
             msa_id="",
             num_residues=int(chain["res_num"]),
+            num_resolved_residues=num_resolved,
             entity_id=int(chain["entity_id"]),
         ))
         if mol_type == nonpolymer_id and affinity_chain_id is None:
@@ -406,7 +443,12 @@ def process_system(
 
     # Interface info
     interface_infos = [
-        InterfaceInfo(chain_1=int(iface["chain_1"]), chain_2=int(iface["chain_2"]))
+        InterfaceInfo(
+            chain_1=int(iface["chain_1"]),
+            chain_2=int(iface["chain_2"]),
+            chain_1_num_res=int(iface["chain_1_num_res"]),
+            chain_2_num_res=int(iface["chain_2_num_res"]),
+        )
         for iface in structure.interfaces
     ]
 
@@ -421,13 +463,19 @@ def process_system(
     # Save
     (outdir / "structures" / mid).mkdir(parents=True, exist_ok=True)
     (outdir / "records" / mid).mkdir(parents=True, exist_ok=True)
+    (outdir / "auth_maps" / mid).mkdir(parents=True, exist_ok=True)
 
     save_dict = asdict(structure)
     save_dict.update(rot_bond_data)
+    save_dict['interaction_residue_mask'] = interaction_residue_mask
     np.savez_compressed(struct_path, **save_dict)
 
     with open(record_path, "w") as f:
         json.dump(asdict(record), f)
+
+    auth_map_path = outdir / "auth_maps" / mid / f"{system_id}.json"
+    with open(auth_map_path, "w") as f:
+        json.dump(parsed.auth_seq_map, f)
 
 
 _worker_state = {}

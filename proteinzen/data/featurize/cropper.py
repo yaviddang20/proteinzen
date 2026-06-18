@@ -243,6 +243,7 @@ class Cropper:
         max_rigids: Optional[int] = None,
         chain_id: Optional[int] = None,
         interface_id: Optional[int] = None,
+        priority_token_mask: Optional[np.ndarray] = None,
     ) -> Tokenized:
         """Crop the data to a maximum number of tokens.
 
@@ -387,6 +388,18 @@ class Cropper:
             new_indices = set(chain_tokens["token_idx"]) - cropped
             cropped.update(new_indices)
             total_rigids += int(np.sum(token_data[list(new_indices)]["rigid_num"]))
+
+        # Seed interaction (priority) protein residues before the greedy distance loop
+        if priority_token_mask is not None and priority_token_mask.any():
+            priority_indices = set(token_data[priority_token_mask]["token_idx"]) - cropped
+            if priority_indices:
+                priority_arr = token_data[np.isin(token_data["token_idx"], list(priority_indices))]
+                new_rig = int(np.sum(priority_arr["rigid_num"]))
+                if (len(priority_indices) <= (max_tokens - len(cropped))) and (
+                    max_rigids is None or (total_rigids + new_rig) <= max_rigids
+                ):
+                    cropped.update(priority_indices)
+                    total_rigids += new_rig
 
         if self.attempt_to_keep_full_binder_chain and interface is not None:
             chain_1_tokens = token_data[token_data["asym_id"] == interface[0]]

@@ -204,7 +204,28 @@ def load_input(record: Record, data_dir, include_h: bool = False):
                                else np.zeros(0, dtype=np.int32),
         }
 
-    return struct, rot_bond_data
+    interaction_residue_mask = structure['interaction_residue_mask'] if 'interaction_residue_mask' in structure else None
+
+    return struct, rot_bond_data, interaction_residue_mask
+
+
+def _build_priority_token_mask(token_data, struct, interaction_residue_mask):
+    """Map per-residue interaction mask to per-token priority mask."""
+    if interaction_residue_mask is None:
+        return None
+    res_lookup = {}  # (asym_id, seqres_j) -> residue_array_idx
+    for chain in struct.chains:
+        asym_id = int(chain['asym_id'])
+        res_start = int(chain['res_idx'])
+        for k in range(int(chain['res_num'])):
+            j = int(struct.residues[res_start + k]['res_idx'])
+            res_lookup[(asym_id, j)] = res_start + k
+    mask = np.zeros(len(token_data), dtype=bool)
+    for i, token in enumerate(token_data):
+        r = res_lookup.get((int(token['asym_id']), int(token['res_idx'])))
+        if r is not None and r < len(interaction_residue_mask):
+            mask[i] = bool(interaction_residue_mask[r])
+    return mask
 
 
 def _apply_rot_bond_data_to_features(features: dict, rot_bond_data) -> None:
@@ -356,7 +377,7 @@ class TrainingDataset(torch.utils.data.Dataset):
             sample.chain_id = None
         task = task_sampler.sample_task()
 
-        struct, rot_bond_data = load_input(sample.record, Path(dataset.data_dir), include_h=self.include_h)
+        struct, rot_bond_data, interaction_residue_mask = load_input(sample.record, Path(dataset.data_dir), include_h=self.include_h)
 
         # Skip structures where a PROTEIN chain contains nucleotide residues
         _nuc_names = {'DA', 'DC', 'DG', 'DT', 'A', 'G', 'C', 'U'}
@@ -425,6 +446,8 @@ class TrainingDataset(torch.utils.data.Dataset):
                 print(sample.record.id, "interface id context", valid_interfaces, interface_tuples, task_data['seed_interface'], struct.chains[struct.mask])
                 raise e
 
+        priority_token_mask = _build_priority_token_mask(token_data, struct, interaction_residue_mask)
+
         if self.cropper is not None:
             crop_size = self.max_crop_residues - task.max_added_tokens(token_data.shape[0])
             if len(tokenized_data.tokens) > crop_size:
@@ -433,7 +456,8 @@ class TrainingDataset(torch.utils.data.Dataset):
                     max_tokens=crop_size,
                     random=np.random,
                     chain_id=sample.chain_id,
-                    interface_id=sample.interface_id
+                    interface_id=sample.interface_id,
+                    priority_token_mask=priority_token_mask,
                 )
 
         # if len(tokenized_data.tokens) == 0:
@@ -555,7 +579,7 @@ class ValidationDataset(torch.utils.data.Dataset):
         sample = self.samples[idx]
         task = task_sampler.sample_task()
 
-        struct, rot_bond_data = load_input(sample.record, Path(dataset.data_dir), include_h=self.include_h)
+        struct, rot_bond_data, interaction_residue_mask = load_input(sample.record, Path(dataset.data_dir), include_h=self.include_h)
 
         _nuc_names = {'DA', 'DC', 'DG', 'DT', 'A', 'G', 'C', 'U'}
         _protein_id = const.chain_type_ids["PROTEIN"]
@@ -620,6 +644,8 @@ class ValidationDataset(torch.utils.data.Dataset):
                 print(sample.record.id, "interface id context", valid_interfaces, interface_tuples, task_data['seed_interface'], struct.chains[struct.mask])
                 raise e
 
+        priority_token_mask = _build_priority_token_mask(token_data, struct, interaction_residue_mask)
+
         if self.cropper is not None:
             crop_size = self.max_crop_residues - task.max_added_tokens(token_data.shape[0])
             if len(tokenized_data.tokens) > crop_size:
@@ -628,7 +654,8 @@ class ValidationDataset(torch.utils.data.Dataset):
                     max_tokens=crop_size,
                     random=np.random,
                     chain_id=sample.chain_id,
-                    interface_id=sample.interface_id
+                    interface_id=sample.interface_id,
+                    priority_token_mask=priority_token_mask,
                 )
 
         if len(tokenized_data.tokens) == 0:

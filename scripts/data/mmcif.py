@@ -99,6 +99,9 @@ class ParsedStructure:
     data: Structure
     info: StructureInfo
     covalents: list[int]
+    # Per-chain mapping from SEQRES position j → auth residue string (None if absent).
+    # Parallel to structure.chains order; each inner list has length chain["res_num"].
+    auth_seq_map: list[dict]  # [{"chain_name": str, "mol_type": int, "auth_indices": list[str|None]}, ...]
 
 
 ####################################################################################################
@@ -1143,6 +1146,7 @@ def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
     atoms = np.array(atom_data, dtype=Atom)
     bonds = np.array(bond_data, dtype=Bond)
     residues = np.array(res_data, dtype=Residue)
+    parsed_chains = chains  # save ParsedChain list before overwrite
     chains = np.array(chain_data, dtype=Chain)
     connections = np.array(connection_data, dtype=Connection)
     mask = np.ones(len(chain_data), dtype=bool)
@@ -1171,4 +1175,13 @@ def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
         mask=mask,
     )
 
-    return ParsedStructure(data=data, info=info, covalents=[])
+    auth_seq_map = [
+        {
+            "chain_name": chain.name,
+            "mol_type": int(chain_np["mol_type"]),
+            "auth_indices": [res.orig_idx for res in chain.residues],
+        }
+        for chain, chain_np in zip(parsed_chains, chains)
+    ]
+
+    return ParsedStructure(data=data, info=info, covalents=[], auth_seq_map=auth_seq_map)
