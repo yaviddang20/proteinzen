@@ -83,7 +83,7 @@ def main():
             skipped += 1
             continue
         tasks.append({
-            "task": "protein_pocket_conditioned",
+            "_target_": "proteinzen.runtime.sampling.protein_pocket.ProteinPocketConditionedSampling",
             "name": system_id,
             "npz_path": str(npz_path.resolve()),
             "num_samples": args.num_samples,
@@ -94,7 +94,7 @@ def main():
 
     args.out_yaml.parent.mkdir(parents=True, exist_ok=True)
     with open(args.out_yaml, "w") as f:
-        yaml.dump({"tasks": tasks}, f, default_flow_style=False, sort_keys=False)
+        yaml.dump(tasks, f, default_flow_style=False, sort_keys=False)
 
     print(f"Wrote {len(tasks)} tasks to {args.out_yaml}")
 
