@@ -89,6 +89,7 @@ def load_annotation_table(plinder_dir: Path) -> dict:
         "system_has_binding_affinity",
         "ligand_molecular_weight",
         "system_proper_ligand_max_molecular_weight",
+        "ligand_is_covalent",
     ]
     t = pq.ParquetFile(path).read(columns=cols)
     result = {}
@@ -316,6 +317,9 @@ def process_system(
     system_dir = plinder_dir / "systems" / system_id
     cif_path = system_dir / "system.cif"
     if not cif_path.exists():
+        return
+
+    if annotation_row.get("ligand_is_covalent"):
         return
 
     try:
