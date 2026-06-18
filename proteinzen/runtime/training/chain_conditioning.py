@@ -53,6 +53,7 @@ class _ChainConditioningBase(TrainingTask):
         condition_mol_type="PROTEIN",
         p_is_unindexed=0.8,
         max_num_res=40,
+        sig_perturb=None,
     ):
         assert t_sched in ["lognorm", "mixed_beta", "uniform"]
         self.prob = prob
@@ -66,6 +67,8 @@ class _ChainConditioningBase(TrainingTask):
         self.condition_mol_type = const.chain_type_ids[condition_mol_type]
         self.p_is_unindexed = p_is_unindexed
         self.max_num_res = max_num_res
+        if sig_perturb is not None:
+            self.sig_perturb = sig_perturb
 
     def sample_t_and_mask(self, data):
         t = _make_t(

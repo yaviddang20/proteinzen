@@ -475,7 +475,16 @@ class MultiSE3Interpolant:
             trans_0 = torch.einsum("bni,bij->bnj", trans_0, align_rot_mats_safe)
 
         if self.use_stochastic_centering:
-            stoch_center = torch.randn_like(center) * self.sig_perturb
+            per_sample_sig = batch.get('sig_perturb', None)
+            if per_sample_sig is not None:
+                sig = torch.where(
+                    torch.isnan(per_sample_sig),
+                    torch.full_like(per_sample_sig, self.sig_perturb),
+                    per_sample_sig,
+                )
+                stoch_center = torch.randn_like(center) * sig[:, None]
+            else:
+                stoch_center = torch.randn_like(center) * self.sig_perturb
             trans_0 = trans_0 + stoch_center[..., None, :]
 
         trans_time = batch['trans_t']

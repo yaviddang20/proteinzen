@@ -347,6 +347,8 @@ def collate(data_list):
         }
         if 'e_min' in data:
             padded_data['e_min'] = data['e_min']
+        if 'sig_perturb' in data:
+            padded_data['sig_perturb'] = data['sig_perturb']
         ## pad token data
         for key, value in data['token'].items():
             pad_len = token_max_len - value.shape[0]

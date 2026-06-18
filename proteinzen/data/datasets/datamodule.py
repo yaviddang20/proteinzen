@@ -472,6 +472,11 @@ class TrainingDataset(torch.utils.data.Dataset):
         features['task'] = task
         features['structure'] = struct
         features['record_id'] = sample.record.id
+        task_sig_perturb = getattr(task, 'sig_perturb', None)
+        features['sig_perturb'] = torch.tensor(
+            task_sig_perturb if task_sig_perturb is not None else float('nan'),
+            dtype=torch.float32,
+        )
 
         _apply_rot_bond_data_to_features(features, rot_bond_data)
 
@@ -670,6 +675,11 @@ class ValidationDataset(torch.utils.data.Dataset):
         features['task'] = task
         features['structure'] = struct
         features['record_id'] = sample.record.id
+        task_sig_perturb = getattr(task, 'sig_perturb', None)
+        features['sig_perturb'] = torch.tensor(
+            task_sig_perturb if task_sig_perturb is not None else float('nan'),
+            dtype=torch.float32,
+        )
 
         _apply_rot_bond_data_to_features(features, rot_bond_data)
 
