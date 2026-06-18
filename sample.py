@@ -139,7 +139,8 @@ def main(sampler,
     model = BiomoleculeSamplingModule(
         model,
         integrator_init=integrator_init,
-        run_cfg=zen_cfg
+        run_cfg=zen_cfg,
+        strict_weight_loading=zen_cfg.get('strict_weight_loading', True),
     )
 
     # make output directories
