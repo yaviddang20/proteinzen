@@ -48,21 +48,51 @@ def write_pdb(structure, rename_chains=True):
     return "\n".join(lines)
 
 
+def resolve_npz(query: str, outdir: Path | None) -> list[Path]:
+    """Resolve a query (path, system_id, or PDB code) to a list of npz paths."""
+    p = Path(query)
+    if p.suffix == ".npz" or p.exists():
+        return [p]
+
+    if outdir is None:
+        raise SystemExit("--outdir is required when using a PDB code or system_id")
+
+    structs = outdir / "structures"
+    # Full system_id (contains "__"): compute mid directly
+    if "__" in query:
+        mid = query[1:3]
+        candidate = structs / mid / f"{query}.npz"
+        if not candidate.exists():
+            raise SystemExit(f"Not found: {candidate}")
+        return [candidate]
+
+    # PDB code: glob across its mid directory
+    pdb = query.lower()
+    mid = pdb[1:3]
+    matches = sorted((structs / mid).glob(f"{pdb}__*.npz"))
+    if not matches:
+        raise SystemExit(f"No structures found for '{pdb}' under {structs / mid}")
+    return matches
+
+
 def main():
     parser = argparse.ArgumentParser(description="Convert plinder_processed npz to PDB")
-    parser.add_argument("npz", type=Path, help="Path to .npz file")
-    parser.add_argument("-o", "--out", type=Path, default=None, help="Output .pdb path (default: same stem as input)")
+    parser.add_argument("query", help="Path to .npz, system_id (e.g. 1abc__1__1__A), or PDB code (e.g. 1abc)")
+    parser.add_argument("-o", "--out", type=Path, default=None, help="Output .pdb path (single result only)")
+    parser.add_argument("--outdir", type=Path, default=None, help="Plinder processed dir (required for PDB code / system_id lookup)")
     parser.add_argument("--no-rename-chains", dest="rename_chains", action="store_false",
                         help="Keep original chain names (default: rename to A, B, C, ...)")
     parser.set_defaults(rename_chains=True)
     args = parser.parse_args()
 
-    structure = Structure.load(args.npz)
-    pdb_str = write_pdb(structure, rename_chains=args.rename_chains)
+    npz_paths = resolve_npz(args.query, args.outdir)
 
-    out_path = args.out or args.npz.with_suffix(".pdb")
-    out_path.write_text(pdb_str)
-    print(f"Written to {out_path}")
+    for npz_path in npz_paths:
+        structure = Structure.load(npz_path)
+        pdb_str = write_pdb(structure, rename_chains=args.rename_chains)
+        out_path = args.out if (args.out and len(npz_paths) == 1) else npz_path.with_suffix(".pdb")
+        out_path.write_text(pdb_str)
+        print(f"Written to {out_path}")
 
 
 if __name__ == "__main__":
