@@ -246,7 +246,16 @@ class MultiSE3Interpolant:
 
     def _sample_trans_0(self, batch, device):
         trans_0 = _centered_gaussian(batch, self.rigids_per_res, device)
-        trans_0 = trans_0 * self.trans_prior_std
+        per_sample_std = batch.get('trans_prior_std', None)
+        if per_sample_std is not None:
+            std = torch.where(
+                torch.isnan(per_sample_std),
+                torch.full_like(per_sample_std, self.trans_prior_std),
+                per_sample_std,
+            )
+            trans_0 = trans_0 * std[:, None, None]
+        else:
+            trans_0 = trans_0 * self.trans_prior_std
         return trans_0.to(device)
 
     def _corrupt_trans(self, trans_1, trans_0, t, rigids_mask, diffuse_mask):
@@ -353,7 +362,16 @@ class MultiSE3Interpolant:
             else:
                 rotmats_0 = self._sample_rotmats_0(rotmats_1)
                 rigids_data["rigids_identity_rot_mask"] = torch.zeros_like(rigids_mask, dtype=torch.bool)
-            trans_0 = torch.randn_like(trans_1) * self.trans_prior_std
+            per_sample_std = batch.get('trans_prior_std', None)
+            if per_sample_std is not None:
+                std = torch.where(
+                    torch.isnan(per_sample_std),
+                    torch.full_like(per_sample_std, self.trans_prior_std),
+                    per_sample_std,
+                )
+                trans_0 = torch.randn_like(trans_1) * std[:, None, None]
+            else:
+                trans_0 = torch.randn_like(trans_1) * self.trans_prior_std
             trans_0 = trans_0 - trans_0.mean(dim=1)[..., None, :]
 
         global_center = (trans_1 * rigids_mask[..., None]).sum(dim=1) / rigids_mask.long().sum(dim=1)[..., None].clip(min=1)

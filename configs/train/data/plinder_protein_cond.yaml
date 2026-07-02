@@ -19,6 +19,7 @@ datasets:
           lognorm_sig: 1.0
           t_min: 0.01
           t_max: 0.99
+          trans_prior_std: 3.0
     exclude_mol_types:
       - "DNA"
       - "RNA"

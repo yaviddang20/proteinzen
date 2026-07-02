@@ -672,7 +672,7 @@ class BiomoleculeModule(L.LightningModule):
                 on_epoch=True,
                 prog_bar=False,
                 batch_size=value.shape[0],
-                sync_dist=False,
+                sync_dist=True,
             )
 
         # ---- t-stratified losses (TRAIN ONLY) ----
@@ -699,7 +699,7 @@ class BiomoleculeModule(L.LightningModule):
                     on_epoch=True,
                     prog_bar=False,
                     batch_size=t.shape[0],
-                    sync_dist=False,
+                    sync_dist=True,
                 )
 
             # t-stratified per-task losses
@@ -720,7 +720,7 @@ class BiomoleculeModule(L.LightningModule):
                     on_epoch=True,
                     prog_bar=False,
                     batch_size=t_per_sample.shape[0],
-                    sync_dist=False,
+                    sync_dist=True,
                 )
 
         # ---- val: per-task losses (val uses fixed t values via stage name) ----
@@ -733,7 +733,7 @@ class BiomoleculeModule(L.LightningModule):
                     on_epoch=True,
                     prog_bar=False,
                     batch_size=value.shape[0],
-                    sync_dist=False,
+                    sync_dist=True,
                 )
 
         # ---- final logging ----
@@ -743,7 +743,7 @@ class BiomoleculeModule(L.LightningModule):
             on_epoch=True,
             prog_bar=True,
             batch_size=batch["t"].shape[0],
-            sync_dist=False,
+            sync_dist=True,
         )
 
     def _shared_step(self, batch, return_outputs=False):
@@ -891,7 +891,7 @@ class BiomoleculeModule(L.LightningModule):
         B = batch["t"].shape[0]
 
         num_gpus = max(1, self.trainer.world_size)
-        n_samples = max(5, num_gpus) // num_gpus
+        n_samples = max(5, 2 * num_gpus) // num_gpus
         write_pdbs = (
             self.trainer.current_epoch % 5 == 0
             and batch_idx == 0  # only first val batch
@@ -1026,7 +1026,7 @@ class BiomoleculeModule(L.LightningModule):
                 "val/composite_pred_trans_mse",
                 composite,
                 prog_bar=True,
-                sync_dist=False,
+                sync_dist=True,
             )
 
     def on_train_epoch_end(self):
@@ -1147,7 +1147,7 @@ class BiomoleculeModule(L.LightningModule):
             path,
             token_residue_idx=batch['token']['residue_idx'].cpu().numpy()[0],
         )
-        self.log(f"epoch_sample/{split}/{task_name}/integration_mse", integration_mse, prog_bar=False, sync_dist=False)
+        self.log(f"epoch_sample/{split}/{task_name}/integration_mse", integration_mse, prog_bar=False, sync_dist=True)
         self._log.info(f"Epoch {epoch} integration sample ({split}) written: {path} (mse={integration_mse:.3f})")
         model.train()
 
@@ -1245,7 +1245,7 @@ class BiomoleculeModule(L.LightningModule):
     #             on_step=None,
     #             on_epoch=True,
     #             batch_size=value.shape[0],
-    #             sync_dist=False)
+    #             sync_dist=True)
 
     #     log_dict = {
     #         ("train/" + key): value
@@ -1273,7 +1273,7 @@ class BiomoleculeModule(L.LightningModule):
     #             on_step=None,
     #             on_epoch=True,
     #             batch_size=t.shape[0],
-    #             sync_dist=False)
+    #             sync_dist=True)
 
     #     self.log_dict(
     #         log_dict,

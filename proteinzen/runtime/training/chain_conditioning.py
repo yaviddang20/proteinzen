@@ -54,6 +54,7 @@ class _ChainConditioningBase(TrainingTask):
         p_is_unindexed=0.8,
         max_num_res=40,
         sig_perturb=None,
+        trans_prior_std=None,
     ):
         assert t_sched in ["lognorm", "mixed_beta", "uniform"]
         self.prob = prob
@@ -69,6 +70,8 @@ class _ChainConditioningBase(TrainingTask):
         self.max_num_res = max_num_res
         if sig_perturb is not None:
             self.sig_perturb = sig_perturb
+        if trans_prior_std is not None:
+            self.trans_prior_std = trans_prior_std
 
     def sample_t_and_mask(self, data):
         t = _make_t(

@@ -477,6 +477,11 @@ class TrainingDataset(torch.utils.data.Dataset):
             task_sig_perturb if task_sig_perturb is not None else float('nan'),
             dtype=torch.float32,
         )
+        task_trans_prior_std = getattr(task, 'trans_prior_std', None)
+        features['trans_prior_std'] = torch.tensor(
+            task_trans_prior_std if task_trans_prior_std is not None else float('nan'),
+            dtype=torch.float32,
+        )
 
         _apply_rot_bond_data_to_features(features, rot_bond_data)
 
@@ -678,6 +683,11 @@ class ValidationDataset(torch.utils.data.Dataset):
         task_sig_perturb = getattr(task, 'sig_perturb', None)
         features['sig_perturb'] = torch.tensor(
             task_sig_perturb if task_sig_perturb is not None else float('nan'),
+            dtype=torch.float32,
+        )
+        task_trans_prior_std = getattr(task, 'trans_prior_std', None)
+        features['trans_prior_std'] = torch.tensor(
+            task_trans_prior_std if task_trans_prior_std is not None else float('nan'),
             dtype=torch.float32,
         )
 
