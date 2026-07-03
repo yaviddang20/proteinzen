@@ -705,7 +705,7 @@ class BiomoleculeModule(L.LightningModule):
                     on_epoch=True,
                     prog_bar=False,
                     batch_size=t.shape[0],
-                    sync_dist=True,
+                    sync_dist=False,
                 )
 
             # t-stratified per-task losses
@@ -749,7 +749,7 @@ class BiomoleculeModule(L.LightningModule):
             on_epoch=True,
             prog_bar=True,
             batch_size=batch["t"].shape[0],
-            sync_dist=True,
+            sync_dist=False,
         )
 
     def _shared_step(self, batch, return_outputs=False):
@@ -1032,7 +1032,7 @@ class BiomoleculeModule(L.LightningModule):
                 "val/composite_pred_trans_mse",
                 composite,
                 prog_bar=True,
-                sync_dist=True,
+                sync_dist=False,
             )
 
     def on_train_epoch_end(self):
@@ -1566,7 +1566,7 @@ class BiomoleculeModule(L.LightningModule):
             on_step=None,
             on_epoch=True,
             batch_size=1,
-            sync_dist=True
+            sync_dist=False
         )
 
 
