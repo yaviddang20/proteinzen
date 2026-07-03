@@ -678,7 +678,7 @@ class BiomoleculeModule(L.LightningModule):
                 on_epoch=True,
                 prog_bar=False,
                 batch_size=value.shape[0],
-                sync_dist=True,
+                sync_dist=False,
             )
 
         # ---- t-stratified losses (TRAIN ONLY) ----
@@ -726,7 +726,7 @@ class BiomoleculeModule(L.LightningModule):
                     on_epoch=True,
                     prog_bar=False,
                     batch_size=t_per_sample.shape[0],
-                    sync_dist=True,
+                    sync_dist=False,
                 )
 
         # ---- val: per-task losses (val uses fixed t values via stage name) ----
@@ -739,7 +739,7 @@ class BiomoleculeModule(L.LightningModule):
                     on_epoch=True,
                     prog_bar=False,
                     batch_size=value.shape[0],
-                    sync_dist=True,
+                    sync_dist=False,
                 )
 
         # ---- final logging ----
@@ -1143,7 +1143,7 @@ class BiomoleculeModule(L.LightningModule):
             path,
             token_residue_idx=batch['token']['residue_idx'].cpu().numpy()[0],
         )
-        self.log(f"epoch_sample/{split}/{task_name}/integration_mse", integration_mse, prog_bar=False, sync_dist=True)
+        self.log(f"epoch_sample/{split}/{task_name}/integration_mse", integration_mse, prog_bar=False, sync_dist=False)
         self._log.info(f"Epoch {epoch} integration sample ({split}) written: {path} (mse={integration_mse:.3f})")
         model.train()
 
