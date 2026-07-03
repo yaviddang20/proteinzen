@@ -124,6 +124,7 @@ def main(model,
     log.info(f"Experiment started in folder: {os.getcwd()}")
 
     # assemble task sampler
+    pl.seed_everything(42, workers=True)
     print(dataset)
     train_dataset_config = omegaconf.OmegaConf.load(dataset['config'])
     val_dataset_config = omegaconf.OmegaConf.load(dataset['val_config'])

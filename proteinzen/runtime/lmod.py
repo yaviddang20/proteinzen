@@ -35,13 +35,16 @@ from proteinzen.data.write.pdb import to_pdb
 
 from proteinzen.model.utils import gather_helper
 from proteinzen.model.denoiser_v2 import MonotonicIncreasingFn
-from proteinzen.stoch_interp.integration import Integrator
+from proteinzen.stoch_interp.integration import Integrator, EulerIntegrator
+from proteinzen.stoch_interp.diffeq import BaseEulerODEStep
+from proteinzen.stoch_interp.model_wrapper import BaseModelForward
 from proteinzen.stoch_interp import so3_utils
+from proteinzen.stoch_interp.multiframe import align_structures
 
 from .utils import gen_pbar_str
 from .ema import EMAModel
 
-from .loss.multiframe import multiframe_fm_loss_dense_batch
+from .loss.multiframe import multiframe_fm_loss_dense_batch, sym_permute_gt_rigids
 from .loss.common import seq_losses_dense_batch
 from proteinzen.boltz.data.types import SamplingResidue
 
@@ -499,6 +502,7 @@ class BiomoleculeModule(L.LightningModule):
                  use_interface_fafe_loss=False,
                  use_interchain_fafe_loss=False,
                  use_brownian_rot_path_loss=False,
+                 postalign_noise=False,
                  epoch_sample_every_n_epochs=5,
                  epoch_sample_num_steps=100,
                  # use_stabilized_high_t_loss=False
@@ -545,6 +549,7 @@ class BiomoleculeModule(L.LightningModule):
         self.use_interface_fafe_loss = use_interface_fafe_loss
         self.use_interchain_fafe_loss = use_interchain_fafe_loss
         self.use_brownian_rot_path_loss = use_brownian_rot_path_loss
+        self.postalign_noise = postalign_noise
         # self.use_stabilized_high_t_loss = use_stabilized_high_t_loss
 
         if learnable_noise_schedule:
@@ -1043,73 +1048,70 @@ class BiomoleculeModule(L.LightningModule):
         model.eval()
 
         batch = _move_to_device(_slice_batch(batch_cpu, 0), device)
-        B = 1
-
-        # Set t=0 for pure-noise initialization, then corrupt to get centered GT + noise
-        batch['t'] = torch.zeros(B, 1, device=device)
-        batch['trans_t'] = batch['t']
-        batch['rot_t'] = batch['t']
-        batch = self.corrupter.corrupt_dense_batch(batch, self.identity_rot_noise)
 
         rigids_data = batch['rigids']
         rigids_mask = rigids_data['rigids_mask']
         rigids_noising_mask = rigids_data['rigids_noising_mask']
 
-        trans_t = rigids_data['trans_t'].clone()
-        rotmats_t = rigids_data['rotmats_t'].clone()
-
-        n_steps = self.epoch_sample_num_steps
-        ts = torch.linspace(0.0, 1.0, n_steps + 1)
-        t_1 = ts[0]
-        denoiser_out = None
-
-        for t_2 in ts[1:]:
-            dt = float(t_2 - t_1)
-            denom = max(1.0 - float(t_1), 1e-4)
-
-            rigids_data['trans_t'] = trans_t
-            rigids_data['rotmats_t'] = rotmats_t
-            rigids_data['rigids_t'] = ru.Rigid(
-                rots=ru.Rotation(rot_mats=rotmats_t), trans=trans_t
-            ).to_tensor_7()
-            batch['t'] = torch.full((B, 1), float(t_1), device=device)
-
-            denoiser_out = model(batch, self_condition=denoiser_out)
-
-            pred_rigids = denoiser_out['denoised_rigids']
-            pred_trans_1 = pred_rigids.get_trans()
-            pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
-
-            trans_vf = (pred_trans_1 - trans_t) / denom
-            trans_t_next = trans_t + dt * trans_vf
-            trans_t_next = torch.where(rigids_noising_mask[..., None], trans_t_next, trans_t)
-
-            rot_vf = so3_utils.calc_rot_vf(rotmats_t, pred_rotmats_1) / denom
-            rot_update = so3_utils.rotvec_to_rotmat(rot_vf * dt)
-            rotmats_t_next = torch.einsum("...ij,...jk->...ik", rotmats_t, rot_update)
-            rotmats_t_next = torch.where(
-                rigids_noising_mask[..., None, None], rotmats_t_next, rotmats_t
+        # Generate noise independently of x_1 (same as sampling datamodule)
+        gt_trans = ru.Rigid.from_tensor_7(rigids_data['rigids_1']).get_trans()
+        per_sample_std = batch.get('trans_prior_std', None)
+        if per_sample_std is not None:
+            std = torch.where(
+                torch.isnan(per_sample_std),
+                torch.full_like(per_sample_std, self.corrupter.trans_prior_std),
+                per_sample_std,
             )
+            trans_t = torch.randn_like(gt_trans) * std[:, None, None]
+        else:
+            trans_t = torch.randn_like(gt_trans) * self.corrupter.trans_prior_std
+        trans_t = trans_t - trans_t.mean(dim=1, keepdim=True)
+        trans_t = torch.where(rigids_noising_mask[..., None], trans_t, gt_trans)
 
-            trans_t = trans_t_next
-            rotmats_t = rotmats_t_next
-            t_1 = t_2
+        eye = torch.eye(3, device=device, dtype=torch.float32)
+        rotmats_t = eye[None, None].expand_as(
+            ru.Rigid.from_tensor_7(rigids_data['rigids_1']).get_rots().get_rot_mats()
+        ).clone()
 
-            if not model.self_conditioning:
-                denoiser_out = None
-
-        # Final model call at t=1
-        rigids_data['trans_t'] = trans_t
-        rigids_data['rotmats_t'] = rotmats_t
-        rigids_data['rigids_t'] = ru.Rigid(
+        # Pre-fill rigids_1 with noise so EulerIntegrator uses it as the start
+        gt_rigid7 = rigids_data['rigids_1'].clone()
+        rigids_data['rigids_1'] = ru.Rigid(
             rots=ru.Rotation(rot_mats=rotmats_t), trans=trans_t
         ).to_tensor_7()
-        batch['t'] = torch.ones(B, 1, device=device)
-        denoiser_out = model(batch, self_condition=denoiser_out)
-        final_rigids = denoiser_out['denoised_rigids']
+
+        integrator = EulerIntegrator(
+            wrapped_model=BaseModelForward(model),
+            diffeq=BaseEulerODEStep(),
+            no_rot_sampling=not self.use_rot_vf_loss,
+        )
+        ts = torch.linspace(0.0, 1.0, self.epoch_sample_num_steps + 1)
+        _, _, final_denoiser_out = integrator.sample(batch, ts)
+        final_rigids = final_denoiser_out['denoised_rigids']
+
+        # Restore GT for MSE computation
+        rigids_data['rigids_1'] = gt_rigid7
 
         out_dir = os.path.join(self.trainer.log_dir, f"epoch_samples/epoch_{epoch:04d}/{split}")
         os.makedirs(out_dir, exist_ok=True)
+
+        gt_rigids_t = ru.Rigid.from_tensor_7(rigids_data['rigids_1'])
+        gt_rigids_t = sym_permute_gt_rigids(final_rigids.get_trans(), gt_rigids_t, batch)
+        gt_trans_t = gt_rigids_t.get_trans()
+        pred_trans_t = final_rigids.get_trans()
+
+        ref_elements_t = rigids_data['rigids_ref_element']
+        noised_heavy_mask_t = (rigids_mask & rigids_noising_mask & (ref_elements_t != 1)).bool()
+        n_noised = noised_heavy_mask_t[0].long().sum().clamp(min=1)
+
+        # Kabsch-align pred to gt on noised heavy atoms
+        align_mask_t = noised_heavy_mask_t[0]
+        align_batch_t = torch.zeros(align_mask_t.sum(), dtype=torch.long, device=align_mask_t.device)
+        _, _, R_t = align_structures(pred_trans_t[0][align_mask_t], align_batch_t, gt_trans_t[0][align_mask_t])
+        pred_mean_t = pred_trans_t[0][align_mask_t].mean(0)
+        gt_mean_t = gt_trans_t[0][align_mask_t].mean(0)
+        pred_aligned_t = (pred_trans_t[0] - pred_mean_t) @ R_t[0] + gt_mean_t
+        se_t = torch.square(pred_aligned_t - gt_trans_t[0]).sum(dim=-1)
+        integration_mse = float((se_t * noised_heavy_mask_t[0]).sum() / n_noised)
 
         gt_rigid7 = rigids_data['rigids_1'].cpu().numpy()
         pred_rigid7 = final_rigids.to_tensor_7().cpu().numpy()
@@ -1119,13 +1121,6 @@ class BiomoleculeModule(L.LightningModule):
         is_atom_mask = rigids_data['rigids_is_atom_mask'].cpu().numpy().astype(bool)
 
         pred_rigid7_display = np.where(noising_mask_np[:, :, None], pred_rigid7, gt_rigid7)
-
-        gt_trans = ru.Rigid.from_tensor_7(torch.from_numpy(gt_rigid7)).get_trans().numpy()
-        pred_trans = final_rigids.get_trans().cpu().numpy()
-        noised_heavy_mask = rigids_mask_np & noising_mask_np & (ref_elements != 1)
-        n_noised = noised_heavy_mask[0].sum().clip(min=1)
-        se = np.square(pred_trans[0] - gt_trans[0]).sum(axis=-1)
-        integration_mse = float((se * noised_heavy_mask[0]).sum() / n_noised)
 
         record_id = batch.get('record_id', [None])[0]
         rid = (record_id if record_id is not None else "sample_0")
@@ -1331,6 +1326,42 @@ class BiomoleculeModule(L.LightningModule):
             rigids_seq_idx,
         )
         rigidwise_weight = seq_weight[rigids_seq]
+
+        if self.postalign_noise:
+            rigids_data = inputs['rigids']
+            rigids_mask = rigids_data['rigids_mask']
+            rigids_noising_mask = rigids_data['rigids_noising_mask']
+            align_mask = (rigids_mask * rigids_noising_mask).bool()
+            num_batch = rigids_mask.shape[0]
+            align_batch = torch.arange(num_batch, device=align_mask.device)[:, None].expand_as(rigids_mask)
+            align_batch = align_batch[align_mask]
+
+            pred_trans = outputs['denoised_rigids'].get_trans()
+            gt_trans = ru.Rigid.from_tensor_7(rigids_data['rigids_1']).get_trans()
+
+            # center pred on its noised-rigid mean before Kabsch (align_structures centers internally)
+            pred_mean = (pred_trans * align_mask[..., None]).sum(dim=1) / align_mask.long().sum(dim=1)[..., None].clip(min=1)
+            gt_mean = (gt_trans * align_mask[..., None]).sum(dim=1) / align_mask.long().sum(dim=1)[..., None].clip(min=1)
+            pred_trans_centered = pred_trans - pred_mean[:, None, :]
+
+            _, _, align_rot_mats = align_structures(
+                pred_trans_centered[align_mask],
+                align_batch,
+                gt_trans[align_mask],
+            )
+
+            if align_rot_mats.shape[0] != num_batch:
+                num_pad = num_batch - align_rot_mats.shape[0]
+                eye = torch.eye(3, device=align_rot_mats.device, dtype=align_rot_mats.dtype)
+                align_rot_mats = torch.cat([align_rot_mats, eye[None].expand(num_pad, -1, -1)], dim=0)
+
+            # rotate centered pred, then shift back to gt frame
+            aligned_trans = torch.einsum("bni,bij->bnj", pred_trans_centered, align_rot_mats) + gt_mean[:, None, :]
+            outputs = dict(outputs)
+            outputs['denoised_rigids'] = ru.Rigid(
+                rots=outputs['denoised_rigids'].get_rots(),
+                trans=aligned_trans,
+            )
 
         frame_fm_loss_dict = multiframe_fm_loss_dense_batch(
             inputs, outputs, sep_rot_loss=not self.learnable_noise_schedule, # use_euclidean_for_rots=self.use_euclidean_for_rots,
