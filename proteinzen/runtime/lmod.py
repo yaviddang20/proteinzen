@@ -6,6 +6,7 @@ from typing import Any
 import warnings
 from dataclasses import replace
 import os
+import shutil
 import json
 
 from xtb.interface import Calculator, Param
@@ -1870,6 +1871,16 @@ class BiomoleculeModule(L.LightningModule):
 
 
     def on_train_start(self):
+        if self.trainer.is_global_zero:
+            # Copy Hydra config to version dir for per-run documentation
+            hydra_cfg_path = '.hydra/config.yaml'
+            if os.path.exists(hydra_cfg_path):
+                shutil.copy(hydra_cfg_path, os.path.join(self.trainer.log_dir, 'config.yaml'))
+            # Log effective batch size
+            dm = self.trainer.datamodule
+            if dm is not None and hasattr(dm, 'batch_size'):
+                self.log('batch_size', float(dm.batch_size), rank_zero_only=True)
+
         if self.use_cosine_annealing:
             last_epoch = self.cosine_annealing_epoch_offset if self.cosine_annealing_epoch_offset is not None else self.current_epoch
             scheduler = self.lr_schedulers()

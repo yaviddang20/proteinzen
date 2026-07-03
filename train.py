@@ -26,7 +26,8 @@ from lightning.pytorch.strategies import DDPStrategy
 from lightning.fabric.plugins.environments import LightningEnvironment
 # from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch import Trainer
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import ModelCheckpoint, Callback
+from lightning.pytorch.loggers import TensorBoardLogger, CSVLogger
 
 # import wandb
 
