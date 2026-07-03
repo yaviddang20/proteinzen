@@ -1542,8 +1542,10 @@ class ConditionedBlockTransformerPairBias(nn.Module):
 
 class FramepairEmbedder(nn.Module):
     def __init__(self,
-                 c_framepair):
+                 c_framepair,
+                 patch_rel_quat_bug=False):
         super().__init__()
+        self.patch_rel_quat_bug = patch_rel_quat_bug
         self.lin_framepair_dist_vec = Linear(3, c_framepair, bias=False)
         self.lin_framepair_rel_quat = Linear(4, c_framepair, bias=False)
         self.lin_framepair_dist = Linear(1, c_framepair, bias=False)
@@ -1581,7 +1583,10 @@ class FramepairEmbedder(nn.Module):
             rots=ru.Rotation(quats=k_rots)
         )
 
-        rel_quat = k_rigids[..., None, :].get_rots().compose_q(q_rigids[..., None].invert().get_rots())
+        if self.patch_rel_quat_bug:
+            rel_quat = q_rigids[..., None].invert().get_rots().compose_q(k_rigids[..., None, :].get_rots())
+        else:
+            rel_quat = k_rigids[..., None, :].get_rots().compose_q(q_rigids[..., None].invert().get_rots())
         rel_quat = rel_quat.get_quats()
         # rel_trans = k_rigids[..., None, :].get_trans() - q_rigids[..., None].get_trans()
         rel_trans = q_rigids[..., None].invert_apply(k_rigids[..., None, :].get_trans())

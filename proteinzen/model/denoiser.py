@@ -241,6 +241,7 @@ class Embedder(nn.Module):
                  embed_hotspot_type=False,
                  embed_rigids_num_real_axes=False,
                  patch_unit_vec_bug=False,
+                 patch_rel_quat_bug=False,
                  embed_rigids_noising_mask=False,
                  use_entity_id_unmasking=False,
     ):
@@ -304,7 +305,8 @@ class Embedder(nn.Module):
             self.rigids_noising_mask_embed = None
 
         self.framepair_init = FramepairEmbedder(
-            c_framepair
+            c_framepair,
+            patch_rel_quat_bug=patch_rel_quat_bug,
         )
         self.frame_tfmr = SequenceFrameTransformerUpdate(
             c_s,
@@ -331,7 +333,8 @@ class Embedder(nn.Module):
         self.use_sc_rigid_transformer = use_sc_rigid_transformer
         if use_sc_rigid_transformer:
             self.sc_framepair_init = FramepairEmbedder(
-                c_framepair
+                c_framepair,
+                patch_rel_quat_bug=patch_rel_quat_bug,
             )
             self.sc_frame_tfmr = SequenceFrameTransformerUpdate(
                 c_s,
@@ -360,7 +363,8 @@ class Embedder(nn.Module):
         self.use_self_folding = use_self_folding
         if use_self_folding:
             self.sf_framepair_init = FramepairEmbedder(
-                c_framepair
+                c_framepair,
+                patch_rel_quat_bug=patch_rel_quat_bug,
             )
             self.sf_frame_tfmr = SequenceFrameTransformerUpdate(
                 c_s,
@@ -1437,6 +1441,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                  num_registers=0,
                  use_bond_rotation=False,
                  patch_unit_vec_bug=False,
+                 patch_rel_quat_bug=False,
                  predict_time=False,
                  predict_energy=False,
                  predict_min_conformer=False,
@@ -1534,6 +1539,7 @@ class IpaMultiRigidDenoiser(nn.Module):
             use_qk_norm=use_qk_norm,
             use_self_folding=self_folding,
             patch_unit_vec_bug=patch_unit_vec_bug,
+            patch_rel_quat_bug=patch_rel_quat_bug,
             predict_time=predict_time,
             use_lap_pe=use_lap_pe,
             lap_pe_k=lap_pe_k,
