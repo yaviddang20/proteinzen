@@ -1345,11 +1345,12 @@ class BiomoleculeModule(L.LightningModule):
             gt_mean = (gt_trans * align_mask[..., None]).sum(dim=1) / align_mask.long().sum(dim=1)[..., None].clip(min=1)
             pred_trans_centered = pred_trans - pred_mean[:, None, :]
 
-            _, _, align_rot_mats = align_structures(
-                pred_trans_centered[align_mask],
-                align_batch,
-                gt_trans[align_mask],
-            )
+            with torch.no_grad():
+                _, _, align_rot_mats = align_structures(
+                    pred_trans_centered[align_mask],
+                    align_batch,
+                    gt_trans[align_mask],
+                )
 
             if align_rot_mats.shape[0] != num_batch:
                 num_pad = num_batch - align_rot_mats.shape[0]
