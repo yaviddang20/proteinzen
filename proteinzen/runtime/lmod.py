@@ -504,6 +504,7 @@ class BiomoleculeModule(L.LightningModule):
                  use_interchain_fafe_loss=False,
                  use_brownian_rot_path_loss=False,
                  postalign_noise=False,
+                 epoch_sample_kabsch=False,
                  epoch_sample_every_n_epochs=5,
                  epoch_sample_num_steps=100,
                  # use_stabilized_high_t_loss=False
@@ -551,6 +552,7 @@ class BiomoleculeModule(L.LightningModule):
         self.use_interchain_fafe_loss = use_interchain_fafe_loss
         self.use_brownian_rot_path_loss = use_brownian_rot_path_loss
         self.postalign_noise = postalign_noise
+        self.epoch_sample_kabsch = epoch_sample_kabsch
         # self.use_stabilized_high_t_loss = use_stabilized_high_t_loss
 
         if learnable_noise_schedule:
@@ -1104,13 +1106,15 @@ class BiomoleculeModule(L.LightningModule):
         noised_heavy_mask_t = (rigids_mask & rigids_noising_mask & (ref_elements_t != 1)).bool()
         n_noised = noised_heavy_mask_t[0].long().sum().clamp(min=1)
 
-        # Kabsch-align pred to gt on noised heavy atoms
-        align_mask_t = noised_heavy_mask_t[0]
-        align_batch_t = torch.zeros(align_mask_t.sum(), dtype=torch.long, device=align_mask_t.device)
-        _, _, R_t = align_structures(pred_trans_t[0][align_mask_t], align_batch_t, gt_trans_t[0][align_mask_t])
-        pred_mean_t = pred_trans_t[0][align_mask_t].mean(0)
-        gt_mean_t = gt_trans_t[0][align_mask_t].mean(0)
-        pred_aligned_t = (pred_trans_t[0] - pred_mean_t) @ R_t[0] + gt_mean_t
+        if self.epoch_sample_kabsch:
+            align_mask_t = noised_heavy_mask_t[0]
+            align_batch_t = torch.zeros(align_mask_t.sum(), dtype=torch.long, device=align_mask_t.device)
+            _, _, R_t = align_structures(pred_trans_t[0][align_mask_t], align_batch_t, gt_trans_t[0][align_mask_t])
+            pred_mean_t = pred_trans_t[0][align_mask_t].mean(0)
+            gt_mean_t = gt_trans_t[0][align_mask_t].mean(0)
+            pred_aligned_t = (pred_trans_t[0] - pred_mean_t) @ R_t[0] + gt_mean_t
+        else:
+            pred_aligned_t = pred_trans_t[0]
         se_t = torch.square(pred_aligned_t - gt_trans_t[0]).sum(dim=-1)
         integration_mse = float((se_t * noised_heavy_mask_t[0]).sum() / n_noised)
 

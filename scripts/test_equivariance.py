@@ -92,7 +92,8 @@ def report(label, errs):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--ckpt', type=Path, required=True)
+    parser.add_argument('--ckpt', type=Path, required=True,
+                        help='Checkpoint path — weights do not affect equivariance, but we need the model arch')
     parser.add_argument('--data_config', type=Path, required=True)
     parser.add_argument('--t', type=float, default=0.5)
     parser.add_argument('--batch_size', type=int, default=1)
@@ -103,9 +104,8 @@ def main():
     np.random.seed(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # load model
-    print("Loading checkpoint...")
     from proteinzen.runtime.lmod import BiomoleculeModule
+    print(f"Loading checkpoint from {args.ckpt}...")
     lmod = BiomoleculeModule.load_from_checkpoint(
         args.ckpt, strict=False, map_location=device
     )
