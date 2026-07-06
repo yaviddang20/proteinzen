@@ -1958,7 +1958,7 @@ class BiomoleculeModule(L.LightningModule):
         if self.trainer.is_global_zero:
             # Copy Hydra config to version dir for per-run documentation
             hydra_cfg_path = '.hydra/config.yaml'
-            if os.path.exists(hydra_cfg_path):
+            if os.path.exists(hydra_cfg_path) and self.trainer.log_dir is not None:
                 shutil.copy(hydra_cfg_path, os.path.join(self.trainer.log_dir, 'config.yaml'))
             # Log effective batch size
             dm = self.trainer.datamodule
