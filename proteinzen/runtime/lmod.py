@@ -1020,23 +1020,33 @@ class BiomoleculeModule(L.LightningModule):
             )
 
     def on_validation_epoch_end(self):
-        for entry in self._pending_traj_writes:
-            i = entry['i']
-            for traj_np, traj_path in [
-                (entry['prot_traj_np'], entry['noise_path']),
-                (entry['clean_traj_np'], entry['clean_path']),
-            ]:
-                with open(traj_path, 'w') as f:
-                    for step_idx, step_rigid7 in enumerate(traj_np):
-                        step_records = _build_all_atom_records(
-                            step_rigid7[i], entry['rigids_mask_np'][i], entry['ref_elements'][i], entry['is_atom_mask'][i],
-                            entry['sc_idx_np'], entry['to_tok_np'], entry['seq_idx_np'],
-                            entry['res_type_np'], entry['asym_id_np'],
-                            token_residue_idx=entry['res_idx_np'],
-                        )
-                        _write_model_block(f, step_records, step_idx + 1)
-                    f.write("END\n")
+        # Gather traj write jobs from all ranks to rank 0, then only rank 0 writes.
+        # This avoids asymmetric IO across ranks causing NCCL timeout.
+        if dist.is_available() and dist.is_initialized() and self.trainer.world_size > 1:
+            gathered = [None] * self.trainer.world_size
+            dist.all_gather_object(gathered, self._pending_traj_writes)
+            all_entries = [e for rank_entries in gathered for e in rank_entries]
+        else:
+            all_entries = self._pending_traj_writes
         self._pending_traj_writes.clear()
+
+        if self.global_rank == 0:
+            for entry in all_entries:
+                i = entry['i']
+                for traj_np, traj_path in [
+                    (entry['prot_traj_np'], entry['noise_path']),
+                    (entry['clean_traj_np'], entry['clean_path']),
+                ]:
+                    with open(traj_path, 'w') as f:
+                        for step_idx, step_rigid7 in enumerate(traj_np):
+                            step_records = _build_all_atom_records(
+                                step_rigid7[i], entry['rigids_mask_np'][i], entry['ref_elements'][i], entry['is_atom_mask'][i],
+                                entry['sc_idx_np'], entry['to_tok_np'], entry['seq_idx_np'],
+                                entry['res_type_np'], entry['asym_id_np'],
+                                token_residue_idx=entry['res_idx_np'],
+                            )
+                            _write_model_block(f, step_records, step_idx + 1)
+                        f.write("END\n")
 
         metrics = self.trainer.callback_metrics
         # Training epoch average: Lightning appends _epoch when on_step=True and on_epoch=True
