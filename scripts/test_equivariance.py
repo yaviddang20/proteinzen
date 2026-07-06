@@ -94,6 +94,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--ckpt', type=Path, required=True,
                         help='Checkpoint path — weights do not affect equivariance, but we need the model arch')
+    parser.add_argument('--hydra_config', type=Path, required=True,
+                        help='Path to .hydra/config.yaml from the training run')
     parser.add_argument('--data_config', type=Path, required=True)
     parser.add_argument('--t', type=float, default=0.5)
     parser.add_argument('--batch_size', type=int, default=1)
@@ -104,11 +106,17 @@ def main():
     np.random.seed(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    import omegaconf
+    from hydra.utils import instantiate
     from proteinzen.runtime.lmod import BiomoleculeModule
-    print(f"Loading checkpoint from {args.ckpt}...")
-    lmod = BiomoleculeModule.load_from_checkpoint(
-        args.ckpt, strict=False, map_location=device
-    )
+
+    print(f"Instantiating model from {args.hydra_config}...")
+    cfg = omegaconf.OmegaConf.load(args.hydra_config)
+    lmod = instantiate(cfg.module, _recursive_=False)
+
+    print(f"Loading weights from {args.ckpt}...")
+    ckpt = torch.load(args.ckpt, map_location=device)
+    lmod.load_state_dict(ckpt['state_dict'], strict=False)
     lmod.eval().to(device)
     model = lmod.ema.module if (lmod.use_ema and lmod.ema is not None) else lmod.model
     model.eval()
