@@ -1086,7 +1086,7 @@ class BiomoleculeModule(L.LightningModule):
             no_rot_sampling=not self.use_rot_vf_loss,
         )
         ts = torch.linspace(0.0, 1.0, self.epoch_sample_num_steps + 1)
-        clean_traj, prot_traj, final_denoiser_out = integrator.sample(batch, ts)
+        _, _, final_denoiser_out = integrator.sample(batch, ts)
         final_rigids = final_denoiser_out['denoised_rigids']
 
         # Restore GT for MSE computation
@@ -1102,7 +1102,6 @@ class BiomoleculeModule(L.LightningModule):
 
         ref_elements_t = rigids_data['rigids_ref_element']
         noised_heavy_mask_t = (rigids_mask & rigids_noising_mask & (ref_elements_t != 1)).bool()
-
         gt_rigid7 = rigids_data['rigids_1'].cpu().numpy()
         pred_rigid7 = final_rigids.to_tensor_7().cpu().numpy()
         rigids_mask_np = rigids_mask.cpu().numpy().astype(bool)
@@ -1113,7 +1112,6 @@ class BiomoleculeModule(L.LightningModule):
 
         task = batch.get('task', [None])[0]
         task_name = task.name if task is not None else "unknown"
-
         record_ids = batch.get('record_id', [None] * gt_rigid7.shape[0])
 
         n_batch = gt_rigid7.shape[0]
@@ -1167,29 +1165,6 @@ class BiomoleculeModule(L.LightningModule):
                 path.replace('.pdb', '_kabsch.pdb'),
                 token_residue_idx=batch['token']['residue_idx'].cpu().numpy()[i],
             )
-
-            sc_idx_np = rigids_data['rigids_sidechain_idx'].cpu().numpy()[i]
-            to_tok_np = rigids_data['rigids_to_token'].cpu().numpy()[i]
-            seq_idx_np = rigids_data['rigids_seq_idx'].cpu().numpy()[i]
-            res_type_np = batch['token']['res_type'].cpu().numpy()[i]
-            asym_id_np = batch['token']['asym_id'].cpu().numpy()[i]
-            res_idx_np = batch['token']['residue_idx'].cpu().numpy()[i]
-
-            for traj, traj_suffix in [(prot_traj, '_traj_noise.pdb'), (clean_traj, '_traj_clean.pdb')]:
-                traj_path = path.replace('.pdb', traj_suffix)
-                with open(traj_path, 'w') as f:
-                    for step_idx, (trans_step, rotmats_step, _) in enumerate(traj):
-                        step_rigid7 = ru.Rigid(
-                            rots=ru.Rotation(rot_mats=rotmats_step),
-                            trans=trans_step,
-                        ).to_tensor_7().cpu().numpy()
-                        step_records = _build_all_atom_records(
-                            step_rigid7[i], rigids_mask_np[i], ref_elements[i], is_atom_mask[i],
-                            sc_idx_np, to_tok_np, seq_idx_np, res_type_np, asym_id_np,
-                            token_residue_idx=res_idx_np,
-                        )
-                        _write_model_block(f, step_records, step_idx + 1)
-                    f.write("END\n")
 
             self.log(f"epoch_sample/{split}/{task_name}/integration_mse", integration_mse, prog_bar=False, sync_dist=False)
             self.log(f"epoch_sample/{split}/{task_name}/integration_mse_kabsch", integration_mse_kabsch, prog_bar=False, sync_dist=False)
