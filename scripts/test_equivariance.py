@@ -112,7 +112,7 @@ def main():
 
     print(f"Instantiating model from {args.hydra_config}...")
     cfg = omegaconf.OmegaConf.load(args.hydra_config)
-    lmod = instantiate(cfg.module, _recursive_=False)
+    lmod = instantiate(cfg.lmodule, _recursive_=False)
 
     print(f"Loading weights from {args.ckpt}...")
     ckpt = torch.load(args.ckpt, map_location=device)
