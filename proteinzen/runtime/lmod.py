@@ -902,11 +902,6 @@ class BiomoleculeModule(L.LightningModule):
             self.trainer.current_epoch % 5 == 0
             and batch_idx == 0  # only first val batch
         )
-        run_epoch_sample = (
-            self.trainer.current_epoch % self.epoch_sample_every_n_epochs == 0
-            and batch_idx == 0
-        )
-
         if batch_idx == 0:
             self._epoch_sample_val_batch = _detach_cpu_batch(batch)
 
@@ -929,11 +924,6 @@ class BiomoleculeModule(L.LightningModule):
                 batch_t,
                 stage=f"val/t_{t_val}",
             )
-
-        if run_epoch_sample:
-            if self._epoch_sample_train_batch is not None:
-                self._run_epoch_sample(self._epoch_sample_train_batch, "train")
-            self._run_epoch_sample(_detach_cpu_batch(batch), "val")
 
     def _collect_val_pdb_data(self, batch, outputs, t_val: float, n_samples: int = 5):
         """Extract all GPU tensors to CPU numpy."""
@@ -1020,6 +1010,13 @@ class BiomoleculeModule(L.LightningModule):
             )
 
     def on_validation_epoch_end(self):
+        if (self.trainer.current_epoch % self.epoch_sample_every_n_epochs == 0
+                and self.global_rank == 0):
+            if self._epoch_sample_train_batch is not None:
+                self._run_epoch_sample(self._epoch_sample_train_batch, "train")
+            if self._epoch_sample_val_batch is not None:
+                self._run_epoch_sample(self._epoch_sample_val_batch, "val")
+
         metrics = self.trainer.callback_metrics
         # Training epoch average: Lightning appends _epoch when on_step=True and on_epoch=True
         train_mse = metrics.get("train/pred_trans_mse_epoch", metrics.get("train/pred_trans_mse"))
