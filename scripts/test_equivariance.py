@@ -112,7 +112,14 @@ def main():
 
     print(f"Instantiating model from {args.hydra_config}...")
     cfg = omegaconf.OmegaConf.load(args.hydra_config)
-    lmod = instantiate(cfg.lmodule)
+    model_inst    = instantiate(cfg.model)
+    corrupter_inst = instantiate(cfg.corrupter)
+    # lmodule has _partial_: true in hydra config; bypass it entirely
+    lmod_cfg = omegaconf.OmegaConf.to_container(cfg.lmodule, resolve=True)
+    lmod_cfg.pop('_target_', None)
+    lmod_cfg.pop('_partial_', None)
+    lmod = BiomoleculeModule(model=model_inst, corrupter=corrupter_inst,
+                             optim={'lr': 1e-4}, **lmod_cfg)
 
     print(f"Loading weights from {args.ckpt}...")
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
@@ -123,8 +130,6 @@ def main():
 
     # get one real batch
     print("Building dataloader...")
-    import omegaconf
-    from hydra.utils import instantiate
     from proteinzen.data.datasets.datamodule import collate
     from torch.utils.data import DataLoader
 
