@@ -1045,7 +1045,7 @@ class BiomoleculeModule(L.LightningModule):
         model = self.ema.module if (self.use_ema and self.ema is not None) else self.model
         model.eval()
 
-        batch = _move_to_device(_slice_batch(batch_cpu, 0), device)
+        batch = _move_to_device(batch_cpu, device)
 
         rigids_data = batch['rigids']
         rigids_mask = rigids_data['rigids_mask']
@@ -1099,20 +1099,6 @@ class BiomoleculeModule(L.LightningModule):
 
         ref_elements_t = rigids_data['rigids_ref_element']
         noised_heavy_mask_t = (rigids_mask & rigids_noising_mask & (ref_elements_t != 1)).bool()
-        n_noised = noised_heavy_mask_t[0].long().sum().clamp(min=1)
-
-        task = batch.get('task', [None])[0]
-        if getattr(task, 'epoch_sample_kabsch', False):
-            align_mask_t = noised_heavy_mask_t[0]
-            align_batch_t = torch.zeros(align_mask_t.sum(), dtype=torch.long, device=align_mask_t.device)
-            _, _, R_t = align_structures(pred_trans_t[0][align_mask_t], align_batch_t, gt_trans_t[0][align_mask_t])
-            pred_mean_t = pred_trans_t[0][align_mask_t].mean(0)
-            gt_mean_t = gt_trans_t[0][align_mask_t].mean(0)
-            pred_aligned_t = (pred_trans_t[0] - pred_mean_t) @ R_t[0] + gt_mean_t
-        else:
-            pred_aligned_t = pred_trans_t[0]
-        se_t = torch.square(pred_aligned_t - gt_trans_t[0]).sum(dim=-1)
-        integration_mse = float((se_t * noised_heavy_mask_t[0]).sum() / n_noised)
 
         gt_rigid7 = rigids_data['rigids_1'].cpu().numpy()
         pred_rigid7 = final_rigids.to_tensor_7().cpu().numpy()
@@ -1120,56 +1106,94 @@ class BiomoleculeModule(L.LightningModule):
         noising_mask_np = rigids_noising_mask.cpu().numpy().astype(bool)
         ref_elements = rigids_data['rigids_ref_element'].cpu().numpy()
         is_atom_mask = rigids_data['rigids_is_atom_mask'].cpu().numpy().astype(bool)
-
         pred_rigid7_display = np.where(noising_mask_np[:, :, None], pred_rigid7, gt_rigid7)
 
-        record_id = batch.get('record_id', [None])[0]
-        rid = (record_id if record_id is not None else "sample_0")
-        rid = rid.replace("/", "_").replace(" ", "_")
-        task_name = batch['task'][0].name if batch.get('task') else "unknown"
-        path = os.path.join(out_dir, f"{task_name}_{rid}_rank{rank}_mse={integration_mse:.3f}.pdb")
+        task = batch.get('task', [None])[0]
+        task_name = task.name if task is not None else "unknown"
 
-        write_val_pdb(
-            gt_rigid7[0],
-            pred_rigid7_display[0],
-            rigids_mask_np[0],
-            ref_elements[0],
-            is_atom_mask[0],
-            rigids_data['rigids_sidechain_idx'].cpu().numpy()[0],
-            rigids_data['rigids_to_token'].cpu().numpy()[0],
-            rigids_data['rigids_seq_idx'].cpu().numpy()[0],
-            batch['token']['res_type'].cpu().numpy()[0],
-            batch['token']['asym_id'].cpu().numpy()[0],
-            path,
-            token_residue_idx=batch['token']['residue_idx'].cpu().numpy()[0],
-        )
-        sc_idx_np = rigids_data['rigids_sidechain_idx'].cpu().numpy()[0]
-        to_tok_np = rigids_data['rigids_to_token'].cpu().numpy()[0]
-        seq_idx_np = rigids_data['rigids_seq_idx'].cpu().numpy()[0]
-        res_type_np = batch['token']['res_type'].cpu().numpy()[0]
-        asym_id_np = batch['token']['asym_id'].cpu().numpy()[0]
-        res_idx_np = batch['token']['residue_idx'].cpu().numpy()[0]
+        record_ids = batch.get('record_id', [None] * gt_rigid7.shape[0])
 
-        def _write_epoch_traj(traj, traj_path):
-            with open(traj_path, "w") as f:
-                for step_idx, (trans_step, rotmats_step, _) in enumerate(traj):
-                    step_rigid7 = ru.Rigid(
-                        rots=ru.Rotation(rot_mats=rotmats_step),
-                        trans=trans_step,
-                    ).to_tensor_7().cpu().numpy()
-                    step_records = _build_all_atom_records(
-                        step_rigid7[0], rigids_mask_np[0], ref_elements[0], is_atom_mask[0],
-                        sc_idx_np, to_tok_np, seq_idx_np, res_type_np, asym_id_np,
-                        token_residue_idx=res_idx_np,
-                    )
-                    _write_model_block(f, step_records, step_idx + 1)
-                f.write("END\n")
+        n_batch = gt_rigid7.shape[0]
+        for i in range(n_batch):
+            n_noised = noised_heavy_mask_t[i].long().sum().clamp(min=1)
 
-        _write_epoch_traj(prot_traj, path.replace('.pdb', '_traj_noise.pdb'))
-        _write_epoch_traj(clean_traj, path.replace('.pdb', '_traj_clean.pdb'))
+            align_mask_i = noised_heavy_mask_t[i]
+            align_batch_i = torch.zeros(align_mask_i.sum(), dtype=torch.long, device=align_mask_i.device)
+            _, _, R_i = align_structures(pred_trans_t[i][align_mask_i], align_batch_i, gt_trans_t[i][align_mask_i])
+            pred_mean_i = pred_trans_t[i][align_mask_i].mean(0)
+            gt_mean_i = gt_trans_t[i][align_mask_i].mean(0)
+            pred_aligned_i = (pred_trans_t[i] - pred_mean_i) @ R_i[0] + gt_mean_i
 
-        self.log(f"epoch_sample/{split}/{task_name}/integration_mse", integration_mse, prog_bar=False, sync_dist=False)
-        self._log.info(f"Epoch {epoch} integration sample ({split}) written: {path} (mse={integration_mse:.3f})")
+            se_i = torch.square(pred_trans_t[i] - gt_trans_t[i]).sum(dim=-1)
+            integration_mse = float((se_i * noised_heavy_mask_t[i]).sum() / n_noised)
+            se_kabsch_i = torch.square(pred_aligned_i - gt_trans_t[i]).sum(dim=-1)
+            integration_mse_kabsch = float((se_kabsch_i * noised_heavy_mask_t[i]).sum() / n_noised)
+
+            rid = record_ids[i] if record_ids[i] is not None else f"sample_{i}"
+            rid = rid.replace("/", "_").replace(" ", "_")
+            path = os.path.join(out_dir, f"{task_name}_{rid}_mse={integration_mse:.3f}_kabsch={integration_mse_kabsch:.3f}.pdb")
+
+            write_val_pdb(
+                gt_rigid7[i],
+                pred_rigid7_display[i],
+                rigids_mask_np[i],
+                ref_elements[i],
+                is_atom_mask[i],
+                rigids_data['rigids_sidechain_idx'].cpu().numpy()[i],
+                rigids_data['rigids_to_token'].cpu().numpy()[i],
+                rigids_data['rigids_seq_idx'].cpu().numpy()[i],
+                batch['token']['res_type'].cpu().numpy()[i],
+                batch['token']['asym_id'].cpu().numpy()[i],
+                path,
+                token_residue_idx=batch['token']['residue_idx'].cpu().numpy()[i],
+            )
+
+            pred_rigid7_aligned = pred_rigid7_display[i].copy()
+            pred_rigid7_aligned[noising_mask_np[i], 4:] = pred_aligned_i.cpu().numpy()[noising_mask_np[i]]
+            write_val_pdb(
+                gt_rigid7[i],
+                pred_rigid7_aligned,
+                rigids_mask_np[i],
+                ref_elements[i],
+                is_atom_mask[i],
+                rigids_data['rigids_sidechain_idx'].cpu().numpy()[i],
+                rigids_data['rigids_to_token'].cpu().numpy()[i],
+                rigids_data['rigids_seq_idx'].cpu().numpy()[i],
+                batch['token']['res_type'].cpu().numpy()[i],
+                batch['token']['asym_id'].cpu().numpy()[i],
+                path.replace('.pdb', '_kabsch.pdb'),
+                token_residue_idx=batch['token']['residue_idx'].cpu().numpy()[i],
+            )
+
+            sc_idx_np = rigids_data['rigids_sidechain_idx'].cpu().numpy()[i]
+            to_tok_np = rigids_data['rigids_to_token'].cpu().numpy()[i]
+            seq_idx_np = rigids_data['rigids_seq_idx'].cpu().numpy()[i]
+            res_type_np = batch['token']['res_type'].cpu().numpy()[i]
+            asym_id_np = batch['token']['asym_id'].cpu().numpy()[i]
+            res_idx_np = batch['token']['residue_idx'].cpu().numpy()[i]
+
+            def _write_epoch_traj(traj, traj_path, idx=i):
+                with open(traj_path, "w") as f:
+                    for step_idx, (trans_step, rotmats_step, _) in enumerate(traj):
+                        step_rigid7 = ru.Rigid(
+                            rots=ru.Rotation(rot_mats=rotmats_step),
+                            trans=trans_step,
+                        ).to_tensor_7().cpu().numpy()
+                        step_records = _build_all_atom_records(
+                            step_rigid7[idx], rigids_mask_np[idx], ref_elements[idx], is_atom_mask[idx],
+                            sc_idx_np, to_tok_np, seq_idx_np, res_type_np, asym_id_np,
+                            token_residue_idx=res_idx_np,
+                        )
+                        _write_model_block(f, step_records, step_idx + 1)
+                    f.write("END\n")
+
+            _write_epoch_traj(prot_traj, path.replace('.pdb', '_traj_noise.pdb'))
+            _write_epoch_traj(clean_traj, path.replace('.pdb', '_traj_clean.pdb'))
+
+            self.log(f"epoch_sample/{split}/{task_name}/integration_mse", integration_mse, prog_bar=False, sync_dist=False)
+            self.log(f"epoch_sample/{split}/{task_name}/integration_mse_kabsch", integration_mse_kabsch, prog_bar=False, sync_dist=False)
+            self._log.info(f"Epoch {epoch} integration sample ({split}) written: {path} (mse={integration_mse:.3f}, kabsch={integration_mse_kabsch:.3f})")
+
         model.train()
 
     #     return loss_dict

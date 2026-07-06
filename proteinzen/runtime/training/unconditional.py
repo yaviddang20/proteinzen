@@ -16,7 +16,6 @@ class UnconditionalGeneration(TrainingTask):
         shift_time_scale=False,
         t_min=0.01,
         t_max=0.99,
-        epoch_sample_kabsch=False,
     ):
         assert t_sched in ['lognorm', 'mixed_beta', 'uniform']
         self.prob = prob
@@ -28,7 +27,6 @@ class UnconditionalGeneration(TrainingTask):
         self.t_min = t_min
         self.t_max = t_max
         self.shift_time_scale = shift_time_scale
-        self.epoch_sample_kabsch = epoch_sample_kabsch
 
     def sample_t_and_mask(self, data):
         residues = data.residues

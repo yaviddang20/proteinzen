@@ -7,7 +7,6 @@ from torch import Tensor
 class TrainingTask(abc.ABC):
     name: str = "abc"  # override this
     prob: float
-    epoch_sample_kabsch: bool = False
 
     def sample_t_and_mask(self, batch) -> Dict[str, Tensor]:
         raise NotImplementedError
