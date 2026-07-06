@@ -115,7 +115,7 @@ def main():
     lmod = instantiate(cfg.lmodule, _recursive_=False)
 
     print(f"Loading weights from {args.ckpt}...")
-    ckpt = torch.load(args.ckpt, map_location=device)
+    ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     lmod.load_state_dict(ckpt['state_dict'], strict=False)
     lmod.eval().to(device)
     model = lmod.ema.module if (lmod.use_ema and lmod.ema is not None) else lmod.model
