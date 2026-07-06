@@ -586,6 +586,7 @@ class BiomoleculeModule(L.LightningModule):
         self.epoch_sample_num_steps = epoch_sample_num_steps
         self._epoch_sample_train_batch = None
         self._epoch_sample_val_batch = None
+        self._pending_traj_writes = []
 
         self.aatype_to_restype_tensor = torch.zeros(const.num_tokens)
         for aatype, restype in AA_TO_RES.items():
@@ -902,6 +903,10 @@ class BiomoleculeModule(L.LightningModule):
             self.trainer.current_epoch % 5 == 0
             and batch_idx == 0  # only first val batch
         )
+        run_epoch_sample = (
+            self.trainer.current_epoch % self.epoch_sample_every_n_epochs == 0
+            and batch_idx == 0
+        )
         if batch_idx == 0:
             self._epoch_sample_val_batch = _detach_cpu_batch(batch)
 
@@ -924,6 +929,11 @@ class BiomoleculeModule(L.LightningModule):
                 batch_t,
                 stage=f"val/t_{t_val}",
             )
+
+        if run_epoch_sample:
+            if self._epoch_sample_train_batch is not None:
+                self._run_epoch_sample(self._epoch_sample_train_batch, "train")
+            self._run_epoch_sample(_detach_cpu_batch(batch), "val")
 
     def _collect_val_pdb_data(self, batch, outputs, t_val: float, n_samples: int = 5):
         """Extract all GPU tensors to CPU numpy."""
@@ -1010,12 +1020,23 @@ class BiomoleculeModule(L.LightningModule):
             )
 
     def on_validation_epoch_end(self):
-        if (self.trainer.current_epoch % self.epoch_sample_every_n_epochs == 0
-                and self.global_rank == 0):
-            if self._epoch_sample_train_batch is not None:
-                self._run_epoch_sample(self._epoch_sample_train_batch, "train")
-            if self._epoch_sample_val_batch is not None:
-                self._run_epoch_sample(self._epoch_sample_val_batch, "val")
+        for entry in self._pending_traj_writes:
+            i = entry['i']
+            for traj_np, traj_path in [
+                (entry['prot_traj_np'], entry['noise_path']),
+                (entry['clean_traj_np'], entry['clean_path']),
+            ]:
+                with open(traj_path, 'w') as f:
+                    for step_idx, step_rigid7 in enumerate(traj_np):
+                        step_records = _build_all_atom_records(
+                            step_rigid7[i], entry['rigids_mask_np'][i], entry['ref_elements'][i], entry['is_atom_mask'][i],
+                            entry['sc_idx_np'], entry['to_tok_np'], entry['seq_idx_np'],
+                            entry['res_type_np'], entry['asym_id_np'],
+                            token_residue_idx=entry['res_idx_np'],
+                        )
+                        _write_model_block(f, step_records, step_idx + 1)
+                    f.write("END\n")
+        self._pending_traj_writes.clear()
 
         metrics = self.trainer.callback_metrics
         # Training epoch average: Lightning appends _epoch when on_step=True and on_epoch=True
@@ -1085,6 +1106,17 @@ class BiomoleculeModule(L.LightningModule):
         ts = torch.linspace(0.0, 1.0, self.epoch_sample_num_steps + 1)
         prot_traj, clean_traj, final_denoiser_out = integrator.sample(batch, ts)
         final_rigids = final_denoiser_out['denoised_rigids']
+
+        # Pre-convert trajectories to CPU numpy now, before any file IO,
+        # so CUDA syncs happen here (inside validation_step) rather than later.
+        prot_traj_np = [
+            ru.Rigid(rots=ru.Rotation(rot_mats=r), trans=t).to_tensor_7().cpu().numpy()
+            for t, r, _ in prot_traj
+        ]
+        clean_traj_np = [
+            ru.Rigid(rots=ru.Rotation(rot_mats=r), trans=t).to_tensor_7().cpu().numpy()
+            for t, r, _ in clean_traj
+        ]
 
         # Restore GT for MSE computation
         rigids_data['rigids_1'] = gt_rigid7
@@ -1172,23 +1204,22 @@ class BiomoleculeModule(L.LightningModule):
             asym_id_np = batch['token']['asym_id'].cpu().numpy()[i]
             res_idx_np = batch['token']['residue_idx'].cpu().numpy()[i]
 
-            def _write_epoch_traj(traj, traj_path, idx=i):
-                with open(traj_path, "w") as f:
-                    for step_idx, (trans_step, rotmats_step, _) in enumerate(traj):
-                        step_rigid7 = ru.Rigid(
-                            rots=ru.Rotation(rot_mats=rotmats_step),
-                            trans=trans_step,
-                        ).to_tensor_7().cpu().numpy()
-                        step_records = _build_all_atom_records(
-                            step_rigid7[idx], rigids_mask_np[idx], ref_elements[idx], is_atom_mask[idx],
-                            sc_idx_np, to_tok_np, seq_idx_np, res_type_np, asym_id_np,
-                            token_residue_idx=res_idx_np,
-                        )
-                        _write_model_block(f, step_records, step_idx + 1)
-                    f.write("END\n")
-
-            _write_epoch_traj(prot_traj, path.replace('.pdb', '_traj_noise.pdb'))
-            _write_epoch_traj(clean_traj, path.replace('.pdb', '_traj_clean.pdb'))
+            self._pending_traj_writes.append({
+                'prot_traj_np': prot_traj_np,
+                'clean_traj_np': clean_traj_np,
+                'noise_path': path.replace('.pdb', '_traj_noise.pdb'),
+                'clean_path': path.replace('.pdb', '_traj_clean.pdb'),
+                'i': i,
+                'rigids_mask_np': rigids_mask_np,
+                'ref_elements': ref_elements,
+                'is_atom_mask': is_atom_mask,
+                'sc_idx_np': sc_idx_np,
+                'to_tok_np': to_tok_np,
+                'seq_idx_np': seq_idx_np,
+                'res_type_np': res_type_np,
+                'asym_id_np': asym_id_np,
+                'res_idx_np': res_idx_np,
+            })
 
             self.log(f"epoch_sample/{split}/{task_name}/integration_mse", integration_mse, prog_bar=False, sync_dist=False)
             self.log(f"epoch_sample/{split}/{task_name}/integration_mse_kabsch", integration_mse_kabsch, prog_bar=False, sync_dist=False)
@@ -1390,12 +1421,8 @@ class BiomoleculeModule(L.LightningModule):
             gt_trans = ru.Rigid.from_tensor_7(rigids_data['rigids_1']).get_trans()
 
             with torch.no_grad():
-                # fully detach alignment constants: no gradients through centering or SVD
-                pred_mean = (pred_trans * align_mask[..., None]).sum(dim=1) / align_mask.long().sum(dim=1)[..., None].clip(min=1)
-                gt_mean = (gt_trans * align_mask[..., None]).sum(dim=1) / align_mask.long().sum(dim=1)[..., None].clip(min=1)
-                pred_trans_centered_for_kabsch = pred_trans - pred_mean[:, None, :]
                 _, _, align_rot_mats = align_structures(
-                    pred_trans_centered_for_kabsch[align_mask],
+                    pred_trans[align_mask],
                     align_batch,
                     gt_trans[align_mask],
                 )
@@ -1404,8 +1431,7 @@ class BiomoleculeModule(L.LightningModule):
                     eye = torch.eye(3, device=align_rot_mats.device, dtype=align_rot_mats.dtype)
                     align_rot_mats = torch.cat([align_rot_mats, eye[None].expand(num_pad, -1, -1)], dim=0)
 
-            # apply fixed (detached) alignment to live pred_trans so gradients flow through pred_trans
-            aligned_trans = torch.einsum("bni,bij->bnj", pred_trans - pred_mean[:, None, :], align_rot_mats) + gt_mean[:, None, :]
+            aligned_trans = torch.einsum("bni,bij->bnj", pred_trans, align_rot_mats)
             outputs = dict(outputs)
             outputs['denoised_rigids'] = ru.Rigid(
                 rots=outputs['denoised_rigids'].get_rots(),
