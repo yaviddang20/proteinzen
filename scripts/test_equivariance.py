@@ -144,10 +144,10 @@ def main():
         return x
 
     batch = to_device(next(iter(loader)))
-    batch['t'] = torch.full((args.batch_size, 1), args.t, device=device)
-    # trans_prior_std may be a top-level batch key not inside a sub-dict
-    if 'trans_prior_std' in batch and isinstance(batch['trans_prior_std'], torch.Tensor):
-        batch['trans_prior_std'] = batch['trans_prior_std'].to(device)
+    t_val = torch.full((args.batch_size,), args.t, device=device)
+    batch['t']       = t_val.unsqueeze(-1)  # [B, 1]
+    batch['trans_t'] = t_val               # [B]
+    batch['rot_t']   = t_val               # [B]
     with torch.no_grad():
         batch = lmod.corrupter.corrupt_dense_batch(batch, lmod.identity_rot_noise)
 
