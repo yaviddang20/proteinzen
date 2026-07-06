@@ -1368,25 +1368,23 @@ class BiomoleculeModule(L.LightningModule):
             pred_trans = outputs['denoised_rigids'].get_trans()
             gt_trans = ru.Rigid.from_tensor_7(rigids_data['rigids_1']).get_trans()
 
-            # center pred on its noised-rigid mean before Kabsch (align_structures centers internally)
-            pred_mean = (pred_trans * align_mask[..., None]).sum(dim=1) / align_mask.long().sum(dim=1)[..., None].clip(min=1)
-            gt_mean = (gt_trans * align_mask[..., None]).sum(dim=1) / align_mask.long().sum(dim=1)[..., None].clip(min=1)
-            pred_trans_centered = pred_trans - pred_mean[:, None, :]
-
             with torch.no_grad():
+                # fully detach alignment constants: no gradients through centering or SVD
+                pred_mean = (pred_trans * align_mask[..., None]).sum(dim=1) / align_mask.long().sum(dim=1)[..., None].clip(min=1)
+                gt_mean = (gt_trans * align_mask[..., None]).sum(dim=1) / align_mask.long().sum(dim=1)[..., None].clip(min=1)
+                pred_trans_centered_for_kabsch = pred_trans - pred_mean[:, None, :]
                 _, _, align_rot_mats = align_structures(
-                    pred_trans_centered[align_mask],
+                    pred_trans_centered_for_kabsch[align_mask],
                     align_batch,
                     gt_trans[align_mask],
                 )
+                if align_rot_mats.shape[0] != num_batch:
+                    num_pad = num_batch - align_rot_mats.shape[0]
+                    eye = torch.eye(3, device=align_rot_mats.device, dtype=align_rot_mats.dtype)
+                    align_rot_mats = torch.cat([align_rot_mats, eye[None].expand(num_pad, -1, -1)], dim=0)
 
-            if align_rot_mats.shape[0] != num_batch:
-                num_pad = num_batch - align_rot_mats.shape[0]
-                eye = torch.eye(3, device=align_rot_mats.device, dtype=align_rot_mats.dtype)
-                align_rot_mats = torch.cat([align_rot_mats, eye[None].expand(num_pad, -1, -1)], dim=0)
-
-            # rotate centered pred, then shift back to gt frame
-            aligned_trans = torch.einsum("bni,bij->bnj", pred_trans_centered, align_rot_mats) + gt_mean[:, None, :]
+            # apply fixed (detached) alignment to live pred_trans so gradients flow through pred_trans
+            aligned_trans = torch.einsum("bni,bij->bnj", pred_trans - pred_mean[:, None, :], align_rot_mats) + gt_mean[:, None, :]
             outputs = dict(outputs)
             outputs['denoised_rigids'] = ru.Rigid(
                 rots=outputs['denoised_rigids'].get_rots(),
