@@ -1107,16 +1107,15 @@ class BiomoleculeModule(L.LightningModule):
         prot_traj, clean_traj, final_denoiser_out = integrator.sample(batch, ts)
         final_rigids = final_denoiser_out['denoised_rigids']
 
-        # Pre-convert trajectories to CPU numpy now, before any file IO,
-        # so CUDA syncs happen here (inside validation_step) rather than later.
-        prot_traj_np = [
-            ru.Rigid(rots=ru.Rotation(rot_mats=r), trans=t).to_tensor_7().cpu().numpy()
-            for t, r, _ in prot_traj
-        ]
-        clean_traj_np = [
-            ru.Rigid(rots=ru.Rotation(rot_mats=r), trans=t).to_tensor_7().cpu().numpy()
-            for t, r, _ in clean_traj
-        ]
+        # Trajectory writing disabled pending investigation of NCCL timeout
+        # prot_traj_np = [
+        #     ru.Rigid(rots=ru.Rotation(rot_mats=r), trans=t).to_tensor_7().cpu().numpy()
+        #     for t, r, _ in prot_traj
+        # ]
+        # clean_traj_np = [
+        #     ru.Rigid(rots=ru.Rotation(rot_mats=r), trans=t).to_tensor_7().cpu().numpy()
+        #     for t, r, _ in clean_traj
+        # ]
 
         # Restore GT for MSE computation
         rigids_data['rigids_1'] = gt_rigid7
@@ -1204,22 +1203,7 @@ class BiomoleculeModule(L.LightningModule):
             asym_id_np = batch['token']['asym_id'].cpu().numpy()[i]
             res_idx_np = batch['token']['residue_idx'].cpu().numpy()[i]
 
-            self._pending_traj_writes.append({
-                'prot_traj_np': prot_traj_np,
-                'clean_traj_np': clean_traj_np,
-                'noise_path': path.replace('.pdb', '_traj_noise.pdb'),
-                'clean_path': path.replace('.pdb', '_traj_clean.pdb'),
-                'i': i,
-                'rigids_mask_np': rigids_mask_np,
-                'ref_elements': ref_elements,
-                'is_atom_mask': is_atom_mask,
-                'sc_idx_np': sc_idx_np,
-                'to_tok_np': to_tok_np,
-                'seq_idx_np': seq_idx_np,
-                'res_type_np': res_type_np,
-                'asym_id_np': asym_id_np,
-                'res_idx_np': res_idx_np,
-            })
+            # self._pending_traj_writes.append({...})  # disabled pending NCCL investigation
 
             self.log(f"epoch_sample/{split}/{task_name}/integration_mse", integration_mse, prog_bar=False, sync_dist=False)
             self.log(f"epoch_sample/{split}/{task_name}/integration_mse_kabsch", integration_mse_kabsch, prog_bar=False, sync_dist=False)
