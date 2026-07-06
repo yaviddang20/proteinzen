@@ -137,10 +137,17 @@ def main():
     val_dataset = instantiate(val_cfg)
     loader = DataLoader(val_dataset, batch_size=args.batch_size,
                         collate_fn=collate, shuffle=True, num_workers=0)
-    batch = next(iter(loader))
-    batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-             for k, v in batch.items()}
+    def to_device(x):
+        if isinstance(x, torch.Tensor): return x.to(device)
+        if isinstance(x, dict): return {k: to_device(v) for k, v in x.items()}
+        if isinstance(x, list): return [to_device(v) for v in x]
+        return x
+
+    batch = to_device(next(iter(loader)))
     batch['t'] = torch.full((args.batch_size, 1), args.t, device=device)
+    # trans_prior_std may be a top-level batch key not inside a sub-dict
+    if 'trans_prior_std' in batch and isinstance(batch['trans_prior_std'], torch.Tensor):
+        batch['trans_prior_std'] = batch['trans_prior_std'].to(device)
     with torch.no_grad():
         batch = lmod.corrupter.corrupt_dense_batch(batch, lmod.identity_rot_noise)
 
