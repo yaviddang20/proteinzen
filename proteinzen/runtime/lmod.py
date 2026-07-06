@@ -586,7 +586,7 @@ class BiomoleculeModule(L.LightningModule):
         self.epoch_sample_num_steps = epoch_sample_num_steps
         self._epoch_sample_train_batch = None
         self._epoch_sample_val_batch = None
-        self._pending_traj_writes = []
+
 
         self.aatype_to_restype_tensor = torch.zeros(const.num_tokens)
         for aatype, restype in AA_TO_RES.items():
@@ -1020,24 +1020,6 @@ class BiomoleculeModule(L.LightningModule):
             )
 
     def on_validation_epoch_end(self):
-        for entry in self._pending_traj_writes:
-            i = entry['i']
-            for traj_np, traj_path in [
-                (entry['prot_traj_np'], entry['noise_path']),
-                (entry['clean_traj_np'], entry['clean_path']),
-            ]:
-                with open(traj_path, 'w') as f:
-                    for step_idx, step_rigid7 in enumerate(traj_np):
-                        step_records = _build_all_atom_records(
-                            step_rigid7[i], entry['rigids_mask_np'][i], entry['ref_elements'][i], entry['is_atom_mask'][i],
-                            entry['sc_idx_np'], entry['to_tok_np'], entry['seq_idx_np'],
-                            entry['res_type_np'], entry['asym_id_np'],
-                            token_residue_idx=entry['res_idx_np'],
-                        )
-                        _write_model_block(f, step_records, step_idx + 1)
-                    f.write("END\n")
-        self._pending_traj_writes.clear()
-
         metrics = self.trainer.callback_metrics
         # Training epoch average: Lightning appends _epoch when on_step=True and on_epoch=True
         train_mse = metrics.get("train/pred_trans_mse_epoch", metrics.get("train/pred_trans_mse"))
@@ -1066,7 +1048,7 @@ class BiomoleculeModule(L.LightningModule):
         model = self.ema.module if (self.use_ema and self.ema is not None) else self.model
         model.eval()
 
-        batch = _move_to_device(batch_cpu, device)
+        batch = _move_to_device(_slice_batch(batch_cpu, 0), device)
 
         rigids_data = batch['rigids']
         rigids_mask = rigids_data['rigids_mask']
@@ -1104,18 +1086,8 @@ class BiomoleculeModule(L.LightningModule):
             no_rot_sampling=not self.use_rot_vf_loss,
         )
         ts = torch.linspace(0.0, 1.0, self.epoch_sample_num_steps + 1)
-        prot_traj, clean_traj, final_denoiser_out = integrator.sample(batch, ts)
+        clean_traj, prot_traj, final_denoiser_out = integrator.sample(batch, ts)
         final_rigids = final_denoiser_out['denoised_rigids']
-
-        # Trajectory writing disabled pending investigation of NCCL timeout
-        # prot_traj_np = [
-        #     ru.Rigid(rots=ru.Rotation(rot_mats=r), trans=t).to_tensor_7().cpu().numpy()
-        #     for t, r, _ in prot_traj
-        # ]
-        # clean_traj_np = [
-        #     ru.Rigid(rots=ru.Rotation(rot_mats=r), trans=t).to_tensor_7().cpu().numpy()
-        #     for t, r, _ in clean_traj
-        # ]
 
         # Restore GT for MSE computation
         rigids_data['rigids_1'] = gt_rigid7
@@ -1203,7 +1175,21 @@ class BiomoleculeModule(L.LightningModule):
             asym_id_np = batch['token']['asym_id'].cpu().numpy()[i]
             res_idx_np = batch['token']['residue_idx'].cpu().numpy()[i]
 
-            # self._pending_traj_writes.append({...})  # disabled pending NCCL investigation
+            for traj, traj_suffix in [(prot_traj, '_traj_noise.pdb'), (clean_traj, '_traj_clean.pdb')]:
+                traj_path = path.replace('.pdb', traj_suffix)
+                with open(traj_path, 'w') as f:
+                    for step_idx, (trans_step, rotmats_step, _) in enumerate(traj):
+                        step_rigid7 = ru.Rigid(
+                            rots=ru.Rotation(rot_mats=rotmats_step),
+                            trans=trans_step,
+                        ).to_tensor_7().cpu().numpy()
+                        step_records = _build_all_atom_records(
+                            step_rigid7[i], rigids_mask_np[i], ref_elements[i], is_atom_mask[i],
+                            sc_idx_np, to_tok_np, seq_idx_np, res_type_np, asym_id_np,
+                            token_residue_idx=res_idx_np,
+                        )
+                        _write_model_block(f, step_records, step_idx + 1)
+                    f.write("END\n")
 
             self.log(f"epoch_sample/{split}/{task_name}/integration_mse", integration_mse, prog_bar=False, sync_dist=False)
             self.log(f"epoch_sample/{split}/{task_name}/integration_mse_kabsch", integration_mse_kabsch, prog_bar=False, sync_dist=False)
