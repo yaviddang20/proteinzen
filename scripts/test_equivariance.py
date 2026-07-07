@@ -21,6 +21,17 @@ import copy
 import sys
 from pathlib import Path
 
+
+class _Tee:
+    def __init__(self, *streams):
+        self._streams = streams
+    def write(self, data):
+        for s in self._streams:
+            s.write(data)
+    def flush(self):
+        for s in self._streams:
+            s.flush()
+
 import numpy as np
 import torch
 from scipy.spatial.transform import Rotation as SciRot
@@ -101,6 +112,11 @@ def main():
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
+
+    out_dir = args.hydra_config.parent.parent
+    out_path = out_dir / f"equivariance_{args.ckpt.stem}.txt"
+    out_file = open(out_path, 'w')
+    sys.stdout = _Tee(sys.__stdout__, out_file)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -225,6 +241,9 @@ def main():
         report("rot_vf         equivariant  (R@)",
                err_vec(o_se3['rot_vf'], rot_vec(o['rot_vf']), mask))
     print(f"{sep}\n")
+    sys.stdout = sys.__stdout__
+    out_file.close()
+    print(f"Results written to {out_path}")
 
 
 if __name__ == '__main__':
