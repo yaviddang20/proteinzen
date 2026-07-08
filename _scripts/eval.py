@@ -511,7 +511,7 @@ def compute_coverage_amr(D, delta):
     return amr_r, cov_r, amr_p, cov_p
 
 
-def compute_geometry_stats(ref_mols, gen_mols, gen_paths, D, out_align_dir, out_relax_dir=None):
+def compute_geometry_stats(ref_mols, gen_mols, gen_paths, D, out_align_dir, out_relax_dir=None, compute_energy=False):
     from rdkit.Chem import rdMolAlign
     per_rmsd, per_bl, per_ba, per_tor, per_clash, per_strain = [], [], [], [], [], []
     for j, (gen, p) in enumerate(zip(gen_mols, gen_paths)):
@@ -531,7 +531,9 @@ def compute_geometry_stats(ref_mols, gen_mols, gen_paths, D, out_align_dir, out_
             except Exception:
                 pass
         per_clash.append(clash_count(gen))
-        relaxed_mol, strain, _, _, _ = xtb_relax(gen)
+        relaxed_mol, strain = None, float("nan")
+        if compute_energy:
+            relaxed_mol, strain, _, _, _ = xtb_relax(gen)
         if np.isfinite(strain):
             per_strain.append(strain)
         if out_align_dir is not None:
@@ -543,7 +545,7 @@ def compute_geometry_stats(ref_mols, gen_mols, gen_paths, D, out_align_dir, out_
                 save_best_pair(probe, ref_a, out_align_dir / out_name)
             except Exception:
                 pass
-        if out_relax_dir is not None and relaxed_mol is not None and np.isfinite(strain):
+        if compute_energy and out_relax_dir is not None and relaxed_mol is not None and np.isfinite(strain):
             try:
                 unrelaxed = Chem.RemoveHs(Chem.Mol(gen))
                 relaxed = Chem.RemoveHs(Chem.Mol(relaxed_mol))
@@ -598,7 +600,7 @@ def mean_or_nan(lst):
     return float(np.mean(lst)) if lst else float("nan")
 
 
-def compute_metrics_for_group(paths, ref_key_no_stereo_to_mols, ref_key_stereo_to_mols, delta, out_align_dir, out_relax_dir=None):
+def compute_metrics_for_group(paths, ref_key_no_stereo_to_mols, ref_key_stereo_to_mols, delta, out_align_dir, out_relax_dir=None, compute_energy=False):
     RDLogger.DisableLog("rdApp.*")
     gen_mols, gen_paths, gen_stereo_flags = [], [], []
     ref_mols_for_group = None
@@ -635,7 +637,7 @@ def compute_metrics_for_group(paths, ref_key_no_stereo_to_mols, ref_key_stereo_t
 
     D = pairwise_rmsd_matrix(ref_mols_for_group, gen_mols)
     amr_r, cov_r, amr_p, cov_p = compute_coverage_amr(D, delta)
-    geom_conn = compute_geometry_stats(ref_mols_for_group, gen_mols, gen_paths, D, out_align_dir, out_relax_dir)
+    geom_conn = compute_geometry_stats(ref_mols_for_group, gen_mols, gen_paths, D, out_align_dir, out_relax_dir, compute_energy=compute_energy)
     if geom_conn is None:
         return empty
     metrics_conn = (amr_r, cov_r, amr_p, cov_p) + geom_conn
@@ -646,7 +648,7 @@ def compute_metrics_for_group(paths, ref_key_no_stereo_to_mols, ref_key_stereo_t
         gen_mols_s = [gen_mols[j] for j in stereo_idx]
         gen_paths_s = [gen_paths[j] for j in stereo_idx]
         amr_r_s, cov_r_s, amr_p_s, cov_p_s = compute_coverage_amr(D_stereo, delta)
-        geom_stereo = compute_geometry_stats(ref_mols_for_group, gen_mols_s, gen_paths_s, D_stereo, None)
+        geom_stereo = compute_geometry_stats(ref_mols_for_group, gen_mols_s, gen_paths_s, D_stereo, None, compute_energy=compute_energy)
         metrics_stereo = (amr_r_s, cov_r_s, amr_p_s, cov_p_s) + (geom_stereo if geom_stereo else (float("nan"),) * 7)
     else:
         metrics_stereo = None
@@ -737,11 +739,15 @@ def run_conformer_eval(args):
     geom_datadir = args.geom_datadir
 
     samples_dir  = out_dir / "samples"
+    compute_energy = args.compute_energy
     out_align_dir  = out_dir / "aligned_pairs"
-    out_relax_dir  = out_dir / "relaxed_pairs"
+    out_relax_dir  = out_dir / "relaxed_pairs" if compute_energy else None
     out_stats_dir  = out_dir / "eval_stats"
 
-    for d in (out_align_dir, out_relax_dir, out_stats_dir):
+    dirs_to_make = [out_align_dir, out_stats_dir]
+    if compute_energy:
+        dirs_to_make.append(out_dir / "relaxed_pairs")
+    for d in dirs_to_make:
         if d.exists():
             shutil.rmtree(d)
         d.mkdir(parents=True)
@@ -788,7 +794,7 @@ def run_conformer_eval(args):
     results = Parallel(n_jobs=n_jobs, backend="loky")(
         delayed(compute_metrics_for_group)(
             paths, ref_key_no_stereo_to_mols, ref_key_stereo_to_mols,
-            delta, out_align_dir, out_relax_dir,
+            delta, out_align_dir, out_relax_dir, compute_energy=compute_energy,
         )
         for paths in groups.values()
     )
@@ -882,7 +888,7 @@ def run_conformer_eval(args):
     print(f"Eval stats saved to {out_stats_dir / 'eval.txt'}")
 
     # ---- xTB energy ----
-    if geom_datadir is not None:
+    if compute_energy and geom_datadir is not None:
         print("Computing GFN2-xTB energies for generated molecules...")
         gen_results = Parallel(n_jobs=n_jobs, backend="loky")(
             delayed(_gen_energies_for_group)(mol_id, paths)
@@ -1515,10 +1521,14 @@ def main():
         help="RMSD threshold for conformer coverage (Å; default: 0.75)",
     )
     parser.add_argument(
+        "--compute-energy", action="store_true", default=False,
+        help="Run xTB energy/strain calculations (slow; off by default).",
+    )
+    parser.add_argument(
         "--geom-datadir", type=Path, default=None,
         help=(
             "GEOM dataset directory (data/geom_drugs_conformers) for Boltzmann-weight "
-            "energy evaluation. If omitted, energy eval is skipped."
+            "energy evaluation. Requires --compute-energy."
         ),
     )
     # Pocket-specific

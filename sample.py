@@ -124,9 +124,11 @@ def main(sampler,
 
     config_path = os.path.join(
         run_dir,
-        ".hydra",
-        "config.yaml"
+        f"lightning_logs/version_{version_num}/config.yaml"
     )
+    if not os.path.exists(config_path):
+        print(f"config.yaml not found in version dir, defaulting to .hydra/config.yaml")
+        config_path = os.path.join(run_dir, ".hydra", "config.yaml")
     model_cfg = load_from_yaml(config_path)
     model = instantiate(model_cfg['model'])
 
