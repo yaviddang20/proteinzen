@@ -18,6 +18,7 @@ Usage:
 """
 import argparse
 import copy
+import math
 import sys
 from pathlib import Path
 
@@ -92,11 +93,24 @@ def err_mat(a, b, mask):
     return (a - b).norm(dim=(-2, -1))[mask]
 
 
-def report(label, errs):
+def err_angle_deg(a, b, mask):
+    """Per-rigid geodesic angle error in degrees between [N,3,3] rotation matrices."""
+    rel = torch.einsum("...ij,...ik->...jk", a, b)  # aᵀ @ b per frame
+    trace = rel[..., 0, 0] + rel[..., 1, 1] + rel[..., 2, 2]
+    angle_rad = torch.acos(((trace - 1.0) / 2.0).clamp(-1.0, 1.0))
+    return (angle_rad * (180.0 / math.pi))[mask]
+
+
+def err_vec_deg(a, b, mask):
+    """L2 norm of difference between [N,3] rotation-vector fields, converted to degrees."""
+    return ((a - b).norm(dim=-1) * (180.0 / math.pi))[mask]
+
+
+def report(label, errs, unit="Å"):
     if errs is None:
         print(f"  {label}: N/A (rot_vf not produced by model)")
         return
-    print(f"  {label}: mean={errs.mean():.4f}  max={errs.max():.4f}  Å")
+    print(f"  {label}: mean={errs.mean():.4f}  max={errs.max():.4f}  {unit}")
 
 
 # ─── main ─────────────────────────────────────────────────────────────────────
@@ -111,10 +125,13 @@ def main():
     parser.add_argument('--t', type=float, default=0.5)
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--version_num', type=str, default=None,
+                        help='Version number to include in output filename (e.g. 2 → equivariance_v2_<stem>.txt)')
     args = parser.parse_args()
 
     out_dir = args.hydra_config.parent.parent
-    out_path = out_dir / f"equivariance_{args.ckpt.stem}.txt"
+    version_tag = f"v{args.version_num}_" if args.version_num is not None else ""
+    out_path = out_dir / f"equivariance_{version_tag}{args.ckpt.stem}.txt"
     out_file = open(out_path, 'w')
     sys.stdout = _Tee(sys.__stdout__, out_file)
 
@@ -202,11 +219,11 @@ def main():
     print("OUTPUT: pred_rotmats_1  (predicted clean rotation matrices)")
     print(sep)
     report("invariant  under translation  (should be ~0)",
-           err_mat(o_td['pred_rotmats_1'], o['pred_rotmats_1'], mask))
+           err_angle_deg(o_td['pred_rotmats_1'], o['pred_rotmats_1'], mask), "°")
     report("invariant  under rotation     (wrong: should be equivariant)",
-           err_mat(o_rd['pred_rotmats_1'], o['pred_rotmats_1'], mask))
+           err_angle_deg(o_rd['pred_rotmats_1'], o['pred_rotmats_1'], mask), "°")
     report("equivariant under rotation    (R@, should be ~0 if SE3-equiv)",
-           err_mat(o_rd['pred_rotmats_1'], rot_mat(o['pred_rotmats_1']), mask))
+           err_angle_deg(o_rd['pred_rotmats_1'], rot_mat(o['pred_rotmats_1']), mask), "°")
 
     print(f"\n{sep}")
     print("OUTPUT: trans_vf  = (pred_trans_1 - trans_t) / (1-t)")
@@ -222,11 +239,11 @@ def main():
     print("OUTPUT: rot_vf  (directly predicted rotation vector field)")
     print(sep)
     report("invariant  under translation  (should be ~0)",
-           err_vec(o_td['rot_vf'], o['rot_vf'], mask) if o['rot_vf'] is not None else None)
+           err_vec_deg(o_td['rot_vf'], o['rot_vf'], mask) if o['rot_vf'] is not None else None, "°")
     report("equivariant under rotation    (R@, should be ~0 if SE3-equiv)",
-           err_vec(o_rd['rot_vf'], rot_vec(o['rot_vf']), mask) if o['rot_vf'] is not None else None)
+           err_vec_deg(o_rd['rot_vf'], rot_vec(o['rot_vf']), mask) if o['rot_vf'] is not None else None, "°")
     report("invariant  under rotation     (wrong: should be equivariant)",
-           err_vec(o_rd['rot_vf'], o['rot_vf'], mask) if o['rot_vf'] is not None else None)
+           err_vec_deg(o_rd['rot_vf'], o['rot_vf'], mask) if o['rot_vf'] is not None else None, "°")
 
     print(f"\n{sep}")
     print("FULL SE(3) equivariance summary")
@@ -234,12 +251,12 @@ def main():
     report("pred_trans_1   equivariant  (R@ + d)",
            err_vec(o_se3['pred_trans_1'], rot_vec(o['pred_trans_1']) + d, mask))
     report("pred_rotmats_1 equivariant  (R@)",
-           err_mat(o_se3['pred_rotmats_1'], rot_mat(o['pred_rotmats_1']), mask))
+           err_angle_deg(o_se3['pred_rotmats_1'], rot_mat(o['pred_rotmats_1']), mask), "°")
     report("trans_vf       equivariant  (R@, d cancels)",
            err_vec(o_se3['trans_vf'], rot_vec(o['trans_vf']), mask))
     if o['rot_vf'] is not None:
         report("rot_vf         equivariant  (R@)",
-               err_vec(o_se3['rot_vf'], rot_vec(o['rot_vf']), mask))
+               err_vec_deg(o_se3['rot_vf'], rot_vec(o['rot_vf']), mask), "°")
     print(f"{sep}\n")
     sys.stdout = sys.__stdout__
     out_file.close()
