@@ -51,12 +51,21 @@ def apply_global_se3(batch, R: torch.Tensor, t: torch.Tensor):
 
     old_trans = rigids.get_trans()                             # [B, N, 3]
     old_rots  = rigids.get_rots().get_rot_mats()               # [B, N, 3, 3]
+    old_quats = rigids.get_rots().get_quats()                  # [B, N, 4]
 
     new_trans = (R @ old_trans.unsqueeze(-1)).squeeze(-1) + t  # [B, N, 3]
     new_rots  = R @ old_rots                                   # [B, N, 3, 3]
 
+    # Compose via quaternion multiplication to preserve sign consistency.
+    # rot_to_quat (eigh) assigns arbitrary signs per-rigid, so R@rot_mat→quat
+    # can flip signs inconsistently, corrupting relative-quat features.
+    q_R = ru.rot_to_quat(R)                                    # [4]
+    q_R_bc = q_R.view(*([1] * (old_quats.dim() - 1)), 4).expand_as(old_quats)
+    new_quats = ru.quat_multiply(q_R_bc, old_quats)            # [B, N, 4]
+
     rd['rigids_t'] = ru.Rigid(
-        rots=ru.Rotation(rot_mats=new_rots), trans=new_trans
+        rots=ru.Rotation(quats=new_quats, normalize_quats=False),
+        trans=new_trans
     ).to_tensor_7()
     if 'trans_t'   in rd: rd['trans_t']   = new_trans
     if 'rotmats_t' in rd: rd['rotmats_t'] = new_rots
