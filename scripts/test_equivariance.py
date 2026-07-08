@@ -125,13 +125,11 @@ def main():
     parser.add_argument('--t', type=float, default=0.5)
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--version_num', type=str, default=None,
-                        help='Version number to include in output filename (e.g. 2 → equivariance_v2_<stem>.txt)')
     args = parser.parse_args()
 
     out_dir = args.hydra_config.parent.parent
-    version_tag = f"v{args.version_num}_" if args.version_num is not None else ""
-    out_path = out_dir / f"equivariance_{version_tag}{args.ckpt.stem}.txt"
+    version_tag = args.ckpt.parent.parent.name  # e.g. "version_0"
+    out_path = out_dir / f"equivariance_{version_tag}_{args.ckpt.stem}.txt"
     out_file = open(out_path, 'w')
     sys.stdout = _Tee(sys.__stdout__, out_file)
 
