@@ -125,11 +125,14 @@ def main():
     parser.add_argument('--t', type=float, default=0.5)
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--no_amp', action='store_true', default=False,
+                        help='Disable bfloat16 autocast to isolate numerical vs architectural errors')
     args = parser.parse_args()
 
     out_dir = args.hydra_config.parent.parent
     version_tag = args.ckpt.parent.parent.name  # e.g. "version_0"
-    out_path = out_dir / f"equivariance_{version_tag}_{args.ckpt.stem}.txt"
+    amp_tag = "_noamp" if args.no_amp else ""
+    out_path = out_dir / f"equivariance_{version_tag}_{args.ckpt.stem}{amp_tag}.txt"
     out_file = open(out_path, 'w')
     sys.stdout = _Tee(sys.__stdout__, out_file)
 
@@ -158,6 +161,8 @@ def main():
     lmod.eval().to(device)
     model = lmod.ema.module if (lmod.use_ema and lmod.ema is not None) else lmod.model
     model.eval()
+    if args.no_amp:
+        model.use_amp = False
 
     # get one real batch
     print("Building dataloader...")
