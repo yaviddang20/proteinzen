@@ -141,7 +141,8 @@ def main():
     out_dir = args.hydra_config.parent.parent
     version_tag = args.ckpt.parent.parent.name  # e.g. "version_0"
     amp_tag = "_noamp" if args.no_amp else ""
-    out_path = out_dir / f"equivariance_{version_tag}_{args.ckpt.stem}{amp_tag}.txt"
+    data_tag = args.data_config.stem
+    out_path = out_dir / f"equivariance_{version_tag}_{args.ckpt.stem}_{data_tag}{amp_tag}.txt"
     out_file = open(out_path, 'w')
     sys.stdout = _Tee(sys.__stdout__, out_file)
 
