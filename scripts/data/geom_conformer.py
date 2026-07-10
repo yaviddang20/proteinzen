@@ -86,7 +86,7 @@ def finalize(outdir: Path) -> None:
 
 
 
-def parse(datadir: Path, data: dict):
+def parse(datadir: Path, data: dict, use_boltzmann_min_energy: bool = True):
     data_id = data['data_id']
     data_path = datadir / data['pickle_path']
     with open(data_path, 'rb') as fp:
@@ -130,8 +130,11 @@ def parse(datadir: Path, data: dict):
     total_weight = sum(boltzmann_weights_list)
     boltzmann_weights_list = [w / total_weight for w in boltzmann_weights_list]
 
-    # Compute xTB energy for the minimum energy conformer (index 0, highest boltzmann weight)
-    e_min = compute_xtb_energy_from_mol(conformer_data[0]['rd_mol'])
+    # Energy of minimum energy conformer (index 0, highest boltzmann weight)
+    if use_boltzmann_min_energy:
+        e_min = conformer_data[0]['totalenergy'] * HARTREE_TO_KCALMOL
+    else:
+        e_min = compute_xtb_energy_from_mol(conformer_data[0]['rd_mol'])
 
     # Create chain metadata
     chain_info = []
@@ -170,6 +173,7 @@ def process_structure(
     datadir: Path,
     outdir: Path,
     overwrite: bool = True,
+    use_boltzmann_min_energy: bool = True,
 ) -> Optional[tuple[str, str]]:
     """Process a target. Returns (error_type, smiles) on failure, None on success."""
     smiles = data[0]
@@ -193,7 +197,7 @@ def process_structure(
 
     try:
         # Parse the target
-        target, rot_bond_data_list = parse(datadir, data_dict)
+        target, rot_bond_data_list = parse(datadir, data_dict, use_boltzmann_min_energy=use_boltzmann_min_energy)
     except Exception:  # noqa: BLE001
         traceback.print_exc()
         print(f"Failed to parse {smiles}")
@@ -246,7 +250,7 @@ def process(args, dataset_mode: str) -> None:
 
     # Run processing
     print("Processing data...")
-    fn = partial(process_structure, datadir=datadir, outdir=outdir, overwrite=args.overwrite)
+    fn = partial(process_structure, datadir=datadir, outdir=outdir, overwrite=args.overwrite, use_boltzmann_min_energy=args.use_boltzmann_min_energy)
     if parallel:
         results = p_umap(fn, metadata, num_cpus=num_processes)
     else:
@@ -300,6 +304,12 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Overwrite existing output files (default: True).",
+    )
+    parser.add_argument(
+        "--use-boltzmann-min-energy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use pre-computed GEOM energy for e_min instead of running xTB (default: True).",
     )
     args = parser.parse_args()
     assert args.dataset in ['qm9', 'drugs']
