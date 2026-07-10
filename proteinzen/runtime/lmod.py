@@ -1896,6 +1896,8 @@ class BiomoleculeModule(L.LightningModule):
             dm = self.trainer.datamodule
             if dm is not None and hasattr(dm, 'batch_size'):
                 self.log('batch_size', float(dm.batch_size), rank_zero_only=True)
+            if self.trainer.world_size is not None:
+                self.log('num_gpus', float(self.trainer.world_size), rank_zero_only=True)
 
         if self.use_cosine_annealing:
             last_epoch = self.cosine_annealing_epoch_offset if self.cosine_annealing_epoch_offset is not None else self.current_epoch
