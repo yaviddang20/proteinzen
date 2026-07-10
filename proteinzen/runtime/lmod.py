@@ -894,6 +894,8 @@ class BiomoleculeModule(L.LightningModule):
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
+        if batch is None:
+            return
         device = batch["t"].device
         B = batch["t"].shape[0]
 

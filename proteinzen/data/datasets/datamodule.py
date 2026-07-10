@@ -750,6 +750,8 @@ class BiomoleculeDataModule(L.LightningDataModule):
         return self.build_dataloader(self.train_dataset, collate)
 
     def val_dataloader(self):
+        if self.val_dataset is None:
+            return []
         return self.build_dataloader(self.val_dataset, collate, shuffle=True)
 
 
