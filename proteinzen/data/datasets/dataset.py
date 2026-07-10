@@ -165,10 +165,16 @@ class MMCIFDataset(data.Dataset):
                 if not keep_mol:
                     continue
 
+            def _nres(chain):
+                v = chain.get('num_resolved_residues')
+                if v is None:
+                    v = chain.get('num_residues')
+                return v or 0
+
             # ensure a minimum protein content
             if self.min_percent_protein:
-                num_protein_res = sum(chain.get('num_resolved_residues', chain['num_residues']) for chain in record['chains'] if chain['mol_type'] == const.chain_type_ids["PROTEIN"])
-                num_res = sum(chain.get('num_resolved_residues', chain['num_residues']) for chain in record['chains'])
+                num_protein_res = sum(_nres(c) for c in record['chains'] if c['mol_type'] == const.chain_type_ids["PROTEIN"])
+                num_res = sum(_nres(c) for c in record['chains'])
                 if num_protein_res / num_res < self.min_percent_protein:
                     continue
 
@@ -194,9 +200,9 @@ class MMCIFDataset(data.Dataset):
 
             # apply some filtering critera that we might change at train time
             if self.count_on_protein_res:
-                num_res = sum(chain.get('num_resolved_residues', chain['num_residues']) for chain in record['chains'] if chain['mol_type'] == const.chain_type_ids['PROTEIN'])
+                num_res = sum(_nres(c) for c in record['chains'] if c['mol_type'] == const.chain_type_ids['PROTEIN'])
             else:
-                num_res = sum(chain.get('num_resolved_residues', chain['num_residues']) for chain in record['chains'])
+                num_res = sum(_nres(c) for c in record['chains'])
             if num_res > self.max_num_res or num_res < self.min_num_res:
                 continue
             if 'structure' in record:
