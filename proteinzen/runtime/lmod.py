@@ -755,6 +755,7 @@ class BiomoleculeModule(L.LightningModule):
 
     def _shared_step(self, batch, return_outputs=False):
 
+        print(f"[R{self.global_rank}] ENTER _shared_step", flush=True)
         corrupter = self.corrupter
         if self.t_sched is not None:
             t = batch['t']
@@ -781,10 +782,13 @@ class BiomoleculeModule(L.LightningModule):
             batch['trans_t'] = batch['t']
             batch['rot_t'] = batch['t']
 
+        print(f"[R{self.global_rank}] BEFORE corrupt", flush=True)
         batch = corrupter.corrupt_dense_batch(batch, self.identity_rot_noise)
+        print(f"[R{self.global_rank}] AFTER corrupt", flush=True)
 
         # self-conditioning (optional)
         self_conditioning = None
+        print(f"[R{self.global_rank}] BEFORE self_condition", flush=True)
         self_folding = None
         if (
             self.model.self_conditioning
@@ -797,15 +801,19 @@ class BiomoleculeModule(L.LightningModule):
                         batch, self_conditioning["pred_seq"]
                     )
                     self_folding = self.model(pred_seq_batch)
+        print(f"[R{self.global_rank}] AFTER self_condition", flush=True)
 
         outputs = self.model(batch, self_conditioning, self_folding)
+        print(f"[R{self.global_rank}] AFTER model", flush=True)
         loss_dict = self._loss_step(batch, outputs)
+        print(f"[R{self.global_rank}] AFTER loss", flush=True)
         if return_outputs:
             return loss_dict, batch, outputs
         return loss_dict
 
     
     def training_step(self, batch, batch_idx):
+        print(f"[R{self.global_rank}] ENTER training_step epoch={self.current_epoch} batch={batch_idx}", flush=True)
         if self.global_step > 0:
             if self.ema is not None:
                 self.ema.update_parameters(self.model)
@@ -819,16 +827,22 @@ class BiomoleculeModule(L.LightningModule):
 
         has_sequential = any(t.name == 'mol_sequential_scaffolding' for t in batch['task'])
 
+
+        print(f"[R{self.global_rank}] BEFORE _shared_step", flush=True)
         if not has_sequential:
             loss_dict = self._shared_step(batch)
         else:
             loss_dict = self._sequential_step(batch)
+        print(f"[R{self.global_rank}] AFTER _shared_step", flush=True)
 
+        print(f"[R{self.global_rank}] BEFORE _log_losses", flush=True)
         self._log_losses(loss_dict, batch, stage="train")
+        print(f"[R{self.global_rank}] AFTER _log_losses", flush=True)
 
         optimizer = self.optimizers()
         lr = optimizer.param_groups[0]['lr']
         self.log("lr", lr, prog_bar=True, logger=True, on_step=True, on_epoch=False, batch_size=1)
+        print(f"[R{self.global_rank}] RETURN LOSS", flush=True)
         return loss_dict["loss"].mean()
 
     def _corrupt_batch(self, batch):
@@ -1088,8 +1102,17 @@ class BiomoleculeModule(L.LightningModule):
             no_rot_sampling=not self.use_rot_vf_loss,
         )
         ts = torch.linspace(0.0, 1.0, self.epoch_sample_num_steps + 1)
-        _, _, final_denoiser_out = integrator.sample(batch, ts)
+        prot_traj, clean_traj, final_denoiser_out = integrator.sample(batch, ts)
         final_rigids = final_denoiser_out['denoised_rigids']
+
+        prot_traj_np = [
+            ru.Rigid(rots=ru.Rotation(rot_mats=r), trans=t).to_tensor_7().cpu().numpy()
+            for t, r, _ in prot_traj
+        ]
+        clean_traj_np = [
+            ru.Rigid(rots=ru.Rotation(rot_mats=r), trans=t).to_tensor_7().cpu().numpy()
+            for t, r, _ in clean_traj
+        ]
 
         # Restore GT for MSE computation
         rigids_data['rigids_1'] = gt_rigid7
@@ -1163,6 +1186,28 @@ class BiomoleculeModule(L.LightningModule):
             path.replace('.pdb', '_kabsch.pdb'),
             token_residue_idx=batch['token']['residue_idx'].cpu().numpy()[0],
         )
+
+        sc_idx_np   = rigids_data['rigids_sidechain_idx'].cpu().numpy()[0]
+        to_tok_np   = rigids_data['rigids_to_token'].cpu().numpy()[0]
+        seq_idx_np  = rigids_data['rigids_seq_idx'].cpu().numpy()[0]
+        res_type_np = batch['token']['res_type'].cpu().numpy()[0]
+        asym_id_np  = batch['token']['asym_id'].cpu().numpy()[0]
+        res_idx_np  = batch['token']['residue_idx'].cpu().numpy()[0]
+        for traj_np, traj_suffix in [
+            (prot_traj_np, '_traj_noise.pdb'),
+            (clean_traj_np, '_traj_clean.pdb'),
+        ]:
+            traj_path = path.replace('.pdb', traj_suffix)
+            with open(traj_path, 'w') as f:
+                for step_idx, step_rigid7 in enumerate(traj_np):
+                    step_records = _build_all_atom_records(
+                        step_rigid7[0], rigids_mask_np[0], ref_elements[0], is_atom_mask[0],
+                        sc_idx_np, to_tok_np, seq_idx_np,
+                        res_type_np, asym_id_np,
+                        token_residue_idx=res_idx_np,
+                    )
+                    _write_model_block(f, step_records, step_idx + 1)
+                f.write("END\n")
 
         self.log(f"epoch_sample/{split}/{task_name}/integration_mse", integration_mse, prog_bar=False, sync_dist=False)
         self.log(f"epoch_sample/{split}/{task_name}/integration_mse_kabsch", integration_mse_kabsch, prog_bar=False, sync_dist=False)
@@ -1340,6 +1385,7 @@ class BiomoleculeModule(L.LightningModule):
 
 
     def _loss_step(self, inputs, outputs):
+        print(f"[R{self.global_rank}] ENTER _loss_step", flush=True)
         token_seq = inputs['token']['seq']
         seq_weight = self.seq_weight.to(token_seq.device)
         rigids_seq_idx = inputs['rigids']['rigids_seq_idx']
@@ -1380,6 +1426,7 @@ class BiomoleculeModule(L.LightningModule):
                 trans=aligned_trans,
             )
 
+        print(f"[R{self.global_rank}] BEFORE multiframe loss", flush=True)
         frame_fm_loss_dict = multiframe_fm_loss_dense_batch(
             inputs, outputs, sep_rot_loss=not self.learnable_noise_schedule, # use_euclidean_for_rots=self.use_euclidean_for_rots,
             t_norm_clip=0.9,
@@ -1399,6 +1446,7 @@ class BiomoleculeModule(L.LightningModule):
             brownian_rot_path=self.use_brownian_rot_path_loss,
             # stabilize_high_t_loss=self.use_stabilized_t_loss
         )
+        print(f"[R{self.global_rank}] AFTER multiframe loss", flush=True)
 
         frame_vf_loss = (
             frame_fm_loss_dict["raw_trans_vf_loss"] +
@@ -1536,6 +1584,8 @@ class BiomoleculeModule(L.LightningModule):
         loss_dict.update(atomic_loss_dict)
         # loss_dict.update(loss_by_task)
 
+        
+        print(f"[R{self.global_rank}] EXIT _loss_step", flush=True)
         return loss_dict
 
 
@@ -1887,11 +1937,12 @@ class BiomoleculeModule(L.LightningModule):
 
 
     def on_train_start(self):
+        log_dir = self.trainer.log_dir  # all ranks must call this — triggers DDP broadcast
         if self.trainer.is_global_zero:
             # Copy Hydra config to version dir for per-run documentation
             hydra_cfg_path = '.hydra/config.yaml'
-            if os.path.exists(hydra_cfg_path) and self.trainer.log_dir is not None:
-                shutil.copy(hydra_cfg_path, os.path.join(self.trainer.log_dir, 'config.yaml'))
+            if os.path.exists(hydra_cfg_path) and log_dir is not None:
+                shutil.copy(hydra_cfg_path, os.path.join(log_dir, 'config.yaml'))
             # Log effective batch size
             dm = self.trainer.datamodule
             if dm is not None and hasattr(dm, 'batch_size'):
