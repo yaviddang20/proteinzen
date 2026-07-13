@@ -538,6 +538,12 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> None:
 
     system_ids = [sid for sid, s in split.items() if s in args.splits]
 
+    if hasattr(args, "system_ids_file") and args.system_ids_file is not None:
+        allowed = set(Path(args.system_ids_file).read_text().split())
+        before = len(system_ids)
+        system_ids = [sid for sid in system_ids if sid in allowed]
+        print(f"system_ids_file: {before} → {len(system_ids)} after pocket filter")
+
     if args.max_systems is not None:
         system_ids = system_ids[:args.max_systems]
 
@@ -575,6 +581,8 @@ if __name__ == "__main__":
     parser.add_argument("--cluster-metric", type=str, default="pli_qcov")
     parser.add_argument("--cluster-threshold", type=int, default=50)
     parser.add_argument("--num-processes", type=int, default=multiprocessing.cpu_count())
+    parser.add_argument("--system-ids-file", type=Path, default=None,
+                        help="Optional text file of allowed system IDs (one per line); from filter_plinder_pocket.py")
     parser.add_argument("--max-systems", type=int, default=None,
                         help="Cap number of systems per split (for debugging)")
     parser.add_argument("--overwrite", action="store_true", default=False,
