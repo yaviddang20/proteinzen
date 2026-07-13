@@ -178,14 +178,17 @@ def run_fpocket(receptor_cif: Path, ligand_centroid: np.ndarray, args) -> Option
         pqr_path = out_dir / "receptor_pockets.pqr"
 
         if not info_path.exists():
+            print(f"[fpocket] info file missing: {info_path}; out_dir contents: {list(out_dir.iterdir()) if out_dir.exists() else 'dir missing'}")
             return None
 
         pockets = _parse_fpocket_info(info_path)
         if not pockets:
+            print(f"[fpocket] no pockets parsed from {info_path}")
             return None
 
         # Get pocket centers to match against ligand centroid
         pocket_centers = _parse_pocket_pqr(pqr_path) if pqr_path.exists() else {}
+        print(f"[fpocket] {len(pockets)} pockets found, {len(pocket_centers)} have centers")
 
         best_pocket = None
         best_dist = float("inf")
@@ -199,6 +202,7 @@ def run_fpocket(receptor_cif: Path, ligand_centroid: np.ndarray, args) -> Option
                 best_dist = dist
                 best_pocket = p
 
+        print(f"[fpocket] best_dist={best_dist:.2f} (threshold={args.max_pocket_center_dist})")
         if best_pocket is None or best_dist > args.max_pocket_center_dist:
             return None
 
