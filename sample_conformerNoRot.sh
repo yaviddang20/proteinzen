@@ -18,7 +18,8 @@ for split in train test; do
         +version_num=${version_num} \
         corrupter.sampling_noise_mode=null \
         sampler.include_h=true \
-        integrator=euler
+        identity_rot_noise=true \
+        integrator=euler_no_rot
 done
 
 python $REPO_ROOT/sample.py \
@@ -31,4 +32,5 @@ python $REPO_ROOT/sample.py \
     +version_num=${version_num} \
     corrupter.sampling_noise_mode=null \
     sampler.include_h=true \
-    integrator=euler
+    identity_rot_noise=true \
+    integrator=euler_no_rot
