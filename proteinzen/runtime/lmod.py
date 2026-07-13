@@ -1087,13 +1087,16 @@ class BiomoleculeModule(L.LightningModule):
         trans_t = trans_t - trans_t.mean(dim=1, keepdim=True)
         trans_t = torch.where(rigids_noising_mask[..., None], trans_t, gt_trans)
 
+        gt_rigid7 = rigids_data['rigids_1'].clone()
+        gt_rotmats = ru.Rigid.from_tensor_7(gt_rigid7).get_rots().get_rot_mats()
+
         eye = torch.eye(3, device=device, dtype=torch.float32)
-        rotmats_t = eye[None, None].expand_as(
-            ru.Rigid.from_tensor_7(rigids_data['rigids_1']).get_rots().get_rot_mats()
-        ).clone()
+        rotmats_t = eye[None, None].expand_as(gt_rotmats).clone()
+        # Restore GT rotations for non-noised (fixed) rigids — mirrors the
+        # trans_t guard above so the protein enters the trajectory correctly.
+        rotmats_t = torch.where(rigids_noising_mask[..., None, None], rotmats_t, gt_rotmats)
 
         # Pre-fill rigids_1 with noise so EulerIntegrator uses it as the start
-        gt_rigid7 = rigids_data['rigids_1'].clone()
         rigids_data['rigids_1'] = ru.Rigid(
             rots=ru.Rotation(rot_mats=rotmats_t), trans=trans_t
         ).to_tensor_7()
@@ -1104,7 +1107,7 @@ class BiomoleculeModule(L.LightningModule):
             no_rot_sampling=not self.use_rot_vf_loss,
         )
         ts = torch.linspace(0.0, 1.0, self.epoch_sample_num_steps + 1)
-        prot_traj, clean_traj, final_denoiser_out = integrator.sample(batch, ts)
+        clean_traj, prot_traj, final_denoiser_out = integrator.sample(batch, ts)
         final_rigids = final_denoiser_out['denoised_rigids']
 
         prot_traj_np = [

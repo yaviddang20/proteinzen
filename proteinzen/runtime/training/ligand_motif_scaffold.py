@@ -171,7 +171,6 @@ class LigandConditionedMotifScaffolding(TrainingTask):
                 continue
             res_start = int(chain["res_idx"])
             res_end = res_start + int(chain["res_num"])
-            copy_atomized_residue_mask[res_start:res_end] = True
 
         if num_potential > 0:
             num_motif = np.random.randint(1, min(num_potential, self.max_num_motif_res) + 1)

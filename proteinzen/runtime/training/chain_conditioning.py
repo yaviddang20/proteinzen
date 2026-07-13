@@ -252,7 +252,6 @@ class LigandConditionedGenerateProtein(_ChainConditioningBase):
                 a_end = a_start + int(res["atom_num"])
                 atom_noising_mask[a_start:a_end] = False
                 res_type_noising_mask[res_idx] = False
-                copy_atomized_residue_mask[res_idx] = True
                 present = atoms[a_start:a_end]["is_present"].astype(bool)
                 if present.any():
                     ligand_atom_coords.append(atoms[a_start:a_end]["coords"][present])
@@ -306,10 +305,6 @@ class LigandConditionedGenerateProtein(_ChainConditioningBase):
                         a_end = a_start + int(res["atom_num"])
                         atom_noising_mask[a_start:a_end] = False
                         res_type_noising_mask[res_idx] = False
-                        if self.motif_is_unindexed:
-                            copy_unindexed_residue_mask[res_idx] = True
-                        else:
-                            copy_indexed_residue_mask[res_idx] = True
 
             # ── 3. Seed interface for cropper ──
             if len(data.interfaces) > 0:
@@ -338,7 +333,4 @@ class LigandConditionedGenerateProtein(_ChainConditioningBase):
         return result
 
     def max_added_tokens(self, N):
-        if not self.interface_condition:
-            return self.max_num_res
-        # ligand copy tokens (bounded by max_num_res) + protein interface copy tokens
-        return self.max_num_res + self.max_num_interface_protein_res
+        return 0

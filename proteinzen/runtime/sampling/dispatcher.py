@@ -8,7 +8,7 @@ from .unconditional import UnconditionalSampling
 from .unconditional_smiles import UnconditionalSamplingFromSMILES
 from .unconditional_smiles import UnconditionalSamplingFromMol
 from .motif_scaffolding import MotifScaffoldingTask
-from .protein_pocket import ProteinPocketConditionedSampling
+from .protein_pocket import ProteinPocketConditionedSampling, LigandPocketConditionedSampling
 
 
 
