@@ -299,13 +299,18 @@ def compute_buried_fraction(
 
 # ── per-system check ──────────────────────────────────────────────────────────
 
-def check_system(system_id: str, plinder_dir: Path, args) -> bool:
+def check_system(system_id: str, plinder_dir: Path, args, verbose: bool = False) -> bool:
     """Return True if the system passes all structure-level filters."""
+    def log(msg):
+        if verbose:
+            print(f"  [{system_id}] {msg}")
+
     system_dir = plinder_dir / "systems" / system_id
     receptor_cif = system_dir / "receptor.cif"
     system_cif = system_dir / "system.cif"
 
     if not receptor_cif.exists() or not system_cif.exists():
+        log(f"missing files (receptor={receptor_cif.exists()}, system={system_cif.exists()})")
         return False
 
     # Compute ligand centroid from system.cif
@@ -319,23 +324,31 @@ def check_system(system_id: str, plinder_dir: Path, args) -> bool:
                         if not atom.is_hydrogen():
                             ligand_coords.append([atom.pos.x, atom.pos.y, atom.pos.z])
         if not ligand_coords:
+            log("no ligand atoms found (entity_type check)")
             return False
         ligand_centroid = np.mean(ligand_coords, axis=0)
-    except Exception:
+        log(f"ligand centroid={ligand_centroid.round(2)}, n_atoms={len(ligand_coords)}")
+    except Exception as e:
+        log(f"ligand centroid failed: {e}")
         return False
 
     # fpocket filter
     if args.min_druggability > 0 or args.min_concavity > 0 or args.min_volume > 0:
         pocket = run_fpocket(receptor_cif, ligand_centroid, args)
         if pocket is None:
+            log("fpocket returned None (no matching pocket or fpocket failed)")
             return False
+        log(f"fpocket pocket: drugg={pocket.get('Druggability Score')}, density={pocket.get('Alpha sphere density')}, vol={pocket.get('Volume')}")
         if not fpocket_filter(pocket, args):
+            log("failed fpocket thresholds")
             return False
 
     # freesasa filter
     if args.min_buried_fraction > 0:
         buried = compute_buried_fraction(receptor_cif, ligand_centroid, args.pocket_radius)
+        log(f"buried_fraction={buried}")
         if buried is None or buried < args.min_buried_fraction:
+            log("failed buried fraction")
             return False
 
     return True
@@ -398,6 +411,8 @@ def main():
     parser.add_argument("--fpocket-sif", type=str,
                         default=str(_REPO_ROOT / "fpocket.sif"),
                         help="Path to fpocket Singularity image (default: {repo_root}/fpocket.sif)")
+    parser.add_argument("--debug-n", type=int, default=0,
+                        help="Run verbosely on the first N candidates and exit (for debugging)")
 
     args = parser.parse_args()
 
@@ -435,6 +450,14 @@ def main():
         and args.min_volume <= 0
         and args.min_buried_fraction <= 0
     )
+
+    if args.debug_n > 0:
+        print(f"\nDebug mode: checking first {args.debug_n} candidates verbosely")
+        for sid in candidate_ids[:args.debug_n]:
+            print(f"\n--- {sid} ---")
+            result = check_system(sid, args.plinder_dir, args, verbose=True)
+            print(f"  => {'PASS' if result else 'FAIL'}")
+        return
 
     if skip_structure:
         passing_ids = candidate_ids
