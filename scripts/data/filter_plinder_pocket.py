@@ -118,6 +118,8 @@ def _parse_pocket_pqr(pqr_path: Path) -> dict[int, np.ndarray]:
 
     fpocket encodes pocket membership in the residue number field.
     """
+    # fpocket pqr columns: record serial name resname chain resseq x y z charge radius
+    # indices:             0      1      2    3       4     5      6 7 8 9      10
     coords_by_pocket: dict[int, list] = {}
     with open(pqr_path) as f:
         for line in f:
@@ -127,8 +129,8 @@ def _parse_pocket_pqr(pqr_path: Path) -> dict[int, np.ndarray]:
             if len(parts) < 9:
                 continue
             try:
-                pocket_id = int(parts[4])  # residue number = pocket index
-                x, y, z = float(parts[5]), float(parts[6]), float(parts[7])
+                pocket_id = int(parts[5])  # resseq = pocket index
+                x, y, z = float(parts[6]), float(parts[7]), float(parts[8])
             except (ValueError, IndexError):
                 continue
             coords_by_pocket.setdefault(pocket_id, []).append([x, y, z])
@@ -232,77 +234,64 @@ def compute_buried_fraction(
             return None
         model = st[0]
 
-        # Collect pocket residue indices (all residues within pocket_radius of ligand centroid)
-        pocket_chains = []
-        all_chains = []
+        # Find pocket residues: all protein residues within pocket_radius of ligand centroid
+        # Store as (chain_name, resseq_str) pairs for freesasa selection
+        pocket_res: list[tuple[str, str]] = []
         for chain in model:
-            pocket_residues = []
-            all_residues = list(chain)
-            all_chains.append(all_residues)
-            for res in all_residues:
+            for res in chain:
                 coords = np.array([[a.pos.x, a.pos.y, a.pos.z] for a in res if not a.is_hydrogen()])
                 if len(coords) == 0:
                     continue
                 if np.linalg.norm(coords - ligand_centroid[None], axis=-1).min() < pocket_radius:
-                    pocket_residues.append(res.seqid.num)
-            pocket_chains.append(pocket_residues)
+                    pocket_res.append((chain.name, str(res.seqid.num)))
 
-        has_pocket = any(len(p) > 0 for p in pocket_chains)
-        if not has_pocket:
+        if not pocket_res:
             return None
 
-        # Full-protein SASA
-        structure_full = freesasa.Structure(str(receptor_cif))
-        result_full = freesasa.calc(structure_full)
-
-        # Pocket residues SASA in full protein context
-        pocket_sasa_in_protein = 0.0
-        for chain_idx, chain in enumerate(model):
-            for res in chain:
-                if res.seqid.num not in pocket_chains[chain_idx]:
-                    continue
-                sel = freesasa.Selection(
-                    f"pocket",
-                    f"chain {chain.name} and resi {res.seqid.num}",
-                )
-                try:
-                    area = result_full.select(f"chain {chain.name} and resi {res.seqid.num}")
-                    pocket_sasa_in_protein += area
-                except Exception:
-                    pass
-
-        if pocket_sasa_in_protein == 0.0:
-            return None
-
-        # Pocket residues SASA in isolation — build a mini structure
+        # Convert to PDB for freesasa (freesasa doesn't support mmCIF)
         with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tf:
-            isolated_path = tf.name
+            full_pdb = tf.name
+        with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tf:
+            iso_pdb = tf.name
 
         try:
-            # Write just the pocket residues to a temp PDB
+            st.write_pdb(full_pdb)
+
+            # Full-protein SASA, then select pocket residues
+            structure_full = freesasa.Structure(full_pdb)
+            result_full = freesasa.calc(structure_full)
+            resi_expr = "+".join(r for _, r in pocket_res)
+            sel_str = f"pocket, resi {resi_expr}"
+            areas = freesasa.selectArea([sel_str], structure_full, result_full)
+            sasa_in_protein = areas.get("pocket", 0.0)
+            if sasa_in_protein == 0.0:
+                return None
+
+            # Isolated pocket residues SASA
             mini_st = gemmi.Structure()
             mini_model = gemmi.Model("1")
-            for chain_idx, chain in enumerate(model):
+            pocket_set = {(c, r) for c, r in pocket_res}
+            for chain in model:
                 mini_chain = gemmi.Chain(chain.name)
                 for res in chain:
-                    if res.seqid.num in pocket_chains[chain_idx]:
+                    if (chain.name, str(res.seqid.num)) in pocket_set:
                         mini_chain.add_residue(res.clone())
                 if len(mini_chain) > 0:
                     mini_model.add_chain(mini_chain)
             mini_st.add_model(mini_model)
-            mini_st.write_pdb(isolated_path)
+            mini_st.write_pdb(iso_pdb)
 
-            structure_iso = freesasa.Structure(isolated_path)
+            structure_iso = freesasa.Structure(iso_pdb)
             result_iso = freesasa.calc(structure_iso)
-            pocket_sasa_isolated = result_iso.totalArea()
+            sasa_isolated = result_iso.totalArea()
         finally:
-            os.unlink(isolated_path)
+            os.unlink(full_pdb)
+            os.unlink(iso_pdb)
 
-        if pocket_sasa_isolated < 1.0:
+        if sasa_isolated < 1.0:
             return None
 
-        buried = 1.0 - (pocket_sasa_in_protein / pocket_sasa_isolated)
-        return float(buried)
+        return float(1.0 - sasa_in_protein / sasa_isolated)
 
     except Exception:
         return None
