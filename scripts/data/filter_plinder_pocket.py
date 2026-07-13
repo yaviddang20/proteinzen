@@ -142,8 +142,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 def _fpocket_cmd(args) -> list[str]:
     sif = Path(args.fpocket_sif)
-    singularity = shutil.which("singularity") or "singularity"
-    return [singularity, "exec", str(sif), "fpocket"]
+    runner = shutil.which("singularity") or shutil.which("apptainer") or "singularity"
+    return [runner, "exec", str(sif), "fpocket"]
 
 
 def run_fpocket(receptor_cif: Path, ligand_centroid: np.ndarray, args) -> Optional[dict]:
@@ -166,6 +166,11 @@ def run_fpocket(receptor_cif: Path, ligand_centroid: np.ndarray, args) -> Option
             timeout=60,
         )
         if result.returncode != 0:
+            print(f"[fpocket] cmd={cmd_prefix[0]} returncode={result.returncode}")
+            if result.stdout:
+                print(f"[fpocket] stdout: {result.stdout.decode(errors='replace')[:500]}")
+            if result.stderr:
+                print(f"[fpocket] stderr: {result.stderr.decode(errors='replace')[:500]}")
             return None
 
         out_dir = tmpdir / "receptor_out"
