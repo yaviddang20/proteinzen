@@ -79,12 +79,28 @@ def annotation_prefilter(row: dict, args) -> bool:
 
 def _cif_to_pdb(cif_path: Path, pdb_path: Path) -> bool:
     """Convert mmCIF to PDB using gemmi. Returns False on failure."""
+    _CHAIN_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
     try:
         st = gemmi.read_structure(str(cif_path))
         st.remove_hydrogens()
+        # PDB format only supports single-character chain IDs; remap if needed
+        for model in st:
+            mapping: dict[str, str] = {}
+            idx = 0
+            for chain in model:
+                if chain.name not in mapping:
+                    if len(chain.name) > 1:
+                        while idx < len(_CHAIN_CHARS) and _CHAIN_CHARS[idx] in mapping.values():
+                            idx += 1
+                        mapping[chain.name] = _CHAIN_CHARS[idx] if idx < len(_CHAIN_CHARS) else chain.name[0]
+                        idx += 1
+                    else:
+                        mapping[chain.name] = chain.name
+                chain.name = mapping[chain.name]
         st.write_pdb(str(pdb_path))
         return True
-    except Exception:
+    except Exception as e:
+        print(f"[fpocket] gemmi error on {cif_path}: {e}")
         return False
 
 
@@ -157,6 +173,7 @@ def run_fpocket(receptor_cif: Path, ligand_centroid: np.ndarray, args) -> Option
         tmpdir = Path(tmpdir)
         pdb_path = tmpdir / "receptor.pdb"
         if not _cif_to_pdb(receptor_cif, pdb_path):
+            print(f"[fpocket] _cif_to_pdb failed for {receptor_cif}")
             return None
 
         result = subprocess.run(
