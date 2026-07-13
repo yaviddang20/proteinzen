@@ -822,9 +822,6 @@ class BiomoleculeModule(L.LightningModule):
             if self.ema_short is not None:
                 self.ema_short.update_parameters(self.model, self.global_step - 1)
 
-        if batch_idx == 0:
-            self._epoch_sample_train_batch = _detach_cpu_batch(batch)
-
         has_sequential = any(t.name == 'mol_sequential_scaffolding' for t in batch['task'])
 
 
@@ -834,6 +831,11 @@ class BiomoleculeModule(L.LightningModule):
         else:
             loss_dict = self._sequential_step(batch)
         print(f"[R{self.global_rank}] AFTER _shared_step", flush=True)
+
+        # Stash AFTER corruption so rigids_1 has centered coords (same as val epoch_sample,
+        # which gets centered rigids_1 via the shallow batch.copy() in validation_step).
+        if batch_idx == 0:
+            self._epoch_sample_train_batch = _detach_cpu_batch(batch)
 
         print(f"[R{self.global_rank}] BEFORE _log_losses", flush=True)
         self._log_losses(loss_dict, batch, stage="train")
