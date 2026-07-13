@@ -204,7 +204,14 @@ def run_fpocket(receptor_cif: Path, ligand_centroid: np.ndarray, args) -> Option
             return None
 
         # Get pocket centers to match against ligand centroid
-        pocket_centers = _parse_pocket_pqr(pqr_path) if pqr_path.exists() else {}
+        if not pqr_path.exists():
+            print(f"[fpocket] pqr missing; out_dir={list(out_dir.iterdir())}")
+            pocket_centers = {}
+        else:
+            with open(pqr_path) as _f:
+                _lines = _f.readlines()
+            print(f"[fpocket] pqr exists, {len(_lines)} lines; first 3: {_lines[:3]}")
+            pocket_centers = _parse_pocket_pqr(pqr_path)
         print(f"[fpocket] {len(pockets)} pockets found, {len(pocket_centers)} have centers")
 
         best_pocket = None
