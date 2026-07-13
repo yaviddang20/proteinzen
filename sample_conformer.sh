@@ -8,17 +8,17 @@ version_num=48835
 # CUDA_VISIBLE_DEVICES=0
 
 for split in train test; do
-    python $REPO_ROOT/sample.py \
-        model_dir=${REPO_ROOT}/outputs/${model_name}/${split} \
-        out_dir=${REPO_ROOT}/sampling/geom_conformer_${split}/${model_name} \
-        sampler.tasks_yaml=${REPO_ROOT}/sampling/geom_conformer_${split}/smiles.yaml \
+    python "$REPO_ROOT/sample.py" \
+        "model_dir='${REPO_ROOT}/outputs/${model_name}/train'" \
+        "out_dir='${REPO_ROOT}/sampling/geom_conformer_${split}/${model_name}'" \
+        "sampler.tasks_yaml='${REPO_ROOT}/sampling/geom_conformer_${split}/smiles.yaml'" \
         sampler.batch_size=32 \
         sampler.trans_std=${trans_std} \
         save_traj=true \
         +version_num=${version_num} \
-        corrupter.sampling_noise_mode=null \
         sampler.include_h=true \
-        integrator=euler
+        integrator=euler \
+        diffeq=base_euler_ode
 done
 
 python $REPO_ROOT/sample.py \
@@ -31,4 +31,5 @@ python $REPO_ROOT/sample.py \
     +version_num=${version_num} \
     corrupter.sampling_noise_mode=null \
     sampler.include_h=true \
-    integrator=euler
+    integrator=euler \
+    diffeq=base_euler_ode

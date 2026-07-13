@@ -12,6 +12,7 @@ import omegaconf
 import torch
 import numpy as np
 import pandas as pd
+from pathlib import Path
 
 from lightning import LightningDataModule, LightningModule, Trainer
 from lightning.pytorch import Trainer
@@ -108,8 +109,8 @@ def main(sampler,
         #     best_ckpt_path = ckpt_path
         if fname == "last.ckpt":
             epoch_list.append((ckpt_path, 1e6))
-        elif '=' in ckpt_path:
-            epoch = ckpt_path.split("=")[1].split("-")[0]
+        elif '=' in Path(ckpt_path).name:
+            epoch = Path(ckpt_path).name.split("=")[1].split("-")[0]
             epoch_list.append((ckpt_path, int(epoch)))
         else:
             continue
