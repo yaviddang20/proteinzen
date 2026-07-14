@@ -27,57 +27,88 @@ from tqdm.auto import tqdm
 _GPU_SUFFIX = re.compile(r'_gpu\d+_batch\d+_idx\d+')
 
 
+def _parse_xyz(line):
+    return float(line[30:38]), float(line[38:46]), float(line[46:54])
+
+def _parse_elem(line):
+    elem = (line[76:78].strip() if len(line) > 76 else "").capitalize()
+    if not elem:
+        elem = line[12:16].strip().lstrip("0123456789").capitalize()
+    return elem
+
 def parse_traj_pdb(path: Path):
-    """Parse a multi-MODEL PDB. Returns list of (lig_heavy_coords) per step."""
+    """Parse a multi-MODEL PDB. Returns list of (prot_coords, lig_coords) per step."""
     steps = []
-    cur_lig = []
+    cur_prot, cur_lig = [], []
     in_model = False
     with open(path) as fh:
         for line in fh:
             rec = line[:6].rstrip()
             if rec == "MODEL":
                 in_model = True
-                cur_lig = []
+                cur_prot, cur_lig = [], []
             elif rec == "ENDMDL":
-                steps.append(np.array(cur_lig, dtype=np.float64) if cur_lig else np.zeros((0, 3)))
+                prot = np.array(cur_prot, dtype=np.float64) if cur_prot else np.zeros((0, 3))
+                lig  = np.array(cur_lig,  dtype=np.float64) if cur_lig  else np.zeros((0, 3))
+                steps.append((prot, lig))
                 in_model = False
-            elif in_model and rec == "HETATM":
-                try:
-                    x, y, z = float(line[30:38]), float(line[38:46]), float(line[46:54])
-                    elem = (line[76:78].strip() if len(line) > 76 else "").capitalize()
-                    if not elem:
-                        elem = line[12:16].strip().lstrip("0123456789").capitalize()
-                    if elem in ("H", "D"):
-                        continue
-                    cur_lig.append((x, y, z))
-                except ValueError:
-                    pass
+            elif in_model:
+                if rec in ("ATOM", "HETATM"):
+                    try:
+                        elem = _parse_elem(line)
+                        if elem in ("H", "D"):
+                            continue
+                        xyz = _parse_xyz(line)
+                        if rec == "ATOM":
+                            cur_prot.append(xyz)
+                        else:
+                            cur_lig.append(xyz)
+                    except ValueError:
+                        pass
     return steps
 
 
-def gt_lig_com(npz_path: str, include_h: bool = False) -> np.ndarray | None:
+def kabsch(P: np.ndarray, Q: np.ndarray):
+    cp, cq = P.mean(0), Q.mean(0)
+    H = (P - cp).T @ (Q - cq)
+    U, _, Vt = np.linalg.svd(H)
+    d = np.linalg.det(Vt.T @ U.T)
+    R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+    t = cq - R @ cp
+    return R, t
+
+def apply_transform(coords: np.ndarray, R: np.ndarray, t: np.ndarray) -> np.ndarray:
+    return (R @ coords.T).T + t
+
+
+def load_gt(npz_path: str) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+    """Returns (gt_prot_coords, gt_lig_coords) heavy atoms only."""
     from proteinzen.runtime.sampling.protein_pocket import load_structure_from_npz, _crop_protein_to_pocket
     from proteinzen.boltz.data import const
+    protein_id    = const.chain_type_ids["PROTEIN"]
     nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
     try:
-        struct = load_structure_from_npz(npz_path, include_h=include_h)
+        struct = load_structure_from_npz(npz_path, include_h=False)
         struct = _crop_protein_to_pocket(struct, max_protein_residues=100)
     except Exception as e:
         print(f"  [GT load error] {npz_path}: {e}")
-        return None
-    lig_list = []
+        return None, None
+    prot_list, lig_list = [], []
     for chain in struct.chains[struct.mask]:
-        if int(chain["mol_type"]) != nonpolymer_id:
-            continue
-        a0 = int(chain["atom_idx"])
+        mol = int(chain["mol_type"])
+        a0  = int(chain["atom_idx"])
         atoms = struct.atoms[a0: a0 + int(chain["atom_num"])]
         present = atoms["is_present"].astype(bool)
         heavy = present & (atoms["element"] != 1)
-        lig_list.append(atoms["coords"][heavy])
+        if mol == protein_id:
+            prot_list.append(atoms["coords"][heavy])
+        elif mol == nonpolymer_id:
+            lig_list.append(atoms["coords"][heavy])
     if not lig_list:
-        return None
-    lig = np.concatenate(lig_list, 0).astype(np.float64)
-    return lig.mean(0)
+        return None, None
+    prot = np.concatenate(prot_list, 0).astype(np.float64) if prot_list else np.zeros((0, 3))
+    lig  = np.concatenate(lig_list,  0).astype(np.float64)
+    return prot, lig
 
 
 def system_id_from_stem(stem: str) -> str | None:
@@ -131,20 +162,29 @@ def main():
     all_com_dists: list[np.ndarray] = []  # per trajectory, array of CoM dist per step
 
     for sid in tqdm(common, desc="evaluating"):
-        gt_com = gt_lig_com(npz_by_sid[sid])
-        if gt_com is None:
+        gt_prot, gt_lig = load_gt(npz_by_sid[sid])
+        if gt_lig is None:
             continue
+        gt_com = gt_lig.mean(0)
+        n_gt_prot = len(gt_prot)
         for traj_path in sorted(groups[sid]):
             steps = parse_traj_pdb(traj_path)
             if not steps:
                 continue
             dists = []
-            for lig_coords in steps:
-                if len(lig_coords) == 0:
+            for gen_prot, gen_lig in steps:
+                if len(gen_lig) == 0:
                     dists.append(np.nan)
+                    continue
+                # Kabsch-align generated protein onto GT protein, apply to ligand
+                if len(gen_prot) > 0 and n_gt_prot > 0:
+                    n_common = min(len(gen_prot), n_gt_prot)
+                    R, t = kabsch(gen_prot[:n_common], gt_prot[:n_common])
+                    aligned_lig = apply_transform(gen_lig, R, t)
                 else:
-                    com = lig_coords.mean(0)
-                    dists.append(float(np.linalg.norm(com - gt_com)))
+                    aligned_lig = gen_lig
+                com = aligned_lig.mean(0)
+                dists.append(float(np.linalg.norm(com - gt_com)))
             all_com_dists.append(np.array(dists))
 
     if not all_com_dists:
