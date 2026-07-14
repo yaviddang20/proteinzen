@@ -714,7 +714,8 @@ class InvariantPointAttention(nn.Module):
         v_pts,
         z,
         mask,
-        pts_cdist=False
+        pts_cdist=False,
+        cross_mask_bias=None,
     ):
         # [*, N_res, N_res, H]
         b = self.linear_b(z)
@@ -731,6 +732,8 @@ class InvariantPointAttention(nn.Module):
         # [*, N_res, N_res]
         square_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
         square_mask = self.inf * (square_mask - 1)
+        if cross_mask_bias is not None:
+            square_mask = square_mask + cross_mask_bias
 
         # [*, H, N_res, N_res]
         pt_att = permute_final_dims(pt_att, (2, 0, 1))
@@ -781,6 +784,7 @@ class InvariantPointAttention(nn.Module):
         _z_reference_list: Optional[Sequence[torch.Tensor]] = None,
         flash_attn=False,
         pts_cdist=True,
+        cross_mask_bias=None,
     ) -> torch.Tensor:
         """
         Args:
@@ -870,7 +874,7 @@ class InvariantPointAttention(nn.Module):
                 kv_pts, [self.no_qk_points, self.no_v_points], dim=-2
             )
 
-            o, o_pt, o_pair = self._attn(q, k, v, q_pts, k_pts, v_pts, z, mask, pts_cdist=pts_cdist)
+            o, o_pt, o_pair = self._attn(q, k, v, q_pts, k_pts, v_pts, z, mask, pts_cdist=pts_cdist, cross_mask_bias=cross_mask_bias)
             if self.ablate_pair_z:
                 o_pair = torch.zeros_like(o_pair)
             o_pt = r[..., None, None].invert_apply(o_pt)

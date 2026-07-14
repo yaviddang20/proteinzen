@@ -94,16 +94,11 @@ class CoMPredictorLit(pl.LightningModule):
                      / lig_mask.float().sum(1, keepdim=True).clamp(min=1)
         etkdg_centered = etkdg_pos - lig_center[:, None, :]
 
-        B, device = etkdg_centered.shape[0], etkdg_centered.device
-        Q, _ = torch.linalg.qr(torch.randn(B, 3, 3, device=device))
-        Q = Q * torch.det(Q).sign()[:, None, None]
-        etkdg_rotated = torch.einsum('bni,bij->bnj', etkdg_centered, Q)
-
         old = ru.Rigid.from_tensor_7(batch['rigids']['rigids_t'])
         old_trans = old.get_trans()
         # Only replace translations for samples where ETKDG succeeded
         replace_mask = (noising_mask & etkdg_valid[:, None])[..., None]
-        new_trans = torch.where(replace_mask, etkdg_rotated, old_trans)
+        new_trans = torch.where(replace_mask, etkdg_centered, old_trans)
         batch['rigids']['rigids_t'] = ru.Rigid(rots=old.get_rots(), trans=new_trans).to_tensor_7()
         batch['rigids']['trans_t']  = new_trans
         return batch
@@ -114,17 +109,21 @@ class CoMPredictorLit(pl.LightningModule):
         batch = self.corrupter.corrupt_dense_batch(batch, identity_rot_noise=False)
         batch = self._apply_etkdg(batch)
 
-        with torch.no_grad():
-            out = self.backbone(batch)
-
-        node_embed = out['node_embed']  # (B, N_tok, c_s)
-
         token_to_rep = batch['token']['token_to_rep_rigid']  # (B, N_tok)
 
         # Token-level noising mask: True = ligand, False = protein
         token_noising_mask = gather_helper(
             batch['rigids']['rigids_noising_mask'][..., None].float(), token_to_rep
         ).squeeze(-1).bool()  # (B, N_tok)
+
+        # Block protein<->ligand rigid attention: -1e5 for cross-type pairs, 0 otherwise
+        same_type = token_noising_mask.unsqueeze(-1) == token_noising_mask.unsqueeze(-2)
+        batch['ipa_cross_mask_bias'] = (~same_type).float() * -1e5
+
+        with torch.no_grad():
+            out = self.backbone(batch)
+
+        node_embed = out['node_embed']  # (B, N_tok, c_s)
 
         # GT CoM: mean crystal ligand translation from rigids_1
         rigids_1_trans = ru.Rigid.from_tensor_7(batch['rigids']['rigids_1']).get_trans()
@@ -139,8 +138,8 @@ class CoMPredictorLit(pl.LightningModule):
 
         com_pred = self.com_head(node_embed, token_noising_mask, token_trans)
         loss = F.mse_loss(com_pred, gt_com)
-        self.log(f'{split}/mse',  loss,        prog_bar=False, sync_dist=True)
-        self.log(f'{split}/rmse', loss.sqrt(), prog_bar=True,  sync_dist=True)
+        self.log(f'{split}/mse',  loss,        prog_bar=False, sync_dist=True, on_epoch=True)
+        self.log(f'{split}/rmse', loss.sqrt(), prog_bar=True,  sync_dist=True, on_epoch=True)
         return loss
 
     def training_step(self, batch, _):   return self._step(batch, 'train')

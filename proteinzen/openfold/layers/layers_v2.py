@@ -525,7 +525,7 @@ class ConditionedInvariantPointAttention(nn.Module):
     @torch.compile(disable=not compile_supported)
     def _compile_attn_aggregate(
         self, b, pt_att, pair_z,
-        q, k, v, v_pts, mask
+        q, k, v, v_pts, mask, cross_mask_bias=None
     ):
         # [*, H, N_res, N_res]
         a = torch.matmul(
@@ -538,6 +538,8 @@ class ConditionedInvariantPointAttention(nn.Module):
         # [*, N_res, N_res]
         square_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
         square_mask = self.inf * (square_mask - 1)
+        if cross_mask_bias is not None:
+            square_mask = square_mask + cross_mask_bias
 
         # [*, H, N_res, N_res]
         pt_att = permute_final_dims(pt_att, (2, 0, 1))
@@ -582,7 +584,7 @@ class ConditionedInvariantPointAttention(nn.Module):
     @torch.compile(disable=not compile_supported)
     def _compile_bias_and_attn_aggregate(
         self,
-        q, k, v, q_pts, k_pts, v_pts, z, mask
+        q, k, v, q_pts, k_pts, v_pts, z, mask, cross_mask_bias=None
     ):
         # [*, N_res, N_res, H]
         b, pair_z = self._gen_pair_bias(z)
@@ -593,7 +595,7 @@ class ConditionedInvariantPointAttention(nn.Module):
         )
 
         o, o_pt, o_pair = self._compile_attn_aggregate(
-            b, pt_att, pair_z, q, k, v, v_pts, mask
+            b, pt_att, pair_z, q, k, v, v_pts, mask, cross_mask_bias=cross_mask_bias
         )
         return o, o_pt, o_pair
 
@@ -605,6 +607,7 @@ class ConditionedInvariantPointAttention(nn.Module):
         z: Optional[torch.Tensor],
         r: Rigid,
         mask: torch.Tensor,
+        cross_mask_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -685,7 +688,7 @@ class ConditionedInvariantPointAttention(nn.Module):
         ##########################
         if True:
             o, o_pt, o_pair = self._compile_bias_and_attn_aggregate(
-                q, k, v, q_pts, k_pts, v_pts, z, mask
+                q, k, v, q_pts, k_pts, v_pts, z, mask, cross_mask_bias=cross_mask_bias
             )
         else:
             # [*, N_res, N_res, H]
@@ -697,7 +700,7 @@ class ConditionedInvariantPointAttention(nn.Module):
             )
 
             o, o_pt, o_pair = self._compile_attn_aggregate(
-                b, pt_att, pair_z, q, k, v, v_pts, mask
+                b, pt_att, pair_z, q, k, v, v_pts, mask, cross_mask_bias=cross_mask_bias
             )
         o_pt = r[..., None, None].invert_apply(o_pt)
 
@@ -730,6 +733,7 @@ class ConditionedInvariantPointAttention(nn.Module):
         mask: torch.Tensor,
         _offload_inference: bool = False,
         _z_reference_list: Optional[Sequence[torch.Tensor]] = None,
+        cross_mask_bias: Optional[torch.Tensor] = None,
         # flash_attn=False
     ) -> torch.Tensor:
         """
@@ -839,6 +843,8 @@ class ConditionedInvariantPointAttention(nn.Module):
         # [*, N_res, N_res]
         square_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
         square_mask = self.inf * (square_mask - 1)
+        if cross_mask_bias is not None:
+            square_mask = square_mask + cross_mask_bias
 
         # [*, H, N_res, N_res]
         pt_att = permute_final_dims(pt_att, (2, 0, 1))
@@ -912,13 +918,15 @@ class ConditionedInvariantPointAttention(nn.Module):
         mask: torch.Tensor,
         _offload_inference: bool = False,
         _z_reference_list: Optional[Sequence[torch.Tensor]] = None,
+        cross_mask_bias: Optional[torch.Tensor] = None,
         # flash_attn=False
     ) -> torch.Tensor:
         if compile_supported:
             return self._compile_forward(
-                s, cond, z, r, mask
+                s, cond, z, r, mask, cross_mask_bias=cross_mask_bias
             )
         else:
             return self._eager_forward(
-                s, cond, z, r, mask, _offload_inference, _z_reference_list
+                s, cond, z, r, mask, _offload_inference, _z_reference_list,
+                cross_mask_bias=cross_mask_bias
             )

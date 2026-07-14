@@ -1035,6 +1035,8 @@ class IpaDenoiser(nn.Module):
         else:
             pred_rot_vf = None
 
+        cross_mask_bias = input_feats.get('ipa_cross_mask_bias')
+
         # Main trunk
         for b in range(self.num_blocks):
             curr_rigids_tensor_7 = curr_rigids.to_tensor_7()
@@ -1045,13 +1047,15 @@ class IpaDenoiser(nn.Module):
                     cond=condition_embed,
                     z=edge_embed,
                     r=token_rigids,
-                    mask=node_mask)
+                    mask=node_mask,
+                    cross_mask_bias=cross_mask_bias)
             else:
                 ipa_embed = self.trunk[f'ipa_{b}'](
                     s=node_embed,
                     z=edge_embed,
                     r=token_rigids,
-                    mask=node_mask)
+                    mask=node_mask,
+                    cross_mask_bias=cross_mask_bias)
             node_embed = (node_embed + ipa_embed) * node_mask[..., None]
 
             seq_tfmr_out = self.trunk[f'tfmr_{b}'](
@@ -1636,6 +1640,8 @@ class IpaMultiRigidDenoiser(nn.Module):
             input_feats['token_mask'] = token_data['token_mask']
             input_feats['token_gather_idx'] = token_data['token_to_rep_rigid']
             input_feats['t'] = data['t']
+            if 'ipa_cross_mask_bias' in data:
+                input_feats['ipa_cross_mask_bias'] = data['ipa_cross_mask_bias']
 
             if self.pairformer is not None:
                 token_embed, edge_embed = self.pairformer(
