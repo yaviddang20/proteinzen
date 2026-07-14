@@ -320,7 +320,7 @@ def select_axes(atom_coord, neighbors, valid_neighbors, valid_neighbor_coords):
     return None
 
 def gen_rand_rot_frame(trans):
-    quat = Rotation.random().as_quat(canonical=True)
+    quat = Rotation.random().as_quat(canonical=True, scalar_first=True)
     return np.concatenate([quat, trans], axis=0), 0
 
 def gen_semirand_rot_frame(center, x_axis_point):
@@ -405,12 +405,12 @@ def arbitrary_atom_to_frame(
 
     _select_axes = fn.partial(select_axes, valid_neighbors=valid_neighbors, valid_neighbor_coords=valid_neighbor_coords)
     if use_identity_rot:
-        quat = Rotation.identity().as_quat(canonical=True)
+        quat = Rotation.identity().as_quat(canonical=True, scalar_first=True)
         trans = atom["coords"]
         return np.concatenate([quat, trans], axis=0), 0
     else:
         if len(neighbors) == 0:
-            quat = Rotation.identity().as_quat(canonical=True)
+            quat = Rotation.random().as_quat(canonical=True, scalar_first=True)
             trans = atom["coords"]
             return np.concatenate([quat, trans], axis=0), 0
         elif len(neighbors) == 1:
