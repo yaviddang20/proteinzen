@@ -1110,7 +1110,7 @@ def _run_plip(pdb_path: str, sif_path: str) -> dict:
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             result = subprocess.run(
-                ["singularity", "exec", sif_path, "plip",
+                ["singularity", "exec", sif_path, "python", "-m", "plip.plipcmd",
                  "-f", str(pdb_path), "-o", tmpdir, "-x"],
                 capture_output=True, text=True, timeout=120,
             )
