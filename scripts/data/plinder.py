@@ -22,6 +22,7 @@ import traceback
 from dataclasses import asdict, replace
 from pathlib import Path
 from functools import partial
+from typing import Optional
 
 import pickle
 
@@ -298,6 +299,17 @@ def merge_rot_bond_data(all_data: list) -> dict:
 
 # ── per-system processing ─────────────────────────────────────────────────────
 
+def _load_pocket_alpha_spheres(system_id: str, pocket_data_dir: Optional[Path]) -> Optional[np.ndarray]:
+    """Load pre-computed fpocket alpha-sphere coords for system_id, or None."""
+    if pocket_data_dir is None:
+        return None
+    mid = system_id[1:3]
+    path = pocket_data_dir / mid / f"{system_id}.npy"
+    if not path.exists():
+        return None
+    return np.load(path)
+
+
 def process_system(
     system_id: str,
     plinder_dir: Path,
@@ -305,6 +317,7 @@ def process_system(
     clusters: dict,
     annotation_row: dict,
     ccd: dict,
+    pocket_data_dir: Optional[Path] = None,
 ) -> None:
     mid = system_mid(system_id)
     struct_path = outdir / "structures" / mid / f"{system_id}.npz"
@@ -470,9 +483,33 @@ def process_system(
     (outdir / "records" / mid).mkdir(parents=True, exist_ok=True)
     (outdir / "auth_maps" / mid).mkdir(parents=True, exist_ok=True)
 
+    # Compute pocket_residue_mask from fpocket alpha-sphere coords if available.
+    # A protein residue is in the pocket if any of its atoms is within 4Å of any alpha sphere.
+    alpha_spheres = _load_pocket_alpha_spheres(system_id, pocket_data_dir)
+    pocket_residue_mask = np.zeros(len(structure.residues), dtype=bool)
+    if alpha_spheres is not None and len(alpha_spheres) > 0:
+        for chain in structure.chains:
+            if int(chain["mol_type"]) != protein_id:
+                continue
+            res_start = int(chain["res_idx"])
+            res_end = res_start + int(chain["res_num"])
+            for r in range(res_start, res_end):
+                res = structure.residues[r]
+                if not res["is_present"]:
+                    continue
+                a_start = int(res["atom_idx"])
+                a_end = a_start + int(res["atom_num"])
+                res_atoms = structure.atoms[a_start:a_end]
+                present_coords = res_atoms["coords"][res_atoms["is_present"].astype(bool)]
+                if len(present_coords) == 0:
+                    continue
+                if cdist(present_coords, alpha_spheres).min() < 4.0:
+                    pocket_residue_mask[r] = True
+
     save_dict = asdict(structure)
     save_dict.update(rot_bond_data)
     save_dict['interaction_residue_mask'] = interaction_residue_mask
+    save_dict['pocket_residue_mask'] = pocket_residue_mask
     np.savez_compressed(struct_path, **save_dict)
 
     record_dict = asdict(record)
@@ -487,7 +524,7 @@ def process_system(
 
 _worker_state = {}
 
-def _worker_init(plinder_dir, outdir, clusters, annotations, ccd_path):
+def _worker_init(plinder_dir, outdir, clusters, annotations, ccd_path, pocket_data_dir=None):
     """Load large shared data once per worker process."""
     global _worker_state
     with open(ccd_path, "rb") as f:
@@ -498,6 +535,7 @@ def _worker_init(plinder_dir, outdir, clusters, annotations, ccd_path):
         "clusters": clusters,
         "annotations": annotations,
         "ccd": ccd,
+        "pocket_data_dir": pocket_data_dir,
     }
 
 
@@ -505,7 +543,10 @@ def process_system_worker(system_id: str) -> None:
     s = _worker_state
     annotation_row = s["annotations"].get(system_id, {})
     try:
-        process_system(system_id, s["plinder_dir"], s["outdir"], s["clusters"], annotation_row, s["ccd"])
+        process_system(
+            system_id, s["plinder_dir"], s["outdir"], s["clusters"],
+            annotation_row, s["ccd"], pocket_data_dir=s.get("pocket_data_dir"),
+        )
     except Exception:
         traceback.print_exc()
         print(f"Unhandled error processing {system_id}")
@@ -554,8 +595,10 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> None:
 
     num_processes = min(args.num_processes, multiprocessing.cpu_count(), len(system_ids))
 
+    pocket_data_dir = getattr(args, "pocket_data_dir", None)
+
     if num_processes > 1:
-        initargs = (plinder_dir, outdir, clusters, annotations, args.ccd_path)
+        initargs = (plinder_dir, outdir, clusters, annotations, args.ccd_path, pocket_data_dir)
         with multiprocessing.Pool(
             processes=num_processes,
             initializer=_worker_init,
@@ -563,7 +606,7 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> None:
         ) as pool:
             list(tqdm(pool.imap_unordered(process_system_worker, system_ids, chunksize=4), total=len(system_ids)))
     else:
-        _worker_init(plinder_dir, outdir, clusters, annotations, args.ccd_path)
+        _worker_init(plinder_dir, outdir, clusters, annotations, args.ccd_path, pocket_data_dir)
         for sid in tqdm(system_ids):
             process_system_worker(sid)
 
@@ -590,6 +633,9 @@ if __name__ == "__main__":
                         help="Cap number of systems per split (for debugging)")
     parser.add_argument("--overwrite", action="store_true", default=False,
                         help="Delete and recreate the output directory before processing")
+    parser.add_argument("--pocket-data-dir", type=Path,
+                        default=Path(os.environ.get("REPO_ROOT", ".")) / "plinder_pocket_alpha_spheres",
+                        help="Directory of per-system alpha-sphere .npy files from filter_plinder_pocket.py")
     args = parser.parse_args()
 
     # Set rdkit pickle options
