@@ -113,7 +113,7 @@ def main():
         if npz.exists():
             npz_by_sid[sid] = str(npz)
 
-    traj_files = sorted(args.traj_dir.glob("*_traj_clean.pdb"))
+    traj_files = sorted(args.traj_dir.glob("*_clean_traj.pdb"))
     if not traj_files:
         sys.exit(f"No *_traj_clean.pdb files found in {args.traj_dir}")
     print(f"Found {len(traj_files)} trajectory files")
@@ -121,7 +121,7 @@ def main():
     # group by system id
     groups: dict[str, list[Path]] = defaultdict(list)
     for p in traj_files:
-        sid = system_id_from_stem(p.stem.replace("_traj_clean", ""))
+        sid = system_id_from_stem(p.stem.replace("_clean_traj", ""))
         if sid:
             groups[sid].append(p)
 
