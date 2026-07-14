@@ -219,11 +219,69 @@ def write_crop_pdb(out_path: Path, struct, set_a: set, set_b: set, seed_mask_a, 
 
     lines.append("END")
     out_path.write_text("\n".join(lines) + "\n")
+    name = out_path.stem
     print(f"\nWrote {out_path}")
-    print("  PyMOL: load crops.pdb; split_states crops")
-    print("         spectrum b, blue_red, crops_0001  # blue=shared, red=unique to crop A")
+    print(f"  PyMOL:    load {out_path}; split_states {name}")
+    print(f"            spectrum b, blue_red, {name}_0001  # blue=shared, red=unique")
+    print(f"  ChimeraX: open {out_path}")
+    print(f"            color bfactor #1.1 palette blue:white:red range 0,1")
+    print(f"            color bfactor #1.2 palette blue:white:red range 0,1")
 
 
+
+
+def _calc_ligand_sasa(struct, crop_set, res_table):
+    """Compute total ligand SASA (Å²) within the cropped protein context.
+
+    Builds a freesasa Structure from all atoms in the crop, then sums
+    per-residue SASA for non-protein chains.
+    Returns (ligand_sasa, total_sasa) or (None, None) if freesasa unavailable.
+    """
+    try:
+        import freesasa
+        freesasa.setVerbosity(freesasa.silent)
+    except ImportError:
+        return None, None
+
+    protein_type = const.chain_type_ids["PROTEIN"]
+    fs = freesasa.Structure()
+    lig_res_keys = set()
+
+    for r in res_table:
+        key = (r["chain"], r["res_idx"])
+        if key not in crop_set:
+            continue
+        if not r["is_protein"]:
+            lig_res_keys.add(key)
+        res_name = r["res_name"][:3]
+        chain_char = r["chain"][0] if r["chain"] else "A"
+        res_num = str(r["res_idx"] % 9999)
+        for atom in r["atoms"]:
+            x, y, z = [float(v) for v in atom["coords"]]
+            try:
+                fs.addAtom(atom["name"], res_name, res_num, chain_char, x, y, z)
+            except Exception:
+                pass
+
+    if fs.nAtoms() == 0:
+        return None, None
+
+    result = freesasa.calc(fs)
+    areas = result.residueAreas()
+
+    lig_sasa = 0.0
+    total_sasa = 0.0
+    for chain_id, residues in areas.items():
+        for res_num_str, area in residues.items():
+            total_sasa += area.total
+            # check if this residue belongs to a ligand chain
+            # we keyed lig_res_keys by (chain_name, res_idx) — match by res_num
+            for key in lig_res_keys:
+                if str(key[1] % 9999) == res_num_str:
+                    lig_sasa += area.total
+                    break
+
+    return lig_sasa, total_sasa
 
 
 def _mask_summary(mask, struct, label):
@@ -378,6 +436,16 @@ def main():
             seed_arr_b[i] = True
 
     write_crop_pdb(out_pdb, struct, pdb_set_a, pdb_set_b, seed_arr_a, seed_arr_b)
+
+    res_table = _build_res_table(struct)
+    sasa_a, total_a = _calc_ligand_sasa(struct, pdb_set_a, res_table)
+    sasa_b, total_b = _calc_ligand_sasa(struct, pdb_set_b, res_table)
+    if sasa_a is not None:
+        print(f"\nLigand SASA (seed={args.pdb_seed}):")
+        print(f"  Crop A (interaction):         {sasa_a:7.1f} Å²  (total context: {total_a:.1f} Å²)")
+        print(f"  Crop B (pocket+interaction):  {sasa_b:7.1f} Å²  (total context: {total_b:.1f} Å²)")
+        delta = sasa_b - sasa_a
+        print(f"  Delta B-A: {delta:+.1f} Å²  ({'more exposed' if delta > 0 else 'more buried'} in pocket crop)")
 
 
 if __name__ == "__main__":
