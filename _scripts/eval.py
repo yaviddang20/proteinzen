@@ -1045,6 +1045,105 @@ def run_conformer_eval(args):
 
 
 # ============================================================
+# Pocket eval — PLIP interaction analysis
+# ============================================================
+
+# Maps PLIP XML container tag → (child element tag, short type label)
+_PLIP_INTERACTION_TAGS = {
+    "hydrophobic_interactions": ("hydrophobic_interaction", "HYDROPHOBIC"),
+    "hydrogen_bonds":           ("hydrogen_bond",           "HBOND"),
+    "water_bridges":            ("water_bridge",            "WATERBRIDGE"),
+    "salt_bridges":             ("salt_bridge",             "SALTBRIDGE"),
+    "pi_stacks":                ("pi_stack",                "PISTACK"),
+    "pi_cation_interactions":   ("pi_cation_interaction",   "PICATION"),
+    "halogen_bonds":            ("halogen_bond",            "HALOGENBOND"),
+    "metal_complexes":          ("metal_complex",           "METALCOMPLEX"),
+}
+PLIP_TYPES = [label for _, label in _PLIP_INTERACTION_TAGS.values()]
+
+
+def _parse_plip_xml(xml_path: str) -> dict:
+    """Parse a PLIP report.xml and return interactions per type.
+
+    Returns dict: {type_label: set of (resnr: int, restype: str)} where each
+    tuple identifies a unique protein residue involved in that interaction type.
+    An interaction is kept if the same (resnr, restype) pair appears in both
+    GT and generated, signalling conservation of that contact.
+    """
+    import xml.etree.ElementTree as ET
+    try:
+        tree = ET.parse(xml_path)
+    except Exception:
+        return {label: set() for _, label in _PLIP_INTERACTION_TAGS.values()}
+
+    root = tree.getroot()
+    result = {label: set() for _, label in _PLIP_INTERACTION_TAGS.values()}
+
+    for bs in root.iter("bindingsite"):
+        interactions_node = bs.find("interactions")
+        if interactions_node is None:
+            continue
+        for container_tag, (child_tag, label) in _PLIP_INTERACTION_TAGS.items():
+            container = interactions_node.find(container_tag)
+            if container is None:
+                continue
+            for interaction in container.findall(child_tag):
+                resnr_el  = interaction.find("resnr")
+                restype_el = interaction.find("restype")
+                if resnr_el is None or restype_el is None:
+                    continue
+                try:
+                    resnr = int(resnr_el.text)
+                except (ValueError, TypeError):
+                    continue
+                result[label].add((resnr, restype_el.text.strip()))
+
+    return result
+
+
+def _run_plip(pdb_path: str, sif_path: str) -> dict:
+    """Run PLIP via Singularity on a complex PDB and return parsed interactions.
+
+    Returns dict: {type_label: set of (resnr, restype)} — empty sets on failure.
+    """
+    empty = {label: set() for _, label in _PLIP_INTERACTION_TAGS.values()}
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = subprocess.run(
+                ["singularity", "exec", sif_path, "plip",
+                 "-f", str(pdb_path), "-o", tmpdir, "-x"],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode != 0:
+                return empty
+            xml_files = list(Path(tmpdir).glob("*.xml"))
+            if not xml_files:
+                return empty
+            return _parse_plip_xml(str(xml_files[0]))
+    except Exception:
+        return empty
+
+
+def _compare_interactions(gt: dict, gen: dict) -> dict:
+    """Count conserved interactions per type.
+
+    Returns dict: {type_label: {"gt": n, "gen": n, "conserved": n, "rate": float}}
+    """
+    out = {}
+    for label in PLIP_TYPES:
+        gt_set  = gt.get(label, set())
+        gen_set = gen.get(label, set())
+        conserved = len(gt_set & gen_set)
+        out[label] = {
+            "gt":        len(gt_set),
+            "gen":       len(gen_set),
+            "conserved": conserved,
+            "rate":      conserved / len(gt_set) if gt_set else float("nan"),
+        }
+    return out
+
+
+# ============================================================
 # Pocket eval — helpers (Kabsch + PDB parsing)
 # ============================================================
 
@@ -1245,7 +1344,8 @@ def write_lig_pdb(path: Path, gt_struct, gen_lig_lig: np.ndarray, lig_elements: 
     path.write_text("\n".join(lines) + "\n")
 
 
-def eval_system_pocket(system_id: str, gen_pdb_paths, gt_struct):
+def eval_system_pocket(system_id: str, gen_pdb_paths, gt_struct,
+                       gt_interactions: dict | None = None, plip_sif: str | None = None):
     gt_prot, gt_lig = extract_gt_coords(gt_struct)
     n_gt_prot = len(gt_prot)
     n_gt_lig  = len(gt_lig)
@@ -1267,21 +1367,54 @@ def eval_system_pocket(system_id: str, gen_pdb_paths, gt_struct):
         mol_template, _ = ligand_mol_from_pdb(str(pdb_path))
         pk = pocket_rmsd_sym(mol_template, gt_lig, gen_lig_pk)
         lig, gen_lig_lig = _lig_rmsd_and_coords(mol_template, gt_lig, gen_lig)
-        records.append(dict(system_id=system_id, sample_idx=idx, pk=pk, lig=lig,
-                            gen_lig_pk=gen_lig_pk, gen_lig_lig=gen_lig_lig,
-                            lig_elements=lig_elements, note=""))
+
+        record = dict(system_id=system_id, sample_idx=idx, pk=pk, lig=lig,
+                      gen_lig_pk=gen_lig_pk, gen_lig_lig=gen_lig_lig,
+                      lig_elements=lig_elements, note="")
+
+        # PLIP interaction conservation
+        if plip_sif and gt_interactions is not None:
+            gen_interactions = _run_plip(str(pdb_path), plip_sif)
+            conservation = _compare_interactions(gt_interactions, gen_interactions)
+            for itype, counts in conservation.items():
+                record[f"plip_{itype}_gt"]        = counts["gt"]
+                record[f"plip_{itype}_gen"]        = counts["gen"]
+                record[f"plip_{itype}_conserved"]  = counts["conserved"]
+                record[f"plip_{itype}_rate"]       = counts["rate"]
+
+        records.append(record)
     return records
 
 
-def _eval_system_pocket_job(system_id, gen_pdb_paths, npz_path, include_h, max_protein_residues):
+def _eval_system_pocket_job(system_id, gen_pdb_paths, npz_path, include_h,
+                            max_protein_residues, plip_sif=None):
     from proteinzen.runtime.sampling.protein_pocket import _crop_protein_to_pocket, load_structure_from_npz
+    from proteinzen.data.write.pdb import to_pdb
+    from dataclasses import replace as dc_replace
     RDLogger.DisableLog("rdApp.*")
     try:
         gt_struct = load_structure_from_npz(npz_path, include_h=include_h)
     except Exception as e:
         return system_id, [], f"npz load error: {e}"
     gt_struct = _crop_protein_to_pocket(gt_struct, max_protein_residues)
-    records = eval_system_pocket(system_id, gen_pdb_paths, gt_struct)
+
+    # Run PLIP on GT complex to get reference interactions
+    gt_interactions = None
+    if plip_sif:
+        try:
+            clean = dc_replace(gt_struct, bonds=gt_struct.bonds[:0],
+                               connections=gt_struct.connections[:0])
+            gt_pdb_str = to_pdb(clean)
+            with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False, mode="w") as tf:
+                tf.write(gt_pdb_str)
+                gt_pdb_path = tf.name
+            gt_interactions = _run_plip(gt_pdb_path, plip_sif)
+            Path(gt_pdb_path).unlink(missing_ok=True)
+        except Exception:
+            gt_interactions = None
+
+    records = eval_system_pocket(system_id, gen_pdb_paths, gt_struct,
+                                 gt_interactions=gt_interactions, plip_sif=plip_sif)
     return system_id, records, None
 
 
@@ -1341,6 +1474,8 @@ def run_pocket_eval(args):
     max_prot    = args.max_protein_residues
     include_h   = args.include_h
     verbose     = args.verbose
+    plip_sif    = str(args.plip_sif)
+    print(f"PLIP: {plip_sif}")
 
     # ---- manifest ----
     manifest_path = data_dir / "manifest.json"
@@ -1392,7 +1527,7 @@ def run_pocket_eval(args):
 
     # ---- parallel evaluation ----
     results = Parallel(n_jobs=n_jobs, backend="loky")(
-        delayed(_eval_system_pocket_job)(sid, pdbs, npz, include_h, max_prot)
+        delayed(_eval_system_pocket_job)(sid, pdbs, npz, include_h, max_prot, plip_sif)
         for sid, pdbs, npz in tqdm(jobs, desc="evaluating")
     )
 
@@ -1456,6 +1591,26 @@ def run_pocket_eval(args):
         return f"{v:.3f}" if np.isfinite(v) else "  inf"
     for sid, n, mn_pk, avg_pk, mn_lig in rows:
         print(f"  {sid:<42} {n:>4} {_fmt(mn_pk):>7} {_fmt(avg_pk):>8} {_fmt(mn_lig):>8}")
+
+    # ---- PLIP conservation summary ----
+    if all_records:
+        print(f"\n--- PLIP Interaction Conservation ---")
+        print(f"  {'type':<14} {'gt_mean':>8} {'gen_mean':>9} {'conserved':>10} {'rate':>7}")
+        for itype in PLIP_TYPES:
+            gt_counts  = [r[f"plip_{itype}_gt"]        for r in all_records if f"plip_{itype}_gt" in r]
+            gen_counts = [r[f"plip_{itype}_gen"]        for r in all_records if f"plip_{itype}_gen" in r]
+            con_counts = [r[f"plip_{itype}_conserved"]  for r in all_records if f"plip_{itype}_conserved" in r]
+            rates      = [r[f"plip_{itype}_rate"]       for r in all_records
+                          if f"plip_{itype}_rate" in r and np.isfinite(r[f"plip_{itype}_rate"])]
+            if not gt_counts:
+                continue
+            print(
+                f"  {itype:<14} "
+                f"{_mean_finite(gt_counts):>8.2f} "
+                f"{_mean_finite(gen_counts):>9.2f} "
+                f"{_mean_finite(con_counts):>10.2f} "
+                f"{_mean_finite(rates):>7.3f}"
+            )
 
     # ---- PDB output ----
     pk_dir  = out_dir / "aligned_pocket"
@@ -1547,6 +1702,10 @@ def main():
     parser.add_argument(
         "--verbose", action="store_true",
         help="Print per-system details during pocket evaluation",
+    )
+    parser.add_argument(
+        "--plip-sif", type=Path, default=Path("plip.sif"),
+        help="Path to PLIP Singularity image (default: ./plip.sif).",
     )
     # Common
     parser.add_argument(
