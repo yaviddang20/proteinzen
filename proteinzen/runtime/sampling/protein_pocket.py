@@ -294,7 +294,9 @@ class ProteinPocketConditionedSampling(SamplingTask):
             "atom_noising_mask": atom_noising_mask,
             "res_type_noising_mask": res_type_noising_mask,
             "residue_is_unindexed_mask": np.zeros(n_residues, dtype=bool),
+            "res_hotspot_type": np.zeros(n_residues, dtype=int),
             "residue_entity_ids": residue_entity_ids,
+            "t": 0.0,
         }
 
         task_name = self.kwargs.get("name", self.task_name)
@@ -397,7 +399,9 @@ class LigandPocketConditionedSampling(SamplingTask):
             "atom_noising_mask": atom_noising_mask,
             "res_type_noising_mask": res_type_noising_mask,
             "residue_is_unindexed_mask": np.zeros(n_residues, dtype=bool),
+            "res_hotspot_type": np.zeros(n_residues, dtype=int),
             "residue_entity_ids": residue_entity_ids,
+            "t": 0.0,
         }
 
         task_name = self.kwargs.get("name", self.task_name)
