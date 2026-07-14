@@ -162,28 +162,21 @@ def _pdb_chain_id(name: str, asym_to_pdb: dict) -> str:
     return asym_to_pdb[name]
 
 
-def write_crop_pdb(out_path: Path, struct, set_a: set, set_b: set, seed_mask_a, seed_mask_b):
+def write_crop_pdb(out_path: Path, struct, set_a: set, set_b: set):
     """Write a 2-model all-atom PDB (protein heavy atoms + ligand all atoms).
 
     MODEL 1 = interaction-only crop (crop A)
     MODEL 2 = pocket+interaction crop (crop B)
-    B-factor: 0.00 shared, 1.00 unique to this model, 0.50 seeded (priority) residue.
-
-    set_a / set_b: sets of (chain_name, res_idx) already computed by _token_residue_set.
-    seed_mask_a/b: bool arrays indexed by residue array index.
+    B-factor: 0.00=A-only (blue), 0.50=shared (white), 1.00=B-only (red).
     """
     res_table = _build_res_table(struct)
-
-    seeded_a = set(seed_mask_a.nonzero()[0]) if seed_mask_a is not None else set()
-    seeded_b = set(seed_mask_b.nonzero()[0]) if seed_mask_b is not None else set()
 
     lines = []
     lines.append("REMARK  MODEL 1: interaction-only crop (crop A)")
     lines.append("REMARK  MODEL 2: pocket+interaction crop (crop B)")
-    lines.append("REMARK  B-factor: 0.00=shared, 1.00=unique to model, 0.50=seeded (priority) residue")
+    lines.append("REMARK  B-factor: 0.00=A-only (blue), 0.50=shared (white), 1.00=B-only (red)")
 
-    for model_num, (crop_set, seeded_set) in enumerate([(set_a, seeded_a), (set_b, seeded_b)], start=1):
-        other = set_b if model_num == 1 else set_a
+    for model_num, crop_set in enumerate([set_a, set_b], start=1):
         lines.append(f"MODEL        {model_num}")
         asym_to_pdb: dict = {}
         serial = 1
@@ -194,12 +187,13 @@ def write_crop_pdb(out_path: Path, struct, set_a: set, set_b: set, seed_mask_a, 
             pdb_chain = _pdb_chain_id(r["chain"], asym_to_pdb)
             res_seq = r["res_idx"] % 9999
             record = "ATOM  " if r["is_protein"] else "HETATM"
-            if key not in other:
-                bfac = 1.00
-            elif r["res_array_idx"] in seeded_set:
-                bfac = 0.50
+            in_both = key in set_a and key in set_b
+            if in_both:
+                bfac = 0.50  # shared = white
+            elif key in set_a:
+                bfac = 0.00  # A-only = blue
             else:
-                bfac = 0.00
+                bfac = 1.00  # B-only = red
             res_name = r["res_name"].ljust(3)
             for atom in r["atoms"]:
                 aname = atom["name"]
@@ -222,10 +216,13 @@ def write_crop_pdb(out_path: Path, struct, set_a: set, set_b: set, seed_mask_a, 
     name = out_path.stem
     print(f"\nWrote {out_path}")
     print(f"  PyMOL:    load {out_path}; split_states {name}")
-    print(f"            spectrum b, blue_red, {name}_0001  # blue=shared, red=unique")
+    print(f"            spectrum b, blue_red, {name}_0001; color yellow, ({name}_0001 and hetatm)")
+    print(f"            spectrum b, blue_red, {name}_0002; color yellow, ({name}_0002 and hetatm)")
     print(f"  ChimeraX: open {out_path}")
     print(f"            color bfactor #1.1 palette blue:white:red range 0,1")
+    print(f"            select #1.1 & ligand; color sel yellow; select clear")
     print(f"            color bfactor #1.2 palette blue:white:red range 0,1")
+    print(f"            select #1.2 & ligand; color sel yellow; select clear")
 
 
 
@@ -400,22 +397,6 @@ def main():
     # --- PDB output ---
     out_pdb = args.out_pdb or Path(f"{args.npz.stem}_crops.pdb")
 
-    # build residue-level priority masks (by residue array index) for B-factor coloring
-    res_table = _build_res_table(struct)
-    res_key_to_array_idx = {(r["chain"], r["res_idx"]): r["res_array_idx"] for r in res_table}
-
-    def _pri_to_res_set(pri_mask):
-        if pri_mask is None:
-            return set()
-        seeded_tok_keys = set()
-        for i, tok in enumerate(token_data):
-            if pri_mask[i]:
-                seeded_tok_keys.add((_chain_label(struct, int(tok["asym_id"])), int(tok["res_idx"])))
-        return {res_key_to_array_idx[k] for k in seeded_tok_keys if k in res_key_to_array_idx}
-
-    seeded_a_res = _pri_to_res_set(pri_a)
-    seeded_b_res = _pri_to_res_set(pri_b)
-
     rng_a = np.random.RandomState(args.pdb_seed)
     pdb_crop_a = cropper.crop(tokenized, max_tokens=args.max_tokens, random=rng_a, priority_token_mask=pri_a)
     rng_b = np.random.RandomState(args.pdb_seed)
@@ -424,26 +405,18 @@ def main():
     pdb_set_a = _token_residue_set(pdb_crop_a.tokens, struct)
     pdb_set_b = _token_residue_set(pdb_crop_b.tokens, struct)
 
-    # pass seeded sets as numpy bool arrays indexed by res_array_idx
-    n_res = len(struct.residues)
-    seed_arr_a = np.zeros(n_res, dtype=bool)
-    seed_arr_b = np.zeros(n_res, dtype=bool)
-    for i in seeded_a_res:
-        if i < n_res:
-            seed_arr_a[i] = True
-    for i in seeded_b_res:
-        if i < n_res:
-            seed_arr_b[i] = True
-
-    write_crop_pdb(out_pdb, struct, pdb_set_a, pdb_set_b, seed_arr_a, seed_arr_b)
+    write_crop_pdb(out_pdb, struct, pdb_set_a, pdb_set_b)
 
     res_table = _build_res_table(struct)
+    full_set = {(r["chain"], r["res_idx"]) for r in res_table}
+    sasa_lig_full, sasa_total_full = _calc_ligand_sasa(struct, full_set, res_table)
     sasa_a, total_a = _calc_ligand_sasa(struct, pdb_set_a, res_table)
     sasa_b, total_b = _calc_ligand_sasa(struct, pdb_set_b, res_table)
     if sasa_a is not None:
         print(f"\nLigand SASA (seed={args.pdb_seed}):")
-        print(f"  Crop A (interaction):         {sasa_a:7.1f} Å²  (total context: {total_a:.1f} Å²)")
-        print(f"  Crop B (pocket+interaction):  {sasa_b:7.1f} Å²  (total context: {total_b:.1f} Å²)")
+        print(f"  Full structure (no crop):     {sasa_lig_full:7.1f} Å²  (total: {sasa_total_full:.1f} Å²)")
+        print(f"  Crop A (interaction):         {sasa_a:7.1f} Å²  (total: {total_a:.1f} Å²)")
+        print(f"  Crop B (pocket+interaction):  {sasa_b:7.1f} Å²  (total: {total_b:.1f} Å²)")
         delta = sasa_b - sasa_a
         print(f"  Delta B-A: {delta:+.1f} Å²  ({'more exposed' if delta > 0 else 'more buried'} in pocket crop)")
 
