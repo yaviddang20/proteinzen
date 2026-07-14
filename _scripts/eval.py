@@ -1109,12 +1109,15 @@ def _run_plip(pdb_path: str, sif_path: str) -> dict:
     empty = {label: set() for _, label in _PLIP_INTERACTION_TAGS.values()}
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
+            import shutil as _shutil
+            local_pdb = os.path.join(tmpdir, "input.pdb")
+            _shutil.copy2(str(pdb_path), local_pdb)
             result = subprocess.run(
-                [sif_path, "-f", str(pdb_path), "-o", tmpdir, "-x"],
+                [sif_path, "-f", local_pdb, "-o", tmpdir, "-x"],
                 capture_output=True, text=True, timeout=120,
             )
             if result.returncode != 0:
-                print(f"  [PLIP] returncode={result.returncode} stderr={result.stderr[:800]}")
+                print(f"  [PLIP] returncode={result.returncode}\nSTDOUT:{result.stdout[-400:]}\nSTDERR:{result.stderr[-800:]}")
                 return empty
             xml_files = list(Path(tmpdir).glob("*.xml"))
             if not xml_files:
