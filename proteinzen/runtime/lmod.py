@@ -2049,7 +2049,12 @@ class BiomoleculeSamplingModule(L.LightningModule):
             B, N = batch['rigids']['rigids_1'].shape[:2]
             eye = torch.eye(3, device=batch['rigids']['rigids_1'].device)
             identity_quat = ru.Rotation(rot_mats=eye.expand(B, N, 3, 3)).get_quats()
-            batch['rigids']['rigids_1'][..., :4] = identity_quat
+            is_atom = batch['rigids']['rigids_is_atom_mask'].bool()
+            batch['rigids']['rigids_1'][..., :4] = torch.where(
+                is_atom[..., None],
+                identity_quat,
+                batch['rigids']['rigids_1'][..., :4],
+            )
 
         clean_traj, prot_traj, final_denoiser_out = self.integrator.sample(
             batch,
