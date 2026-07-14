@@ -6,13 +6,11 @@ micromamba activate $ENV_NAME
 model_name=binder_zen_plinder_cond_no_rotvf_no_prealign
 version_num=834099
 trans_std=16.0
-data_dir=${REPO_ROOT}/plinder_processed/val
 
 yaml_dir=${REPO_ROOT}/sampling/plinder/ligand_cond
 mkdir -p ${yaml_dir}
 
 python ${REPO_ROOT}/_scripts/make_ligand_cond_yaml.py \
-    --data-dir ${data_dir} \
     --out-yaml ${yaml_dir}/val \
     --num-samples 10 \
     --trans-std ${trans_std} \
