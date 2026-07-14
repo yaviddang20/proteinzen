@@ -45,10 +45,12 @@ for direction in protein_cond ligand_cond; do
         model_dir=${REPO_ROOT}/outputs/${model_name}/train \
         out_dir=${REPO_ROOT}/sampling/plinder/${model_name}/${direction} \
         sampler.tasks_yaml=${TASKS_YAML[$direction]} \
-        sampler.batch_size=4 \
+        sampler.batch_size=32 \
         sampler.trans_std=${TRANS_STD[$direction]} \
         sampler.include_h=true \
         +version_num=${version_num} \
-        corrupter.sampling_noise_mode=null \
+        identity_rot_noise=true \
+        integrator=euler_no_rot \
+        diffeq=base_euler_ode \
         save_traj=true
 done
