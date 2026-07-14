@@ -20,16 +20,19 @@ python _scripts/train_com_predictor.py \
 
 import argparse
 import glob
+import inspect
 import os
 from pathlib import Path
 
 import lightning as pl
+from lightning.pytorch.callbacks import ModelCheckpoint
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from hydra_zen import instantiate, load_from_yaml
 
 from proteinzen.data.datasets.datamodule import BiomoleculeDataModule
+from proteinzen.stoch_interp.multiframe import MultiSE3Interpolant
 from proteinzen.model.utils import gather_helper
 from proteinzen.openfold.utils import rigid_utils as ru
 
@@ -70,14 +73,18 @@ class CoMHead(nn.Module):
 # ── lightning module ───────────────────────────────────────────────────────────
 
 class CoMPredictorLit(pl.LightningModule):
-    def __init__(self, backbone: nn.Module, c_s: int, lr: float = 1e-3):
+    def __init__(self, backbone: nn.Module, corrupter, c_s: int, lr: float = 1e-3):
         super().__init__()
         self.backbone = backbone
-        self.backbone.requires_grad_(False)
+        self.corrupter = corrupter
         self.com_head = CoMHead(c_s)
         self.lr = lr
 
     def _step(self, batch, split: str) -> torch.Tensor:
+        batch['trans_t'] = batch['t']
+        batch['rot_t'] = batch['t']
+        batch = self.corrupter.corrupt_dense_batch(batch, identity_rot_noise=False)
+
         with torch.no_grad():
             out = self.backbone(batch)
 
@@ -132,25 +139,35 @@ def resolve_ckpt(run_dir: str, version_num: int, checkpoint_idx: int) -> str:
     return epoch_list[checkpoint_idx][0]
 
 
-def load_backbone(run_dir: str, version_num: int, checkpoint_idx: int):
+def load_backbone_and_corrupter(run_dir: str, version_num: int, checkpoint_idx: int):
     ckpt_path = resolve_ckpt(run_dir, version_num, checkpoint_idx)
     print(f"Loading checkpoint: {ckpt_path}")
 
     config_path = os.path.join(run_dir, f"lightning_logs/version_{version_num}/config.yaml")
     if not os.path.exists(config_path):
         config_path = os.path.join(run_dir, ".hydra", "config.yaml")
-    model_cfg = load_from_yaml(config_path)
+    cfg = load_from_yaml(config_path)
 
-    backbone = instantiate(model_cfg['model'])
+    backbone = instantiate(cfg['model'])
 
     ckpt = torch.load(ckpt_path, map_location='cpu')
     state = {k[len('model.'):]: v
              for k, v in ckpt['state_dict'].items()
              if k.startswith('model.')}
-    backbone.load_state_dict(state, strict=True)
+    backbone.load_state_dict(state, strict=False)
+    backbone.requires_grad_(False)
 
-    c_s = model_cfg['model'].get('c_s', 768)
-    return backbone, c_s
+    valid_params = set(inspect.signature(MultiSE3Interpolant.__init__).parameters) - {'self'}
+    corrupter_kwargs = {k: v for k, v in cfg['corrupter'].items() if k in valid_params}
+    # Old configs have center_on_motif=True but no center_on_motif_then_hotspots.
+    # Current __init__ defaults center_on_motif_then_hotspots=True, which would
+    # trigger the mutual-exclusion assertion. Default it to False here.
+    if corrupter_kwargs.get('center_on_motif', False) and 'center_on_motif_then_hotspots' not in corrupter_kwargs:
+        corrupter_kwargs['center_on_motif_then_hotspots'] = False
+    corrupter = MultiSE3Interpolant(**corrupter_kwargs)
+
+    c_s = cfg['model'].get('c_s', 768)
+    return backbone, corrupter, c_s
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -176,7 +193,7 @@ def main():
 
     pl.seed_everything(args.seed)
 
-    backbone, c_s = load_backbone(args.model_dir, args.version_num, args.checkpoint_idx)
+    backbone, corrupter, c_s = load_backbone_and_corrupter(args.model_dir, args.version_num, args.checkpoint_idx)
     print(f"Backbone loaded, c_s={c_s}")
     assert all(not p.requires_grad for p in backbone.parameters()), \
         "Backbone should be fully frozen"
@@ -196,9 +213,9 @@ def main():
         num_workers=args.num_workers,
     )
 
-    model = CoMPredictorLit(backbone=backbone, c_s=c_s, lr=args.lr)
+    model = CoMPredictorLit(backbone=backbone, corrupter=corrupter, c_s=c_s, lr=args.lr)
 
-    ckpt_cb = pl.callbacks.ModelCheckpoint(
+    ckpt_cb = ModelCheckpoint(
         monitor='val/rmse', mode='min', save_top_k=3, save_last=True,
         filename='epoch={epoch:03d}-val_rmse={val/rmse:.3f}',
         auto_insert_metric_name=False,
