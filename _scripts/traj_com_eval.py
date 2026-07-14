@@ -18,6 +18,9 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 from tqdm.auto import tqdm
 
@@ -93,8 +96,8 @@ def main():
                     help="Directory containing *_traj_clean.pdb files")
     ap.add_argument("--ref-dir", type=Path, required=True,
                     help="Plinder split dir with manifest.json + structures/")
-    ap.add_argument("--n-steps-report", type=int, default=10,
-                    help="Number of evenly-spaced steps to report (default 10)")
+    ap.add_argument("--n-steps-report", type=int, default=50,
+                    help="Number of evenly-spaced steps to report (default 50)")
     args = ap.parse_args()
 
     manifest_path = args.ref_dir / "manifest.json"
@@ -175,6 +178,43 @@ def main():
         finals = np.array(finals)
         print(f"\n  Final step: mean={finals.mean():.3f}  median={np.median(finals):.3f}  "
               f"<2Å={np.mean(finals<2)*100:.1f}%  <5Å={np.mean(finals<5)*100:.1f}%")
+
+    # build per-fraction arrays for plotting
+    means, medians, p25, p75 = [], [], [], []
+    for frac in indices:
+        col = []
+        for d in all_com_dists:
+            idx = int(round(frac * (len(d) - 1)))
+            v = d[idx]
+            if np.isfinite(v):
+                col.append(v)
+        col = np.array(col) if col else np.array([np.nan])
+        means.append(np.nanmean(col))
+        medians.append(np.nanmedian(col))
+        p25.append(np.nanpercentile(col, 25))
+        p75.append(np.nanpercentile(col, 75))
+
+    means, medians = np.array(means), np.array(medians)
+    p25, p75 = np.array(p25), np.array(p75)
+
+    out_dir = args.traj_dir.parent / "traj_com"
+    out_dir.mkdir(exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(indices, means,   label="mean",   color="steelblue", lw=2)
+    ax.plot(indices, medians, label="median", color="orange",    lw=2, ls="--")
+    ax.fill_between(indices, p25, p75, alpha=0.2, color="steelblue", label="25–75%")
+    ax.set_xlabel("ODE step (fraction of trajectory)")
+    ax.set_ylabel("CoM distance to GT (Å)")
+    ax.set_title(f"Ligand CoM distance over trajectory  (n={len(all_com_dists)})")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    plot_path = out_dir / "com_dist_traj.png"
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+    print(f"\n  Plot saved to {plot_path}")
 
 
 if __name__ == "__main__":
