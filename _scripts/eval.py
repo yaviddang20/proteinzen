@@ -1490,15 +1490,23 @@ def run_pocket_eval(args):
     pdb_files = sorted(samples_dir.glob("*.pdb"))
     print(f"Generated PDBs: {len(pdb_files)}")
 
+    import re as _re
+    _GPU_SUFFIX = _re.compile(r'_gpu\d+_batch\d+_idx\d+$')
+
     groups: dict[str, list[Path]] = defaultdict(list)
     unmatched = []
     for p in pdb_files:
         stem = p.stem
-        parts = stem.rsplit("_", 1)
-        if len(parts) == 2 and parts[1].isdigit():
-            groups[parts[0]].append(p)
+        # Handle both legacy "{sid}_{N}" and current "{sid}_gpu{G}_batch{B}_idx{N}"
+        m = _GPU_SUFFIX.search(stem)
+        if m:
+            groups[stem[:m.start()]].append(p)
         else:
-            unmatched.append(p.name)
+            parts = stem.rsplit("_", 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                groups[parts[0]].append(p)
+            else:
+                unmatched.append(p.name)
     if unmatched:
         print(f"  Warning: {len(unmatched)} PDB(s) had unrecognised names — skipped")
 

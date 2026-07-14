@@ -17,20 +17,23 @@ shift 2
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-for SPLIT in train test; do
-    echo "=== ${TASK} / ${SPLIT} ==="
-    if [[ "${TASK}" == "conformer" ]]; then
+if [[ "${TASK}" == "conformer" ]]; then
+    for SPLIT in train test; do
+        echo "=== ${TASK} / ${SPLIT} ==="
         python "${DIR}/_scripts/eval.py" \
             --out-dir "${DIR}/sampling/geom_conformer_${SPLIT}/${MODEL}" \
             --ref-dir "${DIR}/sampling/geom_conformer_${SPLIT}/conformer_mols" \
             "$@"
-    elif [[ "${TASK}" == "pocket" ]]; then
+    done
+elif [[ "${TASK}" == "pocket" ]]; then
+    for DIRECTION in protein_cond ligand_cond; do
+        echo "=== ${TASK} / ${DIRECTION} ==="
         python "${DIR}/_scripts/eval.py" \
-            --out-dir "${DIR}/sampling/plinder_${SPLIT}/${MODEL}" \
-            --ref-dir "${DIR}/plinder_processed/${SPLIT}" \
+            --out-dir "${DIR}/sampling/plinder/${DIRECTION}/${MODEL}" \
+            --ref-dir "${DIR}/plinder_processed/val" \
             "$@"
-    else
-        echo "Unknown task: ${TASK} (expected conformer or pocket)" >&2
-        exit 1
-    fi
-done
+    done
+else
+    echo "Unknown task: ${TASK} (expected conformer or pocket)" >&2
+    exit 1
+fi
