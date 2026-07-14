@@ -46,7 +46,7 @@ def _centered_gaussian(num_rigids):
 
 def _uniform_so3(num_rigids):
     return torch.as_tensor(
-        Rotation.random(num_rigids).as_quat(),
+        Rotation.random(num_rigids).as_quat(canonical=True, scalar_first=True),
         dtype=torch.float32,
     )
 

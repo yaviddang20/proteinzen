@@ -555,7 +555,7 @@ class SampleTemplateTokenizer:
         if np.isclose(self.task_masks['t'], 0):
             num_noise_rigids = rigid_data['rigids_noising_mask'].sum()
             noise_trans = np.random.randn(num_noise_rigids, 3) * self.trans_std
-            noise_quat = Rotation.random(num_noise_rigids).as_quat(canonical=True)
+            noise_quat = Rotation.random(num_noise_rigids).as_quat(canonical=True, scalar_first=True)
             noise_tensor7 = np.concatenate([noise_quat, noise_trans], axis=-1)
             rigid_data['tensor7'][rigid_data['rigids_noising_mask']] = noise_tensor7
         else:
@@ -564,7 +564,7 @@ class SampleTemplateTokenizer:
             ]
             init_trans = init_tensor7[..., 4:]
             init_quat = init_tensor7[..., :4]
-            init_rotmats = Rotation.from_quat(init_quat).as_matrix()
+            init_rotmats = Rotation.from_quat(init_quat, scalar_first=True).as_matrix()
 
             t = self.task_masks['t']
             num_noise_rigids = rigid_data['rigids_noising_mask'].sum()
@@ -584,7 +584,7 @@ class SampleTemplateTokenizer:
                 noisy_rotmats
             )
             rotmats_t = rotmats_t.numpy(force=True)
-            rotquats_t = Rotation.from_matrix(rotmats_t).as_quat(canonical=True)
+            rotquats_t = Rotation.from_matrix(rotmats_t).as_quat(canonical=True, scalar_first=True)
 
             tensor7_t = np.concatenate([rotquats_t, trans_t], axis=-1)
             rigid_data['tensor7'][rigid_data['rigids_noising_mask']] = tensor7_t
