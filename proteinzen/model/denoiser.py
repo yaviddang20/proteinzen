@@ -1689,6 +1689,7 @@ class IpaMultiRigidDenoiser(nn.Module):
         ret['denoised_rigids'] = rigids_out
         ret['decoded_seq_logits'] = seq_logits
         ret['pred_seq'] = pred_seq
+        ret['node_embed'] = score_dict['node_embed']
 
         if self.predict_time:
             ret['time_pred_val'] = score_dict['time_pred_val']
