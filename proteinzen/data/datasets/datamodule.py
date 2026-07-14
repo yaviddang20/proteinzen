@@ -7,6 +7,8 @@ from dataclasses import replace
 
 import numpy as np
 import torch
+from rdkit import Chem
+from rdkit.Chem import AllChem
 from torch.utils.data import DataLoader
 import lightning as L
 import pandas as pd
@@ -108,6 +110,34 @@ def strip_h_from_structure(struct: Structure) -> Structure:
         new_chains[i]['atom_num'] = cumulative_heavy[end] - cumulative_heavy[start]
 
     return replace(struct, atoms=new_atoms, bonds=new_bonds, residues=new_residues, chains=new_chains)
+
+
+def _smiles_etkdg_pos(smiles, n_rigids, rigids_noising_mask):
+    """Generate a random ETKDG conformer from SMILES and return positions as a
+    (n_rigids, 3) tensor (zeros for protein rigids, or on failure)."""
+    result = torch.zeros(n_rigids, 3, dtype=torch.float32)
+    if not smiles:
+        return result
+
+    lig_rigid_indices = rigids_noising_mask.nonzero(as_tuple=True)[0]
+
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return result
+        mol = Chem.AddHs(mol)
+        params = AllChem.ETKDGv3()
+        params.randomSeed = -1
+        if AllChem.EmbedMolecule(mol, params) != 0:
+            return result
+        mol = Chem.RemoveHs(mol)
+        positions = mol.GetConformer().GetPositions()  # (n_lig_atoms, 3)
+        n = min(len(positions), len(lig_rigid_indices))
+        result[lig_rigid_indices[:n]] = torch.from_numpy(positions[:n]).float()
+    except Exception:
+        pass
+
+    return result
 
 
 def load_input(record: Record, data_dir, include_h: bool = False):
@@ -507,6 +537,10 @@ class TrainingDataset(torch.utils.data.Dataset):
             group1_rigid_mask[:n] = torch.from_numpy(group1_atom_mask[:n])
         features['rigids']['group1_rigid_mask'] = group1_rigid_mask
 
+        features['rigids']['etkdg_pos'] = _smiles_etkdg_pos(
+            sample.record.smiles, n_rigids, features['rigids']['rigids_noising_mask'].bool()
+        )
+
         if self.lap_pe_k > 0:
             _add_lap_pe_to_features(features, self.lap_pe_k)
 
@@ -722,6 +756,10 @@ class ValidationDataset(torch.utils.data.Dataset):
             n = min(len(group1_atom_mask), n_rigids)
             group1_rigid_mask[:n] = torch.from_numpy(group1_atom_mask[:n])
         features['rigids']['group1_rigid_mask'] = group1_rigid_mask
+
+        features['rigids']['etkdg_pos'] = _smiles_etkdg_pos(
+            sample.record.smiles, n_rigids, features['rigids']['rigids_noising_mask'].bool()
+        )
 
         if self.lap_pe_k > 0:
             _add_lap_pe_to_features(features, self.lap_pe_k)

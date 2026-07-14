@@ -80,10 +80,39 @@ class CoMPredictorLit(pl.LightningModule):
         self.com_head = CoMHead(c_s)
         self.lr = lr
 
+    def _apply_etkdg(self, batch):
+        etkdg_pos = batch['rigids']['etkdg_pos']           # (B, N, 3)
+        noising_mask = batch['rigids']['rigids_noising_mask'].bool()  # (B, N)
+        rigids_mask  = batch['rigids']['rigids_mask'].bool()
+
+        lig_mask = noising_mask & rigids_mask
+
+        # Per-sample flag: ETKDG succeeded if any ligand atom has non-zero position
+        etkdg_valid = (etkdg_pos * lig_mask[..., None]).abs().sum(dim=(1, 2)) > 0  # (B,)
+
+        lig_center = (etkdg_pos * lig_mask[..., None]).sum(1) \
+                     / lig_mask.float().sum(1, keepdim=True).clamp(min=1)
+        etkdg_centered = etkdg_pos - lig_center[:, None, :]
+
+        B, device = etkdg_centered.shape[0], etkdg_centered.device
+        Q, _ = torch.linalg.qr(torch.randn(B, 3, 3, device=device))
+        Q = Q * torch.det(Q).sign()[:, None, None]
+        etkdg_rotated = torch.einsum('bni,bij->bnj', etkdg_centered, Q)
+
+        old = ru.Rigid.from_tensor_7(batch['rigids']['rigids_t'])
+        old_trans = old.get_trans()
+        # Only replace translations for samples where ETKDG succeeded
+        replace_mask = (noising_mask & etkdg_valid[:, None])[..., None]
+        new_trans = torch.where(replace_mask, etkdg_rotated, old_trans)
+        batch['rigids']['rigids_t'] = ru.Rigid(rots=old.get_rots(), trans=new_trans).to_tensor_7()
+        batch['rigids']['trans_t']  = new_trans
+        return batch
+
     def _step(self, batch, split: str) -> torch.Tensor:
         batch['trans_t'] = batch['t']
         batch['rot_t'] = batch['t']
         batch = self.corrupter.corrupt_dense_batch(batch, identity_rot_noise=False)
+        batch = self._apply_etkdg(batch)
 
         with torch.no_grad():
             out = self.backbone(batch)

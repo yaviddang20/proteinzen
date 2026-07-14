@@ -592,6 +592,7 @@ class Record(JSONSerializable):
     templates: Optional[list[TemplateInfo]] = None
     md: Optional[MDInfo] = None
     affinity: Optional[AffinityInfo] = None
+    smiles: Optional[str] = None
 
 @dataclass(frozen=True)
 class ConformerRecord(JSONSerializable):
