@@ -240,21 +240,28 @@ def _calc_ligand_sasa(struct, crop_set, res_table):
     except ImportError:
         return None, None
 
-    protein_type = const.chain_type_ids["PROTEIN"]
+    # assign each original chain a unique single-char PDB chain ID
+    chain_map: dict[str, str] = {}
+    # track which single-char IDs are ligand chains
+    lig_chain_ids: set[str] = set()
+
     fs = freesasa.Structure()
-    lig_res_keys = set()
 
     for r in res_table:
         key = (r["chain"], r["res_idx"])
         if key not in crop_set:
             continue
+        orig = r["chain"]
+        if orig not in chain_map:
+            idx = len(chain_map)
+            chain_map[orig] = _CHAIN_POOL[idx % len(_CHAIN_POOL)]
+        chain_char = chain_map[orig]
         if not r["is_protein"]:
-            lig_res_keys.add(key)
+            lig_chain_ids.add(chain_char)
         res_name = r["res_name"][:3]
-        chain_char = r["chain"][0] if r["chain"] else "A"
         res_num = str(r["res_idx"] % 9999)
         for atom in r["atoms"]:
-            x, y, z = [float(v) for v in atom["coords"]]
+            x, y, z = float(atom["coords"][0]), float(atom["coords"][1]), float(atom["coords"][2])
             try:
                 fs.addAtom(atom["name"], res_name, res_num, chain_char, x, y, z)
             except Exception:
@@ -269,14 +276,14 @@ def _calc_ligand_sasa(struct, crop_set, res_table):
     lig_sasa = 0.0
     total_sasa = 0.0
     for chain_id, residues in areas.items():
+        is_lig = chain_id in lig_chain_ids
         for res_num_str, area in residues.items():
-            total_sasa += area.total
-            # check if this residue belongs to a ligand chain
-            # we keyed lig_res_keys by (chain_name, res_idx) — match by res_num
-            for key in lig_res_keys:
-                if str(key[1] % 9999) == res_num_str:
-                    lig_sasa += area.total
-                    break
+            v = area.total
+            if v != v:  # nan check
+                continue
+            total_sasa += v
+            if is_lig:
+                lig_sasa += v
 
     return lig_sasa, total_sasa
 
