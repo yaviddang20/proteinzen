@@ -33,6 +33,18 @@ from proteinzen.data.featurize.tokenize import Tokenized, tokenize_structure
 # single-char chain ID pool for PDB format
 _CHAIN_POOL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
+# atomic number -> element symbol (common subset)
+_ELEMENT = {
+    1: 'H', 5: 'B', 6: 'C', 7: 'N', 8: 'O', 9: 'F',
+    12: 'MG', 14: 'SI', 15: 'P', 16: 'S', 17: 'CL',
+    20: 'CA', 25: 'MN', 26: 'FE', 27: 'CO', 28: 'NI',
+    29: 'CU', 30: 'ZN', 34: 'SE', 35: 'BR', 53: 'I',
+}
+
+def _decode_atom_name(raw):
+    """Decode 4-byte encoded atom name (ord(c)-32 encoding) back to string."""
+    return ''.join(chr(int(b) + 32) for b in raw if b != 0).strip()
+
 
 def _load_struct(npz_path: Path):
     raw = np.load(npz_path, allow_pickle=False)
@@ -111,22 +123,33 @@ def _token_residue_set(tokens, struct):
 
 
 def _build_res_table(struct):
-    """Build list of (chain_name, res_idx_in_array, res_name, ca_coords) for all residues."""
+    """Build list of residue dicts with all atom info for PDB writing."""
+    protein_type = const.chain_type_ids["PROTEIN"]
     rows = []
     for chain in struct.chains[struct.mask]:
         chain_name = chain["name"]
+        is_protein = int(chain["mol_type"]) == protein_type
         res_start = int(chain["res_idx"])
         for k in range(int(chain["res_num"])):
             ri = res_start + k
             res = struct.residues[ri]
-            ca_idx = int(res["atom_center"])
-            coords = struct.atoms[ca_idx]["coords"]  # (3,) float32
+            atom_start = int(res["atom_idx"])
+            atom_end = atom_start + int(res["atom_num"])
+            atoms = []
+            for ai in range(atom_start, atom_end):
+                atom = struct.atoms[ai]
+                atoms.append({
+                    "name": _decode_atom_name(atom["name"]),
+                    "element": _ELEMENT.get(int(atom["element"]), 'X'),
+                    "coords": atom["coords"],
+                })
             rows.append({
                 "chain": chain_name,
                 "res_idx": int(res["res_idx"]),
                 "res_array_idx": ri,
                 "res_name": str(res["name"])[:3].upper(),
-                "coords": coords,
+                "is_protein": is_protein,
+                "atoms": atoms,
             })
     return rows
 
@@ -140,7 +163,7 @@ def _pdb_chain_id(name: str, asym_to_pdb: dict) -> str:
 
 
 def write_crop_pdb(out_path: Path, struct, set_a: set, set_b: set, seed_mask_a, seed_mask_b):
-    """Write a 2-model CA-trace PDB.
+    """Write a 2-model all-atom PDB (protein heavy atoms + ligand all atoms).
 
     MODEL 1 = interaction-only crop (crop A)
     MODEL 2 = pocket+interaction crop (crop B)
@@ -151,7 +174,6 @@ def write_crop_pdb(out_path: Path, struct, set_a: set, set_b: set, seed_mask_a, 
     """
     res_table = _build_res_table(struct)
 
-    # seed sets by residue array index
     seeded_a = set(seed_mask_a.nonzero()[0]) if seed_mask_a is not None else set()
     seeded_b = set(seed_mask_b.nonzero()[0]) if seed_mask_b is not None else set()
 
@@ -170,27 +192,36 @@ def write_crop_pdb(out_path: Path, struct, set_a: set, set_b: set, seed_mask_a, 
             if key not in crop_set:
                 continue
             pdb_chain = _pdb_chain_id(r["chain"], asym_to_pdb)
-            res_seq = r["res_idx"] % 9999  # clamp to PDB 4-digit limit
+            res_seq = r["res_idx"] % 9999
+            record = "ATOM  " if r["is_protein"] else "HETATM"
             if key not in other:
                 bfac = 1.00
             elif r["res_array_idx"] in seeded_set:
                 bfac = 0.50
             else:
                 bfac = 0.00
-            x, y, z = float(r["coords"][0]), float(r["coords"][1]), float(r["coords"][2])
             res_name = r["res_name"].ljust(3)
-            lines.append(
-                f"ATOM  {serial:5d}  CA  {res_name} {pdb_chain}{res_seq:4d}    "
-                f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00{bfac:6.2f}           C"
-            )
-            serial += 1
+            for atom in r["atoms"]:
+                aname = atom["name"]
+                # PDB atom name: 4 chars, right-padded; 1-char elements start at col 14
+                if len(aname) < 4:
+                    aname_fmt = f" {aname:<3s}"
+                else:
+                    aname_fmt = f"{aname:<4s}"
+                x, y, z = float(atom["coords"][0]), float(atom["coords"][1]), float(atom["coords"][2])
+                elem = atom["element"]
+                lines.append(
+                    f"{record}{serial:5d} {aname_fmt} {res_name} {pdb_chain}{res_seq:4d}    "
+                    f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00{bfac:6.2f}          {elem:>2s}"
+                )
+                serial += 1
         lines.append("ENDMDL")
 
     lines.append("END")
     out_path.write_text("\n".join(lines) + "\n")
     print(f"\nWrote {out_path}")
-    print("  PyMOL tip: load crops.pdb; split_states crops; color blue, crops_0001; color red, crops_0002")
-    print("             spectrum b, blue_red, crops_0001  # blue=shared, red=unique")
+    print("  PyMOL: load crops.pdb; split_states crops")
+    print("         spectrum b, blue_red, crops_0001  # blue=shared, red=unique to crop A")
 
 
 
