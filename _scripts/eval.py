@@ -1114,7 +1114,7 @@ def _run_plip(pdb_path: str, sif_path: str) -> dict:
                 capture_output=True, text=True, timeout=120,
             )
             if result.returncode != 0:
-                print(f"  [PLIP] returncode={result.returncode} stderr={result.stderr[:300]}")
+                print(f"  [PLIP] returncode={result.returncode} stderr={result.stderr[:800]}")
                 return empty
             xml_files = list(Path(tmpdir).glob("*.xml"))
             if not xml_files:
@@ -1366,14 +1366,21 @@ def eval_system_pocket(system_id: str, gen_pdb_paths, gt_struct,
     for idx, pdb_path in enumerate(sorted(gen_pdb_paths)):
         gen_prot, gen_lig, lig_elements, _ = parse_pdb_atoms(str(pdb_path))
         if len(gen_prot) != n_gt_prot:
-            records.append(dict(system_id=system_id, sample_idx=idx, pk=np.inf, lig=np.inf,
-                                note=f"protein atom count mismatch: gen={len(gen_prot)} gt={n_gt_prot}"))
-            continue
+            # Crop boundary mismatch — align on shared prefix
+            n_common = min(len(gen_prot), n_gt_prot)
+            if n_common == 0:
+                records.append(dict(system_id=system_id, sample_idx=idx, pk=np.inf, lig=np.inf,
+                                    note=f"protein atom count mismatch: gen={len(gen_prot)} gt={n_gt_prot}"))
+                continue
+            gen_prot = gen_prot[:n_common]
+            gt_prot_aligned = gt_prot[:n_common]
+        else:
+            gt_prot_aligned = gt_prot
         if len(gen_lig) != n_gt_lig:
             records.append(dict(system_id=system_id, sample_idx=idx, pk=np.inf, lig=np.inf,
                                 note=f"ligand atom count mismatch: gen={len(gen_lig)} gt={n_gt_lig}"))
             continue
-        R, t = kabsch(gen_prot, gt_prot)
+        R, t = kabsch(gen_prot, gt_prot_aligned)
         gen_lig_pk = apply_transform(gen_lig, R, t)
         mol_template, _ = ligand_mol_from_pdb(str(pdb_path))
         pk = pocket_rmsd_sym(mol_template, gt_lig, gen_lig_pk)
