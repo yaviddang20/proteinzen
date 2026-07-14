@@ -139,8 +139,12 @@ def _parse_fpocket_info(info_path: Path) -> list[dict]:
     return pockets
 
 
-def _parse_pocket_pqr(pqr_path: Path) -> dict[int, np.ndarray]:
-    """Return {pocket_id: mean_center (3,)} from fpocket pockets.pqr.
+def _parse_pocket_pqr(pqr_path: Path) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray]]:
+    """Parse fpocket pockets.pqr.
+
+    Returns (centers, raw_coords) where:
+      centers[pocket_id]    = mean alpha-sphere center (3,)
+      raw_coords[pocket_id] = all alpha-sphere positions (N, 3)
 
     fpocket encodes pocket membership in the residue number field (no chain column).
     """
@@ -155,14 +159,14 @@ def _parse_pocket_pqr(pqr_path: Path) -> dict[int, np.ndarray]:
             if len(parts) < 9:
                 continue
             try:
-                # fpocket pqr: ATOM serial atomname resname resseq x y z charge radius
-                # no chain column — resseq is parts[4], coords start at parts[5]
                 pocket_id = int(parts[4])
                 x, y, z = float(parts[5]), float(parts[6]), float(parts[7])
             except (ValueError, IndexError):
                 continue
             coords_by_pocket.setdefault(pocket_id, []).append([x, y, z])
-    return {pid: np.mean(pts, axis=0) for pid, pts in coords_by_pocket.items()}
+    centers = {pid: np.mean(pts, axis=0) for pid, pts in coords_by_pocket.items()}
+    raw = {pid: np.array(pts, dtype=np.float32) for pid, pts in coords_by_pocket.items()}
+    return centers, raw
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -174,10 +178,12 @@ def _fpocket_cmd(args) -> list[str]:
     return [runner, "exec", str(sif), "fpocket"]
 
 
-def run_fpocket(receptor_cif: Path, ligand_centroid: np.ndarray, args) -> Optional[dict]:
-    """Run fpocket on receptor_cif, return metrics for the pocket closest to ligand_centroid.
+def run_fpocket(
+    receptor_cif: Path, ligand_centroid: np.ndarray, args
+) -> tuple[Optional[dict], Optional[np.ndarray]]:
+    """Run fpocket on receptor_cif, return (pocket_metrics, alpha_sphere_coords).
 
-    Returns None if fpocket fails or no pocket passes quality thresholds.
+    alpha_sphere_coords is shape (N, 3) for the matched pocket, or None on failure.
     """
     cmd_prefix = _fpocket_cmd(args)
 
@@ -185,30 +191,36 @@ def run_fpocket(receptor_cif: Path, ligand_centroid: np.ndarray, args) -> Option
         tmpdir = Path(tmpdir)
         pdb_path = tmpdir / "receptor.pdb"
         if not _cif_to_pdb(receptor_cif, pdb_path):
-            return None
+            return None, None
 
-        result = subprocess.run(
-            cmd_prefix + ["-f", str(pdb_path)],
-            capture_output=True,
-            cwd=tmpdir,
-            timeout=60,
-        )
+        try:
+            result = subprocess.run(
+                cmd_prefix + ["-f", str(pdb_path)],
+                capture_output=True,
+                cwd=tmpdir,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            return None, None
         if result.returncode != 0:
-            return None
+            return None, None
 
         out_dir = tmpdir / "receptor_out"
         info_path = out_dir / "receptor_info.txt"
         pqr_path = out_dir / "receptor_pockets.pqr"
 
         if not info_path.exists():
-            return None
+            return None, None
 
         pockets = _parse_fpocket_info(info_path)
         if not pockets:
-            return None
+            return None, None
 
-        # Get pocket centers to match against ligand centroid
-        pocket_centers = _parse_pocket_pqr(pqr_path) if pqr_path.exists() else {}
+        # Get pocket centers and raw alpha-sphere coords
+        if pqr_path.exists():
+            pocket_centers, pocket_raw_coords = _parse_pocket_pqr(pqr_path)
+        else:
+            pocket_centers, pocket_raw_coords = {}, {}
 
         best_pocket = None
         best_dist = float("inf")
@@ -223,9 +235,10 @@ def run_fpocket(receptor_cif: Path, ligand_centroid: np.ndarray, args) -> Option
                 best_pocket = p
 
         if best_pocket is None or best_dist > args.max_pocket_center_dist:
-            return None
+            return None, None
 
-        return best_pocket
+        alpha_coords = pocket_raw_coords.get(best_pocket["pocket_id"])
+        return best_pocket, alpha_coords
 
 
 def fpocket_filter(pocket: dict, args) -> bool:
@@ -335,8 +348,13 @@ def compute_buried_fraction(
 
 # ── per-system check ──────────────────────────────────────────────────────────
 
-def check_system(system_id: str, plinder_dir: Path, args, verbose: bool = False) -> bool:
-    """Return True if the system passes all structure-level filters."""
+def check_system(
+    system_id: str, plinder_dir: Path, args, verbose: bool = False
+) -> tuple[bool, Optional[np.ndarray]]:
+    """Return (passed, alpha_sphere_coords) for the system.
+
+    alpha_sphere_coords is shape (N, 3) for the matched fpocket pocket, or None.
+    """
     def log(msg):
         if verbose:
             print(f"  [{system_id}] {msg}")
@@ -347,7 +365,7 @@ def check_system(system_id: str, plinder_dir: Path, args, verbose: bool = False)
 
     if not receptor_cif.exists() or not system_cif.exists():
         log(f"missing files (receptor={receptor_cif.exists()}, system={system_cif.exists()})")
-        return False
+        return False, None
 
     # Compute ligand centroid from system.cif
     try:
@@ -361,23 +379,24 @@ def check_system(system_id: str, plinder_dir: Path, args, verbose: bool = False)
                             ligand_coords.append([atom.pos.x, atom.pos.y, atom.pos.z])
         if not ligand_coords:
             log("no ligand atoms found (entity_type check)")
-            return False
+            return False, None
         ligand_centroid = np.mean(ligand_coords, axis=0)
         log(f"ligand centroid={ligand_centroid.round(2)}, n_atoms={len(ligand_coords)}")
     except Exception as e:
         log(f"ligand centroid failed: {e}")
-        return False
+        return False, None
 
     # fpocket filter
+    alpha_coords = None
     if args.min_druggability > 0 or args.min_concavity > 0 or args.min_volume > 0:
-        pocket = run_fpocket(receptor_cif, ligand_centroid, args)
+        pocket, alpha_coords = run_fpocket(receptor_cif, ligand_centroid, args)
         if pocket is None:
             log("fpocket returned None (no matching pocket or fpocket failed)")
-            return False
+            return False, None
         log(f"fpocket pocket: drugg={pocket.get('Druggability Score')}, density={pocket.get('Alpha sphere density')}, vol={pocket.get('Volume')}")
         if not fpocket_filter(pocket, args):
             log("failed fpocket thresholds")
-            return False
+            return False, None
 
     # freesasa filter
     if args.min_buried_fraction > 0:
@@ -385,9 +404,9 @@ def check_system(system_id: str, plinder_dir: Path, args, verbose: bool = False)
         log(f"buried_fraction={buried}")
         if buried is None or buried < args.min_buried_fraction:
             log("failed buried fraction")
-            return False
+            return False, None
 
-    return True
+    return True, alpha_coords
 
 
 # ── worker ────────────────────────────────────────────────────────────────────
@@ -395,14 +414,25 @@ def check_system(system_id: str, plinder_dir: Path, args, verbose: bool = False)
 _state: dict = {}
 
 
-def _worker_init(plinder_dir, args):
+def _worker_init(plinder_dir, args, pocket_data_dir=None):
     _state["plinder_dir"] = plinder_dir
     _state["args"] = args
+    _state["pocket_data_dir"] = pocket_data_dir
+
+
+def _system_mid(system_id: str) -> str:
+    return system_id[1:3]
 
 
 def _worker(system_id: str) -> Optional[str]:
     try:
-        if check_system(system_id, _state["plinder_dir"], _state["args"]):
+        passed, alpha_coords = check_system(system_id, _state["plinder_dir"], _state["args"])
+        if passed:
+            if _state.get("pocket_data_dir") is not None and alpha_coords is not None:
+                mid = _system_mid(system_id)
+                out_dir = Path(_state["pocket_data_dir"]) / mid
+                out_dir.mkdir(parents=True, exist_ok=True)
+                np.save(out_dir / f"{system_id}.npy", alpha_coords)
             return system_id
     except Exception:
         traceback.print_exc()
@@ -449,6 +479,9 @@ def main():
                         help="Path to fpocket Singularity image (default: {repo_root}/fpocket.sif)")
     parser.add_argument("--debug-n", type=int, default=0,
                         help="Run verbosely on the first N candidates and exit (for debugging)")
+    parser.add_argument("--pocket-data-dir", type=Path,
+                        default=_REPO_ROOT / "plinder_pocket_alpha_spheres",
+                        help="Directory to save per-system alpha-sphere coords (*.npy) for pocket-aware cropping")
 
     args = parser.parse_args()
 
@@ -488,12 +521,17 @@ def main():
         and args.min_buried_fraction <= 0
     )
 
+    pocket_data_dir = args.pocket_data_dir
+    if pocket_data_dir is not None:
+        pocket_data_dir.mkdir(parents=True, exist_ok=True)
+        print(f"  Alpha-sphere sidecars will be saved to: {pocket_data_dir}")
+
     if args.debug_n > 0:
         print(f"\nDebug mode: checking first {args.debug_n} candidates verbosely")
         for sid in candidate_ids[:args.debug_n]:
             print(f"\n--- {sid} ---")
-            result = check_system(sid, args.plinder_dir, args, verbose=True)
-            print(f"  => {'PASS' if result else 'FAIL'}")
+            passed, alpha_coords = check_system(sid, args.plinder_dir, args, verbose=True)
+            print(f"  => {'PASS' if passed else 'FAIL'}")
         return
 
     if skip_structure:
@@ -506,14 +544,14 @@ def main():
             with multiprocessing.Pool(
                 processes=n,
                 initializer=_worker_init,
-                initargs=(args.plinder_dir, args),
+                initargs=(args.plinder_dir, args, pocket_data_dir),
             ) as pool:
                 results = list(tqdm(
                     pool.imap_unordered(_worker, candidate_ids, chunksize=4),
                     total=len(candidate_ids),
                 ))
         else:
-            _worker_init(args.plinder_dir, args)
+            _worker_init(args.plinder_dir, args, pocket_data_dir)
             results = [_worker(sid) for sid in tqdm(candidate_ids)]
 
         passing_ids = [sid for sid in results if sid is not None]

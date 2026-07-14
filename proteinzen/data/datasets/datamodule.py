@@ -205,8 +205,9 @@ def load_input(record: Record, data_dir, include_h: bool = False):
         }
 
     interaction_residue_mask = structure['interaction_residue_mask'] if 'interaction_residue_mask' in structure else None
+    pocket_residue_mask = structure['pocket_residue_mask'] if 'pocket_residue_mask' in structure else None
 
-    return struct, rot_bond_data, interaction_residue_mask
+    return struct, rot_bond_data, interaction_residue_mask, pocket_residue_mask
 
 
 def _build_priority_token_mask(token_data, struct, interaction_residue_mask):
@@ -328,6 +329,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         include_h=False,
         use_identity_rot=True,
         lap_pe_k=0,
+        use_pocket_priority=False,
     ):
         super().__init__()
         self.datasets = datasets
@@ -358,6 +360,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.use_identity_rot = use_identity_rot
         self.lap_pe_k = lap_pe_k
         self.mask_nonstandard = mask_nonstandard
+        self.use_pocket_priority = use_pocket_priority
 
         for dataset in datasets:
             records = dataset.manifest
@@ -377,7 +380,7 @@ class TrainingDataset(torch.utils.data.Dataset):
             sample.chain_id = None
         task = task_sampler.sample_task()
 
-        struct, rot_bond_data, interaction_residue_mask = load_input(sample.record, Path(dataset.data_dir), include_h=self.include_h)
+        struct, rot_bond_data, interaction_residue_mask, pocket_residue_mask = load_input(sample.record, Path(dataset.data_dir), include_h=self.include_h)
 
         # Skip structures where a PROTEIN chain contains nucleotide residues
         _nuc_names = {'DA', 'DC', 'DG', 'DT', 'A', 'G', 'C', 'U'}
@@ -445,6 +448,12 @@ class TrainingDataset(torch.utils.data.Dataset):
                 valid_interfaces = valid_interfaces[struct.mask[valid_interfaces["chain_2"]]]
                 print(sample.record.id, "interface id context", valid_interfaces, interface_tuples, task_data['seed_interface'], struct.chains[struct.mask])
                 raise e
+
+        if self.use_pocket_priority and pocket_residue_mask is not None:
+            if interaction_residue_mask is not None:
+                interaction_residue_mask = interaction_residue_mask | pocket_residue_mask
+            else:
+                interaction_residue_mask = pocket_residue_mask
 
         priority_token_mask = _build_priority_token_mask(token_data, struct, interaction_residue_mask)
 
@@ -530,6 +539,7 @@ class ValidationDataset(torch.utils.data.Dataset):
         include_h=False,
         use_identity_rot=True,
         lap_pe_k=0,
+        use_pocket_priority=False,
     ):
         super().__init__()
         self.datasets = datasets
@@ -558,6 +568,7 @@ class ValidationDataset(torch.utils.data.Dataset):
         self.include_h = include_h
         self.use_identity_rot = use_identity_rot
         self.lap_pe_k = lap_pe_k
+        self.use_pocket_priority = use_pocket_priority
 
         for dataset in datasets:
             interface_id = 0 if dataset.interface_crop else None
@@ -589,7 +600,7 @@ class ValidationDataset(torch.utils.data.Dataset):
         sample = self.samples[idx]
         task = task_sampler.sample_task()
 
-        struct, rot_bond_data, interaction_residue_mask = load_input(sample.record, Path(dataset.data_dir), include_h=self.include_h)
+        struct, rot_bond_data, interaction_residue_mask, pocket_residue_mask = load_input(sample.record, Path(dataset.data_dir), include_h=self.include_h)
 
         _nuc_names = {'DA', 'DC', 'DG', 'DT', 'A', 'G', 'C', 'U'}
         _protein_id = const.chain_type_ids["PROTEIN"]
@@ -653,6 +664,12 @@ class ValidationDataset(torch.utils.data.Dataset):
                 valid_interfaces = valid_interfaces[struct.mask[valid_interfaces["chain_2"]]]
                 print(sample.record.id, "interface id context", valid_interfaces, interface_tuples, task_data['seed_interface'], struct.chains[struct.mask])
                 raise e
+
+        if self.use_pocket_priority and pocket_residue_mask is not None:
+            if interaction_residue_mask is not None:
+                interaction_residue_mask = interaction_residue_mask | pocket_residue_mask
+            else:
+                interaction_residue_mask = pocket_residue_mask
 
         priority_token_mask = _build_priority_token_mask(token_data, struct, interaction_residue_mask)
 
