@@ -31,6 +31,7 @@ elif [[ "${TASK}" == "pocket" ]]; then
         --out-dir "${DIR}/sampling/plinder/protein_cond/${MODEL}" \
         --ref-dir "${DIR}/plinder_processed/val" \
         --plip-sif "${DIR}/plip.sif" \
+        --include-h \
         "$@"
 else
     echo "Unknown task: ${TASK} (expected conformer or pocket)" >&2

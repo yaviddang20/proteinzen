@@ -237,7 +237,7 @@ def _build_npz(smiles: str, n_prot_res: int, seed: int) -> dict:
         residues[1 + i]["atom_num"] = 1
         residues[1 + i]["atom_center"] = abs_atom_idx
         residues[1 + i]["atom_disto"] = abs_atom_idx
-        residues[1 + i]["is_standard"] = False
+        residues[1 + i]["is_standard"] = True   # triggers _generate_designed_residue, not atomized
         residues[1 + i]["is_present"] = True
         residues[1 + i]["is_copy"] = False
 

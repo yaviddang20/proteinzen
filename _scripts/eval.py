@@ -1178,6 +1178,9 @@ def parse_pdb_atoms(pdb_path: str):
             if rec == "ATOM":
                 try:
                     x, y, z = float(line[30:38]), float(line[38:46]), float(line[46:54])
+                    elem = (line[76:78].strip() if len(line) > 76 else "").capitalize()
+                    if elem == "H":
+                        continue
                     prot.append((x, y, z))
                 except ValueError:
                     pass
@@ -1188,9 +1191,12 @@ def parse_pdb_atoms(pdb_path: str):
                     element = line[76:78].strip() if len(line) > 76 else ""
                     if not element:
                         element = line[12:16].strip().lstrip("0123456789") or "C"
+                    element = element.capitalize()
+                    if element == "H":
+                        continue
                     lig_serial_to_local[serial] = len(lig)
                     lig.append((x, y, z))
-                    lig_elements.append(element.capitalize())
+                    lig_elements.append(element)
                 except ValueError:
                     pass
             elif rec == "CONECT":
@@ -1299,10 +1305,11 @@ def extract_gt_coords(struct):
         a0  = int(chain["atom_idx"])
         atoms = struct.atoms[a0 : a0 + int(chain["atom_num"])]
         present = atoms["is_present"].astype(bool)
+        heavy = present & (atoms["element"] != 1)
         if mol == protein_id:
-            prot_list.append(atoms["coords"][present])
+            prot_list.append(atoms["coords"][heavy])
         elif mol == nonpolymer_id:
-            lig_list.append(atoms["coords"][present])
+            lig_list.append(atoms["coords"][heavy])
     prot = np.concatenate(prot_list, 0) if prot_list else np.zeros((0, 3))
     lig  = np.concatenate(lig_list,  0) if lig_list  else np.zeros((0, 3))
     return prot.astype(np.float64), lig.astype(np.float64)
@@ -1436,7 +1443,7 @@ def _cov(vals, delta):
 def _min_per_system(records_by_system, key):
     mins = []
     for recs in records_by_system.values():
-        vals = [r[key] for r in recs if np.isfinite(r[key])]
+        vals = [r[key] for r in recs if key in r and np.isfinite(r[key])]
         if vals:
             mins.append(min(vals))
     return mins
@@ -1445,7 +1452,7 @@ def _min_per_system(records_by_system, key):
 def _mean_per_system(records_by_system, key):
     means = []
     for recs in records_by_system.values():
-        vals = [r[key] for r in recs if np.isfinite(r[key])]
+        vals = [r[key] for r in recs if key in r and np.isfinite(r[key])]
         if vals:
             means.append(float(np.mean(vals)))
     return means
@@ -1577,7 +1584,7 @@ def run_pocket_eval(args):
     # ---- aggregate ----
     all_pk   = [r["pk"]       for r in all_records]
     all_lig  = [r["lig"]      for r in all_records]
-    all_com  = [r["com_dist"] for r in all_records if "com_dist" in r]
+    all_com  = [r["com_dist"] for r in all_records if "com_dist" in r and np.isfinite(r["com_dist"])]
     sys_min_pk   = _min_per_system(records_by_system, "pk")
     sys_min_lig  = _min_per_system(records_by_system, "lig")
     sys_min_com  = _min_per_system(records_by_system, "com_dist")
