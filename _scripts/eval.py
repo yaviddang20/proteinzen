@@ -1371,7 +1371,9 @@ def eval_system_pocket(system_id: str, gen_pdb_paths, gt_struct,
         pk = pocket_rmsd_sym(mol_template, gt_lig, gen_lig_pk)
         lig, gen_lig_lig = _lig_rmsd_and_coords(mol_template, gt_lig, gen_lig)
 
+        com_dist = float(np.linalg.norm(gt_lig.mean(0) - gen_lig_pk.mean(0)))
         record = dict(system_id=system_id, sample_idx=idx, pk=pk, lig=lig,
+                      com_dist=com_dist,
                       gen_lig_pk=gen_lig_pk, gen_lig_lig=gen_lig_lig,
                       lig_elements=lig_elements, note="")
 
@@ -1573,12 +1575,15 @@ def run_pocket_eval(args):
         return
 
     # ---- aggregate ----
-    all_pk  = [r["pk"]  for r in all_records]
-    all_lig = [r["lig"] for r in all_records]
+    all_pk   = [r["pk"]       for r in all_records]
+    all_lig  = [r["lig"]      for r in all_records]
+    all_com  = [r["com_dist"] for r in all_records if "com_dist" in r]
     sys_min_pk   = _min_per_system(records_by_system, "pk")
     sys_min_lig  = _min_per_system(records_by_system, "lig")
+    sys_min_com  = _min_per_system(records_by_system, "com_dist")
     sys_mean_pk  = _mean_per_system(records_by_system, "pk")
     sys_mean_lig = _mean_per_system(records_by_system, "lig")
+    sys_mean_com = _mean_per_system(records_by_system, "com_dist")
 
     print(f"\n{'='*60}")
     print(f"  PLINDER POCKET EVAL  —  {len(records_by_system)} systems")
@@ -1586,6 +1591,15 @@ def run_pocket_eval(args):
     _print_pocket_block("Per-sample (pooled)", all_pk, all_lig, deltas)
     _print_pocket_block("Per-system best sample (min pk)", sys_min_pk, sys_min_lig, deltas)
     _print_pocket_block("Per-system mean", sys_mean_pk, sys_mean_lig, deltas)
+
+    print(f"\n--- CoM Distance (Å, pocket-aligned) ---")
+    for label, vals in [("Per-sample (pooled)", all_com),
+                        ("Per-system best (min)", sys_min_com),
+                        ("Per-system mean",       sys_mean_com)]:
+        finite = [v for v in vals if np.isfinite(v)]
+        if finite:
+            print(f"  {label}: mean={np.mean(finite):.3f}  median={np.median(finite):.3f}  "
+                  f"<2Å={np.mean(np.array(finite)<2)*100:.1f}%  <5Å={np.mean(np.array(finite)<5)*100:.1f}%")
 
     print("\n--- Per-system summary (sorted by min pk) ---")
     print(f"  {'system_id':<42} {'n':>4} {'min_pk':>7} {'mean_pk':>8} {'min_lig':>8}")
