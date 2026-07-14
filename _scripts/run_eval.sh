@@ -30,6 +30,7 @@ elif [[ "${TASK}" == "pocket" ]]; then
     python "${DIR}/_scripts/eval.py" \
         --out-dir "${DIR}/sampling/plinder/protein_cond/${MODEL}" \
         --ref-dir "${DIR}/plinder_processed/val" \
+        --plip-sif "${DIR}/plip.sif" \
         "$@"
 else
     echo "Unknown task: ${TASK} (expected conformer or pocket)" >&2
