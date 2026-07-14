@@ -192,10 +192,19 @@ def load_structure_from_npz(npz_path: str, include_h: bool = False) -> Structure
         new_atoms["chirality"] = 0
         atoms = new_atoms
 
+    residues = data["residues"]
+    if "is_copy" not in residues.dtype.names:
+        new_dtype = residues.dtype.descr + [("is_copy", "?")]
+        new_residues = np.empty(residues.shape, dtype=new_dtype)
+        for name in residues.dtype.names:
+            new_residues[name] = residues[name]
+        new_residues["is_copy"] = False
+        residues = new_residues
+
     struct = Structure(
         atoms=atoms,
         bonds=data["bonds"],
-        residues=data["residues"],
+        residues=residues,
         chains=chains,
         connections=data["connections"].astype(Connection),
         interfaces=data["interfaces"],
