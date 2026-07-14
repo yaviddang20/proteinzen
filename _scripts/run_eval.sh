@@ -26,13 +26,11 @@ if [[ "${TASK}" == "conformer" ]]; then
             "$@"
     done
 elif [[ "${TASK}" == "pocket" ]]; then
-    for DIRECTION in protein_cond ligand_cond; do
-        echo "=== ${TASK} / ${DIRECTION} ==="
-        python "${DIR}/_scripts/eval.py" \
-            --out-dir "${DIR}/sampling/plinder/${DIRECTION}/${MODEL}" \
-            --ref-dir "${DIR}/plinder_processed/val" \
-            "$@"
-    done
+    echo "=== ${TASK} / protein_cond ==="
+    python "${DIR}/_scripts/eval.py" \
+        --out-dir "${DIR}/sampling/plinder/protein_cond/${MODEL}" \
+        --ref-dir "${DIR}/plinder_processed/val" \
+        "$@"
 else
     echo "Unknown task: ${TASK} (expected conformer or pocket)" >&2
     exit 1
