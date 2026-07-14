@@ -337,6 +337,38 @@ def main():
         if interaction_mask is not None:
             pocket_only = pocket_mask & ~interaction_mask
             _mask_summary(pocket_only, struct, "pocket-only (new additions)")
+
+        # Sanity check: are pocket-masked residues actually near the ligand?
+        from scipy.spatial.distance import cdist as _cdist
+        protein_type = const.chain_type_ids["PROTEIN"]
+        nonpolymer_type = const.chain_type_ids["NONPOLYMER"]
+        lig_coords_list = []
+        for chain in struct.chains[struct.mask]:
+            if int(chain["mol_type"]) != nonpolymer_type:
+                continue
+            a_start, a_end = int(chain["atom_idx"]), int(chain["atom_idx"]) + int(chain["atom_num"])
+            lig_coords_list.append(struct.atoms[a_start:a_end]["coords"])
+        if lig_coords_list:
+            lig_coords = np.concatenate(lig_coords_list)
+            pocket_res_coords = []
+            interact_res_coords = []
+            for chain in struct.chains[struct.mask]:
+                if int(chain["mol_type"]) != protein_type:
+                    continue
+                for k in range(int(chain["res_num"])):
+                    r = int(chain["res_idx"]) + k
+                    res = struct.residues[r]
+                    ca = struct.atoms[int(res["atom_center"])]["coords"]
+                    if pocket_mask[r]:
+                        pocket_res_coords.append(ca)
+                    if interaction_mask is not None and interaction_mask[r]:
+                        interact_res_coords.append(ca)
+            if pocket_res_coords:
+                dists = _cdist(np.array(pocket_res_coords), lig_coords).min(axis=1)
+                print(f"  pocket residue dist-to-ligand: min={dists.min():.1f}  mean={dists.mean():.1f}  max={dists.max():.1f} Å")
+            if interact_res_coords:
+                dists = _cdist(np.array(interact_res_coords), lig_coords).min(axis=1)
+                print(f"  interact residue dist-to-ligand: min={dists.min():.1f}  mean={dists.mean():.1f}  max={dists.max():.1f} Å")
     else:
         print("  pocket_residue_mask: not present in this NPZ (run plinder.py with --pocket-data-dir)")
 
