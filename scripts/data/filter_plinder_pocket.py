@@ -57,6 +57,10 @@ def annotation_prefilter(row: dict, args) -> bool:
     if not row.get("ligand_is_proper"):
         return False
 
+    # Exclude covalently bonded ligands
+    if row.get("ligand_is_covalent"):
+        return False
+
     # Ligand must be buried enough — crystal contacts indicate surface exposure
     frac_cc = row.get("ligand_fraction_atoms_with_crystal_contacts")
     if frac_cc is not None and frac_cc > args.max_crystal_contacts:
@@ -453,6 +457,7 @@ def main():
     ann_cols = [
         "system_id",
         "ligand_is_proper",
+        "ligand_is_covalent",
         "ligand_fraction_atoms_with_crystal_contacts",
         "ligand_num_pocket_residues",
         "system_pocket_validation_average_rscc",
