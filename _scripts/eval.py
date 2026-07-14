@@ -1115,12 +1115,15 @@ def _run_plip(pdb_path: str, sif_path: str) -> dict:
                 capture_output=True, text=True, timeout=120,
             )
             if result.returncode != 0:
+                print(f"  [PLIP] returncode={result.returncode} stderr={result.stderr[:300]}")
                 return empty
             xml_files = list(Path(tmpdir).glob("*.xml"))
             if not xml_files:
+                print(f"  [PLIP] no XML output for {pdb_path}")
                 return empty
             return _parse_plip_xml(str(xml_files[0]))
-    except Exception:
+    except Exception as e:
+        print(f"  [PLIP] exception: {e}")
         return empty
 
 
