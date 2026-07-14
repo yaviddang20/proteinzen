@@ -1110,8 +1110,7 @@ def _run_plip(pdb_path: str, sif_path: str) -> dict:
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             result = subprocess.run(
-                ["singularity", "exec", sif_path, "python", "-m", "plip.plipcmd",
-                 "-f", str(pdb_path), "-o", tmpdir, "-x"],
+                [sif_path, "-f", str(pdb_path), "-o", tmpdir, "-x"],
                 capture_output=True, text=True, timeout=120,
             )
             if result.returncode != 0:
@@ -1179,7 +1178,9 @@ def parse_pdb_atoms(pdb_path: str):
                 try:
                     x, y, z = float(line[30:38]), float(line[38:46]), float(line[46:54])
                     elem = (line[76:78].strip() if len(line) > 76 else "").capitalize()
-                    if elem == "H":
+                    if not elem:
+                        elem = line[12:16].strip().lstrip("0123456789").capitalize()
+                    if elem in ("H", "D"):
                         continue
                     prot.append((x, y, z))
                 except ValueError:
