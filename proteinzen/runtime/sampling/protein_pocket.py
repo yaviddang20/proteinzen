@@ -277,11 +277,13 @@ class ProteinPocketConditionedSampling(SamplingTask):
         atom_noising_mask = np.ones(n_atoms, dtype=bool)
         res_type_noising_mask = np.ones(n_residues, dtype=bool)
 
+        residue_entity_ids = np.zeros(n_residues, dtype=int)
         for chain in active_chains:
-            if int(chain["mol_type"]) != protein_id:
-                continue
             res_start = int(chain["res_idx"])
             res_end = res_start + int(chain["res_num"])
+            residue_entity_ids[res_start:res_end] = int(chain["entity_id"])
+            if int(chain["mol_type"]) != protein_id:
+                continue
             for res in struct.residues[res_start:res_end]:
                 atom_start = int(res["atom_idx"])
                 atom_end = atom_start + int(res["atom_num"])
@@ -292,6 +294,7 @@ class ProteinPocketConditionedSampling(SamplingTask):
             "atom_noising_mask": atom_noising_mask,
             "res_type_noising_mask": res_type_noising_mask,
             "residue_is_unindexed_mask": np.zeros(n_residues, dtype=bool),
+            "residue_entity_ids": residue_entity_ids,
         }
 
         task_name = self.kwargs.get("name", self.task_name)
@@ -377,11 +380,13 @@ class LigandPocketConditionedSampling(SamplingTask):
         atom_noising_mask = np.ones(n_atoms, dtype=bool)
         res_type_noising_mask = np.ones(n_residues, dtype=bool)
 
+        residue_entity_ids = np.zeros(n_residues, dtype=int)
         for chain in active_chains:
-            if int(chain["mol_type"]) != nonpolymer_id:
-                continue
             res_start = int(chain["res_idx"])
             res_end = res_start + int(chain["res_num"])
+            residue_entity_ids[res_start:res_end] = int(chain["entity_id"])
+            if int(chain["mol_type"]) != nonpolymer_id:
+                continue
             for res in struct.residues[res_start:res_end]:
                 atom_start = int(res["atom_idx"])
                 atom_end = atom_start + int(res["atom_num"])
@@ -392,6 +397,7 @@ class LigandPocketConditionedSampling(SamplingTask):
             "atom_noising_mask": atom_noising_mask,
             "res_type_noising_mask": res_type_noising_mask,
             "residue_is_unindexed_mask": np.zeros(n_residues, dtype=bool),
+            "residue_entity_ids": residue_entity_ids,
         }
 
         task_name = self.kwargs.get("name", self.task_name)
