@@ -77,30 +77,36 @@ def annotation_prefilter(row: dict, args) -> bool:
 
 # ── fpocket ───────────────────────────────────────────────────────────────────
 
+_CHAIN_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+
+def _remap_chains(st) -> dict[str, str]:
+    """Remap multi-char chain names to single-char in-place. Returns old→new mapping."""
+    mapping: dict[str, str] = {}
+    idx = 0
+    for model in st:
+        for chain in model:
+            if chain.name not in mapping:
+                if len(chain.name) > 1:
+                    while idx < len(_CHAIN_CHARS) and _CHAIN_CHARS[idx] in mapping.values():
+                        idx += 1
+                    mapping[chain.name] = _CHAIN_CHARS[idx] if idx < len(_CHAIN_CHARS) else chain.name[0]
+                    idx += 1
+                else:
+                    mapping[chain.name] = chain.name
+            chain.name = mapping[chain.name]
+    return mapping
+
+
 def _cif_to_pdb(cif_path: Path, pdb_path: Path) -> bool:
     """Convert mmCIF to PDB using gemmi. Returns False on failure."""
-    _CHAIN_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
     try:
         st = gemmi.read_structure(str(cif_path))
         st.remove_hydrogens()
-        # PDB format only supports single-character chain IDs; remap if needed
-        for model in st:
-            mapping: dict[str, str] = {}
-            idx = 0
-            for chain in model:
-                if chain.name not in mapping:
-                    if len(chain.name) > 1:
-                        while idx < len(_CHAIN_CHARS) and _CHAIN_CHARS[idx] in mapping.values():
-                            idx += 1
-                        mapping[chain.name] = _CHAIN_CHARS[idx] if idx < len(_CHAIN_CHARS) else chain.name[0]
-                        idx += 1
-                    else:
-                        mapping[chain.name] = chain.name
-                chain.name = mapping[chain.name]
+        _remap_chains(st)
         st.write_pdb(str(pdb_path))
         return True
-    except Exception as e:
-        print(f"[fpocket] gemmi error on {cif_path}: {e}")
+    except Exception:
         return False
 
 
@@ -132,10 +138,10 @@ def _parse_fpocket_info(info_path: Path) -> list[dict]:
 def _parse_pocket_pqr(pqr_path: Path) -> dict[int, np.ndarray]:
     """Return {pocket_id: mean_center (3,)} from fpocket pockets.pqr.
 
-    fpocket encodes pocket membership in the residue number field.
+    fpocket encodes pocket membership in the residue number field (no chain column).
     """
-    # fpocket pqr columns: record serial name resname chain resseq x y z charge radius
-    # indices:             0      1      2    3       4     5      6 7 8 9      10
+    # fpocket pqr columns: record serial name resname resseq x    y    z    charge radius
+    # indices:             0      1      2    3       4      5    6    7    8      9
     coords_by_pocket: dict[int, list] = {}
     with open(pqr_path) as f:
         for line in f:
@@ -145,8 +151,10 @@ def _parse_pocket_pqr(pqr_path: Path) -> dict[int, np.ndarray]:
             if len(parts) < 9:
                 continue
             try:
-                pocket_id = int(parts[5])  # resseq = pocket index
-                x, y, z = float(parts[6]), float(parts[7]), float(parts[8])
+                # fpocket pqr: ATOM serial atomname resname resseq x y z charge radius
+                # no chain column — resseq is parts[4], coords start at parts[5]
+                pocket_id = int(parts[4])
+                x, y, z = float(parts[5]), float(parts[6]), float(parts[7])
             except (ValueError, IndexError):
                 continue
             coords_by_pocket.setdefault(pocket_id, []).append([x, y, z])
@@ -173,7 +181,6 @@ def run_fpocket(receptor_cif: Path, ligand_centroid: np.ndarray, args) -> Option
         tmpdir = Path(tmpdir)
         pdb_path = tmpdir / "receptor.pdb"
         if not _cif_to_pdb(receptor_cif, pdb_path):
-            print(f"[fpocket] _cif_to_pdb failed for {receptor_cif}")
             return None
 
         result = subprocess.run(
@@ -183,11 +190,6 @@ def run_fpocket(receptor_cif: Path, ligand_centroid: np.ndarray, args) -> Option
             timeout=60,
         )
         if result.returncode != 0:
-            print(f"[fpocket] cmd={cmd_prefix[0]} returncode={result.returncode}")
-            if result.stdout:
-                print(f"[fpocket] stdout: {result.stdout.decode(errors='replace')[:500]}")
-            if result.stderr:
-                print(f"[fpocket] stderr: {result.stderr.decode(errors='replace')[:500]}")
             return None
 
         out_dir = tmpdir / "receptor_out"
@@ -195,24 +197,14 @@ def run_fpocket(receptor_cif: Path, ligand_centroid: np.ndarray, args) -> Option
         pqr_path = out_dir / "receptor_pockets.pqr"
 
         if not info_path.exists():
-            print(f"[fpocket] info file missing: {info_path}; out_dir contents: {list(out_dir.iterdir()) if out_dir.exists() else 'dir missing'}")
             return None
 
         pockets = _parse_fpocket_info(info_path)
         if not pockets:
-            print(f"[fpocket] no pockets parsed from {info_path}")
             return None
 
         # Get pocket centers to match against ligand centroid
-        if not pqr_path.exists():
-            print(f"[fpocket] pqr missing; out_dir={list(out_dir.iterdir())}")
-            pocket_centers = {}
-        else:
-            with open(pqr_path) as _f:
-                _lines = _f.readlines()
-            print(f"[fpocket] pqr exists, {len(_lines)} lines; first 3: {_lines[:3]}")
-            pocket_centers = _parse_pocket_pqr(pqr_path)
-        print(f"[fpocket] {len(pockets)} pockets found, {len(pocket_centers)} have centers")
+        pocket_centers = _parse_pocket_pqr(pqr_path) if pqr_path.exists() else {}
 
         best_pocket = None
         best_dist = float("inf")
@@ -226,7 +218,6 @@ def run_fpocket(receptor_cif: Path, ligand_centroid: np.ndarray, args) -> Option
                 best_dist = dist
                 best_pocket = p
 
-        print(f"[fpocket] best_dist={best_dist:.2f} (threshold={args.max_pocket_center_dist})")
         if best_pocket is None or best_dist > args.max_pocket_center_dist:
             return None
 
@@ -267,8 +258,11 @@ def compute_buried_fraction(
             return None
         model = st[0]
 
+        # Remap chains before writing PDB (PDB requires single-char chain IDs)
+        chain_map = _remap_chains(st)
+
         # Find pocket residues: all protein residues within pocket_radius of ligand centroid
-        # Store as (chain_name, resseq_str) pairs for freesasa selection
+        # Store as (remapped_chain_name, resseq_str) pairs for freesasa selection
         pocket_res: list[tuple[str, str]] = []
         for chain in model:
             for res in chain:
@@ -290,20 +284,25 @@ def compute_buried_fraction(
         try:
             st.write_pdb(full_pdb)
 
-            # Full-protein SASA, then select pocket residues
+            # Full-protein SASA, accumulate pocket residue contribution via residueAreas()
+            # (avoids selectArea string-matching issues with insertion codes / auth numbering)
+            freesasa.setVerbosity(freesasa.silent)
             structure_full = freesasa.Structure(full_pdb)
             result_full = freesasa.calc(structure_full)
-            resi_expr = "+".join(r for _, r in pocket_res)
-            sel_str = f"pocket, resi {resi_expr}"
-            areas = freesasa.selectArea([sel_str], structure_full, result_full)
-            sasa_in_protein = areas.get("pocket", 0.0)
+            pocket_set = {(c, r) for c, r in pocket_res}
+            per_res = result_full.residueAreas()  # {chain: {resi_str: ResidueArea}}
+            sasa_in_protein = sum(
+                area.total
+                for chain_id, chain_areas in per_res.items()
+                for resi_str, area in chain_areas.items()
+                if (chain_id, resi_str.strip()) in pocket_set
+            )
             if sasa_in_protein == 0.0:
                 return None
 
             # Isolated pocket residues SASA
             mini_st = gemmi.Structure()
             mini_model = gemmi.Model("1")
-            pocket_set = {(c, r) for c, r in pocket_res}
             for chain in model:
                 mini_chain = gemmi.Chain(chain.name)
                 for res in chain:

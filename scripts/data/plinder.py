@@ -379,6 +379,7 @@ def process_system(
         if not is_valid_ligand(mol):
             return
 
+        ligand_smiles = Chem.MolToSmiles(mol)
         rot_data = compute_rot_bond_data(mol)
         all_rot_bond_data.append(rot_data)
 
@@ -474,8 +475,10 @@ def process_system(
     save_dict['interaction_residue_mask'] = interaction_residue_mask
     np.savez_compressed(struct_path, **save_dict)
 
+    record_dict = asdict(record)
+    record_dict['smiles'] = ligand_smiles
     with open(record_path, "w") as f:
-        json.dump(asdict(record), f)
+        json.dump(record_dict, f)
 
     auth_map_path = outdir / "auth_maps" / mid / f"{system_id}.json"
     with open(auth_map_path, "w") as f:
