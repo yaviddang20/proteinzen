@@ -73,12 +73,14 @@ class CoMHead(nn.Module):
 # ── lightning module ───────────────────────────────────────────────────────────
 
 class CoMPredictorLit(pl.LightningModule):
-    def __init__(self, backbone: nn.Module, corrupter, c_s: int, lr: float = 1e-3):
+    def __init__(self, backbone: nn.Module, corrupter, c_s: int, lr: float = 1e-3,
+                 cosine_annealing_T_max: int = 0):
         super().__init__()
         self.backbone = backbone
         self.corrupter = corrupter
         self.com_head = CoMHead(c_s)
         self.lr = lr
+        self.cosine_annealing_T_max = cosine_annealing_T_max
 
     def _apply_etkdg(self, batch):
         etkdg_pos = batch['rigids']['etkdg_pos']           # (B, N, 3)
@@ -104,6 +106,7 @@ class CoMPredictorLit(pl.LightningModule):
         return batch
 
     def _step(self, batch, split: str) -> torch.Tensor:
+        batch['t'] = torch.ones_like(batch['t'])
         batch['trans_t'] = batch['t']
         batch['rot_t'] = batch['t']
         batch = self.corrupter.corrupt_dense_batch(batch, identity_rot_noise=False)
@@ -146,7 +149,13 @@ class CoMPredictorLit(pl.LightningModule):
     def validation_step(self, batch, _): return self._step(batch, 'val')
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.com_head.parameters(), lr=self.lr, weight_decay=1e-2)
+        optimizer = torch.optim.AdamW(self.com_head.parameters(), lr=self.lr, weight_decay=1e-2)
+        if self.cosine_annealing_T_max > 0:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=self.cosine_annealing_T_max
+            )
+            return {'optimizer': optimizer, 'lr_scheduler': {'scheduler': scheduler, 'interval': 'epoch'}}
+        return optimizer
 
 
 # ── checkpoint / config helpers ───────────────────────────────────────────────
@@ -167,9 +176,9 @@ def resolve_ckpt(run_dir: str, version_num: int, checkpoint_idx: int) -> str:
     return epoch_list[checkpoint_idx][0]
 
 
-def load_backbone_and_corrupter(run_dir: str, version_num: int, checkpoint_idx: int):
+def load_backbone_and_corrupter(run_dir: str, version_num: int, checkpoint_idx: int, load_weights: bool = True):
     ckpt_path = resolve_ckpt(run_dir, version_num, checkpoint_idx)
-    print(f"Loading checkpoint: {ckpt_path}")
+    print(f"Loading proteinzen checkpoint: {ckpt_path}")
 
     config_path = os.path.join(run_dir, f"lightning_logs/version_{version_num}/config.yaml")
     if not os.path.exists(config_path):
@@ -178,11 +187,12 @@ def load_backbone_and_corrupter(run_dir: str, version_num: int, checkpoint_idx: 
 
     backbone = instantiate(cfg['model'])
 
-    ckpt = torch.load(ckpt_path, map_location='cpu')
-    state = {k[len('model.'):]: v
-             for k, v in ckpt['state_dict'].items()
-             if k.startswith('model.')}
-    backbone.load_state_dict(state, strict=False)
+    if load_weights:
+        ckpt = torch.load(ckpt_path, map_location='cpu')
+        state = {k[len('model.'):]: v
+                 for k, v in ckpt['state_dict'].items()
+                 if k.startswith('model.')}
+        backbone.load_state_dict(state, strict=False)
     backbone.requires_grad_(False)
 
     valid_params = set(inspect.signature(MultiSE3Interpolant.__init__).parameters) - {'self'}
@@ -207,6 +217,9 @@ def main():
     ap.add_argument('--version-num',         type=int, default=0)
     ap.add_argument('--checkpoint-idx',      type=int, default=-1,
                     help='-1 = last checkpoint (by epoch)')
+    ap.add_argument('--resume-ckpt',         default=None,
+                    help='Path to a CoM predictor .ckpt to resume from; '
+                         'backbone weights are taken from this ckpt instead of --model-dir')
     ap.add_argument('--dataset-config',      required=True,
                     help='Path to train dataset config yaml (e.g. configs/train/data/plinder_protein_cond.yaml)')
     ap.add_argument('--val-dataset-config',  default=None,
@@ -216,12 +229,21 @@ def main():
     ap.add_argument('--batch-size',          type=int,   default=4)
     ap.add_argument('--num-workers',         type=int,   default=4)
     ap.add_argument('--max-epochs',          type=int,   default=50)
+    ap.add_argument('--cosine-annealing-T-max', type=int, default=0,
+                    help='CosineAnnealingLR T_max in epochs; 0 = disabled (constant lr)')
     ap.add_argument('--seed',                type=int,   default=42)
     args = ap.parse_args()
 
     pl.seed_everything(args.seed)
 
-    backbone, corrupter, c_s = load_backbone_and_corrupter(args.model_dir, args.version_num, args.checkpoint_idx)
+    # If resuming from a CoM predictor ckpt, skip loading proteinzen weights —
+    # Lightning will restore the full model (backbone + com_head) from resume_ckpt.
+    load_weights = args.resume_ckpt is None
+    backbone, corrupter, c_s = load_backbone_and_corrupter(
+        args.model_dir, args.version_num, args.checkpoint_idx, load_weights=load_weights
+    )
+    if args.resume_ckpt:
+        print(f"Resuming from CoM predictor ckpt: {args.resume_ckpt}")
     print(f"Backbone loaded, c_s={c_s}")
     assert all(not p.requires_grad for p in backbone.parameters()), \
         "Backbone should be fully frozen"
@@ -241,7 +263,8 @@ def main():
         num_workers=args.num_workers,
     )
 
-    model = CoMPredictorLit(backbone=backbone, corrupter=corrupter, c_s=c_s, lr=args.lr)
+    model = CoMPredictorLit(backbone=backbone, corrupter=corrupter, c_s=c_s, lr=args.lr,
+                            cosine_annealing_T_max=args.cosine_annealing_T_max)
 
     ckpt_cb = ModelCheckpoint(
         monitor='val/rmse', mode='min', save_top_k=3, save_last=True,
@@ -254,7 +277,7 @@ def main():
         callbacks=[ckpt_cb],
         log_every_n_steps=10,
     )
-    trainer.fit(model, datamodule=datamodule)
+    trainer.fit(model, datamodule=datamodule, ckpt_path=args.resume_ckpt)
 
 
 if __name__ == '__main__':
