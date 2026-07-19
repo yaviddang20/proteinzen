@@ -214,15 +214,19 @@ def write_crop_pdb(out_path: Path, struct, set_a: set, set_b: set):
     lines.append("END")
     out_path.write_text("\n".join(lines) + "\n")
     name = out_path.stem
-    print(f"\nWrote {out_path}")
+    cxc_path = out_path.with_suffix(".cxc")
+    cxc_path.write_text(
+        f"open {out_path.name}\n"
+        f"color bfactor #1.1 palette blue:white:red range 0,1\n"
+        f"select #1.1 & ligand; color sel yellow; select clear\n"
+        f"color bfactor #1.2 palette blue:white:red range 0,1\n"
+        f"select #1.2 & ligand; color sel yellow; select clear\n"
+    )
+    print(f"\nWrote {out_path}  +  {cxc_path}")
     print(f"  PyMOL:    load {out_path}; split_states {name}")
     print(f"            spectrum b, blue_red, {name}_0001; color yellow, ({name}_0001 and hetatm)")
     print(f"            spectrum b, blue_red, {name}_0002; color yellow, ({name}_0002 and hetatm)")
-    print(f"  ChimeraX: open {out_path}")
-    print(f"            color bfactor #1.1 palette blue:white:red range 0,1")
-    print(f"            select #1.1 & ligand; color sel yellow; select clear")
-    print(f"            color bfactor #1.2 palette blue:white:red range 0,1")
-    print(f"            select #1.2 & ligand; color sel yellow; select clear")
+    print(f"  ChimeraX: open {cxc_path.name}  (or drag-drop; put .cxc and .pdb in same folder)")
 
 
 

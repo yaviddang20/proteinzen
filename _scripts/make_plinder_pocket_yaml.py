@@ -55,8 +55,12 @@ def main():
                         help="Randomly sample this many systems (seed=42); default: 30")
     parser.add_argument("--trans-std", type=float, default=3.0,
                         help="Translation noise std (default: 3.0, matches plinder training)")
-    parser.add_argument("--max-protein-residues", type=int, default=100,
-                        help="Crop protein to this many residues closest to ligand (default: 100)")
+    parser.add_argument("--max-protein-residues", type=int, default=None,
+                        help="[protein_cond] Crop to this many residues; None=full protein (default: None)")
+    parser.add_argument("--min-protein-residues", type=int, default=150,
+                        help="[ligand_cond] Min protein residues, sampled per sample (default: 150)")
+    parser.add_argument("--max-protein-residues-ligand-cond", type=int, default=250,
+                        help="[ligand_cond] Max protein residues, sampled per sample (default: 250)")
     parser.add_argument("--include-h", action="store_true",
                         help="Include hydrogen atoms (default: False)")
     args = parser.parse_args()
@@ -91,22 +95,24 @@ def main():
             skipped += 1
             continue
 
-        common = {
+        base = {
             "name": system_id,
             "npz_path": str(npz_path.resolve()),
             "num_samples": args.num_samples,
             "trans_std": args.trans_std,
             "include_h": args.include_h,
-            "max_protein_residues": args.max_protein_residues,
         }
 
-        protein_cond_tasks.append({
-            "_target_": "proteinzen.runtime.sampling.protein_pocket.ProteinPocketConditionedSampling",
-            **common,
-        })
+        pc = {"_target_": "proteinzen.runtime.sampling.protein_pocket.ProteinPocketConditionedSampling", **base}
+        if args.max_protein_residues is not None:
+            pc["max_protein_residues"] = args.max_protein_residues
+        protein_cond_tasks.append(pc)
+
         ligand_cond_tasks.append({
             "_target_": "proteinzen.runtime.sampling.protein_pocket.LigandPocketConditionedSampling",
-            **common,
+            **base,
+            "min_protein_residues": args.min_protein_residues,
+            "max_protein_residues": args.max_protein_residues_ligand_cond,
         })
 
     if skipped:

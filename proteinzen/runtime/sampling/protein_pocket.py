@@ -241,9 +241,9 @@ class ProteinPocketConditionedSampling(SamplingTask):
         Std of the isotropic Gaussian noise applied to ligand atom translations.
     include_h : bool
         Whether to keep hydrogen atoms in the structure.
-    max_protein_residues : int
+    max_protein_residues : int or None
         Crop the protein to this many residues closest to the ligand. Set to
-        None to use the full protein.
+        None to use the full protein (default).
     """
 
     task_name: str = "protein_pocket_conditioned"
@@ -254,7 +254,7 @@ class ProteinPocketConditionedSampling(SamplingTask):
         num_samples: int,
         trans_std: float = 16.0,
         include_h: bool = False,
-        max_protein_residues: int = 100,
+        max_protein_residues: int = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -346,9 +346,10 @@ class LigandPocketConditionedSampling(SamplingTask):
         Std of the isotropic Gaussian noise applied to protein atom translations.
     include_h : bool
         Whether to keep hydrogen atoms in the structure.
+    min_protein_residues : int
+        Minimum number of protein residues to include (sampled per sample).
     max_protein_residues : int
-        Crop the protein to this many residues closest to the ligand. Set to
-        None to use the full protein.
+        Maximum number of protein residues to include (sampled per sample).
     """
 
     task_name: str = "ligand_conditioned_generate_protein"
@@ -359,7 +360,8 @@ class LigandPocketConditionedSampling(SamplingTask):
         num_samples: int,
         trans_std: float = 16.0,
         include_h: bool = False,
-        max_protein_residues: int = 100,
+        min_protein_residues: int = 150,
+        max_protein_residues: int = 250,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -367,55 +369,56 @@ class LigandPocketConditionedSampling(SamplingTask):
         self.num_samples = num_samples
         self.trans_std = trans_std
         self.include_h = include_h
+        self.min_protein_residues = min_protein_residues
         self.max_protein_residues = max_protein_residues
 
     def sample_data(self):
-        struct = load_structure_from_npz(self.npz_path, include_h=self.include_h)
+        import random as _random
+        orig_struct = load_structure_from_npz(self.npz_path, include_h=self.include_h)
 
         protein_id = const.chain_type_ids["PROTEIN"]
         nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
 
-        active_chains = struct.chains[struct.mask]
-        chain_types = {int(c["mol_type"]) for c in active_chains}
+        chain_types = {int(c["mol_type"]) for c in orig_struct.chains[orig_struct.mask]}
         if protein_id not in chain_types:
             raise ValueError(f"No PROTEIN chain in {self.npz_path}")
         if nonpolymer_id not in chain_types:
             raise ValueError(f"No NONPOLYMER (ligand) chain in {self.npz_path}")
 
-        if self.max_protein_residues is not None:
-            struct = _crop_protein_to_pocket(struct, self.max_protein_residues)
-            active_chains = struct.chains[struct.mask]
-
-        n_atoms = len(struct.atoms)
-        n_residues = len(struct.residues)
-        atom_noising_mask = np.ones(n_atoms, dtype=bool)
-        res_type_noising_mask = np.ones(n_residues, dtype=bool)
-
-        residue_entity_ids = np.zeros(n_residues, dtype=int)
-        for chain in active_chains:
-            res_start = int(chain["res_idx"])
-            res_end = res_start + int(chain["res_num"])
-            residue_entity_ids[res_start:res_end] = int(chain["entity_id"])
-            if int(chain["mol_type"]) != nonpolymer_id:
-                continue
-            for res in struct.residues[res_start:res_end]:
-                atom_start = int(res["atom_idx"])
-                atom_end = atom_start + int(res["atom_num"])
-                atom_noising_mask[atom_start:atom_end] = False
-            res_type_noising_mask[res_start:res_end] = False
-
-        task_masks = {
-            "atom_noising_mask": atom_noising_mask,
-            "res_type_noising_mask": res_type_noising_mask,
-            "residue_is_unindexed_mask": np.zeros(n_residues, dtype=bool),
-            "res_hotspot_type": np.zeros(n_residues, dtype=int),
-            "residue_entity_ids": residue_entity_ids,
-            "t": 0.0,
-        }
-
         task_name = self.kwargs.get("name", self.task_name)
 
         for _ in range(self.num_samples):
+            n_prot = _random.randint(self.min_protein_residues, self.max_protein_residues)
+            struct = _crop_protein_to_pocket(orig_struct, n_prot)
+            active_chains = struct.chains[struct.mask]
+
+            n_atoms = len(struct.atoms)
+            n_residues = len(struct.residues)
+            atom_noising_mask = np.ones(n_atoms, dtype=bool)
+            res_type_noising_mask = np.ones(n_residues, dtype=bool)
+
+            residue_entity_ids = np.zeros(n_residues, dtype=int)
+            for chain in active_chains:
+                res_start = int(chain["res_idx"])
+                res_end = res_start + int(chain["res_num"])
+                residue_entity_ids[res_start:res_end] = int(chain["entity_id"])
+                if int(chain["mol_type"]) != nonpolymer_id:
+                    continue
+                for res in struct.residues[res_start:res_end]:
+                    atom_start = int(res["atom_idx"])
+                    atom_end = atom_start + int(res["atom_num"])
+                    atom_noising_mask[atom_start:atom_end] = False
+                res_type_noising_mask[res_start:res_end] = False
+
+            task_masks = {
+                "atom_noising_mask": atom_noising_mask,
+                "res_type_noising_mask": res_type_noising_mask,
+                "residue_is_unindexed_mask": np.zeros(n_residues, dtype=bool),
+                "res_hotspot_type": np.zeros(n_residues, dtype=int),
+                "residue_entity_ids": residue_entity_ids,
+                "t": 0.0,
+            }
+
             token_data, rigid_data, token_bonds, fixed_com, _ = sample_noise_from_struct_template(
                 struct,
                 task_masks=task_masks,
