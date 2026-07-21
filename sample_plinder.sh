@@ -21,7 +21,7 @@ for direction in protein_cond ligand_cond; do
     mkdir -p ${yaml_dir}
 
     python ${REPO_ROOT}/_scripts/make_plinder_pocket_yaml.py \
-        --data-dir ${REPO_ROOT}/plinder_processed/val \
+        --data-dir ${REPO_ROOT}/plinder_pocket_processed/val \
         --out-yaml ${yaml_dir}/val \
         --num-samples 10 \
         --trans-std ${TRANS_STD[$direction]} \

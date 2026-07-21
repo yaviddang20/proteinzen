@@ -29,7 +29,7 @@ elif [[ "${TASK}" == "pocket" ]]; then
     echo "=== ${TASK} / protein_cond ==="
     python "${DIR}/_scripts/eval.py" \
         --out-dir "${DIR}/sampling/plinder/protein_cond/${MODEL}" \
-        --ref-dir "${DIR}/plinder_processed/val" \
+        --ref-dir "${DIR}/plinder_pocket_processed/val" \
         --plip-sif "${DIR}/plip.sif" \
         --include-h \
         "$@"

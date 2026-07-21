@@ -767,14 +767,14 @@ def construct_atoms(
                     atom_center=1,
                     atom_disto=1,
                     is_standard=True,
-                    is_present=True,
+                    is_present=bool(residue['is_present']),
                     is_copy=token['is_copy']
                 )
                 new_residues.append(astuple(res))
 
                 res_atom_names = [i for i in rc.restype_name_to_atom14_names[res_name] if len(i) > 0]
                 atom_coords = np.zeros(len(res_atom_names))
-                atom_is_present = np.ones(len(res_atom_names), dtype=bool)
+                atom_is_present = np.full(len(res_atom_names), bool(residue['is_present']), dtype=bool)
 
                 # construct the rest of the atom data
                 res_atom_names = [i for i in rc.restype_name_to_atom14_names[res_name] if len(i) > 0]
@@ -811,7 +811,7 @@ def construct_atoms(
                     atom_center=0,
                     atom_disto=0,
                     is_standard=False,
-                    is_present=True,
+                    is_present=bool(residue['is_present']),
                     is_copy=False
                 )
                 new_residues.append(astuple(res))
