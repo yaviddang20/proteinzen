@@ -956,8 +956,9 @@ class BiomoleculeModule(L.LightningModule):
             )
 
         if run_epoch_sample:
-            n = max(1, self._epoch_sample_train_batch['rigids']['rigids_mask'].shape[0] // 2)
-            self._run_epoch_sample(self._epoch_sample_train_batch, "train", max_samples=n)
+            if self._epoch_sample_train_batch is not None:
+                n = max(1, self._epoch_sample_train_batch['rigids']['rigids_mask'].shape[0] // 2)
+                self._run_epoch_sample(self._epoch_sample_train_batch, "train", max_samples=n)
             n = max(1, batch['rigids']['rigids_mask'].shape[0] // 2)
             self._run_epoch_sample(batch, "val", max_samples=n)
 
