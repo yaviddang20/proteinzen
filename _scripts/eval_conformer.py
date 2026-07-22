@@ -1,26 +1,13 @@
 #!/usr/bin/env python
-"""Unified evaluator for proteinzen sampling outputs.
+"""Evaluate conformer generation outputs.
 
-Auto-detects the task type from <out_dir>/tasks_config.yaml and runs the
-appropriate evaluation:
-
-  conformer  — UnconditionalSamplingFromSMILES / UnconditionalSamplingFromMol
-               RMSD/coverage/energy metrics vs GEOM reference conformers.
-
-  pocket     — ProteinPocketConditionedSampling
-               Pocket-aligned and ligand-aligned RMSD vs Plinder GT structures.
+Computes RMSD/coverage/energy metrics vs GEOM reference conformers.
 
 Usage
 -----
-# Conformer eval (GEOM):
-python _scripts/eval.py \\
+python _scripts/eval_conformer.py \\
     --out-dir ./sampling/geom_conformer_val/my_model \\
     --ref-dir ./sampling/geom_conformer_val/conformer_mols
-
-# Pocket eval (Plinder):
-python _scripts/eval.py \\
-    --out-dir ./sampling/plinder_val/my_model \\
-    --ref-dir /path/to/plinder_processed/val
 """
 
 import argparse
@@ -44,37 +31,9 @@ from tqdm.auto import tqdm
 
 RDLogger.DisableLog("rdApp.*")
 
-# ============================================================
-# Task detection
-# ============================================================
-
-_CONFORMER_TARGETS = {
-    "proteinzen.runtime.sampling.unconditional_smiles.UnconditionalSamplingFromSMILES",
-    "proteinzen.runtime.sampling.unconditional_smiles.UnconditionalSamplingFromMol",
-}
-_POCKET_TARGETS = {
-    "proteinzen.runtime.sampling.protein_pocket.ProteinPocketConditionedSampling",
-}
-
-
-def detect_task_type(out_dir: Path) -> str:
-    tasks_config = out_dir / "tasks_config.yaml"
-    if not tasks_config.exists():
-        raise FileNotFoundError(f"tasks_config.yaml not found in {out_dir}")
-    with open(tasks_config) as f:
-        config = yaml.safe_load(f)
-    if not isinstance(config, list):
-        raise ValueError(f"Expected flat list in tasks_config.yaml, got {type(config)}")
-    targets = {entry.get("_target_", "") for entry in config if isinstance(entry, dict)}
-    if targets & _CONFORMER_TARGETS:
-        return "conformer"
-    if targets & _POCKET_TARGETS:
-        return "pocket"
-    raise ValueError(f"Unknown task type; targets in config: {targets}")
-
 
 # ============================================================
-# I/O helpers (shared)
+# I/O helpers
 # ============================================================
 
 class _Tee:
@@ -87,7 +46,7 @@ class _Tee:
 
 
 # ============================================================
-# Conformer eval — molecule helpers
+# Molecule helpers
 # ============================================================
 
 def _clean_pdb_block(block):
@@ -208,7 +167,7 @@ def load_and_prepare(pdb_path):
 
 
 # ============================================================
-# Conformer eval — geometry metrics
+# Geometry metrics
 # ============================================================
 
 def heavy_atom_rmsd(mol_ref, mol_gen):
@@ -371,7 +330,7 @@ def clash_count(mol, scale=0.75):
 
 
 # ============================================================
-# Conformer eval — energy (xTB)
+# Energy (xTB)
 # ============================================================
 
 ANGSTROM_TO_BOHR   = 1.8897259886
@@ -486,7 +445,7 @@ def _ref_energies_for_group(mol_id, paths, geom_datadir: Path):
 
 
 # ============================================================
-# Conformer eval — aggregation helpers
+# Aggregation helpers
 # ============================================================
 
 def pairwise_rmsd_matrix(ref_mols, gen_mols):
@@ -659,7 +618,7 @@ def compute_metrics_for_group(paths, ref_key_no_stereo_to_mols, ref_key_stereo_t
 
 
 # ============================================================
-# Conformer eval — torsion helpers
+# Torsion helpers
 # ============================================================
 
 def assign_atom_names(mol_h):
@@ -725,7 +684,7 @@ def circular_std(angles_deg):
 
 
 # ============================================================
-# Conformer eval — main
+# Main eval function
 # ============================================================
 
 def run_conformer_eval(args):
@@ -747,6 +706,7 @@ def run_conformer_eval(args):
     dirs_to_make = [out_align_dir, out_stats_dir]
     if compute_energy:
         dirs_to_make.append(out_dir / "relaxed_pairs")
+
     for d in dirs_to_make:
         if d.exists():
             shutil.rmtree(d)
@@ -763,7 +723,6 @@ def run_conformer_eval(args):
     print(f"  Ref     : {ref_dir}")
     print(f"  delta   : {delta} Å")
 
-    # ---- Load reference molecules ----
     print("\nLoading reference molecules...")
     ref_key_no_stereo_to_mols = defaultdict(list)
     ref_key_stereo_to_mols = defaultdict(list)
@@ -780,7 +739,6 @@ def run_conformer_eval(args):
 
     print(f"  Ref: {sum(len(v) for v in ref_key_no_stereo_to_mols.values())} conformers across {len(ref_mol_id_to_display_smis)} molecules")
 
-    # ---- Collect generated molecules ----
     print("Collecting generated PDBs...")
     pred_paths = [Path(p) for p in glob.glob(str(samples_dir / "*.pdb"))]
     groups = defaultdict(list)
@@ -789,7 +747,6 @@ def run_conformer_eval(args):
         groups[mol_id].append(p)
     print(f"  Gen: {sum(len(v) for v in groups.values())} conformers across {len(groups)} molecules")
 
-    # ---- Run metric computation ----
     print("Running metric computation...")
     results = Parallel(n_jobs=n_jobs, backend="loky")(
         delayed(compute_metrics_for_group)(
@@ -799,7 +756,6 @@ def run_conformer_eval(args):
         for paths in groups.values()
     )
 
-    # ---- Aggregate ----
     agg_conn   = make_metric_lists()
     agg_stereo = make_metric_lists()
     connectivity_no_match_all = []
@@ -844,7 +800,6 @@ def run_conformer_eval(args):
         print(f"  RMSF (gen):     {mean_or_nan(agg['rmsf']):.4f}")
     print(f"\n  RMSF (ref):  {ref_rmsf_mean}")
 
-    # ---- No-match details ----
     if connectivity_no_match_all:
         print(f"\n--- Wrong connectivity ({len(connectivity_no_match_all)}) ---")
         by_name = defaultdict(list)
@@ -887,7 +842,6 @@ def run_conformer_eval(args):
     stats_log.close()
     print(f"Eval stats saved to {out_stats_dir / 'eval.txt'}")
 
-    # ---- xTB energy ----
     if compute_energy and geom_datadir is not None:
         print("Computing GFN2-xTB energies for generated molecules...")
         gen_results = Parallel(n_jobs=n_jobs, backend="loky")(
@@ -941,7 +895,6 @@ def run_conformer_eval(args):
             df.to_csv(out_stats_dir / "energy_stats.csv", index=False)
             print(f"Energy stats saved to {out_stats_dir / 'energy_stats.csv'}")
 
-        # ---- min-energy aligned pairs ----
         out_min_energy_dir = out_dir / "min_energy_aligned_pairs"
         if out_min_energy_dir.exists():
             shutil.rmtree(out_min_energy_dir)
@@ -972,8 +925,6 @@ def run_conformer_eval(args):
                 print(f"  {mol_id[:16]}… failed: {ex}")
         print(f"Done. Written to {out_min_energy_dir}")
 
-        # ---- Torsion spread plots ----
-        import matplotlib.pyplot as plt
         out_plots_dir = out_dir / "torsion_plots"
         if out_plots_dir.exists():
             shutil.rmtree(out_plots_dir)
@@ -1044,676 +995,18 @@ def run_conformer_eval(args):
             plt.close(fig)
 
 
-# ============================================================
-# Pocket eval — PLIP interaction analysis
-# ============================================================
-
-# Maps PLIP XML container tag → (child element tag, short type label)
-_PLIP_INTERACTION_TAGS = {
-    "hydrophobic_interactions": ("hydrophobic_interaction", "HYDROPHOBIC"),
-    "hydrogen_bonds":           ("hydrogen_bond",           "HBOND"),
-    "water_bridges":            ("water_bridge",            "WATERBRIDGE"),
-    "salt_bridges":             ("salt_bridge",             "SALTBRIDGE"),
-    "pi_stacks":                ("pi_stack",                "PISTACK"),
-    "pi_cation_interactions":   ("pi_cation_interaction",   "PICATION"),
-    "halogen_bonds":            ("halogen_bond",            "HALOGENBOND"),
-    "metal_complexes":          ("metal_complex",           "METALCOMPLEX"),
-}
-PLIP_TYPES = [label for _, label in _PLIP_INTERACTION_TAGS.values()]
-
-
-def _parse_plip_xml(xml_path: str) -> dict:
-    """Parse a PLIP report.xml and return interactions per type.
-
-    Returns dict: {type_label: set of (resnr: int, restype: str)} where each
-    tuple identifies a unique protein residue involved in that interaction type.
-    An interaction is kept if the same (resnr, restype) pair appears in both
-    GT and generated, signalling conservation of that contact.
-    """
-    import xml.etree.ElementTree as ET
-    try:
-        tree = ET.parse(xml_path)
-    except Exception:
-        return {label: set() for _, label in _PLIP_INTERACTION_TAGS.values()}
-
-    root = tree.getroot()
-    result = {label: set() for _, label in _PLIP_INTERACTION_TAGS.values()}
-
-    for bs in root.iter("bindingsite"):
-        interactions_node = bs.find("interactions")
-        if interactions_node is None:
-            continue
-        for container_tag, (child_tag, label) in _PLIP_INTERACTION_TAGS.items():
-            container = interactions_node.find(container_tag)
-            if container is None:
-                continue
-            for interaction in container.findall(child_tag):
-                resnr_el  = interaction.find("resnr")
-                restype_el = interaction.find("restype")
-                if resnr_el is None or restype_el is None:
-                    continue
-                try:
-                    resnr = int(resnr_el.text)
-                except (ValueError, TypeError):
-                    continue
-                result[label].add((resnr, restype_el.text.strip()))
-
-    return result
-
-
-def _run_plip(pdb_path: str, sif_path: str) -> dict:
-    """Run PLIP via Singularity on a complex PDB and return parsed interactions.
-
-    Returns dict: {type_label: set of (resnr, restype)} — empty sets on failure.
-    """
-    empty = {label: set() for _, label in _PLIP_INTERACTION_TAGS.values()}
-    try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            import shutil as _shutil
-            local_pdb = os.path.join(tmpdir, "input.pdb")
-            _shutil.copy2(str(pdb_path), local_pdb)
-            result = subprocess.run(
-                [sif_path, "-f", local_pdb, "-o", tmpdir, "-x"],
-                capture_output=True, text=True, timeout=120,
-            )
-            if result.returncode != 0:
-                print(f"  [PLIP] returncode={result.returncode}\nSTDOUT:{result.stdout[-400:]}\nSTDERR:{result.stderr[-800:]}")
-                return empty
-            xml_files = list(Path(tmpdir).glob("*.xml"))
-            if not xml_files:
-                print(f"  [PLIP] no XML output for {pdb_path}")
-                return empty
-            return _parse_plip_xml(str(xml_files[0]))
-    except Exception as e:
-        print(f"  [PLIP] exception: {e}")
-        return empty
-
-
-def _compare_interactions(gt: dict, gen: dict) -> dict:
-    """Count conserved interactions per type.
-
-    Returns dict: {type_label: {"gt": n, "gen": n, "conserved": n, "rate": float}}
-    """
-    out = {}
-    for label in PLIP_TYPES:
-        gt_set  = gt.get(label, set())
-        gen_set = gen.get(label, set())
-        conserved = len(gt_set & gen_set)
-        out[label] = {
-            "gt":        len(gt_set),
-            "gen":       len(gen_set),
-            "conserved": conserved,
-            "rate":      conserved / len(gt_set) if gt_set else float("nan"),
-        }
-    return out
-
-
-# ============================================================
-# Pocket eval — helpers (Kabsch + PDB parsing)
-# ============================================================
-
-def kabsch(P: np.ndarray, Q: np.ndarray):
-    cp, cq = P.mean(0), Q.mean(0)
-    H = (P - cp).T @ (Q - cq)
-    U, _, Vt = np.linalg.svd(H)
-    d = np.linalg.det(Vt.T @ U.T)
-    R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
-    t = cq - R @ cp
-    return R, t
-
-
-def apply_transform(coords: np.ndarray, R: np.ndarray, t: np.ndarray) -> np.ndarray:
-    return (R @ coords.T).T + t
-
-
-def pos_rmsd(A: np.ndarray, B: np.ndarray) -> float:
-    return float(np.sqrt(np.mean(np.sum((A - B) ** 2, axis=-1))))
-
-
-def parse_pdb_atoms(pdb_path: str):
-    prot, lig, lig_elements = [], [], []
-    lig_serial_to_local: dict[int, int] = {}
-    raw_conects: list[tuple[int, int]] = []
-    with open(pdb_path) as fh:
-        for line in fh:
-            rec = line[:6].rstrip()
-            if rec == "ATOM":
-                try:
-                    x, y, z = float(line[30:38]), float(line[38:46]), float(line[46:54])
-                    elem = (line[76:78].strip() if len(line) > 76 else "").capitalize()
-                    if not elem:
-                        elem = line[12:16].strip().lstrip("0123456789").capitalize()
-                    if elem in ("H", "D"):
-                        continue
-                    prot.append((x, y, z))
-                except ValueError:
-                    pass
-            elif rec == "HETATM":
-                try:
-                    serial = int(line[6:11])
-                    x, y, z = float(line[30:38]), float(line[38:46]), float(line[46:54])
-                    element = line[76:78].strip() if len(line) > 76 else ""
-                    if not element:
-                        element = line[12:16].strip().lstrip("0123456789") or "C"
-                    element = element.capitalize()
-                    if element == "H":
-                        continue
-                    lig_serial_to_local[serial] = len(lig)
-                    lig.append((x, y, z))
-                    lig_elements.append(element)
-                except ValueError:
-                    pass
-            elif rec == "CONECT":
-                try:
-                    nums = [int(line[6 + 5 * i : 11 + 5 * i]) for i in range(4)
-                            if line[6 + 5 * i : 11 + 5 * i].strip()]
-                    src = nums[0]
-                    for dst in nums[1:]:
-                        raw_conects.append((src, dst))
-                except ValueError:
-                    pass
-    prot_arr = np.array(prot, dtype=np.float64) if prot else np.zeros((0, 3))
-    lig_arr  = np.array(lig,  dtype=np.float64) if lig  else np.zeros((0, 3))
-    conect_set: set[tuple[int, int]] = set()
-    for s1, s2 in raw_conects:
-        if s1 in lig_serial_to_local and s2 in lig_serial_to_local:
-            a, b = lig_serial_to_local[s1], lig_serial_to_local[s2]
-            conect_set.add((min(a, b), max(a, b)))
-    return prot_arr, lig_arr, lig_elements, conect_set
-
-
-def ligand_mol_from_pdb(pdb_path: str):
-    _, lig_coords, lig_elements, conect = parse_pdb_atoms(pdb_path)
-    n_lig = len(lig_coords)
-    if n_lig == 0:
-        return None, None
-    lines = []
-    for i, ((x, y, z), elem) in enumerate(zip(lig_coords, lig_elements)):
-        name = f"{elem:<2}"
-        lines.append(
-            f"HETATM{i+1:5d} {name}   LIG A   1    "
-            f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          {elem:>2}  "
-        )
-    for a, b in conect:
-        lines.append(f"CONECT{a+1:5d}{b+1:5d}")
-    lines.append("END")
-    block = "\n".join(lines)
-    mol = Chem.MolFromPDBBlock(block, removeHs=True, sanitize=False)
-    if mol is None:
-        return None, None
-    try:
-        Chem.SanitizeMol(mol)
-    except Exception:
-        pass
-    return mol, lig_coords
-
-
-def _clone_with_coords(mol, coords: np.ndarray):
-    if mol is None or mol.GetNumAtoms() != len(coords):
-        return None
-    rw = Chem.RWMol(Chem.Mol(mol))
-    conf = rw.GetConformer()
-    for i, (x, y, z) in enumerate(coords):
-        conf.SetAtomPosition(i, (float(x), float(y), float(z)))
-    return rw.GetMol()
-
-
-def _get_permutations(mol_template, gt_coords, gen_coords):
-    gt_mol  = _clone_with_coords(mol_template, gt_coords)
-    gen_mol = _clone_with_coords(mol_template, gen_coords)
-    if gt_mol is None or gen_mol is None:
-        return None
-    try:
-        matches = gen_mol.GetSubstructMatches(gt_mol, uniquify=False, maxMatches=10000)
-        return [np.array(m, dtype=np.intp) for m in matches] if matches else None
-    except Exception:
-        return None
-
-
-def pocket_rmsd_sym(mol_template, gt_coords: np.ndarray, gen_aligned_coords: np.ndarray) -> float:
-    perms = _get_permutations(mol_template, gt_coords, gen_aligned_coords)
-    if perms is None:
-        return pos_rmsd(gt_coords, gen_aligned_coords)
-    return min(pos_rmsd(gt_coords, gen_aligned_coords[p]) for p in perms)
-
-
-def _lig_rmsd_and_coords(mol_template, gt_coords: np.ndarray, gen_coords: np.ndarray):
-    perms = _get_permutations(mol_template, gt_coords, gen_coords)
-    if perms is None:
-        perms = [np.arange(len(gt_coords), dtype=np.intp)]
-    best_r = float("inf")
-    best_coords = gen_coords
-    for p in perms:
-        permuted = gen_coords[p]
-        R, t = kabsch(permuted, gt_coords)
-        aligned = apply_transform(permuted, R, t)
-        r = pos_rmsd(gt_coords, aligned)
-        if r < best_r:
-            best_r = r
-            best_coords = aligned
-    return best_r, best_coords
-
-
-def lig_rmsd_sym(mol_template, gt_coords: np.ndarray, gen_coords: np.ndarray) -> float:
-    r, _ = _lig_rmsd_and_coords(mol_template, gt_coords, gen_coords)
-    return r
-
-
-def extract_gt_coords(struct):
-    from proteinzen.boltz.data import const
-    protein_id    = const.chain_type_ids["PROTEIN"]
-    nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
-    prot_list, lig_list = [], []
-    for chain in struct.chains[struct.mask]:
-        mol = int(chain["mol_type"])
-        a0  = int(chain["atom_idx"])
-        atoms = struct.atoms[a0 : a0 + int(chain["atom_num"])]
-        present = atoms["is_present"].astype(bool)
-        heavy = present & (atoms["element"] != 1)
-        if mol == protein_id:
-            prot_list.append(atoms["coords"][heavy])
-        elif mol == nonpolymer_id:
-            lig_list.append(atoms["coords"][heavy])
-    prot = np.concatenate(prot_list, 0) if prot_list else np.zeros((0, 3))
-    lig  = np.concatenate(lig_list,  0) if lig_list  else np.zeros((0, 3))
-    return prot.astype(np.float64), lig.astype(np.float64)
-
-
-def _hetatm_lines(coords: np.ndarray, elements: list) -> list:
-    lines = []
-    for i, ((x, y, z), elem) in enumerate(zip(coords, elements)):
-        name = f" {elem:<3}" if len(elem) == 1 else f"{elem:<4}"
-        lines.append(
-            f"HETATM{i+1:5d} {name} LIG B   1    "
-            f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          {elem:>2}  "
-        )
-    return lines
-
-
-def _gt_pdb_body(gt_struct) -> str:
-    from dataclasses import replace as dc_replace
-    from proteinzen.data.write.pdb import to_pdb
-    empty_bonds = gt_struct.bonds[:0]
-    empty_conns = gt_struct.connections[:0]
-    clean_struct = dc_replace(gt_struct, bonds=empty_bonds, connections=empty_conns)
-    return to_pdb(clean_struct).rsplit("END", 1)[0]
-
-
-def write_pocket_pdb(path: Path, gt_struct, gen_lig_pk: np.ndarray, lig_elements: list):
-    gt_body = _gt_pdb_body(gt_struct)
-    prot_lines = [ln for ln in gt_body.splitlines() if ln.startswith("ATOM")]
-    lines = ["MODEL        1", gt_body.rstrip(), "ENDMDL", "MODEL        2"]
-    lines += prot_lines
-    lines += ["TER"]
-    lines += _hetatm_lines(gen_lig_pk, lig_elements)
-    lines += ["ENDMDL", "END"]
-    path.write_text("\n".join(lines) + "\n")
-
-
-def write_lig_pdb(path: Path, gt_struct, gen_lig_lig: np.ndarray, lig_elements: list):
-    gt_hetatm = [ln for ln in _gt_pdb_body(gt_struct).splitlines() if ln.startswith("HETATM")]
-    lines = ["MODEL        1"] + gt_hetatm + ["ENDMDL", "MODEL        2"]
-    lines += _hetatm_lines(gen_lig_lig, lig_elements)
-    lines += ["ENDMDL", "END"]
-    path.write_text("\n".join(lines) + "\n")
-
-
-def eval_system_pocket(system_id: str, gen_pdb_paths, gt_struct,
-                       gt_interactions: dict | None = None, plip_sif: str | None = None):
-    gt_prot, gt_lig = extract_gt_coords(gt_struct)
-    n_gt_prot = len(gt_prot)
-    n_gt_lig  = len(gt_lig)
-    if n_gt_lig == 0:
-        return []
-    records = []
-    for idx, pdb_path in enumerate(sorted(gen_pdb_paths)):
-        gen_prot, gen_lig, lig_elements, _ = parse_pdb_atoms(str(pdb_path))
-        if len(gen_prot) != n_gt_prot:
-            # Crop boundary mismatch — align on shared prefix
-            n_common = min(len(gen_prot), n_gt_prot)
-            if n_common == 0:
-                records.append(dict(system_id=system_id, sample_idx=idx, pk=np.inf, lig=np.inf,
-                                    note=f"protein atom count mismatch: gen={len(gen_prot)} gt={n_gt_prot}"))
-                continue
-            gen_prot = gen_prot[:n_common]
-            gt_prot_aligned = gt_prot[:n_common]
-        else:
-            gt_prot_aligned = gt_prot
-        if len(gen_lig) != n_gt_lig:
-            records.append(dict(system_id=system_id, sample_idx=idx, pk=np.inf, lig=np.inf,
-                                note=f"ligand atom count mismatch: gen={len(gen_lig)} gt={n_gt_lig}"))
-            continue
-        R, t = kabsch(gen_prot, gt_prot_aligned)
-        gen_lig_pk = apply_transform(gen_lig, R, t)
-        mol_template, _ = ligand_mol_from_pdb(str(pdb_path))
-        pk = pocket_rmsd_sym(mol_template, gt_lig, gen_lig_pk)
-        lig, gen_lig_lig = _lig_rmsd_and_coords(mol_template, gt_lig, gen_lig)
-
-        com_dist = float(np.linalg.norm(gt_lig.mean(0) - gen_lig_pk.mean(0)))
-        record = dict(system_id=system_id, sample_idx=idx, pk=pk, lig=lig,
-                      com_dist=com_dist,
-                      gen_lig_pk=gen_lig_pk, gen_lig_lig=gen_lig_lig,
-                      lig_elements=lig_elements, note="")
-
-        # PLIP interaction conservation
-        if plip_sif and gt_interactions is not None:
-            gen_interactions = _run_plip(str(pdb_path), plip_sif)
-            conservation = _compare_interactions(gt_interactions, gen_interactions)
-            for itype, counts in conservation.items():
-                record[f"plip_{itype}_gt"]        = counts["gt"]
-                record[f"plip_{itype}_gen"]        = counts["gen"]
-                record[f"plip_{itype}_conserved"]  = counts["conserved"]
-                record[f"plip_{itype}_rate"]       = counts["rate"]
-
-        records.append(record)
-    return records
-
-
-def _eval_system_pocket_job(system_id, gen_pdb_paths, npz_path, include_h,
-                            max_protein_residues, plip_sif=None):
-    from proteinzen.runtime.sampling.protein_pocket import _crop_protein_to_pocket, load_structure_from_npz
-    from proteinzen.data.write.pdb import to_pdb
-    from dataclasses import replace as dc_replace
-    RDLogger.DisableLog("rdApp.*")
-    try:
-        gt_struct = load_structure_from_npz(npz_path, include_h=include_h)
-    except Exception as e:
-        return system_id, [], f"npz load error: {e}"
-    gt_struct = _crop_protein_to_pocket(gt_struct, max_protein_residues)
-
-    # Run PLIP on GT complex to get reference interactions
-    gt_interactions = None
-    if plip_sif:
-        try:
-            clean = dc_replace(gt_struct, bonds=gt_struct.bonds[:0],
-                               connections=gt_struct.connections[:0])
-            gt_pdb_str = to_pdb(clean)
-            with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False, mode="w") as tf:
-                tf.write(gt_pdb_str)
-                gt_pdb_path = tf.name
-            gt_interactions = _run_plip(gt_pdb_path, plip_sif)
-            Path(gt_pdb_path).unlink(missing_ok=True)
-        except Exception:
-            gt_interactions = None
-
-    records = eval_system_pocket(system_id, gen_pdb_paths, gt_struct,
-                                 gt_interactions=gt_interactions, plip_sif=plip_sif)
-    return system_id, records, None
-
-
-def _mean_finite(vals):
-    arr = np.array([v for v in vals if np.isfinite(v)], dtype=float)
-    return float(arr.mean()) if len(arr) else float("nan")
-
-
-def _cov(vals, delta):
-    arr = np.array([v for v in vals if np.isfinite(v)], dtype=float)
-    return float((arr < delta).mean()) if len(arr) else float("nan")
-
-
-def _min_per_system(records_by_system, key):
-    mins = []
-    for recs in records_by_system.values():
-        vals = [r[key] for r in recs if key in r and np.isfinite(r[key])]
-        if vals:
-            mins.append(min(vals))
-    return mins
-
-
-def _mean_per_system(records_by_system, key):
-    means = []
-    for recs in records_by_system.values():
-        vals = [r[key] for r in recs if key in r and np.isfinite(r[key])]
-        if vals:
-            means.append(float(np.mean(vals)))
-    return means
-
-
-def _print_pocket_block(label, pk_vals, lig_vals, deltas):
-    print(f"\n--- {label} ---")
-    print(f"  n          : {len(pk_vals)}")
-    print(f"  pk  (mean) : {_mean_finite(pk_vals):.3f} Å")
-    for d in deltas:
-        print(f"  COV pk  < {d:.1f}Å : {_cov(pk_vals, d)*100:.1f}%")
-    n_lig = sum(np.isfinite(v) for v in lig_vals)
-    if n_lig:
-        print(f"  lig (mean) : {_mean_finite(lig_vals):.3f} Å  ({n_lig}/{len(lig_vals)} finite)")
-        for d in deltas:
-            print(f"  COV lig < {d:.1f}Å : {_cov(lig_vals, d)*100:.1f}%")
-
-
-# ============================================================
-# Pocket eval — main
-# ============================================================
-
-def run_pocket_eval(args):
-    from proteinzen.runtime.sampling.protein_pocket import _crop_protein_to_pocket, load_structure_from_npz
-
-    out_dir     = args.out_dir
-    data_dir    = args.ref_dir
-    samples_dir = out_dir / "samples"
-    deltas      = args.pocket_deltas
-    n_jobs      = args.n_jobs
-    max_prot    = args.max_protein_residues
-    include_h   = args.include_h
-    verbose     = args.verbose
-    plip_sif    = str(args.plip_sif)
-    print(f"PLIP: {plip_sif}")
-
-    # ---- manifest ----
-    manifest_path = data_dir / "manifest.json"
-    if not manifest_path.exists():
-        sys.exit(f"manifest.json not found at {manifest_path}")
-    with open(manifest_path) as fh:
-        manifest = json.load(fh)
-    system_ids_in_manifest = {rec["id"] for rec in manifest}
-    print(f"Manifest: {len(system_ids_in_manifest)} systems")
-
-    # ---- collect generated PDB files ----
-    pdb_files = sorted(samples_dir.glob("*.pdb"))
-    print(f"Generated PDBs: {len(pdb_files)}")
-
-    import re as _re
-    _GPU_SUFFIX = _re.compile(r'_gpu\d+_batch\d+_idx\d+$')
-
-    groups: dict[str, list[Path]] = defaultdict(list)
-    unmatched = []
-    for p in pdb_files:
-        stem = p.stem
-        # Handle both legacy "{sid}_{N}" and current "{sid}_gpu{G}_batch{B}_idx{N}"
-        m = _GPU_SUFFIX.search(stem)
-        if m:
-            groups[stem[:m.start()]].append(p)
-        else:
-            parts = stem.rsplit("_", 1)
-            if len(parts) == 2 and parts[1].isdigit():
-                groups[parts[0]].append(p)
-            else:
-                unmatched.append(p.name)
-    if unmatched:
-        print(f"  Warning: {len(unmatched)} PDB(s) had unrecognised names — skipped")
-
-    common = sorted(set(groups) & system_ids_in_manifest)
-    print(f"  Systems with generated samples : {len(groups)}")
-    print(f"  Systems evaluated              : {len(common)}")
-    extra   = set(groups) - system_ids_in_manifest
-    missing = system_ids_in_manifest - set(groups)
-    if extra:
-        print(f"  Warning: {len(extra)} sampled systems not in manifest")
-    if missing:
-        print(f"  Note: {len(missing)} manifest systems have no samples")
-
-    # ---- build job list ----
-    jobs = []
-    npz_by_sid: dict[str, str] = {}
-    for sid in common:
-        mid = sid[1:3]
-        npz_path = data_dir / "structures" / mid / f"{sid}.npz"
-        if not npz_path.exists():
-            print(f"  SKIP {sid}: npz not found")
-            continue
-        npz_by_sid[sid] = str(npz_path)
-        jobs.append((sid, groups[sid], str(npz_path)))
-    print(f"  Running {len(jobs)} systems with {n_jobs} workers...")
-
-    # ---- parallel evaluation ----
-    results = Parallel(n_jobs=n_jobs, backend="loky")(
-        delayed(_eval_system_pocket_job)(sid, pdbs, npz, include_h, max_prot, plip_sif)
-        for sid, pdbs, npz in tqdm(jobs, desc="evaluating")
-    )
-
-    # ---- collect results ----
-    all_records: list[dict] = []
-    records_by_system: dict[str, list[dict]] = {}
-    n_atom_mismatch = 0
-    for sid, sys_records, err in results:
-        if err:
-            print(f"  SKIP {sid}: {err}")
-            continue
-        if not sys_records:
-            if verbose:
-                print(f"  SKIP {sid}: no valid samples")
-            continue
-        mismatch_count = sum(1 for r in sys_records if r["note"])
-        n_atom_mismatch += mismatch_count
-        if verbose:
-            for r in sys_records:
-                if r["note"]:
-                    print(f"  [{sid}] sample {r['sample_idx']}: {r['note']}")
-            pks = [r["pk"] for r in sys_records if np.isfinite(r["pk"])]
-            if pks:
-                print(f"  {sid}: {len(pks)} samples, pk min={min(pks):.2f} mean={np.mean(pks):.2f}")
-        records_by_system[sid] = sys_records
-        all_records.extend(sys_records)
-
-    if n_atom_mismatch:
-        print(f"\nWarning: {n_atom_mismatch} samples had atom-count mismatches (skipped)")
-    if not records_by_system:
-        print("No systems evaluated — check paths.")
-        return
-
-    # ---- aggregate ----
-    all_pk   = [r["pk"]       for r in all_records]
-    all_lig  = [r["lig"]      for r in all_records]
-    all_com  = [r["com_dist"] for r in all_records if "com_dist" in r and np.isfinite(r["com_dist"])]
-    sys_min_pk   = _min_per_system(records_by_system, "pk")
-    sys_min_lig  = _min_per_system(records_by_system, "lig")
-    sys_min_com  = _min_per_system(records_by_system, "com_dist")
-    sys_mean_pk  = _mean_per_system(records_by_system, "pk")
-    sys_mean_lig = _mean_per_system(records_by_system, "lig")
-    sys_mean_com = _mean_per_system(records_by_system, "com_dist")
-
-    print(f"\n{'='*60}")
-    print(f"  PLINDER POCKET EVAL  —  {len(records_by_system)} systems")
-    print(f"{'='*60}")
-    _print_pocket_block("Per-sample (pooled)", all_pk, all_lig, deltas)
-    _print_pocket_block("Per-system best sample (min pk)", sys_min_pk, sys_min_lig, deltas)
-    _print_pocket_block("Per-system mean", sys_mean_pk, sys_mean_lig, deltas)
-
-    print(f"\n--- CoM Distance (Å, pocket-aligned) ---")
-    for label, vals in [("Per-sample (pooled)", all_com),
-                        ("Per-system best (min)", sys_min_com),
-                        ("Per-system mean",       sys_mean_com)]:
-        finite = [v for v in vals if np.isfinite(v)]
-        if finite:
-            print(f"  {label}: mean={np.mean(finite):.3f}  median={np.median(finite):.3f}  "
-                  f"<2Å={np.mean(np.array(finite)<2)*100:.1f}%  <5Å={np.mean(np.array(finite)<5)*100:.1f}%")
-
-    print("\n--- Per-system summary (sorted by min pk) ---")
-    print(f"  {'system_id':<42} {'n':>4} {'min_pk':>7} {'mean_pk':>8} {'min_lig':>8}")
-    rows = []
-    for sid, recs in records_by_system.items():
-        pks  = [r["pk"]  for r in recs if np.isfinite(r["pk"])]
-        ligs = [r["lig"] for r in recs if np.isfinite(r["lig"])]
-        rows.append((sid, len(recs),
-                     min(pks) if pks else np.inf,
-                     float(np.mean(pks)) if pks else np.inf,
-                     min(ligs) if ligs else np.inf))
-    rows.sort(key=lambda x: x[2])
-    def _fmt(v):
-        return f"{v:.3f}" if np.isfinite(v) else "  inf"
-    for sid, n, mn_pk, avg_pk, mn_lig in rows:
-        print(f"  {sid:<42} {n:>4} {_fmt(mn_pk):>7} {_fmt(avg_pk):>8} {_fmt(mn_lig):>8}")
-
-    # ---- PLIP conservation summary ----
-    if all_records:
-        print(f"\n--- PLIP Interaction Conservation ---")
-        print(f"  {'type':<14} {'gt_mean':>8} {'gen_mean':>9} {'conserved':>10} {'rate':>7}")
-        for itype in PLIP_TYPES:
-            gt_counts  = [r[f"plip_{itype}_gt"]        for r in all_records if f"plip_{itype}_gt" in r]
-            gen_counts = [r[f"plip_{itype}_gen"]        for r in all_records if f"plip_{itype}_gen" in r]
-            con_counts = [r[f"plip_{itype}_conserved"]  for r in all_records if f"plip_{itype}_conserved" in r]
-            rates      = [r[f"plip_{itype}_rate"]       for r in all_records
-                          if f"plip_{itype}_rate" in r and np.isfinite(r[f"plip_{itype}_rate"])]
-            if not gt_counts:
-                continue
-            print(
-                f"  {itype:<14} "
-                f"{_mean_finite(gt_counts):>8.2f} "
-                f"{_mean_finite(gen_counts):>9.2f} "
-                f"{_mean_finite(con_counts):>10.2f} "
-                f"{_mean_finite(rates):>7.3f}"
-            )
-
-    # ---- PDB output ----
-    pk_dir  = out_dir / "aligned_pocket"
-    lig_dir = out_dir / "aligned_lig"
-    pk_dir.mkdir(exist_ok=True)
-    lig_dir.mkdir(exist_ok=True)
-    n_written = 0
-    for sid, recs in records_by_system.items():
-        valid = [r for r in recs if not r["note"]]
-        if not valid:
-            continue
-        npz_path = npz_by_sid.get(sid)
-        if npz_path is None:
-            continue
-        try:
-            gt_struct = load_structure_from_npz(npz_path, include_h=include_h)
-            gt_struct = _crop_protein_to_pocket(gt_struct, max_prot)
-        except Exception:
-            continue
-        best_pk_rec = min(valid, key=lambda r: r["pk"])
-        if np.isfinite(best_pk_rec["pk"]):
-            write_pocket_pdb(
-                pk_dir / f"{sid}_pk{best_pk_rec['pk']:.2f}.pdb",
-                gt_struct, best_pk_rec["gen_lig_pk"], best_pk_rec["lig_elements"],
-            )
-        best_lig_rec = min(valid, key=lambda r: r["lig"])
-        if np.isfinite(best_lig_rec["lig"]):
-            write_lig_pdb(
-                lig_dir / f"{sid}_lig{best_lig_rec['lig']:.2f}.pdb",
-                gt_struct, best_lig_rec["gen_lig_lig"], best_lig_rec["lig_elements"],
-            )
-        n_written += 1
-    print(f"\nWrote PDB pairs for {n_written} systems → {out_dir}")
-
-
-# ============================================================
-# Main
-# ============================================================
-
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
         "--out-dir", type=Path, required=True,
-        help="sample.py output directory (contains tasks_config.yaml + samples/)",
+        help="sample.py output directory (contains samples/)",
     )
     parser.add_argument(
-        "--ref-dir", type=Path, default=None,
-        help=(
-            "Reference data directory. "
-            "For conformer eval: directory of reference *.pdb files. "
-            "For pocket eval: Plinder split directory with manifest.json + structures/."
-        ),
+        "--ref-dir", type=Path, required=True,
+        help="Directory of reference *.pdb conformer files",
     )
-    parser.add_argument(
-        "--task", choices=["conformer", "pocket"], default=None,
-        help="Override auto-detection of task type.",
-    )
-    # Conformer-specific
     parser.add_argument(
         "--delta", type=float, default=0.75,
         help="RMSD threshold for conformer coverage (Å; default: 0.75)",
@@ -1724,33 +1017,8 @@ def main():
     )
     parser.add_argument(
         "--geom-datadir", type=Path, default=None,
-        help=(
-            "GEOM dataset directory (data/geom_drugs_conformers) for Boltzmann-weight "
-            "energy evaluation. Requires --compute-energy."
-        ),
+        help="GEOM dataset directory for Boltzmann-weight energy evaluation. Requires --compute-energy.",
     )
-    # Pocket-specific
-    parser.add_argument(
-        "--max-protein-residues", type=int, default=100,
-        help="Protein crop radius used during sampling (default: 100)",
-    )
-    parser.add_argument(
-        "--include-h", action="store_true",
-        help="Keep hydrogen atoms (match the --include-h flag used at sample time)",
-    )
-    parser.add_argument(
-        "--pocket-deltas", type=float, nargs="+", default=[2.0, 5.0],
-        help="RMSD thresholds for pocket coverage reporting (Å; default: 2.0 5.0)",
-    )
-    parser.add_argument(
-        "--verbose", action="store_true",
-        help="Print per-system details during pocket evaluation",
-    )
-    parser.add_argument(
-        "--plip-sif", type=Path, default=Path("plip.sif"),
-        help="Path to PLIP Singularity image (default: ./plip.sif).",
-    )
-    # Common
     parser.add_argument(
         "--n-jobs", type=int, default=max(1, mp.cpu_count() // 2),
         help="Parallel workers (default: half of CPU count)",
@@ -1760,18 +1028,7 @@ def main():
     if not args.out_dir.exists():
         sys.exit(f"--out-dir not found: {args.out_dir}")
 
-    task_type = args.task or detect_task_type(args.out_dir)
-    print(f"Task type: {task_type}")
-
-    if args.ref_dir is None:
-        sys.exit("--ref-dir is required")
-
-    if task_type == "conformer":
-        run_conformer_eval(args)
-    elif task_type == "pocket":
-        run_pocket_eval(args)
-    else:
-        sys.exit(f"Unknown task type: {task_type}")
+    run_conformer_eval(args)
 
 
 if __name__ == "__main__":
