@@ -807,7 +807,16 @@ class BiomoleculeDataModule(L.LightningDataModule):
     def val_dataloader(self):
         if self.val_dataset is None:
             return []
-        return self.build_dataloader(self.val_dataset, collate, shuffle=True)
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            self.val_dataset, shuffle=True
+        )
+        return DataLoader(
+            self.val_dataset,
+            sampler=sampler,
+            batch_size=self.batch_size,
+            collate_fn=collate,
+            num_workers=self.num_workers,
+        )
 
 
 class BiomoleculeSamplingDataModule(L.LightningDataModule):
