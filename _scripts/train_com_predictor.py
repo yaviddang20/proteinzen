@@ -228,7 +228,7 @@ def main():
     ap.add_argument('--lr',                  type=float, default=1e-3)
     ap.add_argument('--batch-size',          type=int,   default=4)
     ap.add_argument('--num-workers',         type=int,   default=4)
-    ap.add_argument('--max-epochs',          type=int,   default=50)
+    ap.add_argument('--max-epochs',          type=int,   default=-1)
     ap.add_argument('--cosine-annealing-T-max', type=int, default=0,
                     help='CosineAnnealingLR T_max in epochs; 0 = disabled (constant lr)')
     ap.add_argument('--seed',                type=int,   default=42)
