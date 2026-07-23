@@ -1935,6 +1935,7 @@ class SequenceFrameTransformerUpdate(nn.Module):
         to_queries,
         to_keys,
         to_pairs,
+        rigid_cross_type_mask=None,
     ):
         rigids_embed_flat = self.node_to_frame_broadcast(
             s,
