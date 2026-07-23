@@ -571,13 +571,13 @@ class ConditionedPairUpdate(nn.Module):
         z = z + self.transition(z, cond)
         return z
 
-    def forward(self, node_embed, edge_embed, rigids, edge_mask):
+    def forward(self, node_embed, edge_embed, rigids, edge_mask, cross_type_mask=None):
         global cuet_supported
         global compile_supported
 
         # get pair bias from rbf of distance
         coords = rigids.get_trans()
-        if compile_supported and not self.include_rel_quat:
+        if compile_supported and not self.include_rel_quat and cross_type_mask is None:
             edge_bias = self._gen_edge_bias_no_rel_quat(
                 edge_embed,
                 coords
@@ -587,23 +587,20 @@ class ConditionedPairUpdate(nn.Module):
             if self.include_rel_quat:
                 rots = rigids.get_rots()
                 rel_quats = rots[..., None].invert().compose_q(rots[..., None, :])
-                # [B, I, J, H]
                 dist_bias = self.emb_rbf(
                     torch.cat([
                         rbf(distances, D_min=self.D_min, D_max=self.D_max, D_count=self.num_rbf, device=distances.device),
                         rel_quats.get_quats()
                     ], dim=-1)
                 )
-
             else:
-                # [B, I, J, H]
                 dist_bias = self.emb_rbf(
                     rbf(distances, D_min=self.D_min, D_max=self.D_max, D_count=self.num_rbf, device=distances.device)
                 )
-
+            if cross_type_mask is not None:
+                dist_bias = dist_bias.masked_fill(cross_type_mask[..., None], 0.0)
             third_edge = self._gen_third_edge(edge_embed)
-            edge_bias = dist_bias + third_edge
-            edge_bias = edge_bias.unsqueeze(-4)
+            edge_bias = (dist_bias + third_edge).unsqueeze(-4)
 
         # [B, I, 1, 1, J, H]
         # mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
@@ -749,6 +746,7 @@ class MultiRigidPairEmbedder(nn.Module):
                 token_bonds,
                 sc_rigids=None,
                 sf_rigids=None,
+                cross_type_mask=None,
     ):
         edge_mask = node_mask[..., None] & node_mask[..., None, :]
         same_chain_mask = (asym_id[..., None] == asym_id[..., None, :])
@@ -785,6 +783,12 @@ class MultiRigidPairEmbedder(nn.Module):
             a_sf = self._featurize_rigids(sf_rigids, distogram=True)
         else:
             a_sf = torch.zeros_like(a_current)
+
+        if cross_type_mask is not None:
+            # zero out relative quat / unit vec / distance features for protein↔ligand pairs
+            a_current = a_current.masked_fill(cross_type_mask[..., None], 0.0)
+            a_sc      = a_sc.masked_fill(cross_type_mask[..., None], 0.0)
+            a_sf      = a_sf.masked_fill(cross_type_mask[..., None], 0.0)
 
         if self.use_self_folding:
             z += self.lin_a_ij(torch.cat([a_current, a_sc, a_sf], dim=-1))

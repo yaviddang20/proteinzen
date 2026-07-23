@@ -584,6 +584,7 @@ class Embedder(nn.Module):
             sc_rigids=None,
             sf_rigids=None,
             rigids_lap_pe=None,
+            cross_type_mask=None,
         ):
 
         # build the indexing matrices
@@ -632,6 +633,7 @@ class Embedder(nn.Module):
             token_bonds,
             sc_rigids=node_data['node_sc_rigids'],
             sf_rigids=node_data['node_sf_rigids'],
+            cross_type_mask=cross_type_mask,
         )
 
         rigids_init = self._gen_rigid_features(
@@ -1030,12 +1032,13 @@ class IpaDenoiser(nn.Module):
         node_embed = node_embed * node_mask[..., None]
         rigids_to_nodes = fn.partial(gather_helper, token_gather_idx=input_feats['token_gather_idx'])
 
+        cross_type_mask = input_feats.get('cross_type_mask')  # (B, N_tok, N_tok) bool, True=protein↔ligand
+        cross_mask_bias = cross_type_mask.float() * -1e5 if cross_type_mask is not None else None
+
         if self.accumulate_rot_vf_output:
             pred_rot_vf = 0
         else:
             pred_rot_vf = None
-
-        cross_mask_bias = input_feats.get('ipa_cross_mask_bias')
 
         # Main trunk
         for b in range(self.num_blocks):
@@ -1078,6 +1081,7 @@ class IpaDenoiser(nn.Module):
                 to_queries,
                 to_keys,
                 to_pairs,
+                rigid_cross_type_mask=rigids_noising_mask_flat if cross_type_mask is not None else None,
             )
             if not self.rigid_transformer_rigid_updates:
                 rigid_update = self.trunk[f'rigids_update_{b}'](
@@ -1096,7 +1100,8 @@ class IpaDenoiser(nn.Module):
                 curr_rigids_tensor_7 = curr_rigids.to_tensor_7()
                 token_rigids = ru.Rigid.from_tensor_7(rigids_to_nodes(curr_rigids_tensor_7))
                 edge_embed = self.trunk[f'edge_transition_{b}'](
-                    node_embed, edge_embed, token_rigids, edge_mask)
+                    node_embed, edge_embed, token_rigids, edge_mask,
+                    cross_type_mask=cross_type_mask)
                 edge_embed *= edge_mask[..., None]
 
         if self.detach_grad_pre_seq_pred:
@@ -1604,6 +1609,8 @@ class IpaMultiRigidDenoiser(nn.Module):
             sf_rigids = None
 
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_amp):
+            cross_type_mask = data.get('cross_type_mask')
+
             input_feats = self.embedder(
                 token_mask=token_data['token_mask'],
                 token_seq_idx=(
@@ -1634,14 +1641,15 @@ class IpaMultiRigidDenoiser(nn.Module):
                 sc_rigids=sc_rigids,
                 sf_rigids=sf_rigids,
                 rigids_lap_pe=rigids_data.get('rigids_lap_pe'),
+                cross_type_mask=cross_type_mask,
             )
 
             input_feats['condition_embed'] = input_feats['time_condition_embed']
             input_feats['token_mask'] = token_data['token_mask']
             input_feats['token_gather_idx'] = token_data['token_to_rep_rigid']
             input_feats['t'] = data['t']
-            if 'ipa_cross_mask_bias' in data:
-                input_feats['ipa_cross_mask_bias'] = data['ipa_cross_mask_bias']
+            if cross_type_mask is not None:
+                input_feats['cross_type_mask'] = cross_type_mask
 
             if self.pairformer is not None:
                 token_embed, edge_embed = self.pairformer(

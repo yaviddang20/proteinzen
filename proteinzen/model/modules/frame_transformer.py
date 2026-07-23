@@ -1068,7 +1068,8 @@ class ConditionedBlockInvariantPointAttention(nn.Module):
         s_mask: torch.Tensor,
         to_queries: Callable,
         to_keys: Callable,
-        pts_cdist=True
+        pts_cdist=True,
+        rigid_noising_mask=None,
     ) -> torch.Tensor:
         """
         Args:
@@ -1224,6 +1225,12 @@ class ConditionedBlockInvariantPointAttention(nn.Module):
         # [*, N_block, block_Q, block_K, H]
         a = a + pt_att
         a = a + attn_mask[..., None]
+        if rigid_noising_mask is not None:
+            # block protein↔ligand rigid-level IPA; rigid_noising_mask: (B, N_rigid) True=ligand
+            q_is_lig = to_queries(rigid_noising_mask[..., None].float())     # (B, N_block, block_Q, 1)
+            k_is_lig = to_keys(rigid_noising_mask[..., None].float())        # (B, N_block, block_K, 1)
+            cross = (q_is_lig > 0.5) ^ (k_is_lig.transpose(-2, -1) > 0.5)  # (B, N_block, block_Q, block_K)
+            a = a + cross.float()[..., None] * -1e5
         # [*, N_block, block_Q, H, block_K]
         a = a.transpose(-1, -2)
         a = self.softmax(a)
@@ -2075,6 +2082,7 @@ class ConditionedSequenceFrameTransformerBlock(nn.Module):
         to_keys,
         rigids_mask,
         rigids_to_res_idx,
+        rigid_noising_mask=None,
     ):
         if self.use_conditioned_ipa:
             rigids_embed_update = self.block_ipa(
@@ -2086,6 +2094,7 @@ class ConditionedSequenceFrameTransformerBlock(nn.Module):
                 s_mask=rigids_mask,
                 to_queries=to_queries,
                 to_keys=to_keys,
+                rigid_noising_mask=rigid_noising_mask,
             )
         else:
             rigids_embed_update = self.block_ipa(
@@ -2217,6 +2226,7 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
         to_queries,
         to_keys,
         to_pairs,
+        rigid_cross_type_mask=None,
     ):
         rigids_embed_flat = self.node_to_frame_broadcast(
             s,
@@ -2246,6 +2256,7 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
                 to_keys,
                 rigids_mask,
                 rigids_to_res_idx,
+                rigid_noising_mask=rigid_cross_type_mask,
             )
             if self.add_vanilla_transformer:
                 rigids_embed_flat = self.trunk[f'vanilla_tfmr_{b}'](

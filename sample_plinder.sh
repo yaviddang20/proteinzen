@@ -4,7 +4,7 @@ eval "$(micromamba shell hook --shell bash)"
 micromamba activate $ENV_NAME
 
 model_name=binder_zen_plinder_pocket_cond_no_prealign
-version_num=918508
+version_num=1001941
 
 trans_std_protein_cond=3.0
 trans_std_ligand_cond=16.0
@@ -21,7 +21,7 @@ for split in train test; do
         python ${REPO_ROOT}/_scripts/make_plinder_pocket_yaml.py \
             --data-dir ${REPO_ROOT}/plinder_pocket_processed/${split} \
             --out-yaml ${yaml_dir} \
-            --num-samples 10 \
+            --num-samples 20 \
             --trans-std ${TRANS_STD[$direction]} \
             --include-h
 

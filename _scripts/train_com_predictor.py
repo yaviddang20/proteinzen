@@ -119,9 +119,9 @@ class CoMPredictorLit(pl.LightningModule):
             batch['rigids']['rigids_noising_mask'][..., None].float(), token_to_rep
         ).squeeze(-1).bool()  # (B, N_tok)
 
-        # Block protein<->ligand rigid attention: -1e5 for cross-type pairs, 0 otherwise
-        same_type = token_noising_mask.unsqueeze(-1) == token_noising_mask.unsqueeze(-2)
-        batch['ipa_cross_mask_bias'] = (~same_type).float() * -1e5
+        # mask protein↔ligand geometric information throughout the backbone
+        cross_type_mask = token_noising_mask.unsqueeze(-1) ^ token_noising_mask.unsqueeze(-2)
+        batch['cross_type_mask'] = cross_type_mask
 
         with torch.no_grad():
             out = self.backbone(batch)
