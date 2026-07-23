@@ -26,6 +26,8 @@ from pathlib import Path
 
 import lightning as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.strategies import DDPStrategy
+from lightning.fabric.plugins.environments import LightningEnvironment
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -271,11 +273,15 @@ def main():
         filename='epoch={epoch:03d}-val_rmse={val/rmse:.3f}',
         auto_insert_metric_name=False,
     )
+    devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else 1
     trainer = pl.Trainer(
         default_root_dir=args.out_dir,
         max_epochs=args.max_epochs,
         callbacks=[ckpt_cb],
         log_every_n_steps=10,
+        devices=devices,
+        strategy=DDPStrategy(cluster_environment=LightningEnvironment(), find_unused_parameters=True),
+        use_distributed_sampler=False,
     )
     trainer.fit(model, datamodule=datamodule, ckpt_path=args.resume_ckpt)
 

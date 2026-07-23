@@ -5,6 +5,6 @@ micromamba activate $ENV_NAME
 
 python _scripts/train_com_predictor.py \
     --model-dir outputs/plinder_protein_cond/train \
-    --dataset-config configs/train/data/plinder_protein_cond.yaml \
-    --val-dataset-config configs/train/data/plinder_val.yaml \
+    --dataset-config configs/train/data/com_pocket.yaml \
+    --val-dataset-config configs/train/data/com_pocket_val.yaml \
     --out-dir outputs/com_predictor
