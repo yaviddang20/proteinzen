@@ -199,8 +199,9 @@ def is_valid_ligand(mol: Chem.Mol) -> bool:
     if n_heavy < 5 or n_carbon < 2:
         return False
 
-    # Unspecified atoms (wildcard / unknown element)
-    if any(a.GetAtomicNum() == 0 for a in mol.GetAtoms()):
+    # Only allow drug-like organic elements; excludes metals and wildcard atoms
+    _ORGANIC_ATOMS = {1, 5, 6, 7, 8, 9, 14, 15, 16, 17, 34, 35, 53}  # H,B,C,N,O,F,Si,P,S,Cl,Se,Br,I
+    if any(a.GetAtomicNum() not in _ORGANIC_ATOMS for a in mol.GetAtoms()):
         return False
 
     # Highly charged
