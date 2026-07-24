@@ -357,7 +357,8 @@ def write_lig_pdb(path: Path, gt_struct, gen_lig_lig: np.ndarray, lig_elements: 
 
 
 def eval_system_pocket(system_id: str, gen_pdb_paths, gt_struct,
-                       gt_interactions: dict | None = None, plip_sif: str | None = None):
+                       gt_interactions: dict | None = None, plip_sif: str | None = None,
+                       run_pb: bool = False):
     gt_prot, gt_lig = extract_gt_coords(gt_struct)
     n_gt_prot = len(gt_prot)
     n_gt_lig  = len(gt_lig)
@@ -407,12 +408,16 @@ def eval_system_pocket(system_id: str, gen_pdb_paths, gt_struct,
                 record[f"plip_{itype}_conserved"] = counts["conserved"]
                 record[f"plip_{itype}_rate"]      = counts["rate"]
 
+        if run_pb:
+            pb = run_posebusters(str(pdb_path))
+            record.update(pb)
+
         records.append(record)
     return records
 
 
 def _eval_system_pocket_job(system_id, gen_pdb_paths, npz_path, include_h,
-                            max_protein_residues, plip_sif=None):
+                            max_protein_residues, plip_sif=None, run_pb=False):
     from proteinzen.runtime.sampling.protein_pocket import _crop_protein_to_pocket, load_structure_from_npz
     from proteinzen.data.write.pdb import to_pdb
     from dataclasses import replace as dc_replace
@@ -440,7 +445,8 @@ def _eval_system_pocket_job(system_id, gen_pdb_paths, npz_path, include_h,
             gt_interactions = None
 
     records = eval_system_pocket(system_id, gen_pdb_paths, gt_struct,
-                                 gt_interactions=gt_interactions, plip_sif=plip_sif)
+                                 gt_interactions=gt_interactions, plip_sif=plip_sif,
+                                 run_pb=run_pb)
     return system_id, records, None
 
 
@@ -501,6 +507,9 @@ def run_protein_cond_eval(args):
     include_h   = args.include_h
     verbose     = args.verbose
     plip_sif    = str(args.plip_sif)
+    run_pb      = (not args.no_posebusters) and HAS_POSEBUSTERS
+    if not args.no_posebusters and not HAS_POSEBUSTERS:
+        print("Warning: posebusters not installed — skipping (pip install posebusters to enable).")
     print(f"PLIP: {plip_sif}")
 
     manifest_path = data_dir / "manifest.json"
@@ -553,7 +562,7 @@ def run_protein_cond_eval(args):
     print(f"  Running {len(jobs)} systems with {n_jobs} workers...")
 
     results = Parallel(n_jobs=n_jobs, backend="loky")(
-        delayed(_eval_system_pocket_job)(sid, pdbs, npz, include_h, max_prot, plip_sif)
+        delayed(_eval_system_pocket_job)(sid, pdbs, npz, include_h, max_prot, plip_sif, run_pb)
         for sid, pdbs, npz in tqdm(jobs, desc="evaluating")
     )
 
@@ -862,7 +871,8 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
     input_yaml.write_text(_yaml.dump(boltz_input, default_flow_style=False))
 
     out_dir = refold_output_dir / sample_id
-    cmd = ["boltz", "predict", str(input_yaml), "--out_dir", str(out_dir),
+    cmd = ["micromamba", "run", "-n", "boltz",
+           "boltz", "predict", str(input_yaml), "--out_dir", str(out_dir),
            "--use_msa_server", "--override"]
     if boltz_cache:
         cmd += ["--cache", str(boltz_cache)]
@@ -978,8 +988,9 @@ def run_ligand_cond_eval(args):
     if not smiles_by_sid and global_smiles is None:
         print("Warning: no SMILES source. Refolding inputs will omit ligand.")
 
-    if args.posebusters and not HAS_POSEBUSTERS:
-        print("Warning: --posebusters requested but not installed. Continuing without it.")
+    run_pb = (not args.no_posebusters) and HAS_POSEBUSTERS
+    if not args.no_posebusters and not HAS_POSEBUSTERS:
+        print("Warning: posebusters not installed — skipping (pip install posebusters to enable).")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     refold_input_dir  = args.out_dir / "refold_inputs"
@@ -1002,7 +1013,7 @@ def run_ligand_cond_eval(args):
                 pdb_path=pdb_path, smiles=smiles,
                 refold_input_dir=refold_input_dir, refold_output_dir=refold_output_dir,
                 boltz_cache=getattr(args, "boltz_cache", None),
-                run_pb=args.posebusters and HAS_POSEBUSTERS,
+                run_pb=run_pb,
                 skip_fold=args.no_fold,
                 contact_cutoff=getattr(args, "contact_cutoff", 4.0),
             )
@@ -1149,8 +1160,8 @@ def main():
         help="[ligand_cond] Boltz2 cache directory.",
     )
     parser.add_argument(
-        "--posebusters", action="store_true",
-        help="[ligand_cond] Run PoseBusters (requires: pip install posebusters).",
+        "--no-posebusters", action="store_true",
+        help="Skip PoseBusters (runs by default if posebusters is installed).",
     )
     parser.add_argument(
         "--contact-cutoff", type=float, default=4.0,
