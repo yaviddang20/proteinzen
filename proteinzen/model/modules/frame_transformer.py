@@ -1798,7 +1798,8 @@ class SequenceFrameTransformerBlock(nn.Module):
         to_queries,
         to_keys,
         rigids_mask,
-        rigids_to_res_idx
+        rigids_to_res_idx,
+        rigid_noising_mask=None,
     ):
         rigids_embed_update = self.block_ipa(
             s=rigids_embed,
@@ -1807,6 +1808,7 @@ class SequenceFrameTransformerBlock(nn.Module):
             s_mask=rigids_mask,
             to_queries=to_queries,
             to_keys=to_keys,
+            rigid_noising_mask=rigid_noising_mask,
         )
         rigids_embed = rigids_embed + rigids_embed_update * rigids_mask[..., None]
 
@@ -1964,7 +1966,8 @@ class SequenceFrameTransformerUpdate(nn.Module):
                 to_queries,
                 to_keys,
                 rigids_mask,
-                rigids_to_res_idx
+                rigids_to_res_idx,
+                rigid_noising_mask=rigid_cross_type_mask,
             )
             if self.add_vanilla_transformer:
                 rigids_embed_flat = self.trunk[f'vanilla_tfmr_{b}'](

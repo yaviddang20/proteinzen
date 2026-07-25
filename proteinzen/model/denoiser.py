@@ -678,6 +678,7 @@ class Embedder(nn.Module):
             to_keys
         )
 
+        rigids_noising_mask_padded = rigids_data['rigids_noising_mask']
         rigids_embed, node_embed, framepair_embed, _ = self.frame_tfmr(
             node_init,
             edge_embed,
@@ -690,6 +691,7 @@ class Embedder(nn.Module):
             to_queries,
             to_keys,
             to_pairs,
+            rigid_cross_type_mask=rigids_noising_mask_padded.bool() if cross_type_mask is not None else None,
         )
 
         if self.use_sc_rigid_transformer:
