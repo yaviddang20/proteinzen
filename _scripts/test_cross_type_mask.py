@@ -26,6 +26,7 @@ from hydra_zen import instantiate, load_from_yaml
 sys.path.insert(0, '.')
 from _scripts.train_com_predictor import load_backbone_and_corrupter
 
+from proteinzen.data.featurize.assembler import collate
 from proteinzen.model.utils import gather_helper
 from proteinzen.openfold.utils import rigid_utils as ru
 from proteinzen.stoch_interp.multiframe import MultiSE3Interpolant
@@ -112,8 +113,7 @@ def main():
 
     train_cfg = load_from_yaml(args.dataset_config)
     ds = instantiate(train_cfg)
-    loader = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=False,
-                                         collate_fn=ds.collate_fn if hasattr(ds, 'collate_fn') else None)
+    loader = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=False, collate_fn=collate)
 
     for batch in loader:
         # move to device
