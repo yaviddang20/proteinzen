@@ -811,7 +811,7 @@ def run_posebusters(pdb_path: str, smiles: str | None = None) -> dict:
                 if line.startswith("ATOM") or line.startswith("TER") or line.startswith("END"):
                     out.write(line)
         pb = PoseBusters(config="dock")
-        df = pb.bust(lig_sdf, mol_cond=prot_pdb, full_results=True)
+        df = pb.bust(lig_sdf, mol_cond=prot_pdb, full_report=True)
         results = {}
         for col in df.columns:
             val = df[col].iloc[0]
@@ -863,7 +863,7 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
     refold_input_dir.mkdir(parents=True, exist_ok=True)
     refold_output_dir.mkdir(parents=True, exist_ok=True)
 
-    boltz_input: dict = {"sequences": [{"protein": {"id": "A", "sequence": sequence}}]}
+    boltz_input: dict = {"sequences": [{"protein": {"id": "A", "sequence": sequence, "msa": "empty"}}]}
     if smiles:
         boltz_input["sequences"].append({"ligand": {"id": "B", "smiles": smiles}})
 
@@ -873,7 +873,7 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
     out_dir = refold_output_dir / sample_id
     cmd = ["micromamba", "run", "-n", "boltz",
            "boltz", "predict", str(input_yaml), "--out_dir", str(out_dir),
-           "--use_msa_server", "--override"]
+           "--override"]
     if boltz_cache:
         cmd += ["--cache", str(boltz_cache)]
 
