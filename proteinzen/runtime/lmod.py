@@ -1990,10 +1990,14 @@ class BiomoleculeModule(L.LightningModule):
                 shutil.copy(hydra_cfg_path, os.path.join(log_dir, 'config.yaml'))
             # Log effective batch size
             dm = self.trainer.datamodule
+            batch_size = float(dm.batch_size) if (dm is not None and hasattr(dm, 'batch_size')) else 1.0
+            num_gpus = float(self.trainer.world_size) if self.trainer.world_size is not None else 1.0
+            accum = float(self.trainer.accumulate_grad_batches) if self.trainer.accumulate_grad_batches is not None else 1.0
             if dm is not None and hasattr(dm, 'batch_size'):
-                self.log('batch_size', float(dm.batch_size), rank_zero_only=True)
-            if self.trainer.world_size is not None:
-                self.log('num_gpus', float(self.trainer.world_size), rank_zero_only=True)
+                self.log('batch_size', batch_size, rank_zero_only=True)
+            self.log('num_gpus', num_gpus, rank_zero_only=True)
+            self.log('accum_grad_batches', accum, rank_zero_only=True)
+            self.log('effective_batch_size', batch_size * num_gpus * accum, rank_zero_only=True)
 
         if self.use_cosine_annealing:
             last_epoch = self.cosine_annealing_epoch_offset if self.cosine_annealing_epoch_offset is not None else self.current_epoch
