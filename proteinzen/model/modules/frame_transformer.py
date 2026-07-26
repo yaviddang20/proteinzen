@@ -460,7 +460,8 @@ class BlockInvariantPointAttention(nn.Module):
         s_mask: torch.Tensor,
         to_queries: Callable,
         to_keys: Callable,
-        pts_cdist=True
+        pts_cdist=True,
+        rigid_noising_mask=None,
     ):
         """
         Args:
@@ -589,6 +590,11 @@ class BlockInvariantPointAttention(nn.Module):
         # [*, N_block, block_Q, block_K]
         attn_mask = to_queries(s_mask[..., None].float()) * to_keys(s_mask[..., None].float()).transpose(-1, -2)
         attn_mask = self.inf * (attn_mask - 1)
+        if rigid_noising_mask is not None:
+            q_is_lig = to_queries(rigid_noising_mask[..., None].float())
+            k_is_lig = to_keys(rigid_noising_mask[..., None].float())
+            cross = (q_is_lig > 0.5) ^ (k_is_lig.transpose(-2, -1) > 0.5)
+            attn_mask = attn_mask + cross.float() * -1e5
 
         if True:
             o, o_pt, o_pair = self._compile_bias_and_attn_aggregate(
@@ -911,7 +917,8 @@ class BlockInvariantPointAttention(nn.Module):
         run_compile_path = (not self.ablate_down_z and self.use_qk_norm and self.use_out_gating)
         if compile_supported and run_compile_path:
             return self._compile_forward(
-                s, z, r, s_mask, to_queries, to_keys
+                s, z, r, s_mask, to_queries, to_keys,
+                rigid_noising_mask=rigid_noising_mask,
             )
         else:
             return self._eager_forward(
