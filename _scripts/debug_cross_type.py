@@ -229,7 +229,7 @@ def main():
             framepair_embed = inp['framepair_embed']
             init_rigids = inp['rigids_t']
             rigids_embed_flat = inp['rigids_embed']
-            rigids_token_uid = inp['rigids_to_token']
+            rigids_token_uid = inp['rigids_token_uid']
             rigids_mask_flat = inp['rigids_mask']
             rigids_noising_mask_flat = inp['rigids_noising_mask']
             to_queries = inp['to_queries']

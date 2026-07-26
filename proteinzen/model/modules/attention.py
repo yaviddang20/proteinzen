@@ -299,6 +299,7 @@ class ConditionedTransformerPairBiasLayer(nn.Module):
         self,
         z,
         x_mask,
+        cross_type_mask=None,
     ):
         _z = self.ln_z(z)
         b = self.lin_b(_z)
@@ -306,6 +307,8 @@ class ConditionedTransformerPairBiasLayer(nn.Module):
         # b = b + self.inf * (edge_mask.float() - 1)
         b += self.inf * (x_mask[..., None, :, None].float() - 1)
         b += self.inf * (x_mask[..., None, None].float() - 1)
+        if cross_type_mask is not None:
+            b += cross_type_mask[..., None].float() * -1e5
         return permute_final_dims(b, (2, 0, 1)).contiguous()
 
     @torch.compile(disable=not compile_supported)
@@ -383,7 +386,7 @@ class ConditionedTransformerPairBiasLayer(nn.Module):
 
 
     @torch.compile(disable=not compile_supported)
-    def forward(self, x, cond, z, x_mask):
+    def forward(self, x, cond, z, x_mask, cross_type_mask=None):
         x_mask = x_mask.bool()
 
         q, k, v, out_gate, cond_gate = self._gen_attn_tensors(
@@ -391,7 +394,7 @@ class ConditionedTransformerPairBiasLayer(nn.Module):
             cond,
         )
 
-        b = self._gen_pair_bias(z, x_mask)
+        b = self._gen_pair_bias(z, x_mask, cross_type_mask=cross_type_mask)
 
         with torch.nn.attention.sdpa_kernel(
             backends=[
@@ -436,9 +439,9 @@ class ConditionedTransformerPairBias(nn.Module):
         )
 
     @torch.compile(disable=not compile_supported)
-    def forward(self, x, cond, z, x_mask):
+    def forward(self, x, cond, z, x_mask, cross_type_mask=None):
         for layer in self.layers:
-            x = layer(x, cond, z, x_mask)
+            x = layer(x, cond, z, x_mask, cross_type_mask=cross_type_mask)
         return x
 
 

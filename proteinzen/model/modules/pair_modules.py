@@ -600,6 +600,8 @@ class ConditionedPairUpdate(nn.Module):
             if cross_type_mask is not None:
                 dist_bias = dist_bias.masked_fill(cross_type_mask[..., None], 0.0)
             third_edge = self._gen_third_edge(edge_embed)
+            if cross_type_mask is not None:
+                third_edge = third_edge.masked_fill(cross_type_mask[..., None], 0.0)
             edge_bias = (dist_bias + third_edge).unsqueeze(-4)
 
         # [B, I, 1, 1, J, H]
@@ -610,11 +612,15 @@ class ConditionedPairUpdate(nn.Module):
             mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
 
         z = edge_embed
+        if cross_type_mask is not None:
+            z = z.masked_fill(cross_type_mask[..., None], 0.0)
         z = z + self.trig_attn_start(
             z,
             edge_bias=permute_final_dims(edge_bias, (2, 0, 1)),
             mask_bias=mask_bias
         )
+        if cross_type_mask is not None:
+            z = z.masked_fill(cross_type_mask[..., None], 0.0)
         z = z + self.trig_attn_end(
             z,
             edge_bias=permute_final_dims(edge_bias, (2, 0, 1)),
@@ -805,6 +811,8 @@ class MultiRigidPairEmbedder(nn.Module):
             mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
 
         for i in range(self.no_blocks):
+            if cross_type_mask is not None:
+                z = z.masked_fill(cross_type_mask[..., None], 0.0)
             # z = z + self.dropout_row_layer(
             #     self.trunk[f'mult_out_{i}'](z, edge_mask)
             # )
@@ -822,6 +830,8 @@ class MultiRigidPairEmbedder(nn.Module):
             #     self.trunk[f'attn_end_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
             # )
             z = z + self.trunk[f'attn_start_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
+            if cross_type_mask is not None:
+                z = z.masked_fill(cross_type_mask[..., None], 0.0)
             z = z + self.trunk[f'attn_end_{i}'](z, mask_bias=mask_bias, edge_bias=edge_bias)
             z = z + self.trunk[f'transition_{i}'](z)
 

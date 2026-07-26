@@ -1064,7 +1064,8 @@ class IpaDenoiser(nn.Module):
             node_embed = (node_embed + ipa_embed) * node_mask[..., None]
 
             seq_tfmr_out = self.trunk[f'tfmr_{b}'](
-                node_embed, condition_embed, edge_embed, node_mask)
+                node_embed, condition_embed, edge_embed, node_mask,
+                cross_type_mask=cross_type_mask)
             node_embed = node_embed + self.trunk[f'post_tfmr_{b}'](seq_tfmr_out)
             node_embed = node_embed * node_mask[..., None]
 
