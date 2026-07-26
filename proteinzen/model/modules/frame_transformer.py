@@ -673,7 +673,8 @@ class BlockInvariantPointAttention(nn.Module):
         s_mask: torch.Tensor,
         to_queries: Callable,
         to_keys: Callable,
-        pts_cdist=True
+        pts_cdist=True,
+        rigid_noising_mask=None,
     ) -> torch.Tensor:
         """
         Args:
@@ -829,6 +830,11 @@ class BlockInvariantPointAttention(nn.Module):
         # [*, N_block, block_Q, block_K, H]
         a = a + pt_att
         a = a + attn_mask[..., None]
+        if rigid_noising_mask is not None:
+            q_is_lig = to_queries(rigid_noising_mask[..., None].float())
+            k_is_lig = to_keys(rigid_noising_mask[..., None].float())
+            cross = (q_is_lig > 0.5) ^ (k_is_lig.transpose(-2, -1) > 0.5)
+            a = a + cross.float()[..., None] * -1e5
         # [*, N_block, block_Q, H, block_K]
         a = a.transpose(-1, -2)
         a = self.softmax(a)
@@ -886,7 +892,8 @@ class BlockInvariantPointAttention(nn.Module):
         s_mask: torch.Tensor,
         to_queries: Callable,
         to_keys: Callable,
-        pts_cdist=True
+        pts_cdist=True,
+        rigid_noising_mask=None,
     ) -> torch.Tensor:
         """
         Args:
@@ -908,7 +915,8 @@ class BlockInvariantPointAttention(nn.Module):
             )
         else:
             return self._eager_forward(
-                s, z, r, s_mask, to_queries, to_keys, pts_cdist=pts_cdist
+                s, z, r, s_mask, to_queries, to_keys, pts_cdist=pts_cdist,
+                rigid_noising_mask=rigid_noising_mask,
             )
 
 
