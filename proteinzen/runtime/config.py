@@ -344,6 +344,7 @@ def config_sampling_hydra_store():
         checkpoint_idx=-1,
         num_timesteps=400,
         identity_rot_noise=False,
+        continue_run=False,
         hydra_defaults=[
             {"sampler": "default"},
             {"integrator": "euler"},
