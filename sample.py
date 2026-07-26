@@ -151,13 +151,42 @@ def main(sampler,
     zen_cfg['samples_dir'] = os.path.join(
         zen_cfg['out_dir'], "samples"
     )
-    if os.path.isdir(zen_cfg['samples_dir']):
-        shutil.rmtree(zen_cfg['samples_dir'])
-    os.makedirs(zen_cfg['samples_dir'])
-
     traj_dir = os.path.join(zen_cfg['out_dir'], "traj")
-    if os.path.isdir(traj_dir):
-        shutil.rmtree(traj_dir)
+
+    continue_run = zen_cfg.get('continue_run', False)
+    if continue_run:
+        os.makedirs(zen_cfg['samples_dir'], exist_ok=True)
+        # Count already-generated PDBs per task name prefix.
+        # File pattern: {task_name}_gpu{rank}_batch{idx}_idx{sid}.pdb
+        from collections import defaultdict, Counter
+        existing_per_task = defaultdict(int)
+        if os.path.isdir(zen_cfg['samples_dir']):
+            for fname in os.listdir(zen_cfg['samples_dir']):
+                if not fname.endswith('.pdb') or '_traj' in fname:
+                    continue
+                if '_gpu' in fname:
+                    task_prefix = fname[:fname.index('_gpu')]
+                    existing_per_task[task_prefix] += 1
+        # Count how many samples per task are in the full batch list.
+        total_per_task = Counter(s['task'] for s in sampler.batches)
+        # Trim sampler.batches to only the remaining deficit per task.
+        per_task_kept = defaultdict(int)
+        new_batches = []
+        for s in sampler.batches:
+            task = s['task']
+            deficit = total_per_task[task] - existing_per_task[task]
+            if per_task_kept[task] < deficit:
+                new_batches.append(s)
+                per_task_kept[task] += 1
+        log.info(f"continue_run: keeping {len(new_batches)}/{len(sampler.batches)} samples "
+                 f"(existing: {dict(existing_per_task)})")
+        sampler.batches = new_batches
+    else:
+        if os.path.isdir(zen_cfg['samples_dir']):
+            shutil.rmtree(zen_cfg['samples_dir'])
+        os.makedirs(zen_cfg['samples_dir'])
+        if os.path.isdir(traj_dir):
+            shutil.rmtree(traj_dir)
 
     # record run params
     shutil.copy(
