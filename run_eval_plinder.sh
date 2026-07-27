@@ -26,6 +26,7 @@ for direction in protein_cond ligand_cond; do
         --out-dir     "${OUT_DIR}" \
         --ref-dir     "${DIR}/plinder_pocket_processed/${SPLIT}" \
         --plip-sif    "${DIR}/plip.sif" \
+        --boltz-cache "${BOLTZ_CACHE}" \
         --include-h \
         "$@"
 done
