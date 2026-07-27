@@ -433,7 +433,9 @@ class SampleTemplateTokenizer:
             self.token_data.append(astuple(token))
 
             if noise_atom:
-                atom_tensor7 = np.zeros(7)
+                atom_trans = np.random.randn(3) * self.trans_std
+                atom_quat = Rotation.random().as_quat(canonical=True)
+                atom_tensor7 = np.concatenate([atom_quat, atom_trans], axis=-1)
                 num_real_input_axes = len(list(self.bond_graph.neighbors(atom_idx)))
             else:
                 atom_tensor7, num_real_input_axes = arbitrary_atom_to_frame(
