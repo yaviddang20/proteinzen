@@ -459,7 +459,7 @@ class SampleTemplateTokenizer:
                 is_present=atom["is_present"],
                 rigids_noising_mask=noise_atom,
                 num_real_input_axes=2 if num_real_input_axes > 2 else num_real_input_axes,
-                chirality=0
+                chirality=int(atom["chirality"])
             )
             self.rigid_data.append(astuple(rigid))
             self.rigid_to_token[self.rigid_idx] = self.token_idx
