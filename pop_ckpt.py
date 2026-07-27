@@ -7,8 +7,10 @@ ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 ckpt.pop("optimizer_states", None)
 ckpt.pop("lr_schedulers", None)
 ckpt.pop("callbacks", None)
+ckpt.pop("loops", None)
 ckpt["optimizer_states"] = []
 ckpt["lr_schedulers"] = []
 ckpt["epoch"] = 0
+ckpt["global_step"] = 0
 torch.save(ckpt, f"{ckpt_path.parent}/{ckpt_path.stem}_no_opt.ckpt")
 print(f"Finished saving checkpoint to {ckpt_path.parent}/{ckpt_path.stem}_no_opt.ckpt")
