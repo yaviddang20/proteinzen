@@ -259,7 +259,7 @@ class SampleTemplateTokenizer:
                 is_atomized=False,
                 element=-1,
                 charge=0,
-                chirality=0,
+                chirality=int(res["chirality"]),
                 tensor7=rigid_tensor7[j],
                 is_present=True,
                 rigids_noising_mask=True,
@@ -434,7 +434,7 @@ class SampleTemplateTokenizer:
 
             if noise_atom:
                 atom_trans = np.random.randn(3) * self.trans_std
-                atom_quat = Rotation.random().as_quat(canonical=True)
+                atom_quat = Rotation.random().as_quat(canonical=True, scalar_first=True)
                 atom_tensor7 = np.concatenate([atom_quat, atom_trans], axis=-1)
                 num_real_input_axes = len(list(self.bond_graph.neighbors(atom_idx)))
             else:
