@@ -2,9 +2,7 @@ _target_: proteinzen.data.datasets.datamodule.TrainingDataset
 max_crop_residues: 160
 max_crop_rigids: 512
 use_cropper: true
-cropper:
-  _target_: proteinzen.data.featurize.cropper.Cropper
-  max_protein_residues: 20
+crop_max_protein_residues: 20
 datasets:
   - _target_: proteinzen.data.datasets.dataset.MMCIFDataset
     mode: train

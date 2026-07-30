@@ -353,6 +353,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         samples_per_epoch=1000,  # this is PER GPU
         crop_min_neighbors=0,
         crop_max_neighbors=40,
+        crop_max_protein_residues=None,
         dataset_probs=None,
         remove_mol_types=None,
         mask_nonstandard=False,
@@ -375,7 +376,8 @@ class TrainingDataset(torch.utils.data.Dataset):
         if use_cropper:
             self.cropper = Cropper(
                 min_neighborhood=crop_min_neighbors,
-                max_neighborhood=crop_max_neighbors
+                max_neighborhood=crop_max_neighbors,
+                max_protein_residues=crop_max_protein_residues,
             )
         else:
             self.cropper = None
@@ -567,6 +569,7 @@ class ValidationDataset(torch.utils.data.Dataset):
         samples_per_epoch=1000,  # this is PER GPU
         crop_min_neighbors=0,
         crop_max_neighbors=40,
+        crop_max_protein_residues=None,
         dataset_probs=None,
         remove_mol_types=None,
         mask_nonstandard=False,
@@ -588,7 +591,8 @@ class ValidationDataset(torch.utils.data.Dataset):
         if use_cropper:
             self.cropper = Cropper(
                 min_neighborhood=crop_min_neighbors,
-                max_neighborhood=crop_max_neighbors
+                max_neighborhood=crop_max_neighbors,
+                max_protein_residues=crop_max_protein_residues,
             )
         else:
             self.cropper = None
