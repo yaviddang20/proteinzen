@@ -431,33 +431,32 @@ class PocketPLACERSampling(SamplingTask):
                 trans_std=self.trans_std,
             )
 
-            # PLACER-style: shift each noised rigid's noise to be centered at its
-            # nearest fixed backbone (j=0) rigid rather than the global origin.
-            # Sidechain rigids (j>0): use same-token backbone.
-            # Ligand/atom rigids (j=0, noised): use nearest backbone by distance.
-            bb_trans_by_token = {}
-            bb_positions = []   # [(token_idx, trans)]
-            for r in rigid_data:
-                if int(r["sidechain_idx"]) == 0 and bool(r["is_present"]) and not bool(r["rigids_noising_mask"]):
-                    t = int(r["token_idx"])
-                    trans = r["tensor7"][4:].copy()
-                    bb_trans_by_token[t] = trans
-                    bb_positions.append(trans)
-            bb_positions_arr = np.stack(bb_positions) if bb_positions else None
+            # PLACER-style anchor centering.
+            # Sidechain rigids (j>0): centered at same-token backbone CA.
+            # Ligand rigids (j=0, noised): anchor keeps its own noise; others center at anchor.
+            bb_trans_by_token = {
+                int(r["token_idx"]): r["tensor7"][4:].copy()
+                for r in rigid_data
+                if int(r["sidechain_idx"]) == 0 and bool(r["is_present"]) and not bool(r["rigids_noising_mask"])
+            }
+
+            lig_noised_indices = [
+                i for i in np.where(rigid_data["rigids_noising_mask"])[0]
+                if int(rigid_data[i]["sidechain_idx"]) == 0
+            ]
 
             for i in np.where(rigid_data["rigids_noising_mask"])[0]:
                 sc = int(rigid_data[i]["sidechain_idx"])
                 tok = int(rigid_data[i]["token_idx"])
-                if sc > 0:
-                    # protein sidechain: anchor = same-token backbone
-                    if tok in bb_trans_by_token:
-                        rigid_data["tensor7"][i, 4:] += bb_trans_by_token[tok]
-                else:
-                    # ligand/atom: anchor = nearest backbone by distance
-                    if bb_positions_arr is not None:
-                        pos = rigid_data[i]["tensor7"][4:]
-                        dists = np.linalg.norm(bb_positions_arr - pos[None], axis=-1)
-                        rigid_data["tensor7"][i, 4:] += bb_positions_arr[dists.argmin()]
+                if sc > 0 and tok in bb_trans_by_token:
+                    rigid_data["tensor7"][i, 4:] += bb_trans_by_token[tok]
+
+            if lig_noised_indices:
+                anchor_i = lig_noised_indices[np.random.randint(len(lig_noised_indices))]
+                anchor_noised = rigid_data["tensor7"][anchor_i, 4:].copy()
+                for i in lig_noised_indices:
+                    if i != anchor_i:
+                        rigid_data["tensor7"][i, 4:] += anchor_noised
 
             atoms_centered = struct.atoms.copy()
             atoms_centered["coords"] -= fixed_com[None]

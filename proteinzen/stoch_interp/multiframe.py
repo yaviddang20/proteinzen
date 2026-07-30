@@ -479,12 +479,17 @@ class MultiSE3Interpolant:
                     tok_to_bb[bb_tok] = bb_trans
                     trans_0[b, sc_indices] += tok_to_bb[tok_idx[b, sc_indices]]
 
-                # ligand/atom rigids (sc_idx==0, noised): nearest backbone by distance
+                # ligand/atom rigids (sc_idx==0, noised): PLACER self-anchors within the
+                # ligand subgraph. Anchor keeps its own noise; others center at anchor's
+                # noised position (matches inference — GT unknown at test time).
                 lig_noised = rigids_noising_mask[b].bool() & (sc_idx[b] == 0)
                 if lig_noised.any():
                     lig_indices = lig_noised.nonzero(as_tuple=True)[0]
-                    nearest = torch.cdist(trans_1[b, lig_indices], bb_trans).argmin(dim=-1)
-                    trans_0[b, lig_indices] += bb_trans[nearest]
+                    anchor_idx = lig_indices[torch.randint(len(lig_indices), (1,), device=trans_0.device).item()]
+                    anchor_noised = trans_0[b, anchor_idx].clone()
+                    other_lig = lig_indices[lig_indices != anchor_idx]
+                    if len(other_lig) > 0:
+                        trans_0[b, other_lig] += anchor_noised
 
         do_prealign = torch.tensor(
             [getattr(t, "prealign_noise", self.prealign_noise) for t in batch["task"]],
