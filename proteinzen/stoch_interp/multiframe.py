@@ -450,6 +450,41 @@ class MultiSE3Interpolant:
             atom_data['atom14_alt_gt_positions'] = atom_data['atom14_alt_gt_positions'] - center[..., None, None, :]
             atom_data['atom14_alt_gt_positions'] *= atom_data['atom14_mask'][..., None]
 
+        # PLACER-style per-rigid anchor centering: shift trans_0 so each noised rigid's
+        # noise is centered at its nearest fixed backbone rigid (same token for sidechains,
+        # nearest by distance for ligand atoms) rather than the global origin.
+        use_placer = torch.tensor(
+            [getattr(t, "use_placer_centering", False) for t in batch["task"]],
+            dtype=torch.bool, device=trans_0.device,
+        )
+        if use_placer.any():
+            sc_idx = rigids_data['rigids_sidechain_idx']   # [B, N]
+            tok_idx = rigids_data['rigids_to_token']        # [B, N]
+            bb_mask = (sc_idx == 0) & (~rigids_noising_mask.bool()) & rigids_mask.bool()
+            for b in range(trans_0.shape[0]):
+                if not use_placer[b]:
+                    continue
+                bb_indices = bb_mask[b].nonzero(as_tuple=True)[0]
+                if len(bb_indices) == 0:
+                    continue
+                bb_tok = tok_idx[b, bb_indices]
+                bb_trans = trans_1[b, bb_indices]  # already centered
+
+                # protein sidechain rigids: use same-token backbone as anchor
+                sc_noised = rigids_noising_mask[b].bool() & (sc_idx[b] > 0)
+                if sc_noised.any():
+                    sc_indices = sc_noised.nonzero(as_tuple=True)[0]
+                    max_tok = int(tok_idx[b].max().item()) + 1
+                    tok_to_bb = torch.zeros(max_tok, 3, device=trans_0.device)
+                    tok_to_bb[bb_tok] = bb_trans
+                    trans_0[b, sc_indices] += tok_to_bb[tok_idx[b, sc_indices]]
+
+                # ligand/atom rigids (sc_idx==0, noised): nearest backbone by distance
+                lig_noised = rigids_noising_mask[b].bool() & (sc_idx[b] == 0)
+                if lig_noised.any():
+                    lig_indices = lig_noised.nonzero(as_tuple=True)[0]
+                    nearest = torch.cdist(trans_1[b, lig_indices], bb_trans).argmin(dim=-1)
+                    trans_0[b, lig_indices] += bb_trans[nearest]
 
         do_prealign = torch.tensor(
             [getattr(t, "prealign_noise", self.prealign_noise) for t in batch["task"]],

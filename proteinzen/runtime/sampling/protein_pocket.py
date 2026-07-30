@@ -13,7 +13,7 @@ from proteinzen.boltz.data.types import Structure, Connection
 
 from proteinzen.data.featurize.assembler import featurize
 from proteinzen.data.featurize.sampling import sample_noise_from_struct_template
-from proteinzen.data.featurize.tokenize import Tokenized
+from proteinzen.data.featurize.tokenize import Tokenized, convert_atom_str_to_tuple
 
 from .task import SamplingTask
 
@@ -316,6 +316,148 @@ class ProteinPocketConditionedSampling(SamplingTask):
                 task_masks=task_masks,
                 trans_std=self.trans_std,
             )
+
+            atoms_centered = struct.atoms.copy()
+            atoms_centered["coords"] -= fixed_com[None]
+            struct_centered = replace(struct, atoms=atoms_centered)
+
+            data = Tokenized(
+                tokens=token_data,
+                rigids=rigid_data,
+                bonds=token_bonds,
+                structure=struct_centered,
+            )
+            task_data = {"t": np.array([0.0], dtype=float)}
+
+            yield featurize(data, task_data, task_name=task_name, smiles=None)
+
+
+# ---------------------------------------------------------------------------
+# Pocket sidechain redesign
+# ---------------------------------------------------------------------------
+
+# Backbone atom names stored as ord(c)-32 per character, zero-padded to 4.
+_BACKBONE_ATOMS_ENCODED = frozenset(
+    convert_atom_str_to_tuple(n) for n in ("N", "CA", "C", "O", "CB")
+)
+
+
+class PocketPLACERSampling(SamplingTask):
+    """PLACER-inspired pocket sidechain redesign.
+
+    Crops to the max_protein_residues closest residues to the ligand, fixes the
+    ligand and all backbone frames (j=0), and noises sidechain CG frames (j=1, j=2).
+    Following PLACER, each noised sidechain frame is initialized as:
+        backbone_trans_of_residue + N(0, trans_std²)
+    so noise is centered at the residue's backbone position rather than the global CoM.
+
+    Parameters
+    ----------
+    npz_path : str
+        Path to a proteinzen npz structure file.
+    num_samples : int
+        Number of sidechain conformations to generate.
+    max_protein_residues : int
+        Number of pocket residues to crop to (default: 15).
+    trans_std : float
+        Std of Gaussian noise for sidechain translations (default: 3.0 Å).
+    include_h : bool
+        Whether to keep hydrogen atoms (default: False).
+    """
+
+    task_name: str = "pocket_placer"
+
+    def __init__(
+        self,
+        npz_path: str,
+        num_samples: int,
+        max_protein_residues: int = 15,
+        trans_std: float = 3.0,
+        include_h: bool = False,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.npz_path = npz_path
+        self.num_samples = num_samples
+        self.max_protein_residues = max_protein_residues
+        self.trans_std = trans_std
+        self.include_h = include_h
+
+    def sample_data(self):
+        orig_struct = load_structure_from_npz(self.npz_path, include_h=self.include_h)
+        struct = _crop_protein_to_pocket(orig_struct, self.max_protein_residues)
+        active_chains = struct.chains[struct.mask]
+
+        protein_id = const.chain_type_ids["PROTEIN"]
+
+        n_atoms = len(struct.atoms)
+        n_residues = len(struct.residues)
+
+        # atom_noising_mask: True only for sidechain atoms of cropped protein residues.
+        # Backbone atoms (N, CA, C, O, CB) and all ligand atoms stay False.
+        atom_noising_mask = np.zeros(n_atoms, dtype=bool)
+        residue_entity_ids = np.zeros(n_residues, dtype=int)
+
+        for chain in active_chains:
+            r0 = int(chain["res_idx"])
+            rn = int(chain["res_num"])
+            for ri in range(r0, r0 + rn):
+                residue_entity_ids[ri] = int(chain["entity_id"])
+            if int(chain["mol_type"]) != protein_id:
+                continue
+            for ri in range(r0, r0 + rn):
+                res = struct.residues[ri]
+                a0 = int(res["atom_idx"])
+                for ai in range(a0, a0 + int(res["atom_num"])):
+                    atom_name_key = tuple(int(x) for x in struct.atoms[ai]["name"])
+                    if atom_name_key not in _BACKBONE_ATOMS_ENCODED:
+                        atom_noising_mask[ai] = True
+
+        task_masks = {
+            "atom_noising_mask": atom_noising_mask,
+            "res_type_noising_mask": np.zeros(n_residues, dtype=bool),
+            "residue_is_unindexed_mask": np.zeros(n_residues, dtype=bool),
+            "res_hotspot_type": np.zeros(n_residues, dtype=int),
+            "residue_entity_ids": residue_entity_ids,
+            "t": 0.0,
+        }
+
+        task_name = self.kwargs.get("name", self.task_name)
+
+        for _ in range(self.num_samples):
+            token_data, rigid_data, token_bonds, fixed_com, _ = sample_noise_from_struct_template(
+                struct,
+                task_masks=task_masks,
+                trans_std=self.trans_std,
+            )
+
+            # PLACER-style: shift each noised rigid's noise to be centered at its
+            # nearest fixed backbone (j=0) rigid rather than the global origin.
+            # Sidechain rigids (j>0): use same-token backbone.
+            # Ligand/atom rigids (j=0, noised): use nearest backbone by distance.
+            bb_trans_by_token = {}
+            bb_positions = []   # [(token_idx, trans)]
+            for r in rigid_data:
+                if int(r["sidechain_idx"]) == 0 and bool(r["is_present"]) and not bool(r["rigids_noising_mask"]):
+                    t = int(r["token_idx"])
+                    trans = r["tensor7"][4:].copy()
+                    bb_trans_by_token[t] = trans
+                    bb_positions.append(trans)
+            bb_positions_arr = np.stack(bb_positions) if bb_positions else None
+
+            for i in np.where(rigid_data["rigids_noising_mask"])[0]:
+                sc = int(rigid_data[i]["sidechain_idx"])
+                tok = int(rigid_data[i]["token_idx"])
+                if sc > 0:
+                    # protein sidechain: anchor = same-token backbone
+                    if tok in bb_trans_by_token:
+                        rigid_data["tensor7"][i, 4:] += bb_trans_by_token[tok]
+                else:
+                    # ligand/atom: anchor = nearest backbone by distance
+                    if bb_positions_arr is not None:
+                        pos = rigid_data[i]["tensor7"][4:]
+                        dists = np.linalg.norm(bb_positions_arr - pos[None], axis=-1)
+                        rigid_data["tensor7"][i, 4:] += bb_positions_arr[dists.argmin()]
 
             atoms_centered = struct.atoms.copy()
             atoms_centered["coords"] -= fixed_com[None]

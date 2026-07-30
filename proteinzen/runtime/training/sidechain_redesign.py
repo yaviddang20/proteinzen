@@ -162,3 +162,15 @@ class SidechainRedesign(TrainingTask):
 
     def max_added_tokens(self, N):
         return 0
+
+
+class PocketPLACERTraining(SidechainRedesign):
+    """PLACER-inspired training task: fix backbone, noise sidechains + ligand.
+
+    Identical to SidechainRedesign for the noising mask (backbone fixed, sidechains
+    and ligand noised), but sets use_placer_centering=True so the corrupter centers
+    each noised rigid's noise at its nearest fixed backbone rigid rather than the
+    global origin. Intended for use with plinder_pocket_processed data.
+    """
+    name: str = "pocket_placer"
+    use_placer_centering: bool = True
