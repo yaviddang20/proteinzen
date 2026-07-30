@@ -371,7 +371,7 @@ class PocketPLACERSampling(SamplingTask):
         self,
         npz_path: str,
         num_samples: int,
-        max_protein_residues: int = 15,
+        max_protein_residues: int = 20,
         trans_std: float = 3.0,
         include_h: bool = False,
         **kwargs,

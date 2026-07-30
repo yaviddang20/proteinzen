@@ -211,7 +211,8 @@ class Cropper:
         min_neighborhood: int = 0,
         max_neighborhood: int = 40,
         attempt_to_keep_full_binder_chain: bool = False,
-        full_binder_chain_cap: int = 256
+        full_binder_chain_cap: int = 256,
+        max_protein_residues: Optional[int] = None,
     ) -> None:
         """Initialize the cropper.
 
@@ -234,6 +235,7 @@ class Cropper:
 
         self.attempt_to_keep_full_binder_chain = attempt_to_keep_full_binder_chain
         self.full_binder_chain_cap = full_binder_chain_cap
+        self.max_protein_residues = max_protein_residues
 
     def crop(  # noqa: PLR0915
         self,
@@ -401,6 +403,13 @@ class Cropper:
                     cropped.update(priority_indices)
                     total_rigids += new_rig
 
+        # Count protein tokens already seeded (from priority) for the per-protein cap
+        protein_type = const.chain_type_ids["PROTEIN"]
+        num_protein_cropped = 0
+        if self.max_protein_residues is not None and cropped:
+            cropped_tokens = token_data[np.isin(token_data["token_idx"], list(cropped))]
+            num_protein_cropped = int((cropped_tokens["mol_type"] == protein_type).sum())
+
         if self.attempt_to_keep_full_binder_chain and interface is not None:
             chain_1_tokens = token_data[token_data["asym_id"] == interface[0]]
             chain_1_tokens = chain_1_tokens[chain_1_tokens['is_resolved']]
@@ -464,15 +473,27 @@ class Cropper:
             new_tokens = token_data[list(new_indices)]
             new_rigids = np.sum(new_tokens["rigid_num"])
 
-            # Stop if we exceed the max number of tokens or atoms
+            # Stop if we exceed the max number of tokens or rigids
             if (len(new_indices) > (max_tokens - len(cropped))) or (
                 (max_rigids is not None) and ((total_rigids + new_rigids) > max_rigids)
             ):
                 break
 
+            # Skip (don't break) if adding this protein chain exceeds max_protein_residues
+            is_protein_chain = int(token["mol_type"]) == protein_type
+            new_protein = int((new_tokens["mol_type"] == protein_type).sum())
+            if (
+                self.max_protein_residues is not None
+                and is_protein_chain
+                and num_protein_cropped + new_protein > self.max_protein_residues
+            ):
+                continue
+
             # Add new indices
             cropped.update(new_indices)
             total_rigids += new_rigids
+            if self.max_protein_residues is not None:
+                num_protein_cropped += new_protein
 
         # Get the cropped tokens sorted by index
         token_data = token_data[sorted(cropped)]
