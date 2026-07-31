@@ -334,7 +334,7 @@ class MultiSE3Interpolant:
         return _rots_diffuse_mask(rotmats_t, rotmats_1, diffuse_mask), rot_vf, score_scaling, g_t, E_dlog_igso3, E_dlog_igso3_sq
 
     # @torch.no_grad()
-    def corrupt_dense_batch(self, batch, identity_rot_noise=False):
+    def corrupt_dense_batch(self, batch, identity_rot_noise=False, skip_prealign=False):
         token_data = batch["token"]
         rigids_data = batch["rigids"]
 
@@ -492,7 +492,7 @@ class MultiSE3Interpolant:
                         trans_0[b, other_lig] += anchor_noised
 
         do_prealign = torch.tensor(
-            [getattr(t, "prealign_noise", self.prealign_noise) for t in batch["task"]],
+            [False if skip_prealign else getattr(t, "prealign_noise", self.prealign_noise) for t in batch["task"]],
             dtype=torch.bool, device=trans_0.device,
         )
 

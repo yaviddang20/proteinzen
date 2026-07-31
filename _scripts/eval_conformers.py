@@ -10,6 +10,7 @@ import glob
 import json
 import multiprocessing as mp
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -890,7 +891,7 @@ for mode in _modes:
     pred_paths = [Path(p) for p in glob.glob(PRED_GLOB)]
     groups = defaultdict(list)
     for p in pred_paths:
-        mol_id = p.stem.rsplit("_", 1)[0]
+        mol_id = re.sub(r'_gpu\d+_batch\d+_idx\d+$', '', p.stem)
         groups[mol_id].append(p)
 
     print(f"  Gen: {sum(len(v) for v in groups.values())} conformers across {len(groups)} molecules")
