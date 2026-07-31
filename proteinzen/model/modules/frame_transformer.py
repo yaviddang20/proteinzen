@@ -124,9 +124,9 @@ class GatherUpdate(nn.Module):
                 rigids_embed,
                 rigids_to_res_idx,
                 rigids_mask):
-        broadcast_embed = self.lin(node_embed)
+        # broadcast_embed = self.lin(node_embed)
         broadcast_embed = torch.gather(
-            node_embed,
+            self.lin(node_embed),
             -2,
             rigids_to_res_idx[..., None].expand([-1 for _ in range(rigids_to_res_idx.dim())] + [rigids_embed.shape[-1]])
         )
