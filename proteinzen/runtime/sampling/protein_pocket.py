@@ -393,25 +393,30 @@ class PocketPLACERSampling(SamplingTask):
         n_atoms = len(struct.atoms)
         n_residues = len(struct.residues)
 
-        # atom_noising_mask: True only for sidechain atoms of cropped protein residues.
-        # Backbone atoms (N, CA, C, O, CB) and all ligand atoms stay False.
+        # atom_noising_mask: True for sidechain atoms (non-backbone protein) and all ligand atoms.
+        # Backbone atoms (N, CA, C, O, CB) stay False. Matches training noising exactly.
         atom_noising_mask = np.zeros(n_atoms, dtype=bool)
         residue_entity_ids = np.zeros(n_residues, dtype=int)
+        nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
 
         for chain in active_chains:
             r0 = int(chain["res_idx"])
             rn = int(chain["res_num"])
             for ri in range(r0, r0 + rn):
                 residue_entity_ids[ri] = int(chain["entity_id"])
-            if int(chain["mol_type"]) != protein_id:
-                continue
-            for ri in range(r0, r0 + rn):
-                res = struct.residues[ri]
-                a0 = int(res["atom_idx"])
-                for ai in range(a0, a0 + int(res["atom_num"])):
-                    atom_name_key = tuple(int(x) for x in struct.atoms[ai]["name"])
-                    if atom_name_key not in _BACKBONE_ATOMS_ENCODED:
-                        atom_noising_mask[ai] = True
+            mol_type = int(chain["mol_type"])
+            if mol_type == nonpolymer_id:
+                # noise all ligand atoms
+                a0 = int(chain["atom_idx"])
+                atom_noising_mask[a0:a0 + int(chain["atom_num"])] = True
+            elif mol_type == protein_id:
+                for ri in range(r0, r0 + rn):
+                    res = struct.residues[ri]
+                    a0 = int(res["atom_idx"])
+                    for ai in range(a0, a0 + int(res["atom_num"])):
+                        atom_name_key = tuple(int(x) for x in struct.atoms[ai]["name"])
+                        if atom_name_key not in _BACKBONE_ATOMS_ENCODED:
+                            atom_noising_mask[ai] = True
 
         task_masks = {
             "atom_noising_mask": atom_noising_mask,
