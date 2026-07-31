@@ -765,7 +765,7 @@ class BiomoleculeModule(L.LightningModule):
             sync_dist=False,
         )
 
-    def _shared_step(self, batch, return_outputs=False):
+    def _shared_step(self, batch, return_outputs=False, skip_prealign=False):
 
         print(f"[R{self.global_rank}] ENTER _shared_step", flush=True)
         corrupter = self.corrupter
@@ -795,7 +795,7 @@ class BiomoleculeModule(L.LightningModule):
             batch['rot_t'] = batch['t']
 
         print(f"[R{self.global_rank}] BEFORE corrupt", flush=True)
-        batch = corrupter.corrupt_dense_batch(batch, self.identity_rot_noise)
+        batch = corrupter.corrupt_dense_batch(batch, self.identity_rot_noise, skip_prealign=skip_prealign)
         print(f"[R{self.global_rank}] AFTER corrupt", flush=True)
 
         # self-conditioning (optional)
@@ -940,7 +940,7 @@ class BiomoleculeModule(L.LightningModule):
             batch_t["t"] = torch.full((*batch_t["t"].shape,), t_val, device=device)
 
             if write_pdbs:
-                loss_dict, batch_out, outputs = self._shared_step(batch_t, return_outputs=True)
+                loss_dict, batch_out, outputs = self._shared_step(batch_t, return_outputs=True, skip_prealign=True)
                 pdb_data = self._collect_val_pdb_data(batch_out, outputs, t_val, n_samples=B)
                 del batch_out, outputs
                 torch.cuda.empty_cache()
