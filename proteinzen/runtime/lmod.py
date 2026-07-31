@@ -946,7 +946,7 @@ class BiomoleculeModule(L.LightningModule):
                 torch.cuda.empty_cache()
                 self._write_val_pdbs(pdb_data)
             else:
-                loss_dict = self._shared_step(batch_t)
+                loss_dict = self._shared_step(batch_t, skip_prealign=True)
 
             # log under separate namespace
             self._log_losses(
