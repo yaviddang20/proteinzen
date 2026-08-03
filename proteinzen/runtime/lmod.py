@@ -334,7 +334,7 @@ def _build_all_atom_records(rigid_tensor7, rigids_mask, ref_elements, is_atom_ma
         atom14 = atom14.squeeze(0).numpy()
         atom14_mask = atom14_mask.squeeze(0).bool().numpy()
 
-        one_letter = rc.restypes_with_x[res_type] if res_type < len(rc.restypes_with_x) else 'X'
+        one_letter = rc.restypes_with_x[aa_type] if aa_type < len(rc.restypes_with_x) else 'X'
         res_name = rc.restype_1to3.get(one_letter, 'UNK')
         atom14_names = rc.restype_name_to_atom14_names.get(res_name, [])
         asym_id = int(asym_ids_tok[tok])
