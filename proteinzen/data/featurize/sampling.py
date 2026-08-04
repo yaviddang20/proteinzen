@@ -259,7 +259,7 @@ class SampleTemplateTokenizer:
                 is_atomized=False,
                 element=-1,
                 charge=0,
-                chirality=int(res["chirality"]),
+                chirality=0,
                 tensor7=rigid_tensor7[j],
                 is_present=True,
                 rigids_noising_mask=True,
@@ -432,19 +432,15 @@ class SampleTemplateTokenizer:
             )
             self.token_data.append(astuple(token))
 
-            if noise_atom:
-                atom_trans = np.random.randn(3) * self.trans_std
-                atom_quat = Rotation.random().as_quat(canonical=True, scalar_first=True)
-                atom_tensor7 = np.concatenate([atom_quat, atom_trans], axis=-1)
-                num_real_input_axes = len(list(self.bond_graph.neighbors(atom_idx)))
-            else:
-                atom_tensor7, num_real_input_axes = arbitrary_atom_to_frame(
-                    atom,
-                    atom_idx,
-                    valid_neighbors,
-                    valid_neighbor_coords,
-                    self.bond_graph
-                )
+
+
+            atom_tensor7, num_real_input_axes = arbitrary_atom_to_frame(
+                atom,
+                atom_idx,
+                valid_neighbors,
+                valid_neighbor_coords,
+                self.bond_graph
+            )
 
             # Update atom_idx to token_idx
             self.atom_to_rigid[atom_idx] = self.rigid_idx
