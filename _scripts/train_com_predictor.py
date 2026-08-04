@@ -85,13 +85,13 @@ class CoMPredictorLit(pl.LightningModule):
         self.cosine_annealing_T_max = cosine_annealing_T_max
 
     def _apply_etkdg(self, batch):
+        """Returns (batch, valid_mask) where valid_mask[i] is True if ETKDG succeeded for sample i."""
         etkdg_pos = batch['rigids']['etkdg_pos']           # (B, N, 3)
         noising_mask = batch['rigids']['rigids_noising_mask'].bool()  # (B, N)
         rigids_mask  = batch['rigids']['rigids_mask'].bool()
 
         lig_mask = noising_mask & rigids_mask
 
-        # Per-sample flag: ETKDG succeeded if any ligand atom has non-zero position
         etkdg_valid = (etkdg_pos * lig_mask[..., None]).abs().sum(dim=(1, 2)) > 0  # (B,)
 
         lig_center = (etkdg_pos * lig_mask[..., None]).sum(1) \
@@ -99,20 +99,25 @@ class CoMPredictorLit(pl.LightningModule):
         etkdg_centered = etkdg_pos - lig_center[:, None, :]
 
         old = ru.Rigid.from_tensor_7(batch['rigids']['rigids_t'])
-        old_trans = old.get_trans()
-        # Only replace translations for samples where ETKDG succeeded
         replace_mask = (noising_mask & etkdg_valid[:, None])[..., None]
-        new_trans = torch.where(replace_mask, etkdg_centered, old_trans)
+        new_trans = torch.where(replace_mask, etkdg_centered, old.get_trans())
         batch['rigids']['rigids_t'] = ru.Rigid(rots=old.get_rots(), trans=new_trans).to_tensor_7()
         batch['rigids']['trans_t']  = new_trans
-        return batch
+        return batch, etkdg_valid
 
     def _step(self, batch, split: str) -> torch.Tensor:
         batch['t'] = torch.ones_like(batch['t'])
         batch['trans_t'] = batch['t']
         batch['rot_t'] = batch['t']
         batch = self.corrupter.corrupt_dense_batch(batch, identity_rot_noise=False)
-        batch = self._apply_etkdg(batch)
+        batch, etkdg_valid = self._apply_etkdg(batch)
+
+        if not etkdg_valid.any():
+            return None
+        # filter to only ETKDG-valid samples
+        valid_idx = etkdg_valid.nonzero(as_tuple=True)[0]
+        batch = {k: ({kk: vv[valid_idx] for kk, vv in v.items()} if isinstance(v, dict) else v[valid_idx])
+                 for k, v in batch.items()}
 
         token_to_rep = batch['token']['token_to_rep_rigid']  # (B, N_tok)
 
@@ -251,11 +256,13 @@ def main():
         "Backbone should be fully frozen"
 
     train_cfg = load_from_yaml(args.dataset_config)
+    train_cfg['compute_etkdg_pos'] = True
     train_ds  = instantiate(train_cfg)
 
     val_ds = None
     if args.val_dataset_config:
         val_cfg = load_from_yaml(args.val_dataset_config)
+        val_cfg['compute_etkdg_pos'] = True
         val_ds  = instantiate(val_cfg)
 
     datamodule = BiomoleculeDataModule(

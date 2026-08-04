@@ -361,6 +361,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         use_identity_rot=True,
         lap_pe_k=0,
         use_pocket_priority=False,
+        compute_etkdg_pos=False,
     ):
         super().__init__()
         self.datasets = datasets
@@ -393,6 +394,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.lap_pe_k = lap_pe_k
         self.mask_nonstandard = mask_nonstandard
         self.use_pocket_priority = use_pocket_priority
+        self.compute_etkdg_pos = compute_etkdg_pos
 
         for dataset in datasets:
             records = dataset.manifest
@@ -539,9 +541,12 @@ class TrainingDataset(torch.utils.data.Dataset):
             group1_rigid_mask[:n] = torch.from_numpy(group1_atom_mask[:n])
         features['rigids']['group1_rigid_mask'] = group1_rigid_mask
 
-        features['rigids']['etkdg_pos'] = _smiles_etkdg_pos(
-            sample.record.smiles, n_rigids, features['rigids']['rigids_noising_mask'].bool()
-        )
+        if self.compute_etkdg_pos:
+            features['rigids']['etkdg_pos'] = _smiles_etkdg_pos(
+                sample.record.smiles, n_rigids, features['rigids']['rigids_noising_mask'].bool()
+            )
+        else:
+            features['rigids']['etkdg_pos'] = torch.zeros(n_rigids, 3, dtype=torch.float32)
 
         if self.lap_pe_k > 0:
             _add_lap_pe_to_features(features, self.lap_pe_k)
@@ -577,6 +582,7 @@ class ValidationDataset(torch.utils.data.Dataset):
         use_identity_rot=True,
         lap_pe_k=0,
         use_pocket_priority=False,
+        compute_etkdg_pos=False,
     ):
         super().__init__()
         self.datasets = datasets
@@ -607,6 +613,7 @@ class ValidationDataset(torch.utils.data.Dataset):
         self.use_identity_rot = use_identity_rot
         self.lap_pe_k = lap_pe_k
         self.use_pocket_priority = use_pocket_priority
+        self.compute_etkdg_pos = compute_etkdg_pos
 
         for dataset in datasets:
             interface_id = 0 if dataset.interface_crop else None
@@ -761,9 +768,12 @@ class ValidationDataset(torch.utils.data.Dataset):
             group1_rigid_mask[:n] = torch.from_numpy(group1_atom_mask[:n])
         features['rigids']['group1_rigid_mask'] = group1_rigid_mask
 
-        features['rigids']['etkdg_pos'] = _smiles_etkdg_pos(
-            sample.record.smiles, n_rigids, features['rigids']['rigids_noising_mask'].bool()
-        )
+        if self.compute_etkdg_pos:
+            features['rigids']['etkdg_pos'] = _smiles_etkdg_pos(
+                sample.record.smiles, n_rigids, features['rigids']['rigids_noising_mask'].bool()
+            )
+        else:
+            features['rigids']['etkdg_pos'] = torch.zeros(n_rigids, 3, dtype=torch.float32)
 
         if self.lap_pe_k > 0:
             _add_lap_pe_to_features(features, self.lap_pe_k)
