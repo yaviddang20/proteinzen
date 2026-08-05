@@ -20,8 +20,8 @@ run_one() {
     local IDX=$1
     local SC_STD=${SC_STDS[$IDX]}
     local LIG_STD=${LIG_STDS[$IDX]}
-    local SC_TAG=$(echo $SC_STD | tr '.' 'p')
-    local LIG_TAG=$(echo $LIG_STD | tr '.' 'p')
+    local SC_TAG=$(printf '%g' $SC_STD)
+    local LIG_TAG=$(printf '%g' $LIG_STD)
     local RUN_DIR="${REPO_ROOT}/outputs/binder_zen_plinder_pocket_placer_no_prealign_sc${SC_TAG}_lig${LIG_TAG}/train"
 
     mkdir -p ${REPO_ROOT}/outputs/binder_zen_plinder_pocket_placer_no_prealign_sc${SC_TAG}_lig${LIG_TAG}/debug
@@ -88,7 +88,6 @@ run_one() {
         experiment.checkpointer.every_n_train_steps=500 \
         hydra.run.dir="'${RUN_DIR}'" \
         "experiment.warm_start='${REPO_ROOT}/proteinzen_weights/binder_design_phase2_6/lightning_logs/version_0/checkpoints/last_no_opt.ckpt'" \
-        > "${RUN_DIR}/../run.log" 2>&1
 }
 
 for i in 0 1 2 3 4 5 6 7; do
