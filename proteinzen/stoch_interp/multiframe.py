@@ -461,9 +461,20 @@ class MultiSE3Interpolant:
             sc_idx = rigids_data['rigids_sidechain_idx']   # [B, N]
             tok_idx = rigids_data['rigids_to_token']        # [B, N]
             bb_mask = (sc_idx == 0) & (~rigids_noising_mask.bool()) & rigids_mask.bool()
+            side_chain_std_batch = batch.get('side_chain_trans_prior_std', None)
+            lig_std_batch = batch.get('lig_trans_prior_std', None)
             for b in range(trans_0.shape[0]):
                 if not use_placer[b]:
                     continue
+                # directly sample per-type noise for placer tasks
+                if side_chain_std_batch is not None and not torch.isnan(side_chain_std_batch[b]):
+                    sc_noised = rigids_noising_mask[b].bool() & (sc_idx[b] > 0)
+                    if sc_noised.any():
+                        trans_0[b, sc_noised] = torch.randn(sc_noised.sum(), 3, device=trans_0.device) * side_chain_std_batch[b]
+                if lig_std_batch is not None and not torch.isnan(lig_std_batch[b]):
+                    lig_noised = rigids_noising_mask[b].bool() & (sc_idx[b] == 0)
+                    if lig_noised.any():
+                        trans_0[b, lig_noised] = torch.randn(lig_noised.sum(), 3, device=trans_0.device) * lig_std_batch[b]
                 bb_indices = bb_mask[b].nonzero(as_tuple=True)[0]
                 if len(bb_indices) == 0:
                     continue

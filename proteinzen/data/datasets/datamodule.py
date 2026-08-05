@@ -525,6 +525,12 @@ class TrainingDataset(torch.utils.data.Dataset):
             task_trans_prior_std if task_trans_prior_std is not None else float('nan'),
             dtype=torch.float32,
         )
+        features['side_chain_trans_prior_std'] = torch.tensor(
+            getattr(task, 'side_chain_trans_prior_std', float('nan')), dtype=torch.float32,
+        )
+        features['lig_trans_prior_std'] = torch.tensor(
+            getattr(task, 'lig_trans_prior_std', float('nan')), dtype=torch.float32,
+        )
 
         _apply_rot_bond_data_to_features(features, rot_bond_data)
 
@@ -751,6 +757,12 @@ class ValidationDataset(torch.utils.data.Dataset):
         features['trans_prior_std'] = torch.tensor(
             task_trans_prior_std if task_trans_prior_std is not None else float('nan'),
             dtype=torch.float32,
+        )
+        features['side_chain_trans_prior_std'] = torch.tensor(
+            getattr(task, 'side_chain_trans_prior_std', float('nan')), dtype=torch.float32,
+        )
+        features['lig_trans_prior_std'] = torch.tensor(
+            getattr(task, 'lig_trans_prior_std', float('nan')), dtype=torch.float32,
         )
 
         _apply_rot_bond_data_to_features(features, rot_bond_data)

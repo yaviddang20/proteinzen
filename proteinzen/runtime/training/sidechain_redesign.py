@@ -174,4 +174,5 @@ class PocketPLACERTraining(SidechainRedesign):
     """
     name: str = "pocket_placer"
     use_placer_centering: bool = True
-    trans_prior_std: float = 3.0
+    side_chain_trans_prior_std: float = 3.0
+    lig_trans_prior_std: float = 3.0

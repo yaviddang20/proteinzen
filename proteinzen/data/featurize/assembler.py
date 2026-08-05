@@ -351,6 +351,10 @@ def collate(data_list):
             padded_data['sig_perturb'] = data['sig_perturb']
         if 'trans_prior_std' in data:
             padded_data['trans_prior_std'] = data['trans_prior_std']
+        if 'side_chain_trans_prior_std' in data:
+            padded_data['side_chain_trans_prior_std'] = data['side_chain_trans_prior_std']
+        if 'lig_trans_prior_std' in data:
+            padded_data['lig_trans_prior_std'] = data['lig_trans_prior_std']
         ## pad token data
         for key, value in data['token'].items():
             pad_len = token_max_len - value.shape[0]
