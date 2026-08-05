@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
-# Usage:
-#   bash my_train_binder_zen_plinder_pocket_placer_grid_no_prealign.sh all   # launch all 8 in parallel, one per GPU
-#   bash my_train_binder_zen_plinder_pocket_placer_grid_no_prealign.sh <0-7> # run single config on GPU <idx>
-#
+# Launches all 8 grid configs in parallel, one per GPU (GPU 0-7).
 # Index | sc_std | lig_std
 #   0   |  1.0   |  1.0
 #   1   |  2.0   |  2.0
@@ -94,13 +91,7 @@ run_one() {
         > "${RUN_DIR}/../run.log" 2>&1
 }
 
-ARG=${1:?Usage: $0 <0-7|all>}
-
-if [ "$ARG" = "all" ]; then
-    for i in 0 1 2 3 4 5 6 7; do
-        run_one $i &
-    done
-    wait
-else
-    run_one $ARG
-fi
+for i in 0 1 2 3 4 5 6 7; do
+    run_one $i &
+done
+wait
