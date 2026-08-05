@@ -87,7 +87,7 @@ run_one() {
         experiment.checkpointer.train_time_interval=null \
         experiment.checkpointer.every_n_train_steps=500 \
         hydra.run.dir="'${RUN_DIR}'" \
-        "experiment.warm_start='${REPO_ROOT}/proteinzen_weights/binder_design_phase2_6/lightning_logs/version_0/checkpoints/last_no_opt.ckpt'" \
+        "experiment.warm_start='${REPO_ROOT}/proteinzen_weights/binder_design_phase2_6/lightning_logs/version_0/checkpoints/last_no_opt.ckpt'"
 }
 
 for i in 0 1 2 3 4 5 6 7; do
