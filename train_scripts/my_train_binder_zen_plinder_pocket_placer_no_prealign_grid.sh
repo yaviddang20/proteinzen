@@ -77,8 +77,8 @@ run_one() {
         dataset.config="'${REPO_ROOT}/configs/train/data/plinder_pocket_placer.yaml'" \
         +dataset.val_config="'${REPO_ROOT}/configs/train/data/plinder_pocket_placer_val.yaml'" \
         dataset.include_h=true \
-        dataset.placer_side_chain_trans_prior_std=${SC_STD} \
-        dataset.placer_lig_trans_prior_std=${LIG_STD} \
+        +dataset.placer_side_chain_trans_prior_std=${SC_STD} \
+        +dataset.placer_lig_trans_prior_std=${LIG_STD} \
         experiment.optim.lr=0.0001 \
         experiment.lightning.devices=1 \
         experiment.lightning.strategy=auto \
