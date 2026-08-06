@@ -691,7 +691,7 @@ class BiomoleculeModule(L.LightningModule):
                 on_epoch=True,
                 prog_bar=False,
                 batch_size=value.shape[0],
-                sync_dist=False,
+                sync_dist=True,
             )
 
         # ---- t-stratified losses (TRAIN ONLY) ----
@@ -718,7 +718,7 @@ class BiomoleculeModule(L.LightningModule):
                     on_epoch=True,
                     prog_bar=False,
                     batch_size=t.shape[0],
-                    sync_dist=False,
+                    sync_dist=True,
                 )
 
             # t-stratified per-task losses
@@ -739,7 +739,7 @@ class BiomoleculeModule(L.LightningModule):
                     on_epoch=True,
                     prog_bar=False,
                     batch_size=t_per_sample.shape[0],
-                    sync_dist=False,
+                    sync_dist=True,
                 )
 
         # ---- val: per-task losses (val uses fixed t values via stage name) ----
@@ -752,7 +752,7 @@ class BiomoleculeModule(L.LightningModule):
                     on_epoch=True,
                     prog_bar=False,
                     batch_size=value.shape[0],
-                    sync_dist=False,
+                    sync_dist=True,
                 )
 
         # ---- final logging ----
@@ -762,7 +762,7 @@ class BiomoleculeModule(L.LightningModule):
             on_epoch=True,
             prog_bar=True,
             batch_size=batch["t"].shape[0],
-            sync_dist=False,
+            sync_dist=True,
         )
 
     def _shared_step(self, batch, return_outputs=False, skip_prealign=False):
@@ -929,12 +929,15 @@ class BiomoleculeModule(L.LightningModule):
 
         num_gpus = max(1, self.trainer.world_size)
         # n_samples = min(5, 2 * num_gpus) // num_gpus
+        if batch_idx == 0 and self._epoch_sample_val_batch is None:
+            self._epoch_sample_val_batch = _detach_cpu_batch(batch)
+
         write_pdbs = (
             self.trainer.current_epoch % 5 == 0
             and batch_idx == 0  # only first val batch
         )
         run_epoch_sample = write_pdbs
-        
+
         for t_val in (0.0, 0.5):
             batch_t = batch.copy()
             batch_t["t"] = torch.full((*batch_t["t"].shape,), t_val, device=device)
@@ -942,6 +945,16 @@ class BiomoleculeModule(L.LightningModule):
             if write_pdbs:
                 loss_dict, batch_out, outputs = self._shared_step(batch_t, return_outputs=True, skip_prealign=True)
                 pdb_data = self._collect_val_pdb_data(batch_out, outputs, t_val, n_samples=B)
+                del batch_out, outputs
+                torch.cuda.empty_cache()
+                self._write_val_pdbs(pdb_data)
+
+                stashed = _move_to_device(self._epoch_sample_val_batch, device)
+                stashed_t = stashed.copy()
+                stashed_t["t"] = torch.full((*stashed_t["t"].shape,), t_val, device=device)
+                _, batch_out, outputs = self._shared_step(stashed_t, return_outputs=True, skip_prealign=True)
+                B_stash = stashed_t["t"].shape[0]
+                pdb_data = self._collect_val_pdb_data(batch_out, outputs, t_val, n_samples=B_stash, subdir="val_pdbs_ref")
                 del batch_out, outputs
                 torch.cuda.empty_cache()
                 self._write_val_pdbs(pdb_data)
@@ -961,12 +974,14 @@ class BiomoleculeModule(L.LightningModule):
                 self._run_epoch_sample(self._epoch_sample_train_batch, "train", max_samples=n)
             n = max(1, batch['rigids']['rigids_mask'].shape[0] // 2)
             self._run_epoch_sample(batch, "val", max_samples=n)
+            n = max(1, self._epoch_sample_val_batch['rigids']['rigids_mask'].shape[0] // 2)
+            self._run_epoch_sample(self._epoch_sample_val_batch, "val_ref", max_samples=n)
 
-    def _collect_val_pdb_data(self, batch, outputs, t_val: float, n_samples: int = 5):
+    def _collect_val_pdb_data(self, batch, outputs, t_val: float, n_samples: int = 5, subdir: str = "val_pdbs"):
         """Extract all GPU tensors to CPU numpy."""
         epoch = self.trainer.current_epoch
         rank = self.trainer.global_rank
-        out_dir = os.path.join(self.trainer.log_dir, f"val_pdbs/epoch_{epoch:04d}/t_{t_val}")
+        out_dir = os.path.join(self.trainer.log_dir, f"{subdir}/epoch_{epoch:04d}/t_{t_val}")
         os.makedirs(out_dir, exist_ok=True)
 
         B = batch["t"].shape[0]
@@ -1059,7 +1074,7 @@ class BiomoleculeModule(L.LightningModule):
                 "val/composite_pred_trans_mse",
                 composite,
                 prog_bar=True,
-                sync_dist=False,
+                sync_dist=True,
             )
 
     def on_train_epoch_end(self):
@@ -1255,8 +1270,8 @@ class BiomoleculeModule(L.LightningModule):
 
         integration_mse = float(np.mean(all_mse))
         integration_mse_kabsch = float(np.mean(all_mse_kabsch))
-        self.log(f"epoch_sample/{split}/{task_name}/integration_mse", integration_mse, prog_bar=False, sync_dist=False)
-        self.log(f"epoch_sample/{split}/{task_name}/integration_mse_kabsch", integration_mse_kabsch, prog_bar=False, sync_dist=False)
+        self.log(f"epoch_sample/{split}/{task_name}/integration_mse", integration_mse, prog_bar=False, sync_dist=True)
+        self.log(f"epoch_sample/{split}/{task_name}/integration_mse_kabsch", integration_mse_kabsch, prog_bar=False, sync_dist=True)
         model.train()
 
     #     return loss_dict
@@ -1677,7 +1692,7 @@ class BiomoleculeModule(L.LightningModule):
             on_step=None,
             on_epoch=True,
             batch_size=1,
-            sync_dist=False
+            sync_dist=True
         )
 
 
