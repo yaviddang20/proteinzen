@@ -174,6 +174,7 @@ class PocketPLACERTraining(SidechainRedesign):
     """
     name: str = "pocket_placer"
     use_placer_centering: bool = True
+    epoch_sample_write_kabsch: bool = False
 
     def __init__(self, side_chain_trans_prior_std=3.0, lig_trans_prior_std=3.0, atomize_sidechains=False, **kwargs):
         super().__init__(**kwargs)

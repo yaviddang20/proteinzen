@@ -1194,7 +1194,9 @@ class BiomoleculeModule(L.LightningModule):
         res_idx_np_all  = batch['token']['residue_idx'].cpu().numpy()
 
         all_mse, all_mse_kabsch = [], []
-        task_name = batch['task'][0].name if batch.get('task') else "unknown"
+        task = batch['task'][0] if batch.get('task') else None
+        task_name = task.name if task is not None else "unknown"
+        write_kabsch = task.epoch_sample_write_kabsch if task is not None else True
 
         for i in range(batch_size):
             n_noised = noised_heavy_mask_t[i].long().sum().clamp(min=1)
@@ -1233,22 +1235,23 @@ class BiomoleculeModule(L.LightningModule):
                 token_residue_idx=res_idx_np_all[i],
             )
 
-            pred_rigid7_aligned_i = pred_rigid7_display[i].copy()
-            pred_rigid7_aligned_i[noising_mask_np[i], 4:] = pred_aligned_i.cpu().numpy()[noising_mask_np[i]]
-            write_val_pdb(
-                gt_rigid7_np[i],
-                pred_rigid7_aligned_i,
-                rigids_mask_np[i],
-                ref_elements_np[i],
-                is_atom_mask_np[i],
-                sc_idx_np_all[i],
-                to_tok_np_all[i],
-                seq_idx_np_all[i],
-                res_type_np_all[i],
-                asym_id_np_all[i],
-                path.replace('.pdb', '_kabsch.pdb'),
-                token_residue_idx=res_idx_np_all[i],
-            )
+            if write_kabsch:
+                pred_rigid7_aligned_i = pred_rigid7_display[i].copy()
+                pred_rigid7_aligned_i[noising_mask_np[i], 4:] = pred_aligned_i.cpu().numpy()[noising_mask_np[i]]
+                write_val_pdb(
+                    gt_rigid7_np[i],
+                    pred_rigid7_aligned_i,
+                    rigids_mask_np[i],
+                    ref_elements_np[i],
+                    is_atom_mask_np[i],
+                    sc_idx_np_all[i],
+                    to_tok_np_all[i],
+                    seq_idx_np_all[i],
+                    res_type_np_all[i],
+                    asym_id_np_all[i],
+                    path.replace('.pdb', '_kabsch.pdb'),
+                    token_residue_idx=res_idx_np_all[i],
+                )
 
             for traj_np, traj_suffix in [
                 (prot_traj_np, '_traj_noise.pdb'),
