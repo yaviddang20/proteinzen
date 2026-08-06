@@ -9,9 +9,8 @@ run_one() {
     local IDX=$1
     local STD=${STDS[$IDX]}
     local STD_TAG=$(printf '%g' $STD)
-    local RUN_DIR="${REPO_ROOT}/outputs/geom_identityRot_256_conformer_${STD_TAG}std_stereo_hydrogen_no_rotvf_no_prealign_grid/train"
+    local RUN_DIR="${REPO_ROOT}/outputs/geom_identityRot_256_conformer_${STD_TAG}std_stereo_hydrogen_no_rotvf_no_prealign/train"
 
-    mkdir -p "${REPO_ROOT}/outputs/geom_identityRot_256_conformer_${STD_TAG}std_stereo_hydrogen_no_rotvf_no_prealign_grid/debug"
 
     echo "Run $IDX (GPU $IDX): trans_prior_std=$STD at run_dir $RUN_DIR"
 
