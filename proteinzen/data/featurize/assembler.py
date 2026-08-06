@@ -355,6 +355,8 @@ def collate(data_list):
             padded_data['side_chain_trans_prior_std'] = data['side_chain_trans_prior_std']
         if 'lig_trans_prior_std' in data:
             padded_data['lig_trans_prior_std'] = data['lig_trans_prior_std']
+        if 'atomize_sidechains' in data:
+            padded_data['atomize_sidechains'] = data['atomize_sidechains']
         ## pad token data
         for key, value in data['token'].items():
             pad_len = token_max_len - value.shape[0]

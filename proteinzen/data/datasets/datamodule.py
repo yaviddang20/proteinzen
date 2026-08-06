@@ -531,6 +531,9 @@ class TrainingDataset(torch.utils.data.Dataset):
         features['lig_trans_prior_std'] = torch.tensor(
             getattr(task, 'lig_trans_prior_std', float('nan')), dtype=torch.float32,
         )
+        features['atomize_sidechains'] = torch.tensor(
+            getattr(task, 'atomize_sidechains', False), dtype=torch.bool,
+        )
 
         _apply_rot_bond_data_to_features(features, rot_bond_data)
 
@@ -763,6 +766,9 @@ class ValidationDataset(torch.utils.data.Dataset):
         )
         features['lig_trans_prior_std'] = torch.tensor(
             getattr(task, 'lig_trans_prior_std', float('nan')), dtype=torch.float32,
+        )
+        features['atomize_sidechains'] = torch.tensor(
+            getattr(task, 'atomize_sidechains', False), dtype=torch.bool,
         )
 
         _apply_rot_bond_data_to_features(features, rot_bond_data)

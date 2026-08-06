@@ -175,7 +175,8 @@ class PocketPLACERTraining(SidechainRedesign):
     name: str = "pocket_placer"
     use_placer_centering: bool = True
 
-    def __init__(self, side_chain_trans_prior_std=3.0, lig_trans_prior_std=3.0, **kwargs):
+    def __init__(self, side_chain_trans_prior_std=3.0, lig_trans_prior_std=3.0, atomize_sidechains=False, **kwargs):
         super().__init__(**kwargs)
         self.side_chain_trans_prior_std = side_chain_trans_prior_std
         self.lig_trans_prior_std = lig_trans_prior_std
+        self.atomize_sidechains = atomize_sidechains
