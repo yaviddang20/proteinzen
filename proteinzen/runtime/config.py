@@ -217,6 +217,8 @@ def config_sampling_hydra_store():
         ),
         name="default"
     )
+    corrupter_store = store(group="corrupter")
+    corrupter_store(MultiSE3Interpolant, name="default")
     model_wrapper_store = store(group="model_wrapper")
     model_wrapper_store(
         pbuilds(BaseModelForward),
@@ -347,6 +349,7 @@ def config_sampling_hydra_store():
         continue_run=False,
         hydra_defaults=[
             {"sampler": "default"},
+            {"corrupter": "default"},
             {"integrator": "euler"},
             {"model_wrapper": "base"},
             {"diffeq": "base_euler_sde"},
