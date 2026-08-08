@@ -952,12 +952,13 @@ class BiomoleculeModule(L.LightningModule):
                 stashed = _move_to_device(self._epoch_sample_val_batch, device)
                 stashed_t = stashed.copy()
                 stashed_t["t"] = torch.full((*stashed_t["t"].shape,), t_val, device=device)
-                _, batch_out, outputs = self._shared_step(stashed_t, return_outputs=True, skip_prealign=True)
+                ref_loss_dict, batch_out, outputs = self._shared_step(stashed_t, return_outputs=True, skip_prealign=True)
                 B_stash = stashed_t["t"].shape[0]
                 pdb_data = self._collect_val_pdb_data(batch_out, outputs, t_val, n_samples=B_stash, subdir="val_pdbs_ref")
                 del batch_out, outputs
                 torch.cuda.empty_cache()
                 self._write_val_pdbs(pdb_data)
+                self._log_losses(ref_loss_dict, stashed_t, stage=f"val_ref/t_{t_val}")
             else:
                 loss_dict = self._shared_step(batch_t, skip_prealign=True)
 
@@ -1112,6 +1113,56 @@ class BiomoleculeModule(L.LightningModule):
         else:
             trans_t = torch.randn_like(gt_trans) * self.corrupter.trans_prior_std
         trans_t = trans_t - trans_t.mean(dim=1, keepdim=True)
+
+        # PLACER centering — mirror corrupt_dense_batch logic
+        use_placer = torch.tensor(
+            [getattr(t, "use_placer_centering", False) for t in batch["task"]],
+            dtype=torch.bool, device=device,
+        )
+        if use_placer.any():
+            sc_idx = rigids_data['rigids_sidechain_idx']
+            tok_idx = rigids_data['rigids_to_token']
+            bb_mask = (sc_idx == 0) & (~rigids_noising_mask.bool()) & rigids_mask.bool()
+            side_chain_std_batch = batch.get('side_chain_trans_prior_std', None)
+            lig_std_batch = batch.get('lig_trans_prior_std', None)
+            atomize_sc_batch = batch.get('atomize_sidechains', None)
+            for b in range(trans_t.shape[0]):
+                if not use_placer[b]:
+                    continue
+                atomize_sc = bool(atomize_sc_batch[b]) if atomize_sc_batch is not None else False
+                if side_chain_std_batch is not None and not torch.isnan(side_chain_std_batch[b]):
+                    sc_noised = rigids_noising_mask[b].bool() & (sc_idx[b] > 0)
+                    if sc_noised.any():
+                        trans_t[b, sc_noised] = torch.randn(sc_noised.sum(), 3, device=device) * side_chain_std_batch[b]
+                if lig_std_batch is not None and not torch.isnan(lig_std_batch[b]):
+                    lig_noised = rigids_noising_mask[b].bool() & (sc_idx[b] == 0)
+                    if lig_noised.any():
+                        trans_t[b, lig_noised] = torch.randn(lig_noised.sum(), 3, device=device) * lig_std_batch[b]
+                bb_indices = bb_mask[b].nonzero(as_tuple=True)[0]
+                if len(bb_indices) == 0:
+                    continue
+                bb_tok = tok_idx[b, bb_indices]
+                bb_trans = gt_trans[b, bb_indices]
+                if not atomize_sc:
+                    sc_noised = rigids_noising_mask[b].bool() & (sc_idx[b] > 0)
+                    if sc_noised.any():
+                        sc_indices = sc_noised.nonzero(as_tuple=True)[0]
+                        max_tok = int(tok_idx[b].max().item()) + 1
+                        tok_to_bb = torch.zeros(max_tok, 3, device=device)
+                        tok_to_bb[bb_tok] = bb_trans
+                        trans_t[b, sc_indices] += tok_to_bb[tok_idx[b, sc_indices]]
+                anchor_noised_mask = rigids_noising_mask[b].bool() & (
+                    (sc_idx[b] == 0) if not atomize_sc else (sc_idx[b] >= 0)
+                )
+                lig_noised = rigids_noising_mask[b].bool() & (sc_idx[b] == 0)
+                if lig_noised.any():
+                    anchor_pool = anchor_noised_mask.nonzero(as_tuple=True)[0]
+                    anchor_idx = anchor_pool[torch.randint(len(anchor_pool), (1,), device=device).item()]
+                    anchor_noised = trans_t[b, anchor_idx].clone()
+                    other = anchor_pool[anchor_pool != anchor_idx]
+                    if len(other) > 0:
+                        trans_t[b, other] += anchor_noised
+
         trans_t = torch.where(rigids_noising_mask[..., None], trans_t, gt_trans)
 
         gt_rigid7 = rigids_data['rigids_1'].clone()
