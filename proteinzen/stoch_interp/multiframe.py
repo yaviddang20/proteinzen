@@ -463,11 +463,9 @@ class MultiSE3Interpolant:
             bb_mask = (sc_idx == 0) & (~rigids_noising_mask.bool()) & rigids_mask.bool()
             side_chain_std_batch = batch.get('side_chain_trans_prior_std', None)
             lig_std_batch = batch.get('lig_trans_prior_std', None)
-            atomize_sc_batch = batch.get('atomize_sidechains', None)
             for b in range(trans_0.shape[0]):
                 if not use_placer[b]:
                     continue
-                atomize_sc = bool(atomize_sc_batch[b]) if atomize_sc_batch is not None else False
                 # directly sample per-type noise for placer tasks
                 if side_chain_std_batch is not None and not torch.isnan(side_chain_std_batch[b]):
                     sc_noised = rigids_noising_mask[b].bool() & (sc_idx[b] > 0)
@@ -483,24 +481,19 @@ class MultiSE3Interpolant:
                 bb_tok = tok_idx[b, bb_indices]
                 bb_trans = trans_1[b, bb_indices]  # already centered
 
-                if not atomize_sc:
-                    # protein sidechain rigids: use same-token backbone as anchor
-                    sc_noised = rigids_noising_mask[b].bool() & (sc_idx[b] > 0)
-                    if sc_noised.any():
-                        sc_indices = sc_noised.nonzero(as_tuple=True)[0]
-                        max_tok = int(tok_idx[b].max().item()) + 1
-                        tok_to_bb = torch.zeros(max_tok, 3, device=trans_0.device)
-                        tok_to_bb[bb_tok] = bb_trans
-                        trans_0[b, sc_indices] += tok_to_bb[tok_idx[b, sc_indices]]
+                # sidechain rigids (sc_idx>0): center at same-token backbone CA
+                sc_noised = rigids_noising_mask[b].bool() & (sc_idx[b] > 0)
+                if sc_noised.any():
+                    sc_indices = sc_noised.nonzero(as_tuple=True)[0]
+                    max_tok = int(tok_idx[b].max().item()) + 1
+                    tok_to_bb = torch.zeros(max_tok, 3, device=trans_0.device)
+                    tok_to_bb[bb_tok] = bb_trans
+                    trans_0[b, sc_indices] += tok_to_bb[tok_idx[b, sc_indices]]
 
-                # when atomize_sc: sc frames (sc_idx>0) get no CA-centering and are merged
-                # into the anchor group below so all noised tokens share one anchor.
-                anchor_noised_mask = rigids_noising_mask[b].bool() & (
-                    (sc_idx[b] == 0) if not atomize_sc else (sc_idx[b] >= 0)
-                )
-                # ligand/atom rigids (sc_idx==0, noised): PLACER self-anchors within the
+                # ligand rigids (sc_idx==0, noised): PLACER self-anchors within the
                 # ligand subgraph. Anchor keeps its own noise; others center at anchor's
                 # noised position (matches inference — GT unknown at test time).
+                anchor_noised_mask = rigids_noising_mask[b].bool() & (sc_idx[b] == 0)
                 lig_noised = rigids_noising_mask[b].bool() & (sc_idx[b] == 0)
                 if lig_noised.any():
                     anchor_pool = anchor_noised_mask.nonzero(as_tuple=True)[0]

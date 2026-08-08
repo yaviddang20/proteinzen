@@ -1134,11 +1134,9 @@ class BiomoleculeModule(L.LightningModule):
             bb_mask = (sc_idx == 0) & (~rigids_noising_mask.bool()) & rigids_mask.bool()
             side_chain_std_batch = batch.get('side_chain_trans_prior_std', None)
             lig_std_batch = batch.get('lig_trans_prior_std', None)
-            atomize_sc_batch = batch.get('atomize_sidechains', None)
             for b in range(trans_t.shape[0]):
                 if not use_placer[b]:
                     continue
-                atomize_sc = bool(atomize_sc_batch[b]) if atomize_sc_batch is not None else False
                 if side_chain_std_batch is not None and not torch.isnan(side_chain_std_batch[b]):
                     sc_noised = rigids_noising_mask[b].bool() & (sc_idx[b] > 0)
                     if sc_noised.any():
@@ -1152,17 +1150,14 @@ class BiomoleculeModule(L.LightningModule):
                     continue
                 bb_tok = tok_idx[b, bb_indices]
                 bb_trans = gt_trans[b, bb_indices]
-                if not atomize_sc:
-                    sc_noised = rigids_noising_mask[b].bool() & (sc_idx[b] > 0)
-                    if sc_noised.any():
-                        sc_indices = sc_noised.nonzero(as_tuple=True)[0]
-                        max_tok = int(tok_idx[b].max().item()) + 1
-                        tok_to_bb = torch.zeros(max_tok, 3, device=device)
-                        tok_to_bb[bb_tok] = bb_trans
-                        trans_t[b, sc_indices] += tok_to_bb[tok_idx[b, sc_indices]]
-                anchor_noised_mask = rigids_noising_mask[b].bool() & (
-                    (sc_idx[b] == 0) if not atomize_sc else (sc_idx[b] >= 0)
-                )
+                sc_noised = rigids_noising_mask[b].bool() & (sc_idx[b] > 0)
+                if sc_noised.any():
+                    sc_indices = sc_noised.nonzero(as_tuple=True)[0]
+                    max_tok = int(tok_idx[b].max().item()) + 1
+                    tok_to_bb = torch.zeros(max_tok, 3, device=device)
+                    tok_to_bb[bb_tok] = bb_trans
+                    trans_t[b, sc_indices] += tok_to_bb[tok_idx[b, sc_indices]]
+                anchor_noised_mask = rigids_noising_mask[b].bool() & (sc_idx[b] == 0)
                 lig_noised = rigids_noising_mask[b].bool() & (sc_idx[b] == 0)
                 if lig_noised.any():
                     anchor_pool = anchor_noised_mask.nonzero(as_tuple=True)[0]
@@ -1216,7 +1211,10 @@ class BiomoleculeModule(L.LightningModule):
         clean_traj, prot_traj, final_denoiser_out = integrator.sample(batch, ts)
         final_rigids = final_denoiser_out['denoised_rigids']
 
-        prot_traj_np = [
+        noise_frame_np = ru.Rigid(
+            rots=ru.Rotation(rot_mats=rotmats_t), trans=trans_t
+        ).to_tensor_7().cpu().numpy()
+        prot_traj_np = [noise_frame_np] + [
             ru.Rigid(rots=ru.Rotation(rot_mats=r), trans=t).to_tensor_7().cpu().numpy()
             for t, r, _ in prot_traj
         ]
