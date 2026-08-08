@@ -1101,7 +1101,16 @@ class BiomoleculeModule(L.LightningModule):
         batch_size = rigids_mask.shape[0]
 
         # Generate noise independently of x_1 (same as sampling datamodule)
-        gt_trans = ru.Rigid.from_tensor_7(rigids_data['rigids_1']).get_trans()
+        gt_rigids_1 = ru.Rigid.from_tensor_7(rigids_data['rigids_1'])
+        gt_trans = gt_rigids_1.get_trans()
+
+        # Center GT coords to match corrupt_dense_batch (trans_1 = trans_1 - center)
+        center = (gt_trans * rigids_mask[..., None]).sum(dim=1) / rigids_mask.long().sum(dim=1)[..., None].clamp(min=1)
+        gt_trans = gt_trans - center[:, None, :]
+        rigids_data['rigids_1'] = ru.Rigid(
+            rots=gt_rigids_1.get_rots(), trans=gt_trans
+        ).to_tensor_7()
+
         per_sample_std = batch.get('trans_prior_std', None)
         if per_sample_std is not None:
             std = torch.where(
