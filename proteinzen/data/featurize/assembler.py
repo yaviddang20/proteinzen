@@ -87,6 +87,7 @@ def process_token_features(
     is_copy_token_mask = from_numpy(token_data['is_copy'].copy()).bool()
     token_is_unindexed_mask = from_numpy(token_data['is_unindexed'].copy()).bool()
     seq_noising_mask = from_numpy(token_data["seq_noising_mask"].copy()).bool()
+    hotspot_type = torch.zeros(len(token_data), dtype=torch.long)
     # is_copy_token_mask = from_numpy(is_copy_token_mask.copy()).bool()
     # token_is_unindexed_mask = from_numpy(token_is_unindexed_mask.copy()).bool()
 
@@ -123,6 +124,7 @@ def process_token_features(
             resolved_mask = pad_dim(resolved_mask, 0, pad_len)
             token_to_rep_rigid = pad_dim(token_to_rep_rigid, 0, pad_len)
             seq_noising_mask = pad_dim(seq_noising_mask, 0, pad_len)
+        hotspot_type = pad_dim(hotspot_type, 0, pad_len)
 
     token_features = {
         "token_idx": token_index,
@@ -140,6 +142,7 @@ def process_token_features(
         "token_is_copy_mask": is_copy_token_mask,
         "token_is_unindexed_mask": token_is_unindexed_mask,
         "seq_noising_mask": seq_noising_mask,
+        "hotspot_type": hotspot_type,
         # aggregate / renamed masks for convenience
         "token_mask": resolved_mask.bool() & pad_mask.bool(),
         "seq": res_type,
@@ -208,6 +211,7 @@ def process_rigid_features(
     rigid_to_token = torch.tensor(rigid_to_token, dtype=torch.long)
     new_rigids_noising_mask = from_numpy(rigid_data['rigids_noising_mask'].copy()).bool()
     rigids_seq_idx = from_numpy(rigid_to_seq_idx.copy()).long()
+    rigids_num_real_axes = from_numpy(rigid_data['num_real_input_axes'].copy()).long()
 
     # Compute padding and apply
     if max_rigids is not None:
@@ -228,6 +232,7 @@ def process_rigid_features(
         sidechain_idx = pad_dim(sidechain_idx, 0, pad_len)
         new_rigids_noising_mask = pad_dim(new_rigids_noising_mask, 0, pad_len, value=True)
         rigids_seq_idx = pad_dim(rigids_seq_idx, 0, pad_len)
+        rigids_num_real_axes = pad_dim(rigids_num_real_axes, 0, pad_len)
 
         tensor7_pad = torch.zeros((pad_len, 7), device=tensor7.device, dtype=tensor7.dtype)
         tensor7_pad[:, 0] = 1
@@ -243,6 +248,7 @@ def process_rigid_features(
         "rigids_ref_element": ref_element.long(),
         "rigids_ref_charge": ref_charge.float(),
         "rigids_ref_chirality": ref_chirality.long(),
+        "rigids_num_real_axes": rigids_num_real_axes,
         "rigids_resolved_mask": resolved_mask.bool(),
         "rigids_pad_mask": pad_mask.bool(),
         "rigids_to_token": rigid_to_token,
