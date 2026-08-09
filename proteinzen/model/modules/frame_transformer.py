@@ -13,6 +13,7 @@ from proteinzen.openfold.layers.layers_v2 import (
 )
 from proteinzen.openfold.utils import rigid_utils as ru
 
+from .common import compile_supported
 
 # from boltz1
 def get_indexing_matrix(K, W, H, device):
@@ -63,6 +64,7 @@ class GatherAdaLN(nn.Module):
         self.c_s = c_s
         self.c_cond = c_cond
 
+    @torch.compile(disable=not compile_supported)
     def forward(self, s, cond, cond_to_s_idx, s_mask):
         s = self.ln_s(s)
         cond = self.ln_cond(cond)
@@ -95,6 +97,7 @@ class GatherConditionedTransition(nn.Module):
 
         self.c_s = c_s
 
+    @torch.compile(disable=not compile_supported)
     def forward(self, s, cond, cond_to_s_idx, s_mask):
         s = self.adaln(s, cond, cond_to_s_idx, s_mask)
         b = swish(self.lin_1(s)) * self.lin_2(s)
@@ -115,14 +118,15 @@ class GatherUpdate(nn.Module):
             Linear(c_s, c_frame, bias=False)
         )
 
+    @torch.compile(disable=not compile_supported)
     def forward(self,
                 node_embed,
                 rigids_embed,
                 rigids_to_res_idx,
                 rigids_mask):
-        broadcast_embed = self.lin(node_embed)
+        # broadcast_embed = self.lin(node_embed)
         broadcast_embed = torch.gather(
-            node_embed,
+            self.lin(node_embed),
             -2,
             rigids_to_res_idx[..., None].expand([-1 for _ in range(rigids_to_res_idx.dim())] + [rigids_embed.shape[-1]])
         )
@@ -135,6 +139,7 @@ class ScatterUpdate(nn.Module):
         super().__init__()
         self.lin = Linear(c_frame, c_s, bias=False)
 
+    @torch.compile(disable=not compile_supported)
     def forward(self,
                 rigids_embed,
                 node_embed,
@@ -296,7 +301,158 @@ class BlockInvariantPointAttention(nn.Module):
 
         return pt_att
 
-    def forward(
+    @torch.compile(disable=not compile_supported)
+    def _compile_pts_bias(
+        self,
+        q_pts,
+        k_pts,
+    ):
+        # we can do a lot of these operations in-place which saves us a small chunk of memory
+        pt_att = -2 * torch.einsum("...ahpd,...bhpd->...abh", q_pts, k_pts)
+        q_pts_norm = torch.sum(q_pts ** 2, dim=(-1, -2))
+        k_pts_norm = torch.sum(k_pts ** 2, dim=(-1, -2))
+        pt_att += q_pts_norm[..., None, :]
+        pt_att += k_pts_norm[..., None, :, :]
+
+        head_weights = self.softplus(self.head_weights).view(
+            *((1,) * len(pt_att.shape[:-1]) + (-1,))
+        )
+        head_weights = head_weights * math.sqrt(
+            1.0 / (3 * (self.no_qk_points * 9.0 / 2))
+        )
+        pt_att *= head_weights
+        pt_att *= -0.5
+
+        return pt_att
+
+    @torch.compile(disable=not compile_supported)
+    def _gen_attn_tensors(
+        self,
+        q_in: torch.Tensor,
+        kv_in: torch.Tensor,
+    ):
+        #######################################
+        # Generate scalar and point activations
+        #######################################
+        # [*, N, H * C_hidden]
+        q = self.linear_q(q_in)
+        # [*, N, H * C_hidden]
+        k = self.linear_k(kv_in)
+        # [*, N, H * C_hidden]
+        v = self.linear_v(kv_in)
+
+        # [*, N_block, block_Q, H, C_hidden]
+        q = q.view(q.shape[:-1] + (self.no_heads, -1))
+        # [*, N_block, block_K, H, C_hidden]
+        k = k.view(k.shape[:-1] + (self.no_heads, -1))
+        # [*, N_block, block_K, H, C_hidden]
+        v = v.view(v.shape[:-1] + (self.no_heads, -1))
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        # [*, N, H * P_q * 3]
+        q_pts = self.linear_q_points(q_in)
+        # [*, N, H * (P_q + P_v) * 3]
+        kv_pts = self.linear_kv_points(kv_in)
+        return q, k, v, q_pts, kv_pts
+
+    @torch.compile(disable=not compile_supported)
+    def _gen_pair_bias(
+        self,
+        z,
+    ):
+        # [*, N_block, block_Q, block_K, H]
+        z = self.ln_z(z)
+        b = self.linear_b(z)
+        pair_z = self.down_z(z)
+
+        return b, pair_z
+
+    @torch.compile(disable=not compile_supported)
+    def _compile_attn_aggregate(
+        self, b, pt_att, pair_z,
+        q, k, v, v_pts, attn_mask
+    ):
+        # [*, N_block, block_Q, block_K, H]
+        a = torch.einsum("bnqhc,bnkhc->bnqkh", q, k)
+        a *= math.sqrt(1.0 / (3 * self.c_hidden))
+        a += math.sqrt(1.0 / 3) * b
+
+        # [*, N_block, block_Q, block_K, H]
+        a += pt_att
+        a += attn_mask[..., None]
+        # [*, N_block, block_Q, H, block_K]
+        a = a.transpose(-1, -2)
+        a = self.softmax(a)
+
+        ################
+        # Compute output
+        ################
+        # [*, N_block, block_Q, H, C_hidden]
+        o = torch.einsum("bnqhk,bnkhc->bnqhc", a, v)
+
+        # [*, N_block, block_Q, H * C_hidden]
+        o = flatten_final_dims(o, 2)
+
+        # [*, N_block, block_Q, H, P_v, 3]
+        o_pt = torch.einsum("bnqhk,bnkhvc->bnqhvc", a, v_pts)
+
+        # [*, N_block, block_Q, H, C_z // 4]
+        o_pair = torch.einsum("bnqhk,bnqkc->bnqhc", a, pair_z)
+
+        # [*, N_block, block_Q, H * C_z // 4]
+        o_pair = flatten_final_dims(o_pair, 2)
+
+        return o, o_pt, o_pair
+
+    @torch.compile(disable=not compile_supported)
+    def _compile_bias_and_attn_aggregate(
+        self,
+        q, k, v, q_pts, k_pts, v_pts, z, attn_mask
+    ):
+        # [*, N_block, block_Q, block_K, H]
+        b, pair_z = self._gen_pair_bias(z)
+        # # [*, N_block, block_Q, block_K, H]
+        pt_att = self._compile_pts_bias(q_pts, k_pts)
+
+        # [*, N_block, block_Q, block_K, H]
+        a = torch.einsum("bnqhc,bnkhc->bnqkh", q, k)
+        # a *= math.sqrt(1.0 / (3 * self.c_hidden))
+        # a += math.sqrt(1.0 / 3) * b
+
+        # convert scalars to tensors for torch.compile
+        a *= torch.tensor([math.sqrt(1.0 / (3 * self.c_hidden))], device=a.device)
+        a += torch.tensor([math.sqrt(1.0 / 3)], device=b.device) * b
+
+        # [*, N_block, block_Q, block_K, H]
+        a += pt_att
+        a += attn_mask[..., None]
+        # [*, N_block, block_Q, H, block_K]
+        a = a.transpose(-1, -2)
+        a = self.softmax(a)
+
+        ################
+        # Compute output
+        ################
+        # [*, N_block, block_Q, H, C_hidden]
+        o = torch.einsum("bnqhk,bnkhc->bnqhc", a, v)
+
+        # [*, N_block, block_Q, H * C_hidden]
+        o = flatten_final_dims(o, 2)
+
+        # [*, N_block, block_Q, H, P_v, 3]
+        o_pt = torch.einsum("bnqhk,bnkhvc->bnqhvc", a, v_pts)
+
+        # [*, N_block, block_Q, H, C_z // 4]
+        o_pair = torch.einsum("bnqhk,bnqkc->bnqhc", a, pair_z)
+
+        # [*, N_block, block_Q, H * C_z // 4]
+        o_pair = flatten_final_dims(o_pair, 2)
+
+        return o, o_pt, o_pair
+
+    def _compile_forward(
         self,
         s: torch.Tensor,
         z: torch.Tensor,
@@ -304,7 +460,227 @@ class BlockInvariantPointAttention(nn.Module):
         s_mask: torch.Tensor,
         to_queries: Callable,
         to_keys: Callable,
-        pts_cdist=True
+        pts_cdist=True,
+        rigid_noising_mask=None,
+    ):
+        """
+        Args:
+            s:
+                [*, N_res, C_s] single representation
+            z:
+                [*, N_res, N_res, C_z] pair representation
+            r:
+                [*, N_res] transformation object
+            mask:
+                [*, N_res] mask
+        Returns:
+            [*, N_res, C_s] single representation update
+        """
+        s = self.ln_s(s)
+
+        q_in = to_queries(s)
+        k_in = to_keys(s)
+
+        # we have to do a bunch of shenanigans to collect
+        # the proper rigids, esp since we might not know
+        # if the rigids have mat or quat rots
+        trans = r.get_trans()
+        rots = r.get_rots().get_cur_rot()
+        # [*, N, 4 or 3x3]
+        rots_flat = rots.view(rots.shape[:2] + (-1,))
+        # [*, N_block, block_Q]
+        q_trans = to_queries(trans)
+        # [*, N_block, block_Q, 4 or 3x3]
+        # print("rots", rots)
+        q_rots = to_queries(rots_flat)
+        # print("q_rots", q_rots)
+        if tuple(rots.shape[-2:]) == (3, 3):
+            q_rots = q_rots.view(q_rots.shape[:3] + (3, 3))
+            # [*, N_block, block_Q]
+            q_rigids = ru.Rigid(
+                trans=q_trans,
+                rots=ru.Rotation(rot_mats=q_rots)
+            )
+        else:
+            # [*, N_block, block_Q]
+            q_rigids = ru.Rigid(
+                trans=q_trans,
+                rots=ru.Rotation(quats=q_rots)
+            )
+        # print("q_rigids", q_rigids.get_trans(), q_rigids.get_rots().get_cur_rot())
+        # [*, N_block, block_K]
+        k_trans = to_keys(trans)
+        k_rots = to_keys(rots_flat.view(rots.shape[:2] + (-1,)))
+        # print("k_rots", k_rots)
+        # there's some more shenanigans that needs to happen because to_keys will
+        # zero out some quats which will lead to weird problems
+        if tuple(rots.shape[-2:]) == (3, 3):
+            k_rots = k_rots.view(k_rots.shape[:3] + (3, 3))
+            k_rots[(k_rots == 0).all(dim=(-2, -1))] = torch.eye(3, dtype=k_rots.dtype, device=k_rots.device)[None, None, None]
+            k_rigids = ru.Rigid(
+                trans=k_trans,
+                rots=ru.Rotation(rot_mats=k_rots)
+            )
+        else:
+            mask = (k_rots == 0).all(dim=-1)
+            k_rots = (
+                k_rots * (~mask[..., None])
+                + torch.tensor([1., 0., 0., 0.], device=k_rots.device)[None, None, None] * mask[..., None]
+            )
+            # print("k_rots", k_rots)
+            k_rigids = ru.Rigid(
+                trans=k_trans,
+                rots=ru.Rotation(quats=k_rots)
+            )
+        # print("k_rigids", k_rigids.get_trans(), k_rigids.get_rots().get_cur_rot())
+
+        #######################################
+        # Generate scalar and point activations
+        #######################################
+        if True:
+            q, k, v, q_pts, kv_pts = self._gen_attn_tensors(q_in, k_in)
+        else:
+            # [*, N_block, block_Q, H * C_hidden]
+            q = self.linear_q(q_in)
+            # [*, N_block, block_K, H * C_hidden]
+            k = self.linear_k(k_in)
+            # [*, N_block, block_K, H * C_hidden]
+            v = self.linear_v(k_in)
+            # [*, N_block, block_Q, H, C_hidden]
+            q = q.view(q.shape[:-1] + (self.no_heads, -1))
+
+            # [*, N_block, block_K, H, C_hidden]
+            k = k.view(k.shape[:-1] + (self.no_heads, -1))
+            # [*, N_block, block_K, H, C_hidden]
+            v = v.view(v.shape[:-1] + (self.no_heads, -1))
+
+            if self.use_qk_norm:
+                q = self.q_norm(q)
+                k = self.k_norm(k)
+
+            # [*, N_block, block_Q, H * P_q * 3]
+            q_pts = self.linear_q_points(q_in)
+            # [*, N_block, block_K, H * (P_q + P_v) * 3]
+            kv_pts = self.linear_kv_points(k_in)
+
+        # [*, N_block, block_Q, H * P_q, 3]
+        q_pts = q_pts.view(q_pts.shape[:-1] + (self.no_heads * self.no_qk_points, 3))
+        q_pts = q_rigids[..., None].apply(q_pts)
+
+        # [*, N_block, block_Q, H, P_q, 3]
+        q_pts = q_pts.view(
+            q_pts.shape[:-2] + (self.no_heads, self.no_qk_points, 3)
+        )
+
+        # [*, N_block, block_K, H * (P_q + P_v), 3]
+        kv_pts = kv_pts.view(kv_pts.shape[:-1] + (-1, 3))
+        kv_pts = k_rigids[..., None].apply(kv_pts)
+
+        # [*, N_block, block_K, H, (P_q + P_v), 3]
+        kv_pts = kv_pts.view(kv_pts.shape[:-2] + (self.no_heads, -1, 3))
+
+        # [*, N_block, block_K, H, P_q/P_v, 3]
+        k_pts, v_pts = torch.split(
+            kv_pts, [self.no_qk_points, self.no_v_points], dim=-2
+        )
+
+        ##########################
+        # Compute attention scores
+        ##########################
+        # [*, N_block, block_Q, block_K]
+        attn_mask = to_queries(s_mask[..., None].float()) * to_keys(s_mask[..., None].float()).transpose(-1, -2)
+        attn_mask = self.inf * (attn_mask - 1)
+        if rigid_noising_mask is not None:
+            q_is_lig = to_queries(rigid_noising_mask[..., None].float())
+            k_is_lig = to_keys(rigid_noising_mask[..., None].float())
+            cross = (q_is_lig > 0.5) ^ (k_is_lig.transpose(-2, -1) > 0.5)
+            attn_mask = attn_mask + cross.float() * -1e5
+
+        if True:
+            o, o_pt, o_pair = self._compile_bias_and_attn_aggregate(
+                q, k, v, q_pts, k_pts, v_pts, z, attn_mask
+            )
+            o_pt = q_rigids[..., None, None].invert_apply(o_pt)
+
+            # [*, N_block, block_Q, H * P_v]
+            o_pt_dists = torch.sqrt(torch.sum(o_pt ** 2, dim=-1) + self.eps)
+            o_pt_norm_feats = flatten_final_dims(
+                o_pt_dists, 2)
+
+            # [*, N_block, block_Q, H * P_v * 3]
+            o_pt = flatten_final_dims(o_pt, 3)
+        else:
+            # [*, N_block, block_Q, block_K, H]
+            b, pair_z = self._gen_pair_bias(z)
+            # # [*, N_block, block_Q, block_K, H]
+            pt_att = self._compile_pts_bias(q_pts, k_pts)
+            # [*, N_block, block_Q, block_K, H]
+            a = torch.einsum("bnqhc,bnkhc->bnqkh", q, k)
+            a *= math.sqrt(1.0 / (3 * self.c_hidden))
+            a += math.sqrt(1.0 / 3) * b
+
+            # [*, N_block, block_Q, block_K, H]
+            a += pt_att
+            a += attn_mask[..., None]
+            # [*, N_block, block_Q, H, block_K]
+            a = a.transpose(-1, -2)
+            a = self.softmax(a)
+
+            ################
+            # Compute output
+            ################
+            # [*, N_block, block_Q, H, C_hidden]
+            o = torch.einsum("bnqhk,bnkhc->bnqhc", a, v)
+
+            # [*, N_block, block_Q, H * C_hidden]
+            o = flatten_final_dims(o, 2)
+
+            # [*, N_block, block_Q, H, P_v, 3]
+            o_pt = torch.einsum("bnqhk,bnkhvc->bnqhvc", a, v_pts)
+            o_pt = q_rigids[..., None, None].invert_apply(o_pt)
+
+            # [*, N_block, block_Q, H * P_v]
+            o_pt_dists = torch.sqrt(torch.sum(o_pt ** 2, dim=-1) + self.eps)
+            o_pt_norm_feats = flatten_final_dims(
+                o_pt_dists, 2)
+
+            # [*, N_block, block_Q, H * P_v * 3]
+            o_pt = flatten_final_dims(o_pt, 3)
+
+            # [*, N_block, block_Q, block_K, H, C_z // 4]
+            # pair_z = self.down_z(z)#.to(dtype=a.dtype)
+            # [*, N_block, block_Q, H, C_z // 4]
+            o_pair = torch.einsum("bnqhk,bnqkc->bnqhc", a, pair_z)
+
+            # [*, N_block, block_Q, H * C_z // 4]
+            o_pair = flatten_final_dims(o_pair, 2)
+            if self.ablate_down_z:
+                o_pair = torch.zeros_like(o_pair)
+
+        o_feats = [o, o_pt, o_pt_norm_feats, o_pair]
+        o_feats = torch.cat(
+            o_feats, dim=-1
+        )#.to(dtype=z.dtype)
+
+        if self.out_gate is not None:
+            gate = self.out_gate(q_in)
+            o_feats = o_feats * torch.sigmoid(gate)
+
+        # [*, N_block, block_Q, C_s]
+        out = self.linear_out(o_feats)
+
+        return out.view(s.shape)
+
+    def _eager_forward(
+        self,
+        s: torch.Tensor,
+        z: torch.Tensor,
+        r: ru.Rigid,
+        s_mask: torch.Tensor,
+        to_queries: Callable,
+        to_keys: Callable,
+        pts_cdist=True,
+        rigid_noising_mask=None,
     ) -> torch.Tensor:
         """
         Args:
@@ -360,7 +736,7 @@ class BlockInvariantPointAttention(nn.Module):
         # zero out some quats which will lead to weird problems
         if tuple(rots.shape[-2:]) == (3, 3):
             k_rots = k_rots.view(k_rots.shape[:3] + (3, 3))
-            k_rots[(k_rots == 0).all(dim=(-2, -1))] = torch.eye(3, device=k_rots.device)[None, None, None]
+            k_rots[(k_rots == 0).all(dim=(-2, -1))] = torch.eye(3, dtype=k_rots.dtype, device=k_rots.device)[None, None, None]
             k_rigids = ru.Rigid(
                 trans=k_trans,
                 rots=ru.Rotation(rot_mats=k_rots)
@@ -460,6 +836,11 @@ class BlockInvariantPointAttention(nn.Module):
         # [*, N_block, block_Q, block_K, H]
         a = a + pt_att
         a = a + attn_mask[..., None]
+        if rigid_noising_mask is not None:
+            q_is_lig = to_queries(rigid_noising_mask[..., None].float())
+            k_is_lig = to_keys(rigid_noising_mask[..., None].float())
+            cross = (q_is_lig > 0.5) ^ (k_is_lig.transpose(-2, -1) > 0.5)
+            a = a + cross.float()[..., None] * -1e5
         # [*, N_block, block_Q, H, block_K]
         a = a.transpose(-1, -2)
         a = self.softmax(a)
@@ -508,6 +889,42 @@ class BlockInvariantPointAttention(nn.Module):
         out = self.linear_out(o_feats)
 
         return out.view(s.shape)
+
+    def forward(
+        self,
+        s: torch.Tensor,
+        z: torch.Tensor,
+        r: ru.Rigid,
+        s_mask: torch.Tensor,
+        to_queries: Callable,
+        to_keys: Callable,
+        pts_cdist=True,
+        rigid_noising_mask=None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            s:
+                [*, N_res, C_s] single representation
+            z:
+                [*, N_res, N_res, C_z] pair representation
+            r:
+                [*, N_res] transformation object
+            mask:
+                [*, N_res] mask
+        Returns:
+            [*, N_res, C_s] single representation update
+        """
+        run_compile_path = (not self.ablate_down_z and self.use_qk_norm and self.use_out_gating)
+        if compile_supported and run_compile_path:
+            return self._compile_forward(
+                s, z, r, s_mask, to_queries, to_keys,
+                rigid_noising_mask=rigid_noising_mask,
+            )
+        else:
+            return self._eager_forward(
+                s, z, r, s_mask, to_queries, to_keys, pts_cdist=pts_cdist,
+                rigid_noising_mask=rigid_noising_mask,
+            )
 
 
 class ConditionedBlockInvariantPointAttention(nn.Module):
@@ -666,7 +1083,8 @@ class ConditionedBlockInvariantPointAttention(nn.Module):
         s_mask: torch.Tensor,
         to_queries: Callable,
         to_keys: Callable,
-        pts_cdist=True
+        pts_cdist=True,
+        rigid_noising_mask=None,
     ) -> torch.Tensor:
         """
         Args:
@@ -822,6 +1240,12 @@ class ConditionedBlockInvariantPointAttention(nn.Module):
         # [*, N_block, block_Q, block_K, H]
         a = a + pt_att
         a = a + attn_mask[..., None]
+        if rigid_noising_mask is not None:
+            # block protein↔ligand rigid-level IPA; rigid_noising_mask: (B, N_rigid) True=ligand
+            q_is_lig = to_queries(rigid_noising_mask[..., None].float())     # (B, N_block, block_Q, 1)
+            k_is_lig = to_keys(rigid_noising_mask[..., None].float())        # (B, N_block, block_K, 1)
+            cross = (q_is_lig > 0.5) ^ (k_is_lig.transpose(-2, -1) > 0.5)  # (B, N_block, block_Q, block_K)
+            a = a + cross.float()[..., None] * -1e5
         # [*, N_block, block_Q, H, block_K]
         a = a.transpose(-1, -2)
         a = self.softmax(a)
@@ -1140,8 +1564,10 @@ class ConditionedBlockTransformerPairBias(nn.Module):
 
 class FramepairEmbedder(nn.Module):
     def __init__(self,
-                 c_framepair):
+                 c_framepair,
+                 patch_rel_quat_bug=False):
         super().__init__()
+        self.patch_rel_quat_bug = patch_rel_quat_bug
         self.lin_framepair_dist_vec = Linear(3, c_framepair, bias=False)
         self.lin_framepair_rel_quat = Linear(4, c_framepair, bias=False)
         self.lin_framepair_dist = Linear(1, c_framepair, bias=False)
@@ -1179,7 +1605,10 @@ class FramepairEmbedder(nn.Module):
             rots=ru.Rotation(quats=k_rots)
         )
 
-        rel_quat = k_rigids[..., None, :].get_rots().compose_q(q_rigids[..., None].invert().get_rots())
+        if self.patch_rel_quat_bug:
+            rel_quat = q_rigids[..., None].invert().get_rots().compose_q(k_rigids[..., None, :].get_rots())
+        else:
+            rel_quat = k_rigids[..., None, :].get_rots().compose_q(q_rigids[..., None].invert().get_rots())
         rel_quat = rel_quat.get_quats()
         # rel_trans = k_rigids[..., None, :].get_trans() - q_rigids[..., None].get_trans()
         rel_trans = q_rigids[..., None].invert_apply(k_rigids[..., None, :].get_trans())
@@ -1213,6 +1642,8 @@ class FramepairUpdate(nn.Module):
                 LayerNorm(c_z),
                 Linear(c_z, c_framepair, bias=False)
             )
+            if compile_supported:
+                self.nodepair_to_framepair_broadcast.compile()
         else:
             self.nodepair_to_framepair_broadcast = None
 
@@ -1231,6 +1662,8 @@ class FramepairUpdate(nn.Module):
                 nn.ReLU(),
                 Linear(c_framepair, c_framepair),
             )
+            if compile_supported:
+                self.framepair_ffn.compile()
         else:
             self.framepair_ffn = None
 
@@ -1241,28 +1674,59 @@ class FramepairUpdate(nn.Module):
         rigids_mask,
         to_pairs
     ):
+        bsz, _, n_res, c_z = z.shape
         n_rigids = rigids_mask.shape[-1]
-        # TODO: this is a little jenk
-        # with the batch dim
         with torch.no_grad():
-            rigids_pair_idx = torch.stack([
-                rigids_to_res_idx[0:1, ..., None].tile(1, 1, n_rigids),
-                rigids_to_res_idx[0:1, ..., None, :].tile(1, n_rigids, 1)
-            ], dim=-1)
             rigids_pair_mask = (
-                rigids_mask[0:1, ..., None].tile(1, 1, n_rigids)
-                * rigids_mask[0:1, ..., None, :].tile(1, n_rigids, 1)
+                rigids_mask[..., None].expand(-1, -1, n_rigids)
+                * rigids_mask[..., None, :].expand(-1, n_rigids, -1)
             )
 
             # bmm only works on floating point types
             # but we lose precision on large ints so we disable autocast
             with torch.autocast("cuda", enabled=False):
-                framepairs_idx = to_pairs(rigids_pair_idx.float()).long()
+                framepairs_idx_l = to_pairs(
+                    rigids_to_res_idx[..., None].expand(-1, -1, n_rigids)[..., None].float()
+                ).long()
+                framepairs_idx_r = to_pairs(
+                    rigids_to_res_idx[..., None, :].expand(-1, n_rigids, -1)[..., None].float()
+                ).long()
                 framepairs_mask = to_pairs(rigids_pair_mask[..., None].float()).bool()
+                framepairs_shape = framepairs_idx_l.shape[1:-1]
+                linear_idx = framepairs_idx_l.mul_(n_res).add_(framepairs_idx_r).reshape(bsz, -1)
 
-        framepairs = z[:, framepairs_idx[0, ..., 0], framepairs_idx[0, ..., 1]]
+        framepairs = torch.gather(
+            z.view(bsz, n_res * n_res, c_z),
+            dim=1,
+            index=linear_idx[..., None].expand(-1, -1, c_z),
+        ).view(bsz, *framepairs_shape, c_z)
         framepairs = framepairs * framepairs_mask
         return framepairs
+
+        # # WARNING: this function assumes that the mask for the entire batch is the same
+        # # this works out since we're using sequence-local batching
+        # n_rigids = rigids_mask.shape[-1]
+        # # TODO: this is a little jenk
+        # # with the batch dim
+        # with torch.no_grad():
+        #     rigids_pair_idx = torch.stack([
+        #         rigids_to_res_idx[0:1, ..., None].tile(1, 1, n_rigids),
+        #         rigids_to_res_idx[0:1, ..., None, :].tile(1, n_rigids, 1)
+        #     ], dim=-1)
+        #     rigids_pair_mask = (
+        #         rigids_mask[0:1, ..., None].tile(1, 1, n_rigids)
+        #         * rigids_mask[0:1, ..., None, :].tile(1, n_rigids, 1)
+        #     )
+
+        #     # bmm only works on floating point types
+        #     # but we lose precision on large ints so we disable autocast
+        #     with torch.autocast("cuda", enabled=False):
+        #         framepairs_idx = to_pairs(rigids_pair_idx.float()).long()
+        #         framepairs_mask = to_pairs(rigids_pair_mask[..., None].float()).bool()
+
+        # framepairs = z[:, framepairs_idx[0, ..., 0], framepairs_idx[0, ..., 1]]
+        # framepairs = framepairs * framepairs_mask
+        # return framepairs
 
     def forward(
         self,
@@ -1349,7 +1813,8 @@ class SequenceFrameTransformerBlock(nn.Module):
         to_queries,
         to_keys,
         rigids_mask,
-        rigids_to_res_idx
+        rigids_to_res_idx,
+        rigid_noising_mask=None,
     ):
         rigids_embed_update = self.block_ipa(
             s=rigids_embed,
@@ -1358,6 +1823,7 @@ class SequenceFrameTransformerBlock(nn.Module):
             s_mask=rigids_mask,
             to_queries=to_queries,
             to_keys=to_keys,
+            rigid_noising_mask=rigid_noising_mask,
         )
         rigids_embed = rigids_embed + rigids_embed_update * rigids_mask[..., None]
 
@@ -1486,6 +1952,7 @@ class SequenceFrameTransformerUpdate(nn.Module):
         to_queries,
         to_keys,
         to_pairs,
+        rigid_cross_type_mask=None,
     ):
         rigids_embed_flat = self.node_to_frame_broadcast(
             s,
@@ -1514,7 +1981,8 @@ class SequenceFrameTransformerUpdate(nn.Module):
                 to_queries,
                 to_keys,
                 rigids_mask,
-                rigids_to_res_idx
+                rigids_to_res_idx,
+                rigid_noising_mask=rigid_cross_type_mask,
             )
             if self.add_vanilla_transformer:
                 rigids_embed_flat = self.trunk[f'vanilla_tfmr_{b}'](
@@ -1633,6 +2101,7 @@ class ConditionedSequenceFrameTransformerBlock(nn.Module):
         to_keys,
         rigids_mask,
         rigids_to_res_idx,
+        rigid_noising_mask=None,
     ):
         if self.use_conditioned_ipa:
             rigids_embed_update = self.block_ipa(
@@ -1644,6 +2113,7 @@ class ConditionedSequenceFrameTransformerBlock(nn.Module):
                 s_mask=rigids_mask,
                 to_queries=to_queries,
                 to_keys=to_keys,
+                rigid_noising_mask=rigid_noising_mask,
             )
         else:
             rigids_embed_update = self.block_ipa(
@@ -1775,6 +2245,7 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
         to_queries,
         to_keys,
         to_pairs,
+        rigid_cross_type_mask=None,
     ):
         rigids_embed_flat = self.node_to_frame_broadcast(
             s,
@@ -1804,6 +2275,7 @@ class ConditionedSequenceFrameTransformerUpdate(nn.Module):
                 to_keys,
                 rigids_mask,
                 rigids_to_res_idx,
+                rigid_noising_mask=rigid_cross_type_mask,
             )
             if self.add_vanilla_transformer:
                 rigids_embed_flat = self.trunk[f'vanilla_tfmr_{b}'](
