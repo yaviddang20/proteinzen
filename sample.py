@@ -51,7 +51,7 @@ class Experiment:
             devices = list(range(torch.cuda.device_count()))
             if len(devices) > 1:
                 kwargs['strategy'] = 'ddp_find_unused_parameters_true'
-                kwargs['use_distributed_sampler'] = True
+                kwargs['use_distributed_sampler'] = False
         else:
             devices = 1
 

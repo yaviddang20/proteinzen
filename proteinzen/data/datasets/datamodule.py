@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from rdkit import Chem
 from rdkit.Chem import AllChem
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 import lightning as L
 import pandas as pd
 
@@ -884,6 +884,18 @@ class BiomoleculeSamplingDataModule(L.LightningDataModule):
             self.batch_sampler = None
 
     def predict_dataloader(self):
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_available() and torch.distributed.is_initialized() else 1
+        rank = torch.distributed.get_rank() if world_size > 1 else 0
+        if world_size > 1:
+            dist_sampler = DistributedSampler(
+                self.task_dispatcher,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False,
+                drop_last=False,
+            )
+        else:
+            dist_sampler = None
         if self.batch_sampler is not None:
             dataloader = DataLoader(
                 self.task_dispatcher,
@@ -895,6 +907,7 @@ class BiomoleculeSamplingDataModule(L.LightningDataModule):
             dataloader = DataLoader(
                 self.task_dispatcher,
                 batch_size=self.batch_size,
+                sampler=dist_sampler,
                 collate_fn=collate,
                 shuffle=False
             )
