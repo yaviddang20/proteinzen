@@ -2051,7 +2051,7 @@ class PDBWriter(BasePredictionWriter):
                 if task_name not in self.task_name_counters:
                     self.task_name_counters[task_name] = 0
                 # Use current counter value and increment for next time
-                sample_name = f"{task_name}_{self.task_name_counters[task_name]}"
+                sample_name = f"{task_name}_gpu{rank}_batch{batch_idx}_idx{curr_sample_id}"
                 self.task_name_counters[task_name] += 1
             else:
                 # Fall back to original naming scheme
