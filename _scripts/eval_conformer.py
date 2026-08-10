@@ -107,7 +107,8 @@ def load_pdb(path, perceive_stereo=False):
             bond.SetStereo(rdchem.BondStereo.STEREONONE)
     try:
         Chem.SanitizeMol(mol)
-    except Exception:
+    except Exception as e:
+        print(f"SanitizeMol failed [{path}]: {e}", file=sys.stderr)
         return None
     if perceive_stereo:
         Chem.AssignStereochemistry(mol, cleanIt=False, force=True)
@@ -764,10 +765,13 @@ def run_conformer_eval(args):
     total_attempted = 0
     total_matched_no_stereo = 0
     total_matched_stereo = 0
+    attempted_mol_ids = set()
 
-    for res in results:
+    for mol_id, res in zip(groups.keys(), results):
         metrics_conn, metrics_stereo, conn_nm, stereo_nm, n_att, n_conn, n_stereo = res
         total_attempted += n_att
+        if n_att > 0:
+            attempted_mol_ids.add(mol_id)
         total_matched_no_stereo += n_conn
         total_matched_stereo += n_stereo
         connectivity_no_match_all.extend(conn_nm)
@@ -833,6 +837,7 @@ def run_conformer_eval(args):
         (mol_id, ref_mol_id_to_display_smis.get(mol_id, ("?", "?"))[1])
         for mol_id in sorted(groups.keys())
         if mol_id not in no_match_mol_ids and mol_id in ref_mol_id_to_display_smis
+        and mol_id in attempted_mol_ids
     ]
     if perfect:
         print(f"\n--- Perfectly matched ({len(perfect)}/{len(groups)}) ---")
