@@ -350,7 +350,7 @@ def _build_all_atom_records(rigid_tensor7, rigids_mask, ref_elements, is_atom_ma
             })
 
     # --- Ligand: use rigid translations directly ---
-    ligand_mask = rigids_mask & is_atom_mask & (ref_elements != 1)
+    ligand_mask = rigids_mask & is_atom_mask
     for r_idx in np.where(ligand_mask)[0]:
         tok = int(rigids_to_token[r_idx])
         asym_id = int(asym_ids_tok[tok])
@@ -691,7 +691,7 @@ class BiomoleculeModule(L.LightningModule):
                 on_epoch=True,
                 prog_bar=False,
                 batch_size=value.shape[0],
-                sync_dist=True,
+                sync_dist=False,
             )
 
         # ---- t-stratified losses (TRAIN ONLY) ----
@@ -718,7 +718,7 @@ class BiomoleculeModule(L.LightningModule):
                     on_epoch=True,
                     prog_bar=False,
                     batch_size=t.shape[0],
-                    sync_dist=True,
+                    sync_dist=False,
                 )
 
             # t-stratified per-task losses
@@ -739,7 +739,7 @@ class BiomoleculeModule(L.LightningModule):
                     on_epoch=True,
                     prog_bar=False,
                     batch_size=t_per_sample.shape[0],
-                    sync_dist=True,
+                    sync_dist=False,
                 )
 
         # ---- val: per-task losses (val uses fixed t values via stage name) ----
@@ -752,7 +752,7 @@ class BiomoleculeModule(L.LightningModule):
                     on_epoch=True,
                     prog_bar=False,
                     batch_size=value.shape[0],
-                    sync_dist=True,
+                    sync_dist=False,
                 )
 
         # ---- final logging ----
@@ -762,7 +762,7 @@ class BiomoleculeModule(L.LightningModule):
             on_epoch=True,
             prog_bar=True,
             batch_size=batch["t"].shape[0],
-            sync_dist=True,
+            sync_dist=False,
         )
 
     def _shared_step(self, batch, return_outputs=False, skip_prealign=False):
@@ -1075,7 +1075,7 @@ class BiomoleculeModule(L.LightningModule):
                 "val/composite_pred_trans_mse",
                 composite,
                 prog_bar=True,
-                sync_dist=True,
+                sync_dist=False,
             )
 
     def on_train_epoch_end(self):
@@ -1331,8 +1331,8 @@ class BiomoleculeModule(L.LightningModule):
 
         integration_mse = float(np.mean(all_mse))
         integration_mse_kabsch = float(np.mean(all_mse_kabsch))
-        self.log(f"epoch_sample/{split}/{task_name}/integration_mse", integration_mse, prog_bar=False, sync_dist=True)
-        self.log(f"epoch_sample/{split}/{task_name}/integration_mse_kabsch", integration_mse_kabsch, prog_bar=False, sync_dist=True)
+        self.log(f"epoch_sample/{split}/{task_name}/integration_mse", integration_mse, prog_bar=False, sync_dist=False)
+        self.log(f"epoch_sample/{split}/{task_name}/integration_mse_kabsch", integration_mse_kabsch, prog_bar=False, sync_dist=False)
         model.train()
 
     #     return loss_dict
@@ -1753,7 +1753,7 @@ class BiomoleculeModule(L.LightningModule):
             on_step=None,
             on_epoch=True,
             batch_size=1,
-            sync_dist=True
+            sync_dist=False
         )
 
 
