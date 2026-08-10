@@ -35,6 +35,7 @@ class BiomoleculeTaskDispatcher(Dataset):
 
         task_list = instantiate(self.config)
         for task in task_list:
+            task.include_h = include_h
             self.task_objs.append((None, task))
 
         self.batches = self._optimal_batching()
