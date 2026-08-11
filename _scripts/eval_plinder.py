@@ -868,25 +868,24 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
         boltz_input["sequences"].append({"ligand": {"id": "B", "smiles": smiles}})
 
     input_yaml = refold_input_dir / f"{sample_id}.yaml"
-    input_yaml.write_text(_yaml.dump(boltz_input, default_flow_style=False))
-
     out_dir = refold_output_dir / sample_id
-    cmd = ["micromamba", "run", "-n", "boltz",
-           "boltz", "predict", str(input_yaml), "--out_dir", str(out_dir),
-           "--override"]
-    if boltz_cache:
-        cmd += ["--cache", str(boltz_cache)]
-
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, timeout=600)
-    except subprocess.CalledProcessError as e:
-        return {"plddt": float("nan"), "iptm": float("nan"), "sc_rmsd": float("nan"),
-                "boltz_error": e.stderr.decode()[-200:]}
-    except subprocess.TimeoutExpired:
-        return {"plddt": float("nan"), "iptm": float("nan"), "sc_rmsd": float("nan"),
-                "boltz_error": "timeout"}
-
     pred_dir = out_dir / f"boltz_results_{sample_id}" / "predictions" / sample_id
+
+    if not pred_dir.exists():
+        input_yaml.write_text(_yaml.dump(boltz_input, default_flow_style=False))
+        cmd = ["micromamba", "run", "-n", "boltz",
+               "boltz", "predict", str(input_yaml), "--out_dir", str(out_dir),
+               "--override"]
+        if boltz_cache:
+            cmd += ["--cache", str(boltz_cache)]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=600)
+        except subprocess.CalledProcessError as e:
+            return {"plddt": float("nan"), "iptm": float("nan"), "sc_rmsd": float("nan"),
+                    "boltz_error": e.stderr.decode()[-200:]}
+        except subprocess.TimeoutExpired:
+            return {"plddt": float("nan"), "iptm": float("nan"), "sc_rmsd": float("nan"),
+                    "boltz_error": "timeout"}
     conf_files = sorted(pred_dir.glob("confidence_*_model_0.json"))
     plddt, iptm = float("nan"), float("nan")
     if conf_files:

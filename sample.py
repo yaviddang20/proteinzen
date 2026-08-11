@@ -188,6 +188,9 @@ def main(sampler,
         os.makedirs(zen_cfg['samples_dir'], exist_ok=True)
         if os.path.isdir(traj_dir):
             shutil.rmtree(traj_dir)
+        refold_dir = os.path.join(zen_cfg['out_dir'], "refold_outputs")
+        if os.path.isdir(refold_dir):
+            shutil.rmtree(refold_dir)
 
     # record run params
     shutil.copy(
