@@ -886,7 +886,7 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
         return {"plddt": float("nan"), "iptm": float("nan"), "sc_rmsd": float("nan"),
                 "boltz_error": "timeout"}
 
-    pred_dir = out_dir / "predictions" / sample_id
+    pred_dir = out_dir / f"boltz_results_{sample_id}" / "predictions" / sample_id
     conf_files = sorted(pred_dir.glob("confidence_*_model_0.json"))
     plddt, iptm = float("nan"), float("nan")
     if conf_files:
