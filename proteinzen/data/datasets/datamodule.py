@@ -884,8 +884,9 @@ class BiomoleculeSamplingDataModule(L.LightningDataModule):
             self.batch_sampler = None
 
     def predict_dataloader(self):
-        world_size = torch.distributed.get_world_size() if torch.distributed.is_available() and torch.distributed.is_initialized() else 1
-        rank = torch.distributed.get_rank() if world_size > 1 else 0
+        trainer = self.trainer if self.trainer is not None else None
+        world_size = trainer.world_size if trainer is not None else 1
+        rank = trainer.global_rank if trainer is not None else 0
         if world_size > 1:
             dist_sampler = DistributedSampler(
                 self.task_dispatcher,
@@ -897,9 +898,15 @@ class BiomoleculeSamplingDataModule(L.LightningDataModule):
         else:
             dist_sampler = None
         if self.batch_sampler is not None:
+            if world_size > 1:
+                sharded_idxs = self.batch_sampler.batch_idxs[rank::world_size]
+                sampler = type(self.batch_sampler).__new__(type(self.batch_sampler))
+                sampler.batch_idxs = sharded_idxs
+            else:
+                sampler = self.batch_sampler
             dataloader = DataLoader(
                 self.task_dispatcher,
-                batch_sampler=self.batch_sampler,
+                batch_sampler=sampler,
                 collate_fn=collate,
                 shuffle=False
             )

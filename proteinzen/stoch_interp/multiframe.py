@@ -353,14 +353,8 @@ class MultiSE3Interpolant:
             trans_0 = rigids_0.get_trans()
             rotmats_0 = rigids_0.get_rots().get_rot_mats()
         else:
-            if identity_rot_noise:
-                is_atom = rigids_data["rigids_is_atom_mask"].bool()
-                rotmats_0_sampled = self._sample_rotmats_0(rotmats_1)
-                eye = torch.eye(3, device=rotmats_1.device, dtype=torch.float32).expand(*rotmats_1.shape[:-2], 3, 3)
-                rotmats_0 = torch.where(is_atom[..., None, None], eye, rotmats_0_sampled)
-                rigids_data["rigids_identity_rot_mask"] = is_atom
-            else:
-                rotmats_0 = self._sample_rotmats_0(rotmats_1)
+            rotmats_0 = self._sample_rotmats_0(rotmats_1)
+            if not identity_rot_noise:
                 rigids_data["rigids_identity_rot_mask"] = torch.zeros_like(rigids_mask, dtype=torch.bool)
             per_sample_std = batch.get('trans_prior_std', None)
             if per_sample_std is not None:
@@ -574,6 +568,15 @@ class MultiSE3Interpolant:
             rigids_mask,
             rigids_noising_mask.bool(),
         )
+
+        if identity_rot_noise:
+            is_atom = rigids_data["rigids_is_atom_mask"].bool()
+            eye = torch.eye(3, device=rotmats_1.device, dtype=torch.float32).expand_as(rotmats_1)
+            atom_rotmats_t = so3_utils.geodesic_t(rot_time[..., None], rotmats_1, eye)
+            atom_rot_vf = so3_utils.calc_rot_vf(atom_rotmats_t, rotmats_1) / (1 - rot_time)[..., None]
+            rotmats_t = torch.where(is_atom[..., None, None], atom_rotmats_t, rotmats_t)
+            rot_vf = torch.where(is_atom[..., None], atom_rot_vf, rot_vf)
+            rigids_data["rigids_identity_rot_mask"] = is_atom
 
         rotvecs_t = so3_utils.rotmat_to_rotvec(rotmats_t)
         angle_t = torch.linalg.vector_norm(rotvecs_t + 1e-8, dim=-1)
