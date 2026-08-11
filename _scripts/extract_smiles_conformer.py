@@ -102,7 +102,7 @@ def write_smiles_yaml(smiles_sample, conformer_counts, output_yaml_path):
         tasks.append({
             "_target_": "proteinzen.runtime.sampling.unconditional_smiles.UnconditionalSamplingFromSMILES",
             "smiles": smiles,
-            "num_samples": min(2 * k, 32),
+            "num_samples": 2 * k,
             "name": hashlib.sha256(smiles.encode()).hexdigest()
         })
 
@@ -229,7 +229,7 @@ def write_mol_yaml(first_conformer_output_pdb_paths, conformer_counts, output_ya
         tasks.append({
             "_target_": "proteinzen.runtime.sampling.unconditional_smiles.UnconditionalSamplingFromMol",
             "mol_pdb_path": str(pdb_path),
-            "num_samples": min(2 * k, 32),
+            "num_samples": 2 * k,
             "name": name
         })
 
