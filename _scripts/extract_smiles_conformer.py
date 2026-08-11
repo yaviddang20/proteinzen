@@ -348,6 +348,16 @@ def main():
     train_smiles_sample = random.sample(sorted(train_smiles_set), NUM_TEST)
     test_smiles_sample = random.sample(sorted(test_smiles_set), NUM_TEST)
 
+    # Clean old outputs before writing
+    for d in [
+        conformer_train_dir / "conformer_mols",
+        conformer_train_dir / "first_conformer_mols",
+        conformer_test_dir / "conformer_mols",
+        conformer_test_dir / "first_conformer_mols",
+    ]:
+        if d.exists():
+            shutil.rmtree(d)
+
     # Write conformer PDBs
     train_first_conformer_output_pdb_paths, train_conformer_counts = write_conformer_pdb_paths(
         train_smiles_sample, train_manifest, conformer_train_dir / "conformer_mols", TRAIN_DATASET_DIR
