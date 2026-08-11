@@ -185,7 +185,7 @@ def main(sampler,
     else:
         if os.path.isdir(zen_cfg['samples_dir']):
             shutil.rmtree(zen_cfg['samples_dir'])
-        os.makedirs(zen_cfg['samples_dir'])
+        os.makedirs(zen_cfg['samples_dir'], exist_ok=True)
         if os.path.isdir(traj_dir):
             shutil.rmtree(traj_dir)
 
