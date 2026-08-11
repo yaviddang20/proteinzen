@@ -27,7 +27,7 @@ from proteinzen.data.featurize.tokenize import Tokenized, convert_atom_str_to_tu
 from proteinzen.data.featurize.sampling import (
     sample_noise_from_struct_template,
 )
-from proteinzen.data.featurize.assembler import featurize_inference
+from proteinzen.data.featurize.assembler import featurize as featurize_inference
 
 from proteinzen.runtime.sampling.protein import PartiallyNoisedChain
 
