@@ -175,49 +175,39 @@ def write_geom_drugs_molecule_to_pdb(npz_paths, output_dir, smiles=None):
     return output_paths
 
 
-def _write_conformer_worker(args):
-    """Top-level worker for multiprocessing: processes one SMILES entry."""
-    smiles, molecule_ids, output_dir, dataset_dir = args
-    npz_paths = get_npz_paths(molecule_ids, dataset_dir)
+def _write_all_conformers_from_pickle(args):
+    """Write ALL conformers for a SMILES directly from the raw rdkit pickle."""
+    smiles, output_dir = args
     try:
-        return write_geom_drugs_molecule_to_pdb(npz_paths=npz_paths, output_dir=output_dir, smiles=smiles)[0]
+        pkl_mols = _load_pickle_conformers(smiles)
+        if not pkl_mols:
+            print(f"No pickle found for {smiles[:60]}...")
+            return None, 0
+        name = hashlib.sha256(smiles.encode()).hexdigest()
+        output_paths = []
+        for conf_idx, mol in sorted(pkl_mols.items()):
+            output_path = output_dir / f"{name}_{conf_idx}.pdb"
+            Chem.MolToPDBFile(mol, str(output_path), confId=0)
+            output_paths.append(output_path)
+        return output_paths[0], len(output_paths)
     except Exception:
         print(f"Failed for {smiles[:60]}...")
         traceback.print_exc()
-        return None
+        return None, 0
 
 
 def write_conformer_pdb_paths(smiles_sample, manifest, output_dir, dataset_dir, num_workers=None):
     smiles_to_use = sorted([str(s) for s in smiles_sample])
-
-    print("Building SMILES to molecule ID mapping...")
-    smiles_to_ids = {}
-    for entry in manifest:
-        method = entry.get('structures', {})[0].get('method', '')
-        if method.startswith('QM9:'):
-            entry_smiles = method[4:]
-            smiles_to_ids[entry_smiles] = entry['ids']
-
-    print(f"Mapped {len(smiles_to_ids)} SMILES to molecule IDs\n")
-
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    worker_args = []
-    conformer_counts = []
-    for smiles in smiles_to_use:
-        if smiles not in smiles_to_ids:
-            print(f"SMILES not found in manifest: {smiles[:60]}...")
-            continue
-        worker_args.append((smiles, smiles_to_ids[smiles], output_dir, dataset_dir))
-        conformer_counts.append(len(smiles_to_ids[smiles]))
+    worker_args = [(smiles, output_dir) for smiles in smiles_to_use]
 
     n_workers = num_workers or cpu_count()
     print(f"Processing {len(worker_args)} molecules with {n_workers} workers...")
     with Pool(processes=n_workers) as pool:
-        results = pool.map(_write_conformer_worker, worker_args)
+        results = pool.map(_write_all_conformers_from_pickle, worker_args)
 
-    pdb_paths = [p for p, _ in zip(results, conformer_counts) if p is not None]
-    counts = [c for p, c in zip(results, conformer_counts) if p is not None]
+    pdb_paths = [p for p, c in results if p is not None]
+    counts = [c for p, c in results if p is not None]
     return pdb_paths, counts
 
 
