@@ -891,7 +891,7 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
     if conf_files:
         try:
             conf = json.loads(conf_files[0].read_text())
-            plddt = float(np.mean(conf.get("plddt", [float("nan")])))
+            plddt = float(conf.get("complex_plddt", float("nan")))
             iptm = float(conf.get("iptm", float("nan")))
         except Exception:
             pass
