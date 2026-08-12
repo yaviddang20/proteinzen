@@ -37,11 +37,14 @@ from tqdm import tqdm
 from mmcif import parse_mmcif
 
 from proteinzen.boltz.data import const
+from rdkit.Chem import AllChem
 from proteinzen.boltz.data.types import (
     AffinityInfo,
+    Atom,
     ChainInfo,
     InterfaceInfo,
     Record,
+    Structure,
     StructureInfo,
 )
 from proteinzen.data.featurize.mol.sampling import (
@@ -52,6 +55,94 @@ from proteinzen.data.featurize.mol.sampling import (
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
+def _atom_name_bytes(name: str) -> tuple:
+    name = name.strip()[:4]
+    chars = [ord(c) - 32 for c in name]
+    chars += [0] * (4 - len(chars))
+    return tuple(chars)
+
+
+def _insert_ligand_h(structure: "Structure", mol_with_h) -> "Structure":
+    """Append RDKit-estimated H atoms to the ligand (nonpolymer) chain in structure."""
+    nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
+
+    if mol_with_h is None or mol_with_h.GetNumConformers() == 0:
+        return structure
+
+    conf = mol_with_h.GetConformer()
+    h_entries = []
+    h_idx = 1
+    for atom in mol_with_h.GetAtoms():
+        if atom.GetAtomicNum() != 1:
+            continue
+        pos = conf.GetAtomPosition(atom.GetIdx())
+        coords = (float(pos.x), float(pos.y), float(pos.z))
+        name = f"H{h_idx}" if h_idx > 1 else "H"
+        h_entries.append((
+            _atom_name_bytes(name),
+            1,       # element: H
+            0,       # charge
+            coords,  # coords
+            coords,  # conformer (same)
+            True,    # is_present
+            0,       # chirality
+        ))
+        h_idx += 1
+
+    if not h_entries:
+        return structure
+
+    n_h = len(h_entries)
+
+    # Find the ligand chain
+    lig_chain_idx = next(
+        (i for i, c in enumerate(structure.chains)
+         if int(c["mol_type"]) == nonpolymer_id),
+        None
+    )
+    if lig_chain_idx is None:
+        return structure
+
+    lig_chain = structure.chains[lig_chain_idx]
+    insert_at = int(lig_chain["atom_idx"]) + int(lig_chain["atom_num"])
+
+    h_atoms = np.array(h_entries, dtype=np.dtype(Atom))
+    new_atoms = np.concatenate([
+        structure.atoms[:insert_at],
+        h_atoms,
+        structure.atoms[insert_at:],
+    ])
+
+    new_residues = structure.residues.copy()
+    lig_res_start = int(lig_chain["res_idx"])
+    lig_res_end = lig_res_start + int(lig_chain["res_num"])
+    for r in range(lig_res_start, lig_res_end):
+        new_residues[r]["atom_num"] += n_h
+
+    for r in range(len(new_residues)):
+        if new_residues[r]["atom_idx"] >= insert_at:
+            new_residues[r]["atom_idx"] += n_h
+        if new_residues[r]["atom_center"] >= insert_at:
+            new_residues[r]["atom_center"] += n_h
+        if new_residues[r]["atom_disto"] >= insert_at:
+            new_residues[r]["atom_disto"] += n_h
+
+    new_chains = structure.chains.copy()
+    new_chains[lig_chain_idx]["atom_num"] += n_h
+    for c in range(lig_chain_idx + 1, len(new_chains)):
+        new_chains[c]["atom_idx"] += n_h
+
+    return Structure(
+        atoms=new_atoms,
+        bonds=structure.bonds,
+        residues=new_residues,
+        chains=new_chains,
+        connections=structure.connections,
+        interfaces=structure.interfaces,
+        mask=structure.mask,
+    )
+
 
 def system_mid(system_id: str) -> str:
     """Two-char subdirectory key derived from PDB ID (chars 1-2 of system_id)."""
@@ -326,15 +417,15 @@ def process_system(
     auth_map_path = outdir / "auth_maps" / mid / f"{system_id}.json"
 
     if struct_path.exists() and record_path.exists() and auth_map_path.exists():
-        return
+        return None
 
     system_dir = plinder_dir / "systems" / system_id
     cif_path = system_dir / "system.cif"
     if not cif_path.exists():
-        return
+        return "no_cif"
 
     if annotation_row.get("ligand_is_covalent"):
-        return
+        return "covalent"
 
     try:
         # Parse full complex (protein + ligand chains via CCD)
@@ -343,7 +434,7 @@ def process_system(
     except Exception:
         traceback.print_exc()
         print(f"Failed to parse {system_id}")
-        return
+        return "parse_error"
 
     # Skip systems with nucleic acid content (DNA/RNA — not supported by tokenizer)
     # Check both mol_type (correctly parsed chains) and residue names (gemmi misclassification)
@@ -352,13 +443,13 @@ def process_system(
     rna_id = const.chain_type_ids["RNA"]
     for chain in structure.chains:
         if int(chain["mol_type"]) in (dna_id, rna_id):
-            return
+            return "nucleic_acid"
         # Catch gemmi misclassifying DNA chains as PeptideL
         res_start = int(chain["res_idx"])
         res_end = res_start + int(chain["res_num"])
         for res in structure.residues[res_start:res_end]:
             if str(res["name"]) in _nuc_residues:
-                return
+                return "nucleic_acid"
 
     nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
     protein_id = const.chain_type_ids["PROTEIN"]
@@ -367,7 +458,7 @@ def process_system(
     n_protein = sum(1 for c in structure.chains if int(c["mol_type"]) == protein_id)
     n_ligand = sum(1 for c in structure.chains if int(c["mol_type"]) == nonpolymer_id)
     if n_protein != 1 or n_ligand != 1:
-        return
+        return "multi_chain"
 
     # Load ligand SDF files and validate each ligand mol
     ligand_sdfs = get_ligand_sdfs(system_dir)
@@ -384,20 +475,25 @@ def process_system(
         if sdf_path is None and ligand_sdfs:
             sdf_path = next(iter(ligand_sdfs.values()))
         if sdf_path is None:
-            return  # no SDF for this ligand chain → skip system
+            return "no_sdf"
 
-        mol = Chem.SDMolSupplier(str(sdf_path), removeHs=True, sanitize=True)[0]
+        mol = Chem.SDMolSupplier(str(sdf_path), removeHs=False, sanitize=True)[0]
         if mol is None:
-            return
+            return "mol_parse_error"
 
-        if not is_valid_ligand(mol):
-            return
+        mol_no_h = AllChem.RemoveHs(mol)
+        if not is_valid_ligand(mol_no_h):
+            return "invalid_ligand"
 
-        ligand_smiles = Chem.MolToSmiles(mol)
-        rot_data = compute_rot_bond_data(mol)
+        mol_with_h = AllChem.AddHs(mol, addCoords=True) if mol.GetNumConformers() > 0 else None
+        ligand_smiles = Chem.MolToSmiles(mol_no_h)
+        rot_data = compute_rot_bond_data(mol_no_h)
         all_rot_bond_data.append(rot_data)
 
     rot_bond_data = merge_rot_bond_data(all_rot_bond_data)
+
+    # Add H to ligand atoms (mmcif parser strips H; re-add from RDKit geometry)
+    structure = _insert_ligand_h(structure, mol_with_h)
 
     # Compute interaction_residue_mask: protein residues within atom_interface_cutoff of any ligand atom
     interaction_residue_mask = np.zeros(len(structure.residues), dtype=bool)
@@ -522,6 +618,8 @@ def process_system(
     with open(auth_map_path, "w") as f:
         json.dump(parsed.auth_seq_map, f)
 
+    return None
+
 
 _worker_state = {}
 
@@ -540,17 +638,19 @@ def _worker_init(plinder_dir, outdir, clusters, annotations, ccd_path, pocket_da
     }
 
 
-def process_system_worker(system_id: str) -> None:
+def process_system_worker(system_id: str) -> tuple[str, Optional[str]]:
     s = _worker_state
     annotation_row = s["annotations"].get(system_id, {})
     try:
-        process_system(
+        reason = process_system(
             system_id, s["plinder_dir"], s["outdir"], s["clusters"],
             annotation_row, s["ccd"], pocket_data_dir=s.get("pocket_data_dir"),
         )
+        return system_id, reason
     except Exception:
         traceback.print_exc()
         print(f"Unhandled error processing {system_id}")
+        return system_id, "unhandled_error"
 
 
 # ── finalize ──────────────────────────────────────────────────────────────────
@@ -605,11 +705,27 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> None:
             initializer=_worker_init,
             initargs=initargs,
         ) as pool:
-            list(tqdm(pool.imap_unordered(process_system_worker, system_ids, chunksize=4), total=len(system_ids)))
+            results = list(tqdm(pool.imap_unordered(process_system_worker, system_ids, chunksize=4), total=len(system_ids)))
     else:
         _worker_init(plinder_dir, outdir, clusters, annotations, args.ccd_path, pocket_data_dir)
-        for sid in tqdm(system_ids):
-            process_system_worker(sid)
+        results = [process_system_worker(sid) for sid in tqdm(system_ids)]
+
+    # Tally filter reasons
+    filtered_ids: dict[str, list[str]] = {}
+    for sid, reason in results:
+        if reason is not None:
+            filtered_ids.setdefault(reason, []).append(sid)
+
+    filter_counts = {reason: len(ids) for reason, ids in filtered_ids.items()}
+    n_ok = sum(1 for _, r in results if r is None)
+    print(f"Processed: {n_ok} written, {len(system_ids) - n_ok} filtered")
+    for reason, count in sorted(filter_counts.items(), key=lambda x: -x[1]):
+        print(f"  {reason}: {count}")
+
+    with open(outdir / "filter_stats.json", "w") as f:
+        json.dump(filter_counts, f, indent=2)
+    with open(outdir / "filtered_ids.json", "w") as f:
+        json.dump(filtered_ids, f, indent=2)
 
     finalize(outdir)
 
