@@ -25,7 +25,7 @@ from proteinzen.stoch_interp.diffeq import (
 )
 from proteinzen.stoch_interp.model_wrapper import (
     BaseModelForward, RSTFMForward, SequenceEntropyGradient, DistogramCompactGradient,
-    PredLocalFafeGradient
+    PredLocalFafeGradient, ChiralityPotentialGradient
 )
 from proteinzen.stoch_interp.steering.integrator import SteeredIntegrator
 from proteinzen.stoch_interp.steering.reward_scoring import EndpointRewardScorer
@@ -239,6 +239,10 @@ def config_sampling_hydra_store():
     model_wrapper_store(
         pbuilds(PredLocalFafeGradient),
         name="pred_local_fafe_gradient"
+    )
+    model_wrapper_store(
+        pbuilds(ChiralityPotentialGradient),
+        name="chirality_potential"
     )
 
     integrator_store = store(group="integrator")

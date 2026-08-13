@@ -410,3 +410,93 @@ class PredLocalFafeGradient(ModelForwardWrapper):
             loss.backward()
 
         return model_input, model_outputs
+
+
+class ChiralityPotentialGradient(ModelForwardWrapper):
+    """Gradient guidance that penalizes incorrect stereocenter handedness.
+
+    For each noised rigid with CW/CCW chirality, computes the signed triple
+    product of the first three bonded neighbor vectors and penalizes the wrong
+    sign. Raw (unnormalized) triple product so gradient magnitude scales with
+    bond lengths — larger, more committed geometry gets a stronger push.
+    """
+
+    CW = 1   # CHI_TETRAHEDRAL_CW
+    CCW = 2  # CHI_TETRAHEDRAL_CCW
+
+    def __init__(self, model, chirality_weight: float = 1.0, **kwargs):
+        super().__init__(model, **kwargs)
+        self.chirality_weight = chirality_weight
+
+    def compute_gradient(self, model_input, aux_inputs=None, self_condition=None):
+        def maybe_detach(t):
+            if isinstance(t, (torch.Tensor, Rigid)):
+                return t.detach()
+            return t
+
+        model_input = map_structure(maybe_detach, model_input)
+        if self_condition is not None:
+            self_condition = map_structure(maybe_detach, self_condition)
+
+        # Run model (no grad) to get base scores/vfs
+        model_outputs = self.model(model_input, self_condition=self_condition)
+
+        # Compute chirality potential gradient on rigids_t
+        with torch.enable_grad():
+            assert not torch.is_inference_mode_enabled()
+            model_input['rigids']['rigids_t'] = model_input['rigids']['rigids_t'].detach()
+            model_input['rigids']['rigids_t'].requires_grad_(True)
+            model_input['rigids']['rigids_t'].grad = None
+
+            loss = self._chirality_loss(model_input)
+            if loss is not None:
+                loss.backward()
+
+        return model_input, model_outputs
+
+    def _chirality_loss(self, model_input):
+        rigids_t      = model_input['rigids']['rigids_t']            # (B, R, 7)
+        chirality     = model_input['rigids']['rigids_ref_chirality'] # (B, R)
+        noising_mask  = model_input['rigids']['rigids_noising_mask'].bool()  # (B, R)
+        rigids_to_tok = model_input['rigids']['rigids_to_token']     # (B, R)
+        token_bonds   = model_input['token']['token_bonds']          # (B, T, T)
+
+        positions = rigids_t[..., 4:7]  # translations (B, R, 3)
+        B, R = chirality.shape
+        T = token_bonds.shape[1]
+
+        # inverse map: token → first rigid that maps to it
+        tok_to_rigid = rigids_t.new_full((B, T), -1, dtype=torch.long)
+        for b in range(B):
+            for r in range(R):
+                t = rigids_to_tok[b, r].item()
+                if tok_to_rigid[b, t] < 0:
+                    tok_to_rigid[b, t] = r
+
+        is_stereo = ((chirality == self.CW) | (chirality == self.CCW)) & noising_mask
+
+        loss = positions.new_zeros(())
+        n = 0
+        for b in range(B):
+            for r in is_stereo[b].nonzero(as_tuple=True)[0].tolist():
+                center_tok = rigids_to_tok[b, r].item()
+                nbr_toks = (token_bonds[b, center_tok] > 0).nonzero(as_tuple=True)[0]
+                if len(nbr_toks) < 3:
+                    continue
+                nbr_rigids = tok_to_rigid[b, nbr_toks[:3]]
+                if (nbr_rigids < 0).any():
+                    continue
+
+                p  = positions[b, r]
+                a  = positions[b, nbr_rigids[0]] - p
+                bv = positions[b, nbr_rigids[1]] - p
+                c  = positions[b, nbr_rigids[2]] - p
+
+                det = torch.dot(a, torch.linalg.cross(bv, c))
+                sign_target = 1.0 if chirality[b, r].item() == self.CW else -1.0
+                loss = loss + (-sign_target * det)
+                n += 1
+
+        if n == 0:
+            return None
+        return self.chirality_weight * loss / n
