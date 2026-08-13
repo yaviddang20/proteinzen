@@ -133,12 +133,12 @@ def main():
     if skipped:
         print(f"Skipped {skipped} systems whose npz files were not found.")
 
-    out_stem = args.out_yaml
-    out_stem.parent.mkdir(parents=True, exist_ok=True)
+    out_dir = args.out_yaml
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    protein_cond_path = out_stem.parent / (out_stem.name + "_protein_cond.yaml")
-    ligand_cond_path  = out_stem.parent / (out_stem.name + "_ligand_cond.yaml")
-    placer_path       = out_stem.parent / (out_stem.name + "_placer.yaml")
+    protein_cond_path = out_dir / "protein_cond.yaml"
+    ligand_cond_path  = out_dir / "ligand_cond.yaml"
+    placer_path       = out_dir / "placer.yaml"
 
     with open(protein_cond_path, "w") as f:
         yaml.dump(protein_cond_tasks, f, default_flow_style=False, sort_keys=False)
