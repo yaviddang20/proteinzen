@@ -430,12 +430,25 @@ class ChiralityPotentialGradient(ModelForwardWrapper):
 
     def compute_gradient(self, model_input, aux_inputs=None, self_condition=None):
         model_outputs = self.model(model_input, self_condition=self_condition)
+        return model_input, model_outputs
+
+    @torch.no_grad()
+    def get_scores_and_vfs(self, model_input, aux_inputs=None, self_condition=None):
+        scores_and_vfs, model_outputs = super().get_scores_and_vfs(
+            model_input, aux_inputs, self_condition
+        )
 
         grad = self._chirality_grad(model_input)
         if grad is not None:
-            model_input['rigids']['rigids_t'].grad = grad
+            trans_grad = grad[..., 4:7]  # (B, R, 3) — negative gradient = guidance direction
+            trans_time = model_input['trans_t']
+            trans_t = model_input['rigids']['trans_t']
+            # treat chirality gradient as a trans score and convert to VF
+            chirality_trans_vf = self.trans_score_to_trans_vf(trans_time, -trans_grad, trans_t)
+            scores_and_vfs['gradient_trans_vf'] = chirality_trans_vf
+            scores_and_vfs['gradient_rot_vf'] = torch.zeros_like(scores_and_vfs['base_rot_vf'])
 
-        return model_input, model_outputs
+        return scores_and_vfs, model_outputs
 
     def _chirality_grad(self, model_input):
         rigids_t      = model_input['rigids']['rigids_t']            # (B, R, 7)
