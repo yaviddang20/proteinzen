@@ -246,6 +246,7 @@ class Cropper:
         chain_id: Optional[int] = None,
         interface_id: Optional[int] = None,
         priority_token_mask: Optional[np.ndarray] = None,
+        max_protein_residues: Optional[int] = None,
     ) -> Tokenized:
         """Crop the data to a maximum number of tokens.
 
@@ -280,6 +281,9 @@ class Cropper:
                 "if we want to try to keep a full binder chain, "
                 "make sure that we can accomedate the whole chain in the crop!"
             )
+
+        # Resolve effective protein residue cap (caller override takes precedence)
+        effective_max_protein_residues = max_protein_residues if max_protein_residues is not None else self.max_protein_residues
 
         # Randomly select a neighborhood size
         neighborhood_size = random.choice(self.neighborhood_sizes)
@@ -406,7 +410,7 @@ class Cropper:
         # Count protein tokens already seeded (from priority) for the per-protein cap
         protein_type = const.chain_type_ids["PROTEIN"]
         num_protein_cropped = 0
-        if self.max_protein_residues is not None and cropped:
+        if effective_max_protein_residues is not None and cropped:
             cropped_tokens = token_data[np.isin(token_data["token_idx"], list(cropped))]
             num_protein_cropped = int((cropped_tokens["mol_type"] == protein_type).sum())
 
@@ -483,16 +487,16 @@ class Cropper:
             is_protein_chain = int(token["mol_type"]) == protein_type
             new_protein = int((new_tokens["mol_type"] == protein_type).sum())
             if (
-                self.max_protein_residues is not None
+                effective_max_protein_residues is not None
                 and is_protein_chain
-                and num_protein_cropped + new_protein > self.max_protein_residues
+                and num_protein_cropped + new_protein > effective_max_protein_residues
             ):
                 continue
 
             # Add new indices
             cropped.update(new_indices)
             total_rigids += new_rigids
-            if self.max_protein_residues is not None:
+            if effective_max_protein_residues is not None:
                 num_protein_cropped += new_protein
 
         # Get the cropped tokens sorted by index

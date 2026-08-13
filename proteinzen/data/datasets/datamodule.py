@@ -501,6 +501,7 @@ class TrainingDataset(torch.utils.data.Dataset):
                     chain_id=sample.chain_id,
                     interface_id=sample.interface_id,
                     priority_token_mask=priority_token_mask,
+                    max_protein_residues=task.crop_max_protein_residues,
                 )
 
         # if len(tokenized_data.tokens) == 0:
@@ -737,6 +738,7 @@ class ValidationDataset(torch.utils.data.Dataset):
                     chain_id=sample.chain_id,
                     interface_id=sample.interface_id,
                     priority_token_mask=priority_token_mask,
+                    max_protein_residues=task.crop_max_protein_residues,
                 )
 
         if len(tokenized_data.tokens) == 0:

@@ -8,6 +8,7 @@ class TrainingTask(abc.ABC):
     name: str = "abc"  # override this
     prob: float
     epoch_sample_write_kabsch: bool = True
+    crop_max_protein_residues: int = None
 
     def sample_t_and_mask(self, batch) -> Dict[str, Tensor]:
         raise NotImplementedError

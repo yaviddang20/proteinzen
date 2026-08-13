@@ -175,9 +175,11 @@ class PocketPLACERTraining(SidechainRedesign):
     name: str = "pocket_placer"
     use_placer_centering: bool = True
     epoch_sample_write_kabsch: bool = False
+    crop_max_protein_residues: int = 20
 
-    def __init__(self, side_chain_trans_prior_std=3.0, lig_trans_prior_std=3.0, atomize_sidechains=False, **kwargs):
+    def __init__(self, side_chain_trans_prior_std=3.0, lig_trans_prior_std=3.0, atomize_sidechains=False, crop_max_protein_residues=20, **kwargs):
         super().__init__(**kwargs)
         self.side_chain_trans_prior_std = side_chain_trans_prior_std
         self.lig_trans_prior_std = lig_trans_prior_std
         self.atomize_sidechains = atomize_sidechains
+        self.crop_max_protein_residues = crop_max_protein_residues
