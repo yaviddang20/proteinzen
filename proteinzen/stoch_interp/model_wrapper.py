@@ -429,43 +429,26 @@ class ChiralityPotentialGradient(ModelForwardWrapper):
         self.chirality_weight = chirality_weight
 
     def compute_gradient(self, model_input, aux_inputs=None, self_condition=None):
-        def maybe_detach(t):
-            if isinstance(t, (torch.Tensor, Rigid)):
-                return t.detach()
-            return t
-
-        model_input = map_structure(maybe_detach, model_input)
-        if self_condition is not None:
-            self_condition = map_structure(maybe_detach, self_condition)
-
-        # Run model (no grad) to get base scores/vfs
         model_outputs = self.model(model_input, self_condition=self_condition)
 
-        # Compute chirality potential gradient on rigids_t
-        with torch.inference_mode(False), torch.enable_grad():
-            model_input['rigids']['rigids_t'] = model_input['rigids']['rigids_t'].detach()
-            model_input['rigids']['rigids_t'].requires_grad_(True)
-            model_input['rigids']['rigids_t'].grad = None
-
-            loss = self._chirality_loss(model_input)
-            if loss is not None:
-                loss.backward()
+        grad = self._chirality_grad(model_input)
+        if grad is not None:
+            model_input['rigids']['rigids_t'].grad = grad
 
         return model_input, model_outputs
 
-    def _chirality_loss(self, model_input):
+    def _chirality_grad(self, model_input):
         rigids_t      = model_input['rigids']['rigids_t']            # (B, R, 7)
         chirality     = model_input['rigids']['rigids_ref_chirality'] # (B, R)
-        noising_mask  = model_input['rigids']['rigids_noising_mask'].bool()  # (B, R)
+        noising_mask  = model_input['rigids']['rigids_noising_mask'].bool()
         rigids_to_tok = model_input['rigids']['rigids_to_token']     # (B, R)
         token_bonds   = model_input['token']['token_bonds']          # (B, T, T)
 
-        positions = rigids_t[..., 4:7]  # translations (B, R, 3)
+        positions = rigids_t[..., 4:7].float()  # (B, R, 3)
         B, R = chirality.shape
         T = token_bonds.shape[1]
 
-        # inverse map: token → first rigid that maps to it
-        tok_to_rigid = rigids_t.new_full((B, T), -1, dtype=torch.long)
+        tok_to_rigid = positions.new_full((B, T), -1, dtype=torch.long)
         for b in range(B):
             for r in range(R):
                 t = rigids_to_tok[b, r].item()
@@ -474,8 +457,9 @@ class ChiralityPotentialGradient(ModelForwardWrapper):
 
         is_stereo = ((chirality == self.CW) | (chirality == self.CCW)) & noising_mask
 
-        loss = positions.new_zeros(())
+        trans_grad = torch.zeros_like(positions)
         n = 0
+
         for b in range(B):
             for r in is_stereo[b].nonzero(as_tuple=True)[0].tolist():
                 center_tok = rigids_to_tok[b, r].item()
@@ -486,16 +470,30 @@ class ChiralityPotentialGradient(ModelForwardWrapper):
                 if (nbr_rigids < 0).any():
                     continue
 
+                ra, rb, rc = nbr_rigids[0].item(), nbr_rigids[1].item(), nbr_rigids[2].item()
                 p  = positions[b, r]
-                a  = positions[b, nbr_rigids[0]] - p
-                bv = positions[b, nbr_rigids[1]] - p
-                c  = positions[b, nbr_rigids[2]] - p
+                a  = positions[b, ra] - p
+                bv = positions[b, rb] - p
+                c  = positions[b, rc] - p
 
-                det = torch.dot(a, torch.linalg.cross(bv, c))
-                sign_target = 1.0 if chirality[b, r].item() == self.CW else -1.0
-                loss = loss + (-sign_target * det)
+                sign = 1.0 if chirality[b, r].item() == self.CW else -1.0
+
+                # analytical gradients of E = -sign * dot(a, cross(bv, c))
+                g_a  = -sign * torch.linalg.cross(bv, c)
+                g_bv = -sign * torch.linalg.cross(c, a)
+                g_c  = -sign * torch.linalg.cross(a, bv)
+                g_p  = -(g_a + g_bv + g_c)
+
+                trans_grad[b, r]  += g_p
+                trans_grad[b, ra] += g_a
+                trans_grad[b, rb] += g_bv
+                trans_grad[b, rc] += g_c
                 n += 1
 
         if n == 0:
             return None
-        return self.chirality_weight * loss / n
+
+        trans_grad = self.chirality_weight * trans_grad / n
+        grad = torch.zeros_like(rigids_t)
+        grad[..., 4:7] = trans_grad
+        return grad
