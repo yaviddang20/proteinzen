@@ -1,9 +1,10 @@
 """
 Generate sample.py task YAMLs for Plinder protein-ligand sampling.
 
-Produces two output files:
+Produces three output files:
   <out-yaml-stem>_protein_cond.yaml  — fix protein, generate ligand
   <out-yaml-stem>_ligand_cond.yaml   — fix ligand, generate protein
+  <out-yaml-stem>_placer.yaml        — fix backbone+ligand, generate sidechains
 
 Usage
 -----
@@ -20,11 +21,16 @@ python _scripts/make_plinder_pocket_yaml.py \
     --out-yaml sampling/plinder/val \
     --num-samples 10
 
-# Then run sampling (protein-cond direction):
+# Then run sampling:
 python sample.py \
     sampler.tasks_yaml=sampling/plinder/val_protein_cond.yaml \
     model_dir=/path/to/run \
     out_dir=./plinder_samples/protein_cond
+
+python sample.py \
+    sampler.tasks_yaml=sampling/plinder/val_placer.yaml \
+    model_dir=/path/to/run \
+    out_dir=./plinder_samples/placer
 """
 
 import argparse
@@ -57,6 +63,8 @@ def main():
                         help="Translation noise std (default: 3.0, matches plinder training)")
     parser.add_argument("--max-protein-residues", type=int, default=None,
                         help="[protein_cond] Crop to this many residues; None=full protein (default: None)")
+    parser.add_argument("--placer-max-protein-residues", type=int, default=20,
+                        help="[placer] Crop to this many pocket residues (default: 20)")
     parser.add_argument("--min-protein-residues", type=int, default=150,
                         help="[ligand_cond] Min protein residues, sampled per sample (default: 150)")
     parser.add_argument("--max-protein-residues-ligand-cond", type=int, default=250,
@@ -85,6 +93,7 @@ def main():
 
     protein_cond_tasks = []
     ligand_cond_tasks = []
+    placer_tasks = []
     skipped = 0
 
     for record in manifest:
@@ -115,6 +124,12 @@ def main():
             "max_protein_residues": args.max_protein_residues_ligand_cond,
         })
 
+        placer_tasks.append({
+            "_target_": "proteinzen.runtime.sampling.protein_pocket.PocketPLACERSampling",
+            **base,
+            "max_protein_residues": args.placer_max_protein_residues,
+        })
+
     if skipped:
         print(f"Skipped {skipped} systems whose npz files were not found.")
 
@@ -123,6 +138,7 @@ def main():
 
     protein_cond_path = out_stem.parent / (out_stem.name + "_protein_cond.yaml")
     ligand_cond_path  = out_stem.parent / (out_stem.name + "_ligand_cond.yaml")
+    placer_path       = out_stem.parent / (out_stem.name + "_placer.yaml")
 
     with open(protein_cond_path, "w") as f:
         yaml.dump(protein_cond_tasks, f, default_flow_style=False, sort_keys=False)
@@ -130,8 +146,12 @@ def main():
     with open(ligand_cond_path, "w") as f:
         yaml.dump(ligand_cond_tasks, f, default_flow_style=False, sort_keys=False)
 
+    with open(placer_path, "w") as f:
+        yaml.dump(placer_tasks, f, default_flow_style=False, sort_keys=False)
+
     print(f"Wrote {len(protein_cond_tasks)} tasks to {protein_cond_path}")
     print(f"Wrote {len(ligand_cond_tasks)} tasks to {ligand_cond_path}")
+    print(f"Wrote {len(placer_tasks)} tasks to {placer_path}")
 
 
 if __name__ == "__main__":
