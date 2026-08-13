@@ -518,6 +518,7 @@ class BiomoleculeModule(L.LightningModule):
                  postalign_noise=False,
                  epoch_sample_every_n_epochs=5,
                  epoch_sample_num_steps=100,
+                 seq_noise_schedule=False,
                  # use_stabilized_high_t_loss=False
     ):
         super().__init__()
@@ -596,6 +597,7 @@ class BiomoleculeModule(L.LightningModule):
         self.accumulate_grad_batches = accumulate_grad_batches
         self.epoch_sample_every_n_epochs = epoch_sample_every_n_epochs
         self.epoch_sample_num_steps = epoch_sample_num_steps
+        self.seq_noise_schedule = seq_noise_schedule
         self._epoch_sample_train_batch = None
         self._epoch_sample_val_batch = None
 
@@ -797,6 +799,21 @@ class BiomoleculeModule(L.LightningModule):
         print(f"[R{self.global_rank}] BEFORE corrupt", flush=True)
         batch = corrupter.corrupt_dense_batch(batch, self.identity_rot_noise, skip_prealign=skip_prealign)
         print(f"[R{self.global_rank}] AFTER corrupt", flush=True)
+
+        if self.seq_noise_schedule:
+            t = batch['t']  # [B, 1]
+            seq_noising_mask = batch['token']['seq_noising_mask']  # [B, N_res]
+            for b in range(seq_noising_mask.shape[0]):
+                t_b = float(t[b].item())
+                maskable = seq_noising_mask[b].nonzero(as_tuple=True)[0]
+                if len(maskable) == 0:
+                    continue
+                n_keep_masked = round(t_b * len(maskable))
+                n_unmask = len(maskable) - n_keep_masked
+                if n_unmask > 0:
+                    perm = torch.randperm(len(maskable), device=seq_noising_mask.device)
+                    unmask_idx = maskable[perm[:n_unmask]]
+                    batch['token']['seq_noising_mask'][b, unmask_idx] = False
 
         # self-conditioning (optional)
         self_conditioning = None
@@ -1206,6 +1223,7 @@ class BiomoleculeModule(L.LightningModule):
             wrapped_model=BaseModelForward(model),
             diffeq=BaseEulerODEStep(),
             no_rot_sampling=not self.use_rot_vf_loss,
+            unmask_seq=self.seq_noise_schedule,
         )
         ts = torch.linspace(0.0, 1.0, self.epoch_sample_num_steps + 1)
         clean_traj, prot_traj, final_denoiser_out = integrator.sample(batch, ts)

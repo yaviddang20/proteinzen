@@ -17,10 +17,12 @@ class Integrator(abc.ABC):
         *,
         wrapped_model: ModelForwardWrapper,
         diffeq: DifferentialEquation,
+        unmask_seq: bool = False,
         **kwargs
     ):
         self.model = wrapped_model
         self.diffeq = diffeq
+        self.unmask_seq = unmask_seq
 
     def sample(
         self,
@@ -44,7 +46,13 @@ class Integrator(abc.ABC):
         # set up initial integration conditions
         t_1 = ts[0]
         prev_denoiser_out = None
-        for t_2 in tqdm.tqdm(ts[1:]):
+
+        num_steps = len(ts) - 1
+        if self.unmask_seq:
+            # Count initially masked (binder) tokens per sample — fixed reference
+            n_masked_init = batch['token']['seq_noising_mask'].sum(dim=-1).long()  # [B]
+
+        for step_idx, t_2 in enumerate(tqdm.tqdm(ts[1:])):
             trans_t, rotmats_t, _ = prot_traj[-1]
             prev_denoiser_out, prot_traj_point, clean_traj_point = self.integration_step(
                 batch,
@@ -56,6 +64,31 @@ class Integrator(abc.ABC):
             )
             prot_traj.append(prot_traj_point)
             clean_traj.append(clean_traj_point)
+
+            if self.unmask_seq:
+                seq_logits = prev_denoiser_out['decoded_seq_logits']  # [B, N_res, n_aa+1]
+                seq_noising_mask = batch['token']['seq_noising_mask']  # [B, N_res]
+                probs = torch.softmax(seq_logits[..., :-1], dim=-1)   # [B, N_res, n_aa]
+                confidence = probs.max(dim=-1).values                  # [B, N_res]
+                pred_seq = seq_logits[..., :-1].argmax(dim=-1)        # [B, N_res]
+
+                for b in range(seq_noising_mask.shape[0]):
+                    n_b = int(n_masked_init[b].item())
+                    if n_b == 0:
+                        continue
+                    target_committed = round((step_idx + 1) * n_b / num_steps)
+                    already_committed = n_b - int(seq_noising_mask[b].sum().item())
+                    n_to_commit = max(0, target_committed - already_committed)
+                    if n_to_commit == 0:
+                        continue
+                    n_still_masked = int(seq_noising_mask[b].sum().item())
+                    k = min(n_to_commit, n_still_masked)
+                    masked_conf = confidence[b] * seq_noising_mask[b].float()
+                    top_k_idx = masked_conf.topk(k).indices
+                    batch['token']['seq_noising_mask'][b, top_k_idx] = False
+                    batch['token']['res_type'][b, top_k_idx] = pred_seq[b, top_k_idx]
+                    batch['token']['seq'][b, top_k_idx] = pred_seq[b, top_k_idx]
+
             t_1 = t_2
 
         trans_t, rotmats_t, _ = prot_traj[-1]
