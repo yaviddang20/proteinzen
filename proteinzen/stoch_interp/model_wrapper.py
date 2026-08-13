@@ -442,8 +442,7 @@ class ChiralityPotentialGradient(ModelForwardWrapper):
         model_outputs = self.model(model_input, self_condition=self_condition)
 
         # Compute chirality potential gradient on rigids_t
-        with torch.enable_grad():
-            assert not torch.is_inference_mode_enabled()
+        with torch.inference_mode(False), torch.enable_grad():
             model_input['rigids']['rigids_t'] = model_input['rigids']['rigids_t'].detach()
             model_input['rigids']['rigids_t'].requires_grad_(True)
             model_input['rigids']['rigids_t'].grad = None
