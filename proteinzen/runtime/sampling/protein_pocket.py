@@ -12,7 +12,7 @@ from proteinzen.boltz.data import const
 from proteinzen.boltz.data.types import Structure, Connection
 
 from proteinzen.data.featurize.assembler import featurize
-from proteinzen.data.featurize.sampling import sample_noise_from_struct_template
+from proteinzen.data.featurize.sampling import sample_noise_from_struct_template, generate_protein_structure_template
 from proteinzen.data.featurize.tokenize import Tokenized, convert_atom_str_to_tuple
 
 from .task import SamplingTask
@@ -143,6 +143,7 @@ def _crop_protein_to_pocket(struct: Structure, max_protein_residues: int) -> Str
     for i, ri in enumerate(kept_res_idx):
         res = struct.residues[ri]
         new_residues[i]["atom_idx"] = old_to_new_atom[int(res["atom_idx"])]
+        new_residues[i]["res_idx"] = i
 
     old_res_to_new = np.full(n_res, -1, dtype=np.int64)
     old_res_to_new[kept_res_idx] = np.arange(len(kept_res_idx))
@@ -531,33 +532,37 @@ class LigandPocketConditionedSampling(SamplingTask):
         if nonpolymer_id not in chain_types:
             raise ValueError(f"No NONPOLYMER (ligand) chain in {self.npz_path}")
 
+        # Extract ligand-only structure; reused across samples (deepcopied inside generate_protein_structure_template)
+        lig_struct = _crop_protein_to_pocket(orig_struct, 0)
+        n_lig_res = len(lig_struct.residues)
+        lig_res_is_unindexed = np.zeros(n_lig_res, dtype=bool)
+
         task_name = self.kwargs.get("name", self.task_name)
 
         for _ in range(self.num_samples):
             n_prot = _random.randint(self.min_protein_residues, self.max_protein_residues)
-            struct = _crop_protein_to_pocket(orig_struct, n_prot)
-            active_chains = struct.chains[struct.mask]
 
-            n_atoms = len(struct.atoms)
+            # Fresh sequential protein template + fixed ligand (no gaps in res_idx)
+            struct = generate_protein_structure_template(
+                {'A': n_prot},
+                extra_mols=lig_struct,
+                extra_mols_residue_is_unindexed_mask=lig_res_is_unindexed,
+            )
+
             n_residues = len(struct.residues)
-            atom_noising_mask = np.ones(n_atoms, dtype=bool)
-            res_type_noising_mask = np.ones(n_residues, dtype=bool)
+            n_atoms = len(struct.atoms)  # ligand atoms only; protein template has none
 
             residue_entity_ids = np.zeros(n_residues, dtype=int)
-            for chain in active_chains:
+            for chain in struct.chains[struct.mask]:
                 res_start = int(chain["res_idx"])
                 res_end = res_start + int(chain["res_num"])
                 residue_entity_ids[res_start:res_end] = int(chain["entity_id"])
-                if int(chain["mol_type"]) != nonpolymer_id:
-                    continue
-                for res in struct.residues[res_start:res_end]:
-                    atom_start = int(res["atom_idx"])
-                    atom_end = atom_start + int(res["atom_num"])
-                    atom_noising_mask[atom_start:atom_end] = False
-                res_type_noising_mask[res_start:res_end] = False
+
+            res_type_noising_mask = np.zeros(n_residues, dtype=bool)
+            res_type_noising_mask[:n_prot] = True  # noise protein, fix ligand
 
             task_masks = {
-                "atom_noising_mask": atom_noising_mask,
+                "atom_noising_mask": np.zeros(n_atoms, dtype=bool),  # all ligand atoms; all fixed
                 "res_type_noising_mask": res_type_noising_mask,
                 "residue_is_unindexed_mask": np.zeros(n_residues, dtype=bool),
                 "res_hotspot_type": np.zeros(n_residues, dtype=int),
