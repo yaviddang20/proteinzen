@@ -458,7 +458,7 @@ def process_system(
     n_protein = sum(1 for c in structure.chains if int(c["mol_type"]) == protein_id)
     n_ligand = sum(1 for c in structure.chains if int(c["mol_type"]) == nonpolymer_id)
     if n_protein != 1 or n_ligand != 1:
-        return "multi_chain"
+        return f"chain_filter_protein{n_protein}_ligand{n_ligand}"
 
     # Load ligand SDF files and validate each ligand mol
     ligand_sdfs = get_ligand_sdfs(system_dir)
