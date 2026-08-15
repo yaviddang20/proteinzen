@@ -375,6 +375,7 @@ class PocketPLACERSampling(SamplingTask):
         max_protein_residues: int = 20,
         trans_std: float = 3.0,
         include_h: bool = False,
+        atomize_sidechains: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -383,6 +384,9 @@ class PocketPLACERSampling(SamplingTask):
         self.max_protein_residues = max_protein_residues
         self.trans_std = trans_std
         self.include_h = include_h
+        self.atomize_sidechains = atomize_sidechains
+        if atomize_sidechains:
+            raise NotImplementedError("atomize_sidechains is not yet supported in PocketPLACERSampling — SampleTemplateTokenizer does not route standard residues through the atomized path")
 
     def sample_data(self):
         orig_struct = load_structure_from_npz(self.npz_path, include_h=self.include_h)
@@ -397,6 +401,7 @@ class PocketPLACERSampling(SamplingTask):
         # atom_noising_mask: True for sidechain atoms (non-backbone protein) and all ligand atoms.
         # Backbone atoms (N, CA, C, O, CB) stay False. Matches training noising exactly.
         atom_noising_mask = np.zeros(n_atoms, dtype=bool)
+        copy_atomized_residue_mask = np.zeros(n_residues, dtype=bool)
         residue_entity_ids = np.zeros(n_residues, dtype=int)
         nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
 
@@ -418,6 +423,8 @@ class PocketPLACERSampling(SamplingTask):
                         atom_name_key = tuple(int(x) for x in struct.atoms[ai]["name"])
                         if atom_name_key not in _BACKBONE_ATOMS_ENCODED:
                             atom_noising_mask[ai] = True
+                    if self.atomize_sidechains:
+                        copy_atomized_residue_mask[ri] = True
 
         task_masks = {
             "atom_noising_mask": atom_noising_mask,
@@ -425,6 +432,7 @@ class PocketPLACERSampling(SamplingTask):
             "residue_is_unindexed_mask": np.zeros(n_residues, dtype=bool),
             "res_hotspot_type": np.zeros(n_residues, dtype=int),
             "residue_entity_ids": residue_entity_ids,
+            "copy_atomized_residue_mask": copy_atomized_residue_mask,
             "t": 0.0,
         }
 
