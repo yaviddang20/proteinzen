@@ -155,9 +155,11 @@ def fuse_protein_chains(
     chain order into one merged chain, with a fresh, continuous local `res_idx`
     sequence (no gap between the original chains — they're treated as one
     contiguous protein). Non-protein chains (e.g. the ligand) are kept as-is,
-    renumbered to sit after the merged chain. `structure.interfaces` is dropped
-    (mirrors `Structure.remove_invalid_chains`, which does the same whenever chain
-    indices are restructured) since it isn't used downstream of this script.
+    renumbered to sit after the merged chain. `structure.interfaces` is remapped
+    through the same chain merge: interfaces between two now-merged protein
+    sub-chains collapse to a meaningless self-pair and are dropped, but interfaces
+    involving another chain (e.g. the ligand) are kept, since training configs with
+    `interface_crop: true` require `record.interfaces` to stay non-empty.
 
     If `structure` has <= 1 protein chain, returns the inputs unchanged.
     """
@@ -260,6 +262,22 @@ def fuse_protein_chains(
         new_connections["atom_1"] = atom_remap[structure.connections["atom_1"]]
         new_connections["atom_2"] = atom_remap[structure.connections["atom_2"]]
 
+    # Remap interfaces through chain_map; drop the ones that were between two of the
+    # now-merged protein sub-chains (they collapse to a meaningless self-pair). Interfaces
+    # between the merged protein chain and another chain (e.g. the ligand) are kept, since
+    # downstream training (interface_crop / interface_id=0 pocket cropping) depends on
+    # record.interfaces being non-empty.
+    new_interfaces_rows = []
+    for iface in structure.interfaces:
+        nc1, nc2 = chain_map[int(iface["chain_1"])], chain_map[int(iface["chain_2"])]
+        if nc1 == nc2:
+            continue
+        new_interfaces_rows.append((nc1, nc2, int(iface["chain_1_num_res"]), int(iface["chain_2_num_res"])))
+    new_interfaces = (
+        np.array(new_interfaces_rows, dtype=structure.interfaces.dtype)
+        if new_interfaces_rows else np.zeros(0, dtype=structure.interfaces.dtype)
+    )
+
     new_structure = replace(
         structure,
         atoms=new_atoms,
@@ -267,7 +285,7 @@ def fuse_protein_chains(
         residues=new_residues,
         chains=new_chains,
         connections=new_connections,
-        interfaces=np.zeros(0, dtype=structure.interfaces.dtype),
+        interfaces=new_interfaces,
         mask=np.ones(len(new_chains), dtype=bool),
     )
 

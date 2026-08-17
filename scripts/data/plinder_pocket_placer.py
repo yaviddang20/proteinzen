@@ -1,16 +1,18 @@
 """
-Process Plinder multi-protein-chain systems into the plinder_pocket_placer dataset.
+Process Plinder systems (1-3 protein chains) into the plinder_pocket_placer dataset.
 
 plinder.py only keeps systems with exactly one protein chain, filtering out systems
-with 2-3 protein chains (`chain_filter_protein{2,3}_ligand1`). This script instead
-picks up those 2-3-protein-chain systems and fuses their protein chains into a
-single chain/entity — residues are concatenated in chain order under one fresh,
-continuous residue index (no gap between the original chains) — so they can be
-used to train the pocket PLACER model, which only cares about the local pocket
-around the ligand rather than original chain boundaries.
+with 2-3 protein chains (`chain_filter_protein{2,3}_ligand1`). This script accepts
+1-3-protein-chain systems; whenever a system has 2 or 3 protein chains, they're
+fused into a single chain/entity — residues are concatenated in chain order under
+one fresh, continuous residue index (no gap between the original chains) — so
+multi-chain pockets can be used to train the pocket PLACER model alongside ordinary
+single-chain systems, since PLACER only cares about the local pocket around the
+ligand rather than original chain boundaries. `fuse_protein_chains` is a no-op for
+single-protein-chain systems, so this is a strict superset of plinder.py's dataset.
 
 Reuses plinder.py's parsing, filtering, and per-system processing wholesale; the
-only difference is which protein-chain counts are accepted (2 or 3, instead of 1)
+only difference is which protein-chain counts are accepted (1-3, instead of just 1)
 and that `fuse_multi_chain=True` is passed through so `process_system` calls
 `fuse_protein_chains` before featurization.
 
@@ -55,8 +57,9 @@ if __name__ == "__main__":
                         help="Directory of per-system alpha-sphere .npy files from filter_plinder_pocket.py")
     args = parser.parse_args()
 
-    # Fixed for this dataset: accept only 2-3 protein-chain systems, fused into one chain.
-    args.allowed_protein_chain_counts = (2, 3)
+    # Fixed for this dataset: accept 1-3 protein-chain systems; 2-3 protein chains get
+    # fused into one chain (fuse_protein_chains is a no-op for single-protein-chain systems).
+    args.allowed_protein_chain_counts = (1, 2, 3)
     args.fuse_multi_chain = True
 
     # Set rdkit pickle options
