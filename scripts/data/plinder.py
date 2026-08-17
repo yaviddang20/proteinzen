@@ -29,6 +29,7 @@ import pickle
 import numpy as np
 import pyarrow.parquet as pq
 import rdkit
+import yaml
 from scipy.spatial.distance import cdist
 from rdkit import Chem
 from rdkit.Chem import rdMolDescriptors
@@ -142,6 +143,141 @@ def _insert_ligand_h(structure: "Structure", mol_with_h) -> "Structure":
         interfaces=structure.interfaces,
         mask=structure.mask,
     )
+
+
+def fuse_protein_chains(
+    structure: "Structure",
+    auth_seq_map: Optional[list] = None,
+) -> tuple:
+    """Merge all PROTEIN chains in `structure` into a single chain/entity.
+
+    Residues from each original protein chain are concatenated in their original
+    chain order into one merged chain, with a fresh, continuous local `res_idx`
+    sequence (no gap between the original chains — they're treated as one
+    contiguous protein). Non-protein chains (e.g. the ligand) are kept as-is,
+    renumbered to sit after the merged chain. `structure.interfaces` is dropped
+    (mirrors `Structure.remove_invalid_chains`, which does the same whenever chain
+    indices are restructured) since it isn't used downstream of this script.
+
+    If `structure` has <= 1 protein chain, returns the inputs unchanged.
+    """
+    protein_id = const.chain_type_ids["PROTEIN"]
+    protein_idxs = [i for i, c in enumerate(structure.chains) if int(c["mol_type"]) == protein_id]
+    if len(protein_idxs) <= 1:
+        return structure, auth_seq_map
+
+    protein_idx_set = set(protein_idxs)
+    other_idxs = [i for i in range(len(structure.chains)) if i not in protein_idx_set]
+
+    n_atoms_total = len(structure.atoms)
+    n_res_total = len(structure.residues)
+    atom_remap = np.empty(n_atoms_total, dtype=np.int32)
+    res_remap = np.empty(n_res_total, dtype=np.int32)
+
+    new_atom_chunks: list = []
+    new_res_chunks: list = []
+    atom_cursor = 0
+    res_cursor = 0
+
+    def append_block(old_chain_idx: int):
+        nonlocal atom_cursor, res_cursor
+        chain = structure.chains[old_chain_idx]
+        a0, an = int(chain["atom_idx"]), int(chain["atom_num"])
+        r0, rn = int(chain["res_idx"]), int(chain["res_num"])
+
+        atoms = structure.atoms[a0:a0 + an].copy()
+        residues = structure.residues[r0:r0 + rn].copy()
+
+        atom_shift = atom_cursor - a0
+        if rn:
+            residues["atom_idx"] += atom_shift
+            residues["atom_center"] += atom_shift
+            residues["atom_disto"] += atom_shift
+
+        atom_remap[a0:a0 + an] = np.arange(atom_cursor, atom_cursor + an)
+        res_remap[r0:r0 + rn] = np.arange(res_cursor, res_cursor + rn)
+
+        new_atom_chunks.append(atoms)
+        new_res_chunks.append(residues)
+
+        new_atom_idx, new_res_idx = atom_cursor, res_cursor
+        atom_cursor += an
+        res_cursor += rn
+        return new_atom_idx, an, new_res_idx, rn, residues
+
+    # Merged protein chain block goes first; residues get a fresh, contiguous
+    # local res_idx sequence spanning all constituent chains (no gap).
+    merged_atom_idx = atom_cursor
+    merged_res_idx = res_cursor
+    local_res_cursor = 0
+    merged_auth_indices = []
+    for pidx in protein_idxs:
+        _, _, _, rn, residues = append_block(pidx)
+        if rn:
+            local_min = int(residues["res_idx"].min())
+            residues["res_idx"] += local_res_cursor - local_min
+            local_res_cursor = int(residues["res_idx"].max()) + 1
+        if auth_seq_map is not None:
+            merged_auth_indices.extend(auth_seq_map[pidx]["auth_indices"])
+    merged_atom_num = atom_cursor - merged_atom_idx
+    merged_res_num = res_cursor - merged_res_idx
+
+    other_blocks = [(oidx, *append_block(oidx)) for oidx in other_idxs]
+
+    new_atoms = np.concatenate(new_atom_chunks, dtype=structure.atoms.dtype) if new_atom_chunks else structure.atoms[:0]
+    new_residues = np.concatenate(new_res_chunks, dtype=structure.residues.dtype) if new_res_chunks else structure.residues[:0]
+
+    new_chains = np.zeros(1 + len(other_idxs), dtype=structure.chains.dtype)
+    new_chains[0] = structure.chains[protein_idxs[0]]
+    new_chains[0]["atom_idx"] = merged_atom_idx
+    new_chains[0]["atom_num"] = merged_atom_num
+    new_chains[0]["res_idx"] = merged_res_idx
+    new_chains[0]["res_num"] = merged_res_num
+    new_chains[0]["asym_id"] = 0
+    new_chains[0]["sym_id"] = 0
+
+    chain_map = {pidx: 0 for pidx in protein_idxs}
+    for k, (oidx, new_a_idx, an, new_r_idx, rn, _) in enumerate(other_blocks, start=1):
+        new_chains[k] = structure.chains[oidx]
+        new_chains[k]["atom_idx"] = new_a_idx
+        new_chains[k]["atom_num"] = an
+        new_chains[k]["res_idx"] = new_r_idx
+        new_chains[k]["res_num"] = rn
+        new_chains[k]["asym_id"] = k
+        chain_map[oidx] = k
+
+    new_bonds = structure.bonds.copy()
+    if len(new_bonds):
+        new_bonds["atom_1"] = atom_remap[new_bonds["atom_1"]]
+        new_bonds["atom_2"] = atom_remap[new_bonds["atom_2"]]
+
+    new_connections = structure.connections.copy()
+    if len(new_connections):
+        new_connections["chain_1"] = [chain_map[c] for c in structure.connections["chain_1"]]
+        new_connections["chain_2"] = [chain_map[c] for c in structure.connections["chain_2"]]
+        new_connections["res_1"] = res_remap[structure.connections["res_1"]]
+        new_connections["res_2"] = res_remap[structure.connections["res_2"]]
+        new_connections["atom_1"] = atom_remap[structure.connections["atom_1"]]
+        new_connections["atom_2"] = atom_remap[structure.connections["atom_2"]]
+
+    new_structure = replace(
+        structure,
+        atoms=new_atoms,
+        bonds=new_bonds,
+        residues=new_residues,
+        chains=new_chains,
+        connections=new_connections,
+        interfaces=np.zeros(0, dtype=structure.interfaces.dtype),
+        mask=np.ones(len(new_chains), dtype=bool),
+    )
+
+    new_auth_seq_map = None
+    if auth_seq_map is not None:
+        merged_entry = dict(auth_seq_map[protein_idxs[0]])
+        merged_entry["auth_indices"] = merged_auth_indices
+        new_auth_seq_map = [merged_entry] + [auth_seq_map[oidx] for oidx in other_idxs]
+
+    return new_structure, new_auth_seq_map
 
 
 def system_mid(system_id: str) -> str:
@@ -410,6 +546,8 @@ def process_system(
     annotation_row: dict,
     ccd: dict,
     pocket_data_dir: Optional[Path] = None,
+    allowed_protein_chain_counts: tuple = (1,),
+    fuse_multi_chain: bool = False,
 ) -> None:
     mid = system_mid(system_id)
     struct_path = outdir / "structures" / mid / f"{system_id}.npz"
@@ -431,6 +569,7 @@ def process_system(
         # Parse full complex (protein + ligand chains via CCD)
         parsed = parse_mmcif(str(cif_path), components=ccd, ignore_connections=False, use_assembly=False)
         structure = parsed.data
+        auth_seq_map = parsed.auth_seq_map
     except Exception:
         traceback.print_exc()
         print(f"Failed to parse {system_id}")
@@ -454,11 +593,14 @@ def process_system(
     nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
     protein_id = const.chain_type_ids["PROTEIN"]
 
-    # Only process systems with exactly one protein chain and one ligand chain
+    # Only process systems with an allowed protein chain count and exactly one ligand chain
     n_protein = sum(1 for c in structure.chains if int(c["mol_type"]) == protein_id)
     n_ligand = sum(1 for c in structure.chains if int(c["mol_type"]) == nonpolymer_id)
-    if n_protein != 1 or n_ligand != 1:
+    if n_protein not in allowed_protein_chain_counts or n_ligand != 1:
         return f"chain_filter_protein{n_protein}_ligand{n_ligand}"
+
+    if fuse_multi_chain and n_protein > 1:
+        structure, auth_seq_map = fuse_protein_chains(structure, auth_seq_map)
 
     # Load ligand SDF files and validate each ligand mol
     ligand_sdfs = get_ligand_sdfs(system_dir)
@@ -616,14 +758,15 @@ def process_system(
 
     auth_map_path = outdir / "auth_maps" / mid / f"{system_id}.json"
     with open(auth_map_path, "w") as f:
-        json.dump(parsed.auth_seq_map, f)
+        json.dump(auth_seq_map, f)
 
     return None
 
 
 _worker_state = {}
 
-def _worker_init(plinder_dir, outdir, clusters, annotations, ccd_path, pocket_data_dir=None):
+def _worker_init(plinder_dir, outdir, clusters, annotations, ccd_path, pocket_data_dir=None,
+                  allowed_protein_chain_counts=(1,), fuse_multi_chain=False):
     """Load large shared data once per worker process."""
     global _worker_state
     with open(ccd_path, "rb") as f:
@@ -635,6 +778,8 @@ def _worker_init(plinder_dir, outdir, clusters, annotations, ccd_path, pocket_da
         "annotations": annotations,
         "ccd": ccd,
         "pocket_data_dir": pocket_data_dir,
+        "allowed_protein_chain_counts": allowed_protein_chain_counts,
+        "fuse_multi_chain": fuse_multi_chain,
     }
 
 
@@ -645,6 +790,8 @@ def process_system_worker(system_id: str) -> tuple[str, Optional[str]]:
         reason = process_system(
             system_id, s["plinder_dir"], s["outdir"], s["clusters"],
             annotation_row, s["ccd"], pocket_data_dir=s.get("pocket_data_dir"),
+            allowed_protein_chain_counts=s.get("allowed_protein_chain_counts", (1,)),
+            fuse_multi_chain=s.get("fuse_multi_chain", False),
         )
         return system_id, reason
     except Exception:
@@ -655,7 +802,7 @@ def process_system_worker(system_id: str) -> tuple[str, Optional[str]]:
 
 # ── finalize ──────────────────────────────────────────────────────────────────
 
-def finalize(outdir: Path) -> None:
+def finalize(outdir: Path) -> int:
     records = []
     failed = 0
     for record_file in (outdir / "records").rglob("*.json"):
@@ -669,11 +816,12 @@ def finalize(outdir: Path) -> None:
     with open(outdir / "manifest.json", "w") as f:
         json.dump(records, f, indent=2)
     print(f"Wrote manifest with {len(records)} entries")
+    return len(records)
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
-def process(args, clusters: dict, annotations: dict, split: dict) -> None:
+def process(args, clusters: dict, annotations: dict, split: dict) -> int:
     plinder_dir = args.plinder_dir
     outdir = args.outdir
     if args.overwrite and outdir.exists():
@@ -697,9 +845,12 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> None:
     num_processes = min(args.num_processes, multiprocessing.cpu_count(), len(system_ids))
 
     pocket_data_dir = getattr(args, "pocket_data_dir", None)
+    allowed_protein_chain_counts = tuple(getattr(args, "allowed_protein_chain_counts", (1,)))
+    fuse_multi_chain = getattr(args, "fuse_multi_chain", False)
 
     if num_processes > 1:
-        initargs = (plinder_dir, outdir, clusters, annotations, args.ccd_path, pocket_data_dir)
+        initargs = (plinder_dir, outdir, clusters, annotations, args.ccd_path, pocket_data_dir,
+                    allowed_protein_chain_counts, fuse_multi_chain)
         with multiprocessing.Pool(
             processes=num_processes,
             initializer=_worker_init,
@@ -707,7 +858,8 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> None:
         ) as pool:
             results = list(tqdm(pool.imap_unordered(process_system_worker, system_ids, chunksize=4), total=len(system_ids)))
     else:
-        _worker_init(plinder_dir, outdir, clusters, annotations, args.ccd_path, pocket_data_dir)
+        _worker_init(plinder_dir, outdir, clusters, annotations, args.ccd_path, pocket_data_dir,
+                      allowed_protein_chain_counts, fuse_multi_chain)
         results = [process_system_worker(sid) for sid in tqdm(system_ids)]
 
     # Tally filter reasons
@@ -727,7 +879,7 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> None:
     with open(outdir / "filtered_ids.json", "w") as f:
         json.dump(filtered_ids, f, indent=2)
 
-    finalize(outdir)
+    return finalize(outdir)
 
 
 
@@ -778,7 +930,14 @@ if __name__ == "__main__":
     split = load_split(args.plinder_dir)
     print(f"Loaded {len(split)} split assignments")
 
+    split_counts = {}
     for split_name in ["train", "val", "test"]:
         print(f"\n=== Processing split: {split_name} ===")
         split_args = argparse.Namespace(**{**vars(args), "splits": [split_name], "outdir": args.outdir / split_name})
-        process(split_args, clusters, annotations, split)
+        split_counts[split_name] = process(split_args, clusters, annotations, split)
+
+    stats = {**split_counts, "total": sum(split_counts.values())}
+    args.outdir.mkdir(parents=True, exist_ok=True)
+    with open(args.outdir / "dataset_stats.yaml", "w") as f:
+        yaml.dump(stats, f, default_flow_style=False, sort_keys=False)
+    print(f"Wrote dataset stats to {args.outdir / 'dataset_stats.yaml'}")

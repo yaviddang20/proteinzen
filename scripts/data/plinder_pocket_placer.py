@@ -1,0 +1,95 @@
+"""
+Process Plinder multi-protein-chain systems into the plinder_pocket_placer dataset.
+
+plinder.py only keeps systems with exactly one protein chain, filtering out systems
+with 2-3 protein chains (`chain_filter_protein{2,3}_ligand1`). This script instead
+picks up those 2-3-protein-chain systems and fuses their protein chains into a
+single chain/entity — residues are concatenated in chain order under one fresh,
+continuous residue index (no gap between the original chains) — so they can be
+used to train the pocket PLACER model, which only cares about the local pocket
+around the ligand rather than original chain boundaries.
+
+Reuses plinder.py's parsing, filtering, and per-system processing wholesale; the
+only difference is which protein-chain counts are accepted (2 or 3, instead of 1)
+and that `fuse_multi_chain=True` is passed through so `process_system` calls
+`fuse_protein_chains` before featurization.
+
+Output layout mirrors plinder.py: one subdirectory per split (train/val/test),
+each containing structures/, records/, auth_maps/, manifest.json, plus a top-level
+dataset_stats.yaml with per-split and total system counts.
+"""
+
+import argparse
+import multiprocessing
+import os
+from pathlib import Path
+
+import rdkit
+import yaml
+
+from plinder import load_annotation_table, load_clusters, load_split, process
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Process Plinder 2-3-protein-chain systems (fused into one chain) into the plinder_pocket_placer dataset."
+    )
+    parser.add_argument("--ccd-path", type=Path, default=Path(os.environ.get("REPO_ROOT", ".")) / "ccd.pkl",
+                        help="Path to ccd.pkl (default: $REPO_ROOT/ccd.pkl)")
+    parser.add_argument("--plinder-dir", type=Path, required=True,
+                        help="Path to plinder data root (e.g. /mnt/scratch/.../plinder/2024-06/v2)")
+    parser.add_argument("--outdir", type=Path, required=True,
+                        help="Output root — one subdirectory per split (train/val/test)")
+    parser.add_argument("--cluster-algorithm", type=str, default="communities")
+    parser.add_argument("--cluster-directed", action="store_true", default=False)
+    parser.add_argument("--cluster-metric", type=str, default="pli_qcov")
+    parser.add_argument("--cluster-threshold", type=int, default=50)
+    parser.add_argument("--num-processes", type=int, default=multiprocessing.cpu_count())
+    parser.add_argument("--system-ids-file", type=Path, default=None,
+                        help="Optional text file of allowed system IDs (one per line); from filter_plinder_pocket.py")
+    parser.add_argument("--max-systems", type=int, default=None,
+                        help="Cap number of systems per split (for debugging)")
+    parser.add_argument("--overwrite", action="store_true", default=False,
+                        help="Delete and recreate the output directory before processing")
+    parser.add_argument("--pocket-data-dir", type=Path,
+                        default=Path(os.environ.get("REPO_ROOT", ".")) / "plinder_pocket_alpha_spheres",
+                        help="Directory of per-system alpha-sphere .npy files from filter_plinder_pocket.py")
+    args = parser.parse_args()
+
+    # Fixed for this dataset: accept only 2-3 protein-chain systems, fused into one chain.
+    args.allowed_protein_chain_counts = (2, 3)
+    args.fuse_multi_chain = True
+
+    # Set rdkit pickle options
+    pickle_option = rdkit.Chem.PropertyPickleOptions.AllProps
+    rdkit.Chem.SetDefaultPickleProperties(pickle_option)
+
+    # Load shared data once
+    print("Loading clusters...")
+    clusters = load_clusters(
+        args.plinder_dir,
+        algorithm=args.cluster_algorithm,
+        directed=args.cluster_directed,
+        metric=args.cluster_metric,
+        threshold=args.cluster_threshold,
+    )
+    print(f"Loaded {len(clusters)} cluster assignments")
+
+    print("Loading annotation table...")
+    annotations = load_annotation_table(args.plinder_dir)
+    print(f"Loaded {len(annotations)} annotation rows")
+
+    print("Loading split...")
+    split = load_split(args.plinder_dir)
+    print(f"Loaded {len(split)} split assignments")
+
+    split_counts = {}
+    for split_name in ["train", "val", "test"]:
+        print(f"\n=== Processing split: {split_name} ===")
+        split_args = argparse.Namespace(**{**vars(args), "splits": [split_name], "outdir": args.outdir / split_name})
+        split_counts[split_name] = process(split_args, clusters, annotations, split)
+
+    stats = {**split_counts, "total": sum(split_counts.values())}
+    args.outdir.mkdir(parents=True, exist_ok=True)
+    with open(args.outdir / "dataset_stats.yaml", "w") as f:
+        yaml.dump(stats, f, default_flow_style=False, sort_keys=False)
+    print(f"Wrote dataset stats to {args.outdir / 'dataset_stats.yaml'}")

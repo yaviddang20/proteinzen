@@ -376,6 +376,7 @@ class PocketPLACERSampling(SamplingTask):
         trans_std: float = 3.0,
         include_h: bool = False,
         atomize_sidechains: bool = False,
+        fix_ligand: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -385,6 +386,7 @@ class PocketPLACERSampling(SamplingTask):
         self.trans_std = trans_std
         self.include_h = include_h
         self.atomize_sidechains = atomize_sidechains
+        self.fix_ligand = fix_ligand
         if atomize_sidechains:
             raise NotImplementedError("atomize_sidechains is not yet supported in PocketPLACERSampling — SampleTemplateTokenizer does not route standard residues through the atomized path")
 
