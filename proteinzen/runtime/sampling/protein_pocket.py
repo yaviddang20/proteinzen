@@ -414,9 +414,9 @@ class PocketPLACERSampling(SamplingTask):
                 residue_entity_ids[ri] = int(chain["entity_id"])
             mol_type = int(chain["mol_type"])
             if mol_type == nonpolymer_id:
-                # noise all ligand atoms
-                a0 = int(chain["atom_idx"])
-                atom_noising_mask[a0:a0 + int(chain["atom_num"])] = True
+                if not self.fix_ligand:
+                    a0 = int(chain["atom_idx"])
+                    atom_noising_mask[a0:a0 + int(chain["atom_num"])] = True
             elif mol_type == protein_id:
                 for ri in range(r0, r0 + rn):
                     res = struct.residues[ri]

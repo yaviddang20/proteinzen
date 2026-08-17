@@ -630,6 +630,12 @@ def process_system(
         mol_with_h = AllChem.AddHs(mol, addCoords=True) if mol.GetNumConformers() > 0 else None
         ligand_smiles = Chem.MolToSmiles(mol_no_h)
         rot_data = compute_rot_bond_data(mol_no_h)
+        # compute_rot_bond_fragments/compute_ring_atom_masks each redo their own AddHs/RemoveHs
+        # round-trip internally and can (rarely, for degenerate ligands) land on a different heavy
+        # atom count than n_lig here; guard against the resulting shape mismatch rather than crash.
+        n_lig = rot_data["n_lig"]
+        if rot_data["rot_frag_a"].shape[1] != n_lig or rot_data["ring_masks"].shape[1] != n_lig:
+            return "rot_bond_shape_mismatch"
         all_rot_bond_data.append(rot_data)
 
     rot_bond_data = merge_rot_bond_data(all_rot_bond_data)
