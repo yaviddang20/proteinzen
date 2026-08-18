@@ -36,15 +36,19 @@ DATASET = "drugs"  # only GEOM-DRUGS is used in this pipeline (see gen_filter_ge
 
 
 def _mol_size(smiles: str) -> Optional[tuple]:
-    """Return (smiles, n_heavy_atoms, mol_wt), or None if unparseable."""
+    """Return (smiles, n_heavy_atoms, n_atoms_with_h, mol_wt), or None if unparseable.
+    Chem.MolFromSmiles leaves H implicit, so mol.GetNumAtoms() alone only ever counts
+    heavy atoms — AddHs is needed to get the H-inclusive total atom count too."""
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
-    return smiles, mol.GetNumAtoms(), Descriptors.MolWt(mol)
+    n_heavy = mol.GetNumAtoms()
+    n_with_h = Chem.AddHs(mol).GetNumAtoms()
+    return smiles, n_heavy, n_with_h, Descriptors.MolWt(mol)
 
 
 def _size_stats(smiles_list: list, num_processes: int) -> dict:
-    """Atom-count / molecular-weight distribution stats over a list of SMILES."""
+    """Atom-count (heavy and H-inclusive) / molecular-weight distribution stats over a list of SMILES."""
     if not smiles_list:
         return {"n_molecules": 0}
     if num_processes > 1 and len(smiles_list) > 1000:
@@ -60,16 +64,23 @@ def _size_stats(smiles_list: list, num_processes: int) -> dict:
     if not results:
         return stats
 
-    atom_counts = [r[1] for r in results]
-    mol_wts = [r[2] for r in results]
-    largest = max(results, key=lambda r: r[1])
+    n_heavy_list = [r[1] for r in results]
+    n_with_h_list = [r[2] for r in results]
+    mol_wts = [r[3] for r in results]
+    largest = max(results, key=lambda r: r[1])  # ranked by heavy-atom count
     smallest = min(results, key=lambda r: r[1])
     stats.update({
-        "atom_count": {
-            "min": min(atom_counts),
-            "max": max(atom_counts),
-            "mean": round(statistics.mean(atom_counts), 2),
-            "median": statistics.median(atom_counts),
+        "atom_count_heavy": {
+            "min": min(n_heavy_list),
+            "max": max(n_heavy_list),
+            "mean": round(statistics.mean(n_heavy_list), 2),
+            "median": statistics.median(n_heavy_list),
+        },
+        "atom_count_with_h": {
+            "min": min(n_with_h_list),
+            "max": max(n_with_h_list),
+            "mean": round(statistics.mean(n_with_h_list), 2),
+            "median": statistics.median(n_with_h_list),
         },
         "mol_wt": {
             "min": round(min(mol_wts), 2),
@@ -77,8 +88,8 @@ def _size_stats(smiles_list: list, num_processes: int) -> dict:
             "mean": round(statistics.mean(mol_wts), 2),
             "median": round(statistics.median(mol_wts), 2),
         },
-        "largest_molecule": {"smiles": largest[0], "n_atoms": largest[1], "mol_wt": round(largest[2], 2)},
-        "smallest_molecule": {"smiles": smallest[0], "n_atoms": smallest[1], "mol_wt": round(smallest[2], 2)},
+        "largest_molecule": {"smiles": largest[0], "n_heavy_atoms": largest[1], "n_atoms_with_h": largest[2], "mol_wt": round(largest[3], 2)},
+        "smallest_molecule": {"smiles": smallest[0], "n_heavy_atoms": smallest[1], "n_atoms_with_h": smallest[2], "mol_wt": round(smallest[3], 2)},
     })
     return stats
 
@@ -196,7 +207,7 @@ def main():
         if report["splits"][m].get("processed") and report["splits"][m]["processed"].get("largest_molecule")
     ]
     if largest_per_split:
-        report["largest_molecule_overall_processed"] = dict(max(largest_per_split, key=lambda x: x["n_atoms"]))
+        report["largest_molecule_overall_processed"] = dict(max(largest_per_split, key=lambda x: x["n_heavy_atoms"]))
 
     outfile.parent.mkdir(parents=True, exist_ok=True)
     with open(outfile, "w") as f:

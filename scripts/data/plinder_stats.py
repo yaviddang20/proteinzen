@@ -38,14 +38,22 @@ NONPOLYMER_ID = const.chain_type_ids["NONPOLYMER"]
 
 
 def _ligand_size(args) -> Optional[tuple]:
-    """Return (system_id, n_heavy_atoms, mol_wt), or None if unparseable/missing."""
+    """Return (system_id, smiles, n_heavy_atoms, n_atoms_with_h, mol_wt), or None if
+    unparseable/missing. Chem.MolFromSmiles leaves H implicit, so mol.GetNumAtoms()
+    alone only ever counts heavy atoms — AddHs is needed for the H-inclusive count too.
+    Note this is derived from record['smiles'], which plinder.py stores as the
+    Hs-stripped ligand SMILES (Chem.MolToSmiles(mol_no_h)) — so n_atoms_with_h here is
+    RDKit's re-added H count, not necessarily identical to the H count actually present
+    in the source structure."""
     system_id, smiles = args
     if not smiles:
         return None
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
-    return system_id, smiles, mol.GetNumAtoms(), Descriptors.MolWt(mol)
+    n_heavy = mol.GetNumAtoms()
+    n_with_h = Chem.AddHs(mol).GetNumAtoms()
+    return system_id, smiles, n_heavy, n_with_h, Descriptors.MolWt(mol)
 
 
 def _ligand_size_stats(records: list, num_processes: int) -> dict:
@@ -64,16 +72,23 @@ def _ligand_size_stats(records: list, num_processes: int) -> dict:
     if not results:
         return stats
 
-    atom_counts = [r[2] for r in results]
-    mol_wts = [r[3] for r in results]
-    largest = max(results, key=lambda r: r[2])
+    n_heavy_list = [r[2] for r in results]
+    n_with_h_list = [r[3] for r in results]
+    mol_wts = [r[4] for r in results]
+    largest = max(results, key=lambda r: r[2])  # ranked by heavy-atom count
     smallest = min(results, key=lambda r: r[2])
     stats.update({
-        "atom_count": {
-            "min": min(atom_counts),
-            "max": max(atom_counts),
-            "mean": round(statistics.mean(atom_counts), 2),
-            "median": statistics.median(atom_counts),
+        "atom_count_heavy": {
+            "min": min(n_heavy_list),
+            "max": max(n_heavy_list),
+            "mean": round(statistics.mean(n_heavy_list), 2),
+            "median": statistics.median(n_heavy_list),
+        },
+        "atom_count_with_h": {
+            "min": min(n_with_h_list),
+            "max": max(n_with_h_list),
+            "mean": round(statistics.mean(n_with_h_list), 2),
+            "median": statistics.median(n_with_h_list),
         },
         "mol_wt": {
             "min": round(min(mol_wts), 2),
@@ -81,8 +96,8 @@ def _ligand_size_stats(records: list, num_processes: int) -> dict:
             "mean": round(statistics.mean(mol_wts), 2),
             "median": round(statistics.median(mol_wts), 2),
         },
-        "largest_ligand": {"system_id": largest[0], "smiles": largest[1], "n_atoms": largest[2], "mol_wt": round(largest[3], 2)},
-        "smallest_ligand": {"system_id": smallest[0], "smiles": smallest[1], "n_atoms": smallest[2], "mol_wt": round(smallest[3], 2)},
+        "largest_ligand": {"system_id": largest[0], "smiles": largest[1], "n_heavy_atoms": largest[2], "n_atoms_with_h": largest[3], "mol_wt": round(largest[4], 2)},
+        "smallest_ligand": {"system_id": smallest[0], "smiles": smallest[1], "n_heavy_atoms": smallest[2], "n_atoms_with_h": smallest[3], "mol_wt": round(smallest[4], 2)},
     })
     return stats
 
