@@ -520,10 +520,16 @@ class BiomoleculeModule(L.LightningModule):
                  epoch_sample_num_steps=100,
                  seq_noise_schedule=False,
                  # use_stabilized_high_t_loss=False
+                 lora_config=None,
     ):
         super().__init__()
         self._log = logging.getLogger(__name__)
         self.model = model
+        if lora_config is not None:
+            from peft import get_peft_model, LoraConfig
+            self.model = get_peft_model(self.model, LoraConfig(**lora_config))
+            self.model.print_trainable_parameters()
+        self.lora_config = lora_config
         if compile_model:
             self.model.compile()
         self.corrupter = corrupter
@@ -2104,6 +2110,8 @@ class BiomoleculeModule(L.LightningModule):
     def configure_optimizers(self):
         if self.bond_rotation_head_only:
             params = self.model.bond_rotation_head.parameters()
+        elif self.lora_config is not None:
+            params = (p for p in self.model.parameters() if p.requires_grad)
         else:
             params = self.model.parameters()
 
