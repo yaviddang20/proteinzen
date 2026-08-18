@@ -1,6 +1,11 @@
 import torch
 
 
+class SamplingDivergedError(RuntimeError):
+    """Raised when a denoiser forward pass produces NaN rigids/sequence during
+    sampling. """
+
+
 def gather_helper(tensor, token_gather_idx):
     new_dims = tensor.dim() - token_gather_idx.dim()
     idx_expand = token_gather_idx.view(

@@ -34,7 +34,7 @@ from proteinzen.data.featurize.sampling import construct_atoms
 # from proteinzen.data.write.mmcif import to_mmcif
 from proteinzen.data.write.pdb import to_pdb
 
-from proteinzen.model.utils import gather_helper
+from proteinzen.model.utils import gather_helper, SamplingDivergedError
 from proteinzen.model.denoiser_v2 import MonotonicIncreasingFn
 from proteinzen.stoch_interp.integration import Integrator, EulerIntegrator
 from proteinzen.stoch_interp.diffeq import BaseEulerODEStep
@@ -2202,10 +2202,14 @@ class BiomoleculeSamplingModule(L.LightningModule):
                 batch['rigids']['rigids_1'][..., :4],
             )
 
-        clean_traj, prot_traj, final_denoiser_out = self.integrator.sample(
-            batch,
-            ts
-        )
+        try:
+            clean_traj, prot_traj, final_denoiser_out = self.integrator.sample(
+                batch,
+                ts
+            )
+        except SamplingDivergedError as e:
+            self._log.warning(f"Skipping batch {batch_idx} (task(s): {batch.get('task')}): {e}")
+            return []
 
         ret = self._post_process_outputs(
             batch,

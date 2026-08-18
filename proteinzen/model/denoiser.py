@@ -11,7 +11,7 @@ from scipy.optimize import linear_sum_assignment
 from proteinzen.boltz.data import const
 
 from proteinzen.model.modules.attention import ConditionedTransformerPairBias
-from proteinzen.model.utils import gather_helper
+from proteinzen.model.utils import gather_helper, SamplingDivergedError
 from proteinzen.openfold.layers.layers import InvariantPointAttention, Dropout, TriangleMultiplicationOutgoing, TriangleMultiplicationIncoming, permute_final_dims
 from proteinzen.openfold.layers.layers_v2 import (
     Linear, ConditionedInvariantPointAttention, BackboneUpdate, TorsionAngles, LayerNorm, AdaLN, ConditionedTransition,
@@ -1699,8 +1699,9 @@ class IpaMultiRigidDenoiser(nn.Module):
         pred_seq = pred_seq * seq_noising_mask + token_data['seq'] * (~seq_noising_mask)
 
         if rigids_out.to_tensor_7().isnan().any() or pred_seq.isnan().any():
-            print("caught a nan in forward")
-            exit()
+            task_names = data.get('task')
+            print(f"caught a nan in forward, task(s): {task_names}")
+            raise SamplingDivergedError(f"NaN in forward for task(s): {task_names}")
 
         ret = {}
         ret['denoised_rigids'] = rigids_out
