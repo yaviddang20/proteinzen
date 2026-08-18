@@ -18,7 +18,7 @@ Writes:
   {outfile} (default {processed_dir}/geom_stats.yaml)
 
 Usage:
-  python scripts/data/geom_stats.py --dataset drugs
+  python scripts/data/geom_stats.py
 """
 import argparse
 import json
@@ -31,6 +31,8 @@ from typing import Optional
 import yaml
 from rdkit import Chem
 from rdkit.Chem import Descriptors
+
+DATASET = "drugs"  # only GEOM-DRUGS is used in this pipeline (see gen_filter_geom.sh etc.)
 
 
 def _mol_size(smiles: str) -> Optional[tuple]:
@@ -105,7 +107,6 @@ def main():
     parser.add_argument("--processed-dir", type=Path,
                          default=Path(os.environ.get("REPO_ROOT", ".")) / "data" / "geom_drugs_conformers",
                          help="Dir with {mode}/manifest.json + {mode}/errors.json (geom_conformer.py output)")
-    parser.add_argument("--dataset", type=str, default="drugs", choices=["qm9", "drugs"])
     parser.add_argument("--outfile", type=Path, default=None,
                          help="Where to write the yaml report (default: {processed-dir}/geom_stats.yaml)")
     parser.add_argument("--num-processes", type=int, default=multiprocessing.cpu_count())
@@ -115,7 +116,7 @@ def main():
     report = {}
 
     # --- Stage 1: raw ---
-    raw_path = args.rdkit_dir / f"summary_{args.dataset}.json"
+    raw_path = args.rdkit_dir / f"summary_{DATASET}.json"
     raw = _load_json(raw_path)
     if raw is not None:
         smiles_list = [s for s in raw if len(s) > 1]
@@ -126,13 +127,13 @@ def main():
         report["raw"] = None
 
     # --- Stage 2: post filter_geom.py ---
-    filtered_path = args.rdkit_dir / f"filtered_summary_{args.dataset}.json"
+    filtered_path = args.rdkit_dir / f"filtered_summary_{DATASET}.json"
     filtered = _load_json(filtered_path)
     if filtered is not None:
         smiles_list = [s for s in filtered if len(s) > 1]
         print(f"[filter_geom] {filtered_path}: {len(smiles_list)} molecules")
         stage = _size_stats(smiles_list, args.num_processes)
-        errors = _load_json(args.rdkit_dir / f"filter_errors_{args.dataset}.json")
+        errors = _load_json(args.rdkit_dir / f"filter_errors_{DATASET}.json")
         if errors is not None:
             stage["errors_by_type"] = {k: len(v) for k, v in errors.items()}
             stage["n_errors"] = sum(len(v) for v in errors.values())
@@ -146,7 +147,7 @@ def main():
     for mode in ["train", "val", "test"]:
         split_report = {}
 
-        split_summary_path = args.rdkit_dir / f"{mode}_filtered_summary_{args.dataset}.json"
+        split_summary_path = args.rdkit_dir / f"{mode}_filtered_summary_{DATASET}.json"
         split_summary = _load_json(split_summary_path)
         if split_summary is not None:
             smiles_list = [s for s in split_summary if len(s) > 1]
