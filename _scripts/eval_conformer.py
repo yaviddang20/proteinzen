@@ -95,7 +95,7 @@ def canon_smi_from_mol(mol, stereo=True):
     return mol_to_match_key(mol, stereo=stereo)
 
 
-def load_pdb(path, perceive_stereo=False):
+def load_pdb(path, perceive_stereo=False, smiles=None):
     from rdkit.Chem import rdchem
     mol = Chem.MolFromPDBFile(path, removeHs=True, sanitize=False)
     if mol is None:
@@ -108,11 +108,45 @@ def load_pdb(path, perceive_stereo=False):
     try:
         Chem.SanitizeMol(mol)
     except Exception as e:
-        print(f"SanitizeMol failed [{path}]: {e}", file=sys.stderr)
-        return None
+        # PDB has no bond-order field, so RDKit has to guess bond orders from
+        # geometry on read-back; that guess can produce an invalid valence
+        # (e.g. a crowded stereocenter with two P substituents). If the true
+        # SMILES is known (REMARK SMILES header), recover correct bond orders
+        # from it via substructure match on connectivity — which PDB CONECT
+        # records preserve exactly, even though bond order isn't — instead of
+        # giving up on the mol entirely.
+        if smiles is not None:
+            recovered = _bond_orders_from_template_raw(mol, smiles)
+            if recovered is not None:
+                mol = recovered
+            else:
+                print(f"SanitizeMol failed [{path}]: {e}", file=sys.stderr)
+                return None
+        else:
+            print(f"SanitizeMol failed [{path}]: {e}", file=sys.stderr)
+            return None
     if perceive_stereo:
         Chem.AssignStereochemistry(mol, cleanIt=False, force=True)
     return mol
+
+
+def _bond_orders_from_template_raw(mol, smiles):
+    """Recover bond orders for a mol whose own valence-strict sanitize failed,
+    using a known-correct SMILES template. `mol` need not be sanitized first —
+    AssignBondOrdersFromTemplate matches on connectivity, not bond order, so a
+    best-effort (non-raising) sanitize is enough to get the ring perception the
+    substructure match needs."""
+    from rdkit.Chem import AllChem
+    try:
+        template = Chem.RemoveHs(AllChem.MolFromSmiles(smiles))
+        if template is None:
+            return None
+        Chem.SanitizeMol(mol, catchErrors=True)
+        fixed = AllChem.AssignBondOrdersFromTemplate(template, mol)
+        Chem.SanitizeMol(fixed)
+        return fixed
+    except Exception:
+        return None
 
 
 def _parse_remark_smiles(pdb_path):
@@ -142,7 +176,7 @@ def _apply_smiles_template(mol, smiles):
 
 def load_and_prepare(pdb_path):
     smiles = _parse_remark_smiles(pdb_path)
-    mol = load_pdb(pdb_path, perceive_stereo=False)
+    mol = load_pdb(pdb_path, perceive_stereo=False, smiles=smiles)
     if mol is None:
         return None, None, None, None, None
     if smiles is not None:
@@ -153,7 +187,7 @@ def load_and_prepare(pdb_path):
     display_smi_no_stereo = canon_smi_from_mol(mol, stereo=False)
     match_no_stereo = mol_to_match_key(mol, stereo=False)
 
-    mol_stereo = load_pdb(pdb_path, perceive_stereo=True)
+    mol_stereo = load_pdb(pdb_path, perceive_stereo=True, smiles=smiles)
     if mol_stereo is not None:
         if smiles is not None:
             mol_stereo = _apply_smiles_template(mol_stereo, smiles)

@@ -8,6 +8,7 @@ from pathlib import Path
 from multiprocessing import Pool, cpu_count
 
 from rdkit import Chem
+from rdkit.Chem import AllChem
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -28,6 +29,44 @@ def _load_pickle_conformers(raw_smiles):
         return {}
 
 
+def _write_pdb_with_smiles_remark(mol, out_path, smiles, conf_id=0):
+    """Write mol to PDB with a REMARK SMILES header line. PDB has no bond-order
+    field, so eval_conformer.py's _parse_remark_smiles/_apply_smiles_template
+    (and sanity_xtb.py's load_pdb_mol) rely on this line to recover correct
+    bond orders from the known SMILES when RDKit's geometry-based guess on
+    read-back gets them wrong."""
+    block = Chem.MolToPDBBlock(mol, confId=conf_id)
+    with open(out_path, "w") as f:
+        f.write(f"REMARK SMILES {smiles}\n")
+        f.write(block)
+
+
+def _pdb_roundtrip_ok(pdb_path, smiles):
+    """Confirm the PDB we just wrote can actually be reloaded — either it
+    sanitizes directly, or (PDB bond-order guess is wrong but connectivity,
+    preserved via CONECT records, is fine) the known SMILES template recovers
+    valid bond orders. Mirrors eval_conformer.py's load_pdb/_apply_smiles_template
+    recovery path, so a file that passes this check is guaranteed loadable there."""
+    mol = Chem.MolFromPDBFile(str(pdb_path), removeHs=True, sanitize=False)
+    if mol is None:
+        return False
+    try:
+        Chem.SanitizeMol(mol)
+        return True
+    except Exception:
+        pass
+    try:
+        template = Chem.RemoveHs(AllChem.MolFromSmiles(smiles))
+        if template is None:
+            return False
+        Chem.SanitizeMol(mol, catchErrors=True)
+        fixed = AllChem.AssignBondOrdersFromTemplate(template, mol)
+        Chem.SanitizeMol(fixed)
+        return True
+    except Exception:
+        return False
+
+
 def _write_conformers_worker(args):
     raw_smiles, corrected_smiles, output_dir = args
     try:
@@ -37,12 +76,22 @@ def _write_conformers_worker(args):
             return None, 0
         name = hashlib.sha256(corrected_smiles.encode()).hexdigest()
         first_path = None
+        n_written = 0
+        n_skipped = 0
         for conf_idx, mol in sorted(pkl_mols.items()):
             out = output_dir / f"{name}_{conf_idx}.pdb"
-            Chem.MolToPDBFile(mol, str(out), confId=0)
+            _write_pdb_with_smiles_remark(mol, out, corrected_smiles, conf_id=0)
+            if not _pdb_roundtrip_ok(out, corrected_smiles):
+                print(f"Skipping unrecoverable PDB round-trip: {out}")
+                out.unlink(missing_ok=True)
+                n_skipped += 1
+                continue
             if first_path is None:
                 first_path = out
-        return first_path, len(pkl_mols)
+            n_written += 1
+        if n_skipped:
+            print(f"{corrected_smiles[:60]}...: wrote {n_written}, skipped {n_skipped} (failed PDB round-trip)")
+        return first_path, n_written
     except Exception:
         traceback.print_exc()
         return None, 0
