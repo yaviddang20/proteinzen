@@ -45,7 +45,7 @@ from proteinzen.stoch_interp.multiframe import align_structures
 from .utils import gen_pbar_str
 from .ema import EMAModel
 
-from .loss.multiframe import multiframe_fm_loss_dense_batch, sym_permute_gt_rigids
+from .loss.multiframe import multiframe_fm_loss_dense_batch, sym_permute_gt_rigids, bond_length_rmse, bond_angle_rmse
 from .loss.common import seq_losses_dense_batch
 from proteinzen.boltz.data.types import SamplingResidue
 
@@ -1275,13 +1275,23 @@ class BiomoleculeModule(L.LightningModule):
         asym_id_np_all  = batch['token']['asym_id'].cpu().numpy()
         res_idx_np_all  = batch['token']['residue_idx'].cpu().numpy()
 
-        all_mse, all_mse_kabsch = [], []
+        all_mse, all_mse_kabsch, all_mse_all_rigids, all_seq_recovery = [], [], [], []
         task = batch['task'][0] if batch.get('task') else None
         task_name = task.name if task is not None else "unknown"
         write_kabsch = task.epoch_sample_write_kabsch if task is not None else True
 
+        pred_seq_all = final_denoiser_out['pred_seq']
+        gt_seq_all = batch['token']['res_type']
+        seq_noising_mask_all = batch['token']['seq_noising_mask']
+
+        # unrestricted (all rigids, not just heavy atoms) — matches pred_trans_mse's
+        # masking in multiframe.py, as opposed to noised_heavy_mask_t which matches
+        # pred_heavy_atoms_trans_mse
+        noised_all_mask_t = (rigids_mask & rigids_noising_mask).bool()
+
         for i in range(batch_size):
             n_noised = noised_heavy_mask_t[i].long().sum().clamp(min=1)
+            n_noised_all = noised_all_mask_t[i].long().sum().clamp(min=1)
 
             align_mask_i = noised_heavy_mask_t[i]
             align_batch_i = torch.zeros(align_mask_i.sum(), dtype=torch.long, device=align_mask_i.device)
@@ -1292,10 +1302,21 @@ class BiomoleculeModule(L.LightningModule):
 
             se_i = torch.square(pred_trans_t[i] - gt_trans_t[i]).sum(dim=-1)
             mse_i = float((se_i * noised_heavy_mask_t[i]).sum() / n_noised)
+            mse_all_rigids_i = float((se_i * noised_all_mask_t[i]).sum() / n_noised_all)
             se_kabsch_i = torch.square(pred_aligned_i - gt_trans_t[i]).sum(dim=-1)
             mse_kabsch_i = float((se_kabsch_i * noised_heavy_mask_t[i]).sum() / n_noised)
             all_mse.append(mse_i)
             all_mse_kabsch.append(mse_kabsch_i)
+            all_mse_all_rigids.append(mse_all_rigids_i)
+
+            # sequence recovery: only over tokens the model actually had to predict
+            # (non-noised tokens are copied straight from ground truth in denoiser.py,
+            # so including them would inflate recovery with trivially "correct" positions)
+            seq_mask_i = seq_noising_mask_all[i].bool()
+            n_seq_noised = seq_mask_i.long().sum().clamp(min=1)
+            seq_correct_i = ((pred_seq_all[i] == gt_seq_all[i]) & seq_mask_i).float().sum()
+            seq_recovery_i = float(seq_correct_i / n_seq_noised)
+            all_seq_recovery.append(seq_recovery_i)
 
             record_id = batch.get('record_id', [None])[i]
             rid = (record_id if record_id is not None else f"sample_{i}")
@@ -1351,12 +1372,20 @@ class BiomoleculeModule(L.LightningModule):
                         _write_model_block(f, step_records, step_idx + 1)
                     f.write("END\n")
 
-            self._log.info(f"Epoch {epoch} integration sample ({split})[{i}] written: {path} (mse={mse_i:.3f}, kabsch={mse_kabsch_i:.3f})")
+            self._log.info(f"Epoch {epoch} integration sample ({split})[{i}] written: {path} (mse={mse_i:.3f}, kabsch={mse_kabsch_i:.3f}, seq_recovery={seq_recovery_i:.3f})")
 
         integration_mse = float(np.mean(all_mse))
         integration_mse_kabsch = float(np.mean(all_mse_kabsch))
-        self.log(f"epoch_sample/{split}/{task_name}/integration_mse", integration_mse, prog_bar=False, sync_dist=False)
-        self.log(f"epoch_sample/{split}/{task_name}/integration_mse_kabsch", integration_mse_kabsch, prog_bar=False, sync_dist=False)
+        integration_mse_all_rigids = float(np.mean(all_mse_all_rigids))
+        integration_seq_recovery = float(np.mean(all_seq_recovery))
+        integration_bond_length_rmse = float(bond_length_rmse(batch, final_denoiser_out))
+        integration_bond_angle_rmse = float(bond_angle_rmse(batch, final_denoiser_out))
+        self.log(f"integration_{split}/{task_name}/seq_recovery", integration_seq_recovery, prog_bar=False, sync_dist=False)
+        self.log(f"integration_{split}/{task_name}/mse", integration_mse, prog_bar=False, sync_dist=False)
+        self.log(f"integration_{split}/{task_name}/mse_kabsch", integration_mse_kabsch, prog_bar=False, sync_dist=False)
+        self.log(f"integration_{split}/{task_name}/mse_all_rigids", integration_mse_all_rigids, prog_bar=False, sync_dist=False)
+        self.log(f"integration_{split}/{task_name}/bond_length_rmse", integration_bond_length_rmse, prog_bar=False, sync_dist=False)
+        self.log(f"integration_{split}/{task_name}/bond_angle_rmse", integration_bond_angle_rmse, prog_bar=False, sync_dist=False)
         model.train()
 
     #     return loss_dict
