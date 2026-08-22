@@ -1275,7 +1275,7 @@ class BiomoleculeModule(L.LightningModule):
         asym_id_np_all  = batch['token']['asym_id'].cpu().numpy()
         res_idx_np_all  = batch['token']['residue_idx'].cpu().numpy()
 
-        all_mse, all_mse_kabsch, all_mse_all_rigids, all_seq_recovery = [], [], [], []
+        all_mse, all_mse_kabsch, all_mse_kabsch_heavy, all_mse_all_rigids, all_seq_recovery = [], [], [], [], []
         task = batch['task'][0] if batch.get('task') else None
         task_name = task.name if task is not None else "unknown"
         write_kabsch = task.epoch_sample_write_kabsch if task is not None else True
@@ -1305,8 +1305,11 @@ class BiomoleculeModule(L.LightningModule):
             mse_all_rigids_i = float((se_i * noised_all_mask_t[i]).sum() / n_noised_all)
             se_kabsch_i = torch.square(pred_aligned_i - gt_trans_t[i]).sum(dim=-1)
             mse_kabsch_i = float((se_kabsch_i * noised_heavy_mask_t[i]).sum() / n_noised)
+            mse_kabsch_all_rigids_i = float((se_kabsch_i * noised_all_mask_t[i]).sum() / n_noised_all)
+            mse_kabsch_heavy_i = float((se_kabsch_i * noised_heavy_mask_t[i]).sum() / n_noised)
             all_mse.append(mse_i)
-            all_mse_kabsch.append(mse_kabsch_i)
+            all_mse_kabsch.append(mse_kabsch_all_rigids_i)
+            all_mse_kabsch_heavy.append(mse_kabsch_heavy_i)
             all_mse_all_rigids.append(mse_all_rigids_i)
 
             # sequence recovery: only over tokens the model actually had to predict
@@ -1321,7 +1324,7 @@ class BiomoleculeModule(L.LightningModule):
             record_id = batch.get('record_id', [None])[i]
             rid = (record_id if record_id is not None else f"sample_{i}")
             rid = rid.replace("/", "_").replace(" ", "_")
-            path = os.path.join(out_dir, f"{task_name}_{rid}_rank{rank}_mse={mse_i:.3f}_kabsch={mse_kabsch_i:.3f}.pdb")
+            path = os.path.join(out_dir, f"{task_name}_{rid}_rank{rank}_mse={mse_all_rigids_i:.3f}_kabsch={mse_kabsch_i:.3f}.pdb")
 
             write_val_pdb(
                 gt_rigid7_np[i],
@@ -1372,7 +1375,7 @@ class BiomoleculeModule(L.LightningModule):
                         _write_model_block(f, step_records, step_idx + 1)
                     f.write("END\n")
 
-            self._log.info(f"Epoch {epoch} integration sample ({split})[{i}] written: {path} (mse={mse_i:.3f}, kabsch={mse_kabsch_i:.3f}, seq_recovery={seq_recovery_i:.3f})")
+            self._log.info(f"Epoch {epoch} integration sample ({split})[{i}] written: {path} (mse={mse_all_rigids_i:.3f}, heavy_atoms_mse={mse_i:.3f}, kabsch={mse_kabsch_i:.3f}, seq_recovery={seq_recovery_i:.3f})")
 
         integration_mse = float(np.mean(all_mse))
         integration_mse_kabsch = float(np.mean(all_mse_kabsch))
@@ -1381,9 +1384,10 @@ class BiomoleculeModule(L.LightningModule):
         integration_bond_length_rmse = float(bond_length_rmse(batch, final_denoiser_out))
         integration_bond_angle_rmse = float(bond_angle_rmse(batch, final_denoiser_out))
         self.log(f"integration_{split}/{task_name}/seq_recovery", integration_seq_recovery, prog_bar=False, sync_dist=False)
-        self.log(f"integration_{split}/{task_name}/mse", integration_mse, prog_bar=False, sync_dist=False)
+        self.log(f"integration_{split}/{task_name}/mse", integration_mse_all_rigids, prog_bar=False, sync_dist=False)
         self.log(f"integration_{split}/{task_name}/mse_kabsch", integration_mse_kabsch, prog_bar=False, sync_dist=False)
-        self.log(f"integration_{split}/{task_name}/mse_all_rigids", integration_mse_all_rigids, prog_bar=False, sync_dist=False)
+        self.log(f"integration_{split}/{task_name}/heavy_atoms_mse", integration_mse, prog_bar=False, sync_dist=False)
+        self.log(f"integration_{split}/{task_name}/heavy_atoms_mse_kabsch", float(np.mean(all_mse_kabsch_heavy)), prog_bar=False, sync_dist=False)
         self.log(f"integration_{split}/{task_name}/bond_length_rmse", integration_bond_length_rmse, prog_bar=False, sync_dist=False)
         self.log(f"integration_{split}/{task_name}/bond_angle_rmse", integration_bond_angle_rmse, prog_bar=False, sync_dist=False)
         model.train()
