@@ -145,6 +145,153 @@ def _insert_ligand_h(structure: "Structure", mol_with_h) -> "Structure":
     )
 
 
+def _drop_chains(structure: "Structure", auth_seq_map: Optional[list], keep_mask: np.ndarray):
+    """Drop chains where keep_mask is False, remapping atoms/residues/bonds/
+    connections/auth_seq_map accordingly. Unlike Structure.remove_invalid_chains,
+    interfaces are NOT wholesale-dropped — an interface survives (remapped)
+    whenever both of its chains survive, and is only dropped if it referenced a
+    removed chain. Chain order is preserved for all surviving chains."""
+    if keep_mask.all():
+        return structure, auth_seq_map
+
+    keep_idxs = [i for i in range(len(structure.chains)) if keep_mask[i]]
+
+    n_atoms_total = len(structure.atoms)
+    n_res_total = len(structure.residues)
+    atom_remap = np.full(n_atoms_total, -1, dtype=np.int32)
+    res_remap = np.full(n_res_total, -1, dtype=np.int32)
+
+    new_atom_chunks, new_res_chunks = [], []
+    atom_cursor, res_cursor = 0, 0
+    new_chain_rows = []
+    chain_map = {}
+
+    for new_idx, old_idx in enumerate(keep_idxs):
+        chain = structure.chains[old_idx]
+        a0, an = int(chain["atom_idx"]), int(chain["atom_num"])
+        r0, rn = int(chain["res_idx"]), int(chain["res_num"])
+
+        atoms = structure.atoms[a0:a0 + an].copy()
+        residues = structure.residues[r0:r0 + rn].copy()
+        shift = atom_cursor - a0
+        if rn:
+            residues["atom_idx"] += shift
+            residues["atom_center"] += shift
+            residues["atom_disto"] += shift
+
+        atom_remap[a0:a0 + an] = np.arange(atom_cursor, atom_cursor + an)
+        res_remap[r0:r0 + rn] = np.arange(res_cursor, res_cursor + rn)
+
+        new_atom_chunks.append(atoms)
+        new_res_chunks.append(residues)
+
+        new_chain = chain.copy()
+        new_chain["atom_idx"] = atom_cursor
+        new_chain["res_idx"] = res_cursor
+        new_chain["asym_id"] = new_idx
+        new_chain_rows.append(new_chain)
+        chain_map[old_idx] = new_idx
+
+        atom_cursor += an
+        res_cursor += rn
+
+    new_atoms = np.concatenate(new_atom_chunks, dtype=structure.atoms.dtype)
+    new_residues = np.concatenate(new_res_chunks, dtype=structure.residues.dtype)
+    new_chains = np.array([tuple(r) for r in new_chain_rows], dtype=structure.chains.dtype)
+
+    new_bonds = structure.bonds.copy()
+    if len(new_bonds):
+        keep_bond = (atom_remap[new_bonds["atom_1"]] >= 0) & (atom_remap[new_bonds["atom_2"]] >= 0)
+        new_bonds = new_bonds[keep_bond]
+        new_bonds["atom_1"] = atom_remap[new_bonds["atom_1"]]
+        new_bonds["atom_2"] = atom_remap[new_bonds["atom_2"]]
+
+    new_connections = structure.connections.copy()
+    if len(new_connections):
+        keep_conn = (atom_remap[new_connections["atom_1"]] >= 0) & (atom_remap[new_connections["atom_2"]] >= 0)
+        new_connections = new_connections[keep_conn]
+        if len(new_connections):
+            new_connections["chain_1"] = [chain_map[int(c)] for c in new_connections["chain_1"]]
+            new_connections["chain_2"] = [chain_map[int(c)] for c in new_connections["chain_2"]]
+            new_connections["res_1"] = res_remap[new_connections["res_1"]]
+            new_connections["res_2"] = res_remap[new_connections["res_2"]]
+            new_connections["atom_1"] = atom_remap[new_connections["atom_1"]]
+            new_connections["atom_2"] = atom_remap[new_connections["atom_2"]]
+
+    new_interfaces_rows = []
+    for iface in structure.interfaces:
+        c1, c2 = int(iface["chain_1"]), int(iface["chain_2"])
+        if c1 not in chain_map or c2 not in chain_map:
+            continue
+        new_interfaces_rows.append((chain_map[c1], chain_map[c2], int(iface["chain_1_num_res"]), int(iface["chain_2_num_res"])))
+    new_interfaces = (
+        np.array(new_interfaces_rows, dtype=structure.interfaces.dtype)
+        if new_interfaces_rows else np.zeros(0, dtype=structure.interfaces.dtype)
+    )
+
+    new_structure = replace(
+        structure,
+        atoms=new_atoms,
+        bonds=new_bonds,
+        residues=new_residues,
+        chains=new_chains,
+        connections=new_connections,
+        interfaces=new_interfaces,
+        mask=np.ones(len(new_chains), dtype=bool),
+    )
+
+    new_auth_seq_map = None
+    if auth_seq_map is not None:
+        new_auth_seq_map = [auth_seq_map[old_idx] for old_idx in keep_idxs]
+
+    return new_structure, new_auth_seq_map
+
+
+def filter_noncontacting_protein_chains(
+    structure: "Structure",
+    auth_seq_map: Optional[list] = None,
+) -> tuple:
+    """Drop PROTEIN chains that never come within const.atom_interface_cutoff of
+    any ligand (NONPOLYMER) atom. Plinder can bundle a crystallographically
+    co-located but functionally irrelevant chain into a system's receptor-chain
+    list; fusing such a chain in would add noise (an irrelevant chain as pocket
+    context), not signal, to a pocket-placer training example.
+    """
+    protein_id = const.chain_type_ids["PROTEIN"]
+    nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
+
+    ligand_coords_list = []
+    for chain in structure.chains:
+        if int(chain["mol_type"]) != nonpolymer_id:
+            continue
+        a_start, a_num = int(chain["atom_idx"]), int(chain["atom_num"])
+        atoms = structure.atoms[a_start:a_start + a_num]
+        present = atoms["is_present"].astype(bool)
+        if present.any():
+            ligand_coords_list.append(atoms["coords"][present])
+
+    if not ligand_coords_list:
+        # no resolved ligand atoms to check contact against; leave chains as-is
+        return structure, auth_seq_map
+
+    ligand_coords = np.concatenate(ligand_coords_list)
+
+    keep_mask = np.ones(len(structure.chains), dtype=bool)
+    for i, chain in enumerate(structure.chains):
+        if int(chain["mol_type"]) != protein_id:
+            continue
+        a_start, a_num = int(chain["atom_idx"]), int(chain["atom_num"])
+        atoms = structure.atoms[a_start:a_start + a_num]
+        present = atoms["is_present"].astype(bool)
+        if not present.any():
+            keep_mask[i] = False
+            continue
+        if cdist(atoms["coords"][present], ligand_coords).min() >= const.atom_interface_cutoff:
+            keep_mask[i] = False
+
+    return _drop_chains(structure, auth_seq_map, keep_mask)
+
+
 def fuse_protein_chains(
     structure: "Structure",
     auth_seq_map: Optional[list] = None,
@@ -350,6 +497,40 @@ def load_split(plinder_dir: Path) -> dict:
     path = plinder_dir / "splits" / "split.parquet"
     t = pq.ParquetFile(path).read(columns=["system_id", "split"])
     return dict(zip(t["system_id"].to_pylist(), t["split"].to_pylist()))
+
+
+def dedupe_assemblies(system_ids: list) -> list:
+    """Keep only the lowest-assembly-index system per apparent NCS-duplicate
+    group. Plinder system IDs are {pdb_id}__{assembly_idx}__{receptor_chains}__
+    {ligand_chains}; a single crystal's asymmetric unit can contain multiple
+    non-crystallographic-symmetry copies of the same biological complex, each
+    assigned its own assembly index and its own (disjoint) set of chain letters
+    — so the raw receptor/ligand chain strings differ across assemblies of the
+    "same" complex by construction and can't be used as a grouping key directly.
+    Group by (pdb_id, n_receptor_chains, n_ligand_chains) instead, and keep only
+    the lowest assembly index in each group.
+    """
+    groups: dict = {}
+    for sid in system_ids:
+        parts = sid.split("__")
+        if len(parts) != 4:
+            groups[(sid,)] = [(0, sid)]
+            continue
+        pdb_id, assembly_idx, receptor_chains, ligand_chains = parts
+        n_receptor = len(receptor_chains.split("_"))
+        n_ligand = len(ligand_chains.split("_"))
+        key = (pdb_id, n_receptor, n_ligand)
+        try:
+            assembly_num = int(assembly_idx)
+        except ValueError:
+            assembly_num = 0
+        groups.setdefault(key, []).append((assembly_num, sid))
+
+    kept = []
+    for members in groups.values():
+        _, sid = min(members, key=lambda x: x[0])
+        kept.append(sid)
+    return kept
 
 
 def get_ligand_sdfs(system_dir: Path) -> dict:
@@ -611,6 +792,9 @@ def process_system(
     nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
     protein_id = const.chain_type_ids["PROTEIN"]
 
+    if fuse_multi_chain:
+        structure, auth_seq_map = filter_noncontacting_protein_chains(structure, auth_seq_map)
+
     # Only process systems with an allowed protein chain count and exactly one ligand chain
     n_protein = sum(1 for c in structure.chains if int(c["mol_type"]) == protein_id)
     n_ligand = sum(1 for c in structure.chains if int(c["mol_type"]) == nonpolymer_id)
@@ -826,7 +1010,7 @@ def process_system_worker(system_id: str) -> tuple[str, Optional[str]]:
 
 # ── finalize ──────────────────────────────────────────────────────────────────
 
-def finalize(outdir: Path) -> int:
+def finalize(outdir: Path) -> dict:
     records = []
     failed = 0
     for record_file in (outdir / "records").rglob("*.json"):
@@ -839,8 +1023,16 @@ def finalize(outdir: Path) -> int:
         print(f"Failed to parse {failed} record files")
     with open(outdir / "manifest.json", "w") as f:
         json.dump(records, f, indent=2)
-    print(f"Wrote manifest with {len(records)} entries")
-    return len(records)
+    unique_clusters = {
+        c["cluster_id"]
+        for r in records
+        for c in r.get("chains", [])
+        if c.get("cluster_id", -1) != -1
+    }
+    n_systems = len(records)
+    n_clusters = len(unique_clusters)
+    print(f"Wrote manifest with {n_systems} systems, {n_clusters} unique clusters")
+    return {"systems": n_systems, "clusters": n_clusters}
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -854,6 +1046,11 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> int:
     outdir.mkdir(parents=True, exist_ok=True)
 
     system_ids = [sid for sid, s in split.items() if s in args.splits]
+
+    if getattr(args, "dedupe_assemblies", True):
+        before = len(system_ids)
+        system_ids = dedupe_assemblies(system_ids)
+        print(f"dedupe_assemblies: {before} → {len(system_ids)}")
 
     if hasattr(args, "system_ids_file") and args.system_ids_file is not None:
         allowed = set(Path(args.system_ids_file).read_text().split())
@@ -924,6 +1121,10 @@ if __name__ == "__main__":
                         help="Optional text file of allowed system IDs (one per line); from filter_plinder_pocket.py")
     parser.add_argument("--max-systems", type=int, default=None,
                         help="Cap number of systems per split (for debugging)")
+    parser.add_argument("--dedupe-assemblies", action=argparse.BooleanOptionalAction, default=True,
+                        help="Keep only the lowest-assembly-index system per apparent NCS-duplicate group "
+                             "(same pdb_id/receptor-chain-count/ligand-chain-count, different assembly index). "
+                             "Default: True; pass --no-dedupe-assemblies to disable.")
     parser.add_argument("--overwrite", action="store_true", default=False,
                         help="Delete and recreate the output directory before processing")
     parser.add_argument("--pocket-data-dir", type=Path,
@@ -960,7 +1161,13 @@ if __name__ == "__main__":
         split_args = argparse.Namespace(**{**vars(args), "splits": [split_name], "outdir": args.outdir / split_name})
         split_counts[split_name] = process(split_args, clusters, annotations, split)
 
-    stats = {**split_counts, "total": sum(split_counts.values())}
+    stats = {
+        **split_counts,
+        "total": {
+            "systems": sum(v["systems"] for v in split_counts.values()),
+            "clusters": sum(v["clusters"] for v in split_counts.values()),
+        },
+    }
     args.outdir.mkdir(parents=True, exist_ok=True)
     with open(args.outdir / "dataset_stats.yaml", "w") as f:
         yaml.dump(stats, f, default_flow_style=False, sort_keys=False)

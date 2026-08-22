@@ -50,6 +50,10 @@ if __name__ == "__main__":
                         help="Optional text file of allowed system IDs (one per line); from filter_plinder_pocket.py")
     parser.add_argument("--max-systems", type=int, default=None,
                         help="Cap number of systems per split (for debugging)")
+    parser.add_argument("--dedupe-assemblies", action=argparse.BooleanOptionalAction, default=True,
+                        help="Keep only the lowest-assembly-index system per apparent NCS-duplicate group "
+                             "(same pdb_id/receptor-chain-count/ligand-chain-count, different assembly index). "
+                             "Default: True; pass --no-dedupe-assemblies to disable.")
     parser.add_argument("--overwrite", action="store_true", default=False,
                         help="Delete and recreate the output directory before processing")
     parser.add_argument("--pocket-data-dir", type=Path,
@@ -91,7 +95,13 @@ if __name__ == "__main__":
         split_args = argparse.Namespace(**{**vars(args), "splits": [split_name], "outdir": args.outdir / split_name})
         split_counts[split_name] = process(split_args, clusters, annotations, split)
 
-    stats = {**split_counts, "total": sum(split_counts.values())}
+    stats = {
+        **split_counts,
+        "total": {
+            "systems": sum(v["systems"] for v in split_counts.values()),
+            "clusters": sum(v["clusters"] for v in split_counts.values()),
+        },
+    }
     args.outdir.mkdir(parents=True, exist_ok=True)
     with open(args.outdir / "dataset_stats.yaml", "w") as f:
         yaml.dump(stats, f, default_flow_style=False, sort_keys=False)
