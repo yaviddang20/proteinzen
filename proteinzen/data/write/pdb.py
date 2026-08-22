@@ -37,7 +37,7 @@ def to_pdb(
         pdb_lines.append(f"REMARK SMILES {smiles}")
 
     atom_index = 1
-    atom_reindex_ter = []
+    atom_reindex_ter = {}
 
     # Load periodic table for element mapping
     periodic_table = Chem.GetPeriodicTable()
@@ -140,7 +140,7 @@ def to_pdb(
                     f"{element:>2}{charge:>2}"
                 )
                 pdb_lines.append(atom_line)
-                atom_reindex_ter.append(atom_index)
+                atom_reindex_ter[atom_start + i] = atom_index
                 atom_index += 1
 
             if record_type != 'HETATM':
@@ -165,8 +165,12 @@ def to_pdb(
             atom2 = structure.atoms[bond["atom_2"]]
             if not atom1["is_present"] or not atom2["is_present"]:
                 continue
-            atom1_idx = atom_reindex_ter[bond["atom_1"]]
-            atom2_idx = atom_reindex_ter[bond["atom_2"]]
+            atom1_idx = atom_reindex_ter.get(int(bond["atom_1"]))
+            atom2_idx = atom_reindex_ter.get(int(bond["atom_2"]))
+            if atom1_idx is None or atom2_idx is None:
+                # atom belongs to a chain excluded by structure.mask, so it was
+                # never written as an ATOM/HETATM record — skip the bond too.
+                continue
             conect_line = f"CONECT{atom1_idx:>5}{atom2_idx:>5}"
             pdb_lines.append(conect_line)
 
