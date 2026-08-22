@@ -209,6 +209,7 @@ class MultiSE3Interpolant:
                  unwrapped_rot_noise_sig=1.5,
                  use_euclidean_for_rots=False,
                  rot_sfm=False,
+                 ca_perturb_std=0.0,
     ):
         self._igso3 = None
 
@@ -232,6 +233,7 @@ class MultiSE3Interpolant:
         self.use_unwrapped_rot_noise = use_unwrapped_rot_noise
         self.unwrapped_rot_noise_sig = unwrapped_rot_noise_sig
         self.rots_use_brownian_path = rots_use_brownian_path
+        self.ca_perturb_std = ca_perturb_std
 
     @property
     def igso3(self):
@@ -347,7 +349,14 @@ class MultiSE3Interpolant:
         # [N]
         rigids_mask = rigids_data["rigids_mask"]
         rigids_noising_mask = rigids_data["rigids_noising_mask"]
-    
+
+        if self.ca_perturb_std > 0:
+            is_atom = rigids_data["rigids_is_atom_mask"].bool()
+            sc_idx = rigids_data["rigids_sidechain_idx"]
+            is_backbone_ca = (sc_idx == 0) & (~is_atom) & rigids_mask.bool()
+            ca_noise = torch.randn_like(trans_1) * self.ca_perturb_std
+            trans_1 = torch.where(is_backbone_ca[..., None], trans_1 + ca_noise, trans_1)
+
         if "rigids_0" in rigids_data:
             rigids_0 = ru.Rigid.from_tensor_7(rigids_data["rigids_0"])
             trans_0 = rigids_0.get_trans()
