@@ -483,6 +483,7 @@ def load_annotation_table(plinder_dir: Path) -> dict:
         "ligand_molecular_weight",
         "system_proper_ligand_max_molecular_weight",
         "ligand_is_covalent",
+        "entry_resolution",
     ]
     t = pq.ParquetFile(path).read(columns=cols)
     result = {}
@@ -490,6 +491,33 @@ def load_annotation_table(plinder_dir: Path) -> dict:
     for i, sid in enumerate(ids):
         result[sid] = {c: t[c][i].as_py() for c in cols}
     return result
+
+
+def dedupe_by_cluster95(
+    system_ids: list,
+    plinder_dir: Path,
+    annotations: dict,
+    algorithm: str = "communities",
+    directed: bool = False,
+    metric: str = "pli_qcov",
+    threshold: int = 95,
+) -> list:
+    """Keep only the best-resolution representative per high-threshold cluster."""
+    clusters95 = load_clusters(plinder_dir, algorithm=algorithm, directed=directed, metric=metric, threshold=threshold)
+    id_set = set(system_ids)
+    # Group system_ids by their 95-cluster label; systems not in clusters95 get their own singleton group
+    groups: dict[str, list] = {}
+    for sid in system_ids:
+        label = clusters95.get(sid, sid)  # fallback: treat as own cluster
+        groups.setdefault(label, []).append(sid)
+
+    def resolution(sid):
+        row = annotations.get(sid, {})
+        r = row.get("entry_resolution")
+        return r if r is not None else float("inf")  # missing resolution sorts last
+
+    kept = [min(members, key=resolution) for members in groups.values()]
+    return kept
 
 
 def load_split(plinder_dir: Path) -> dict:
@@ -747,6 +775,7 @@ def process_system(
     pocket_data_dir: Optional[Path] = None,
     allowed_protein_chain_counts: tuple = (1,),
     fuse_multi_chain: bool = False,
+    max_ligand_heavy_atoms: Optional[int] = 200,
 ) -> None:
     mid = system_mid(system_id)
     struct_path = outdir / "structures" / mid / f"{system_id}.npz"
@@ -828,6 +857,8 @@ def process_system(
         mol_no_h = AllChem.RemoveHs(mol)
         if not is_valid_ligand(mol_no_h):
             return "invalid_ligand"
+        if max_ligand_heavy_atoms is not None and mol_no_h.GetNumAtoms() > max_ligand_heavy_atoms:
+            return "ligand_too_large"
 
         mol_with_h = AllChem.AddHs(mol, addCoords=True) if mol.GetNumConformers() > 0 else None
         ligand_smiles = Chem.MolToSmiles(mol_no_h)
@@ -974,7 +1005,7 @@ def process_system(
 _worker_state = {}
 
 def _worker_init(plinder_dir, outdir, clusters, annotations, ccd_path, pocket_data_dir=None,
-                  allowed_protein_chain_counts=(1,), fuse_multi_chain=False):
+                  allowed_protein_chain_counts=(1,), fuse_multi_chain=False, max_ligand_heavy_atoms=200):
     """Load large shared data once per worker process."""
     global _worker_state
     with open(ccd_path, "rb") as f:
@@ -988,6 +1019,7 @@ def _worker_init(plinder_dir, outdir, clusters, annotations, ccd_path, pocket_da
         "pocket_data_dir": pocket_data_dir,
         "allowed_protein_chain_counts": allowed_protein_chain_counts,
         "fuse_multi_chain": fuse_multi_chain,
+        "max_ligand_heavy_atoms": max_ligand_heavy_atoms,
     }
 
 
@@ -1000,6 +1032,7 @@ def process_system_worker(system_id: str) -> tuple[str, Optional[str]]:
             annotation_row, s["ccd"], pocket_data_dir=s.get("pocket_data_dir"),
             allowed_protein_chain_counts=s.get("allowed_protein_chain_counts", (1,)),
             fuse_multi_chain=s.get("fuse_multi_chain", False),
+            max_ligand_heavy_atoms=s.get("max_ligand_heavy_atoms", 200),
         )
         return system_id, reason
     except Exception:
@@ -1052,6 +1085,20 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> int:
         system_ids = dedupe_assemblies(system_ids)
         print(f"dedupe_assemblies: {before} → {len(system_ids)}")
 
+    dedup_threshold = getattr(args, "dedup_cluster_threshold", None)
+    if dedup_threshold:
+        before = len(system_ids)
+        system_ids = dedupe_by_cluster95(
+            system_ids,
+            plinder_dir,
+            annotations,
+            algorithm=getattr(args, "cluster_algorithm", "communities"),
+            directed=getattr(args, "cluster_directed", False),
+            metric=getattr(args, "cluster_metric", "pli_qcov"),
+            threshold=dedup_threshold,
+        )
+        print(f"dedupe_by_cluster{dedup_threshold}: {before} → {len(system_ids)}")
+
     if hasattr(args, "system_ids_file") and args.system_ids_file is not None:
         allowed = set(Path(args.system_ids_file).read_text().split())
         before = len(system_ids)
@@ -1068,10 +1115,11 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> int:
     pocket_data_dir = getattr(args, "pocket_data_dir", None)
     allowed_protein_chain_counts = tuple(getattr(args, "allowed_protein_chain_counts", (1,)))
     fuse_multi_chain = getattr(args, "fuse_multi_chain", False)
+    max_ligand_heavy_atoms = getattr(args, "max_ligand_heavy_atoms", 200)
 
     if num_processes > 1:
         initargs = (plinder_dir, outdir, clusters, annotations, args.ccd_path, pocket_data_dir,
-                    allowed_protein_chain_counts, fuse_multi_chain)
+                    allowed_protein_chain_counts, fuse_multi_chain, max_ligand_heavy_atoms)
         with multiprocessing.Pool(
             processes=num_processes,
             initializer=_worker_init,
@@ -1080,7 +1128,7 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> int:
             results = list(tqdm(pool.imap_unordered(process_system_worker, system_ids, chunksize=4), total=len(system_ids)))
     else:
         _worker_init(plinder_dir, outdir, clusters, annotations, args.ccd_path, pocket_data_dir,
-                      allowed_protein_chain_counts, fuse_multi_chain)
+                      allowed_protein_chain_counts, fuse_multi_chain, max_ligand_heavy_atoms)
         results = [process_system_worker(sid) for sid in tqdm(system_ids)]
 
     # Tally filter reasons
@@ -1125,6 +1173,12 @@ if __name__ == "__main__":
                         help="Keep only the lowest-assembly-index system per apparent NCS-duplicate group "
                              "(same pdb_id/receptor-chain-count/ligand-chain-count, different assembly index). "
                              "Default: True; pass --no-dedupe-assemblies to disable.")
+    parser.add_argument("--dedup-cluster-threshold", type=int, default=95,
+                        help="Keep only the best-resolution representative per cluster at this threshold "
+                             "before processing. Uses the same algorithm/metric as --cluster-*. "
+                             "Default: 95; pass --dedup-cluster-threshold 0 to disable.")
+    parser.add_argument("--max-ligand-heavy-atoms", type=int, default=200,
+                        help="Filter out systems whose ligand has more than this many heavy atoms (default: 200)")
     parser.add_argument("--overwrite", action="store_true", default=False,
                         help="Delete and recreate the output directory before processing")
     parser.add_argument("--pocket-data-dir", type=Path,
