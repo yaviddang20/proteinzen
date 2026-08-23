@@ -775,7 +775,7 @@ def process_system(
     pocket_data_dir: Optional[Path] = None,
     allowed_protein_chain_counts: tuple = (1,),
     fuse_multi_chain: bool = False,
-    max_ligand_heavy_atoms: Optional[int] = 200,
+    max_ligand_atoms: Optional[int] = 200,
 ) -> None:
     mid = system_mid(system_id)
     struct_path = outdir / "structures" / mid / f"{system_id}.npz"
@@ -857,7 +857,7 @@ def process_system(
         mol_no_h = AllChem.RemoveHs(mol)
         if not is_valid_ligand(mol_no_h):
             return "invalid_ligand"
-        if max_ligand_heavy_atoms is not None and mol_no_h.GetNumAtoms() > max_ligand_heavy_atoms:
+        if max_ligand_atoms is not None and mol.GetNumAtoms() > max_ligand_atoms:
             return "ligand_too_large"
 
         mol_with_h = AllChem.AddHs(mol, addCoords=True) if mol.GetNumConformers() > 0 else None
@@ -1005,7 +1005,7 @@ def process_system(
 _worker_state = {}
 
 def _worker_init(plinder_dir, outdir, clusters, annotations, ccd_path, pocket_data_dir=None,
-                  allowed_protein_chain_counts=(1,), fuse_multi_chain=False, max_ligand_heavy_atoms=200):
+                  allowed_protein_chain_counts=(1,), fuse_multi_chain=False, max_ligand_atoms=200):
     """Load large shared data once per worker process."""
     global _worker_state
     with open(ccd_path, "rb") as f:
@@ -1019,7 +1019,7 @@ def _worker_init(plinder_dir, outdir, clusters, annotations, ccd_path, pocket_da
         "pocket_data_dir": pocket_data_dir,
         "allowed_protein_chain_counts": allowed_protein_chain_counts,
         "fuse_multi_chain": fuse_multi_chain,
-        "max_ligand_heavy_atoms": max_ligand_heavy_atoms,
+        "max_ligand_atoms": max_ligand_atoms,
     }
 
 
@@ -1032,7 +1032,7 @@ def process_system_worker(system_id: str) -> tuple[str, Optional[str]]:
             annotation_row, s["ccd"], pocket_data_dir=s.get("pocket_data_dir"),
             allowed_protein_chain_counts=s.get("allowed_protein_chain_counts", (1,)),
             fuse_multi_chain=s.get("fuse_multi_chain", False),
-            max_ligand_heavy_atoms=s.get("max_ligand_heavy_atoms", 200),
+            max_ligand_atoms=s.get("max_ligand_atoms", 200),
         )
         return system_id, reason
     except Exception:
@@ -1115,11 +1115,11 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> int:
     pocket_data_dir = getattr(args, "pocket_data_dir", None)
     allowed_protein_chain_counts = tuple(getattr(args, "allowed_protein_chain_counts", (1,)))
     fuse_multi_chain = getattr(args, "fuse_multi_chain", False)
-    max_ligand_heavy_atoms = getattr(args, "max_ligand_heavy_atoms", 200)
+    max_ligand_atoms = getattr(args, "max_ligand_atoms", 200)
 
     if num_processes > 1:
         initargs = (plinder_dir, outdir, clusters, annotations, args.ccd_path, pocket_data_dir,
-                    allowed_protein_chain_counts, fuse_multi_chain, max_ligand_heavy_atoms)
+                    allowed_protein_chain_counts, fuse_multi_chain, max_ligand_atoms)
         with multiprocessing.Pool(
             processes=num_processes,
             initializer=_worker_init,
@@ -1128,7 +1128,7 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> int:
             results = list(tqdm(pool.imap_unordered(process_system_worker, system_ids, chunksize=4), total=len(system_ids)))
     else:
         _worker_init(plinder_dir, outdir, clusters, annotations, args.ccd_path, pocket_data_dir,
-                      allowed_protein_chain_counts, fuse_multi_chain, max_ligand_heavy_atoms)
+                      allowed_protein_chain_counts, fuse_multi_chain, max_ligand_atoms)
         results = [process_system_worker(sid) for sid in tqdm(system_ids)]
 
     # Tally filter reasons
@@ -1177,8 +1177,8 @@ if __name__ == "__main__":
                         help="Keep only the best-resolution representative per cluster at this threshold "
                              "before processing. Uses the same algorithm/metric as --cluster-*. "
                              "Default: 95; pass --dedup-cluster-threshold 0 to disable.")
-    parser.add_argument("--max-ligand-heavy-atoms", type=int, default=200,
-                        help="Filter out systems whose ligand has more than this many heavy atoms (default: 200)")
+    parser.add_argument("--max-ligand-atoms", type=int, default=200,
+                        help="Filter out systems whose ligand has more than this many total atoms, including H (default: 200)")
     parser.add_argument("--overwrite", action="store_true", default=False,
                         help="Delete and recreate the output directory before processing")
     parser.add_argument("--pocket-data-dir", type=Path,

@@ -58,8 +58,8 @@ if __name__ == "__main__":
                         help="Keep only the best-resolution representative per cluster at this threshold "
                              "before processing. Uses the same algorithm/metric as --cluster-*. "
                              "Default: 95; pass --dedup-cluster-threshold 0 to disable.")
-    parser.add_argument("--max-ligand-heavy-atoms", type=int, default=200,
-                        help="Filter out systems whose ligand has more than this many heavy atoms (default: 200)")
+    parser.add_argument("--max-ligand-atoms", type=int, default=200,
+                        help="Filter out systems whose ligand has more than this many total atoms, including H (default: 200)")
     parser.add_argument("--overwrite", action="store_true", default=False,
                         help="Delete and recreate the output directory before processing")
     parser.add_argument("--pocket-data-dir", type=Path,
