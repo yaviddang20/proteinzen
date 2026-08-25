@@ -1080,7 +1080,7 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> int:
 
     system_ids = [sid for sid, s in split.items() if s in args.splits]
 
-    if getattr(args, "dedupe_assemblies", True):
+    if getattr(args, "dedupe_assemblies", False):
         before = len(system_ids)
         system_ids = dedupe_assemblies(system_ids)
         print(f"dedupe_assemblies: {before} → {len(system_ids)}")
@@ -1169,10 +1169,12 @@ if __name__ == "__main__":
                         help="Optional text file of allowed system IDs (one per line); from filter_plinder_pocket.py")
     parser.add_argument("--max-systems", type=int, default=None,
                         help="Cap number of systems per split (for debugging)")
-    parser.add_argument("--dedupe-assemblies", action=argparse.BooleanOptionalAction, default=True,
+    parser.add_argument("--dedupe-assemblies", action=argparse.BooleanOptionalAction, default=False,
                         help="Keep only the lowest-assembly-index system per apparent NCS-duplicate group "
                              "(same pdb_id/receptor-chain-count/ligand-chain-count, different assembly index). "
-                             "Default: True; pass --no-dedupe-assemblies to disable.")
+                             "KNOWN BUG: the grouping key doesn't verify ligand identity, so distinct systems "
+                             "sharing a PDB entry + chain-count shape get incorrectly collapsed too. "
+                             "Default: False until fixed; pass --dedupe-assemblies to enable anyway.")
     parser.add_argument("--dedup-cluster-threshold", type=int, default=95,
                         help="Keep only the best-resolution representative per cluster at this threshold "
                              "before processing. Uses the same algorithm/metric as --cluster-*. "
