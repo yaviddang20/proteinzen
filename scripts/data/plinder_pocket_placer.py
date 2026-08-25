@@ -67,7 +67,13 @@ if __name__ == "__main__":
                              "Angstroms (matches AlphaFold2's training filter). Default: 9.0; pass "
                              "--max-resolution 0 to disable (keep everything, including null resolution).")
     parser.add_argument("--overwrite", action="store_true", default=False,
-                        help="Delete and recreate the output directory before processing")
+                        help="Force reprocessing of every system (ignore cached output files) and, at the end "
+                             "of a full/unrestricted run, delete any on-disk structures/records/auth_maps files "
+                             "no longer in the new manifest. Never wipes the output directory upfront, so files "
+                             "for still-valid systems stay in place the whole run — safe to run while something "
+                             "else is training off this same directory. Pruning is skipped if combined with "
+                             "--max-systems/--system-ids-file, since that would incorrectly delete valid systems "
+                             "outside this restricted run's scope.")
     parser.add_argument("--pocket-data-dir", type=Path,
                         default=Path(os.environ.get("REPO_ROOT", ".")) / "plinder_pocket_alpha_spheres",
                         help="Directory of per-system alpha-sphere .npy files from filter_plinder_pocket.py")

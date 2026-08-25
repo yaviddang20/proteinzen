@@ -790,13 +790,14 @@ def process_system(
     fuse_multi_chain: bool = False,
     max_ligand_atoms: Optional[int] = 200,
     max_resolution: Optional[float] = 9.0,
+    force: bool = False,
 ) -> None:
     mid = system_mid(system_id)
     struct_path = outdir / "structures" / mid / f"{system_id}.npz"
     record_path = outdir / "records" / mid / f"{system_id}.json"
     auth_map_path = outdir / "auth_maps" / mid / f"{system_id}.json"
 
-    if struct_path.exists() and record_path.exists() and auth_map_path.exists():
+    if not force and struct_path.exists() and record_path.exists() and auth_map_path.exists():
         return None
 
     system_dir = plinder_dir / "systems" / system_id
@@ -1029,7 +1030,7 @@ _worker_state = {}
 
 def _worker_init(plinder_dir, outdir, clusters, annotations, ccd_path, pocket_data_dir=None,
                   allowed_protein_chain_counts=(1,), fuse_multi_chain=False, max_ligand_atoms=200,
-                  max_resolution=9.0):
+                  max_resolution=9.0, force=False):
     """Load large shared data once per worker process."""
     global _worker_state
     with open(ccd_path, "rb") as f:
@@ -1045,6 +1046,7 @@ def _worker_init(plinder_dir, outdir, clusters, annotations, ccd_path, pocket_da
         "fuse_multi_chain": fuse_multi_chain,
         "max_ligand_atoms": max_ligand_atoms,
         "max_resolution": max_resolution,
+        "force": force,
     }
 
 
@@ -1059,12 +1061,38 @@ def process_system_worker(system_id: str) -> tuple[str, Optional[str]]:
             fuse_multi_chain=s.get("fuse_multi_chain", False),
             max_ligand_atoms=s.get("max_ligand_atoms", 200),
             max_resolution=s.get("max_resolution", 9.0),
+            force=s.get("force", False),
         )
         return system_id, reason
     except Exception:
         traceback.print_exc()
         print(f"Unhandled error processing {system_id}")
         return system_id, "unhandled_error"
+
+
+def prune_stale_outputs(outdir: Path, kept_ids: set) -> int:
+    """Delete on-disk structures/records/auth_maps files for system_ids that
+    are no longer in kept_ids. Called only for a full, unrestricted --overwrite
+    run, after new/updated outputs have already been (re)written — so a valid
+    system's file is never missing, it's either the old copy or the freshly
+    reprocessed one. Only genuinely stale files (filtered out by this run, or
+    dropped by a logic/config change) get removed.
+    """
+    removed = 0
+    for subdir, ext in [("structures", ".npz"), ("records", ".json"), ("auth_maps", ".json")]:
+        base = outdir / subdir
+        if not base.exists():
+            continue
+        for f in base.glob(f"*/*{ext}"):
+            if f.stem not in kept_ids:
+                f.unlink()
+                removed += 1
+        for mid_dir in base.iterdir():
+            if mid_dir.is_dir() and not any(mid_dir.iterdir()):
+                mid_dir.rmdir()
+    if removed:
+        print(f"Pruned {removed} stale files no longer in the new manifest")
+    return removed
 
 
 # ── finalize ──────────────────────────────────────────────────────────────────
@@ -1099,9 +1127,6 @@ def finalize(outdir: Path) -> dict:
 def process(args, clusters: dict, annotations: dict, split: dict) -> int:
     plinder_dir = args.plinder_dir
     outdir = args.outdir
-    if args.overwrite and outdir.exists():
-        import shutil
-        shutil.rmtree(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
     system_ids = [sid for sid, s in split.items() if s in args.splits]
@@ -1145,10 +1170,11 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> int:
     max_resolution = getattr(args, "max_resolution", 9.0)
     if max_resolution is not None and max_resolution <= 0:
         max_resolution = None  # disabled
+    force = bool(getattr(args, "overwrite", False))
 
     if num_processes > 1:
         initargs = (plinder_dir, outdir, clusters, annotations, args.ccd_path, pocket_data_dir,
-                    allowed_protein_chain_counts, fuse_multi_chain, max_ligand_atoms, max_resolution)
+                    allowed_protein_chain_counts, fuse_multi_chain, max_ligand_atoms, max_resolution, force)
         with multiprocessing.Pool(
             processes=num_processes,
             initializer=_worker_init,
@@ -1157,7 +1183,7 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> int:
             results = list(tqdm(pool.imap_unordered(process_system_worker, system_ids, chunksize=4), total=len(system_ids)))
     else:
         _worker_init(plinder_dir, outdir, clusters, annotations, args.ccd_path, pocket_data_dir,
-                      allowed_protein_chain_counts, fuse_multi_chain, max_ligand_atoms, max_resolution)
+                      allowed_protein_chain_counts, fuse_multi_chain, max_ligand_atoms, max_resolution, force)
         results = [process_system_worker(sid) for sid in tqdm(system_ids)]
 
     # Tally filter reasons
@@ -1176,6 +1202,17 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> int:
         json.dump(filter_counts, f, indent=2)
     with open(outdir / "filtered_ids.json", "w") as f:
         json.dump(filtered_ids, f, indent=2)
+
+    if args.overwrite:
+        restricted = args.max_systems is not None or (
+            hasattr(args, "system_ids_file") and args.system_ids_file is not None
+        )
+        if restricted:
+            print("--overwrite set, but this run is restricted (--max-systems/--system-ids-file); "
+                  "skipping stale-file prune to avoid deleting valid systems outside this run's scope.")
+        else:
+            kept_ids = {sid for sid, reason in results if reason is None}
+            prune_stale_outputs(outdir, kept_ids)
 
     return finalize(outdir)
 
@@ -1215,7 +1252,13 @@ if __name__ == "__main__":
                              "Angstroms (matches AlphaFold2's training filter). Default: 9.0; pass "
                              "--max-resolution 0 to disable (keep everything, including null resolution).")
     parser.add_argument("--overwrite", action="store_true", default=False,
-                        help="Delete and recreate the output directory before processing")
+                        help="Force reprocessing of every system (ignore cached output files) and, at the end "
+                             "of a full/unrestricted run, delete any on-disk structures/records/auth_maps files "
+                             "no longer in the new manifest. Never wipes the output directory upfront, so files "
+                             "for still-valid systems stay in place the whole run — safe to run while something "
+                             "else is training off this same directory. Pruning is skipped if combined with "
+                             "--max-systems/--system-ids-file, since that would incorrectly delete valid systems "
+                             "outside this restricted run's scope.")
     parser.add_argument("--pocket-data-dir", type=Path,
                         default=Path(os.environ.get("REPO_ROOT", ".")) / "plinder_pocket_alpha_spheres",
                         help="Directory of per-system alpha-sphere .npy files from filter_plinder_pocket.py")
