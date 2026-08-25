@@ -62,6 +62,10 @@ if __name__ == "__main__":
                              "Default: 95; pass --dedup-cluster-threshold 0 to disable.")
     parser.add_argument("--max-ligand-atoms", type=int, default=200,
                         help="Filter out systems whose ligand has more than this many total atoms, including H (default: 200)")
+    parser.add_argument("--max-resolution", type=float, default=9.0,
+                        help="Filter out systems whose entry resolution is missing or exceeds this value, in "
+                             "Angstroms (matches AlphaFold2's training filter). Default: 9.0; pass "
+                             "--max-resolution 0 to disable (keep everything, including null resolution).")
     parser.add_argument("--overwrite", action="store_true", default=False,
                         help="Delete and recreate the output directory before processing")
     parser.add_argument("--pocket-data-dir", type=Path,

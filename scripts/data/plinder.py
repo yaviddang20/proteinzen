@@ -485,6 +485,8 @@ def load_annotation_table(plinder_dir: Path) -> dict:
         "ligand_is_covalent",
         "entry_resolution",
         "ligand_ccd_code",
+        "system_pass_validation_criteria",
+        "ligand_is_proper",
     ]
     t = pq.ParquetFile(path).read(columns=cols)
     result = {}
@@ -787,6 +789,7 @@ def process_system(
     allowed_protein_chain_counts: tuple = (1,),
     fuse_multi_chain: bool = False,
     max_ligand_atoms: Optional[int] = 200,
+    max_resolution: Optional[float] = 9.0,
 ) -> None:
     mid = system_mid(system_id)
     struct_path = outdir / "structures" / mid / f"{system_id}.npz"
@@ -803,6 +806,14 @@ def process_system(
 
     if annotation_row.get("ligand_is_covalent"):
         return "covalent"
+
+    if not annotation_row.get("ligand_is_proper", True):
+        return "not_proper_ligand"
+
+    if max_resolution is not None:
+        resolution = annotation_row.get("entry_resolution")
+        if resolution is None or resolution > max_resolution:
+            return "resolution_filtered"
 
     try:
         # Parse full complex (protein + ligand chains via CCD)
@@ -1003,6 +1014,7 @@ def process_system(
 
     record_dict = asdict(record)
     record_dict['smiles'] = ligand_smiles
+    record_dict['system_pass_validation_criteria'] = bool(annotation_row.get('system_pass_validation_criteria'))
     with open(record_path, "w") as f:
         json.dump(record_dict, f)
 
@@ -1016,7 +1028,8 @@ def process_system(
 _worker_state = {}
 
 def _worker_init(plinder_dir, outdir, clusters, annotations, ccd_path, pocket_data_dir=None,
-                  allowed_protein_chain_counts=(1,), fuse_multi_chain=False, max_ligand_atoms=200):
+                  allowed_protein_chain_counts=(1,), fuse_multi_chain=False, max_ligand_atoms=200,
+                  max_resolution=9.0):
     """Load large shared data once per worker process."""
     global _worker_state
     with open(ccd_path, "rb") as f:
@@ -1031,6 +1044,7 @@ def _worker_init(plinder_dir, outdir, clusters, annotations, ccd_path, pocket_da
         "allowed_protein_chain_counts": allowed_protein_chain_counts,
         "fuse_multi_chain": fuse_multi_chain,
         "max_ligand_atoms": max_ligand_atoms,
+        "max_resolution": max_resolution,
     }
 
 
@@ -1044,6 +1058,7 @@ def process_system_worker(system_id: str) -> tuple[str, Optional[str]]:
             allowed_protein_chain_counts=s.get("allowed_protein_chain_counts", (1,)),
             fuse_multi_chain=s.get("fuse_multi_chain", False),
             max_ligand_atoms=s.get("max_ligand_atoms", 200),
+            max_resolution=s.get("max_resolution", 9.0),
         )
         return system_id, reason
     except Exception:
@@ -1127,10 +1142,13 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> int:
     allowed_protein_chain_counts = tuple(getattr(args, "allowed_protein_chain_counts", (1,)))
     fuse_multi_chain = getattr(args, "fuse_multi_chain", False)
     max_ligand_atoms = getattr(args, "max_ligand_atoms", 200)
+    max_resolution = getattr(args, "max_resolution", 9.0)
+    if max_resolution is not None and max_resolution <= 0:
+        max_resolution = None  # disabled
 
     if num_processes > 1:
         initargs = (plinder_dir, outdir, clusters, annotations, args.ccd_path, pocket_data_dir,
-                    allowed_protein_chain_counts, fuse_multi_chain, max_ligand_atoms)
+                    allowed_protein_chain_counts, fuse_multi_chain, max_ligand_atoms, max_resolution)
         with multiprocessing.Pool(
             processes=num_processes,
             initializer=_worker_init,
@@ -1139,7 +1157,7 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> int:
             results = list(tqdm(pool.imap_unordered(process_system_worker, system_ids, chunksize=4), total=len(system_ids)))
     else:
         _worker_init(plinder_dir, outdir, clusters, annotations, args.ccd_path, pocket_data_dir,
-                      allowed_protein_chain_counts, fuse_multi_chain, max_ligand_atoms)
+                      allowed_protein_chain_counts, fuse_multi_chain, max_ligand_atoms, max_resolution)
         results = [process_system_worker(sid) for sid in tqdm(system_ids)]
 
     # Tally filter reasons
@@ -1192,6 +1210,10 @@ if __name__ == "__main__":
                              "Default: 95; pass --dedup-cluster-threshold 0 to disable.")
     parser.add_argument("--max-ligand-atoms", type=int, default=200,
                         help="Filter out systems whose ligand has more than this many total atoms, including H (default: 200)")
+    parser.add_argument("--max-resolution", type=float, default=9.0,
+                        help="Filter out systems whose entry resolution is missing or exceeds this value, in "
+                             "Angstroms (matches AlphaFold2's training filter). Default: 9.0; pass "
+                             "--max-resolution 0 to disable (keep everything, including null resolution).")
     parser.add_argument("--overwrite", action="store_true", default=False,
                         help="Delete and recreate the output directory before processing")
     parser.add_argument("--pocket-data-dir", type=Path,
