@@ -791,6 +791,7 @@ def process_system(
     max_ligand_atoms: Optional[int] = 200,
     max_resolution: Optional[float] = 9.0,
     force: bool = False,
+    require_quality_pass: bool = False,
 ) -> None:
     mid = system_mid(system_id)
     struct_path = outdir / "structures" / mid / f"{system_id}.npz"
@@ -815,6 +816,9 @@ def process_system(
         resolution = annotation_row.get("entry_resolution")
         if resolution is None or resolution > max_resolution:
             return "resolution_filtered"
+
+    if require_quality_pass and not annotation_row.get("system_pass_validation_criteria", False):
+        return "quality_filtered"
 
     try:
         # Parse full complex (protein + ligand chains via CCD)
@@ -1030,7 +1034,7 @@ _worker_state = {}
 
 def _worker_init(plinder_dir, outdir, clusters, annotations, ccd_path, pocket_data_dir=None,
                   allowed_protein_chain_counts=(1,), fuse_multi_chain=False, max_ligand_atoms=200,
-                  max_resolution=9.0, force=False):
+                  max_resolution=9.0, force=False, require_quality_pass=False):
     """Load large shared data once per worker process."""
     global _worker_state
     with open(ccd_path, "rb") as f:
@@ -1047,6 +1051,7 @@ def _worker_init(plinder_dir, outdir, clusters, annotations, ccd_path, pocket_da
         "max_ligand_atoms": max_ligand_atoms,
         "max_resolution": max_resolution,
         "force": force,
+        "require_quality_pass": require_quality_pass,
     }
 
 
@@ -1062,6 +1067,7 @@ def process_system_worker(system_id: str) -> tuple[str, Optional[str]]:
             max_ligand_atoms=s.get("max_ligand_atoms", 200),
             max_resolution=s.get("max_resolution", 9.0),
             force=s.get("force", False),
+            require_quality_pass=s.get("require_quality_pass", False),
         )
         return system_id, reason
     except Exception:
@@ -1171,10 +1177,12 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> int:
     if max_resolution is not None and max_resolution <= 0:
         max_resolution = None  # disabled
     force = bool(getattr(args, "overwrite", False))
+    require_quality_pass = bool(getattr(args, "require_quality_pass", False))
 
     if num_processes > 1:
         initargs = (plinder_dir, outdir, clusters, annotations, args.ccd_path, pocket_data_dir,
-                    allowed_protein_chain_counts, fuse_multi_chain, max_ligand_atoms, max_resolution, force)
+                    allowed_protein_chain_counts, fuse_multi_chain, max_ligand_atoms, max_resolution, force,
+                    require_quality_pass)
         with multiprocessing.Pool(
             processes=num_processes,
             initializer=_worker_init,
@@ -1183,7 +1191,8 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> int:
             results = list(tqdm(pool.imap_unordered(process_system_worker, system_ids, chunksize=4), total=len(system_ids)))
     else:
         _worker_init(plinder_dir, outdir, clusters, annotations, args.ccd_path, pocket_data_dir,
-                      allowed_protein_chain_counts, fuse_multi_chain, max_ligand_atoms, max_resolution, force)
+                      allowed_protein_chain_counts, fuse_multi_chain, max_ligand_atoms, max_resolution, force,
+                      require_quality_pass)
         results = [process_system_worker(sid) for sid in tqdm(system_ids)]
 
     # Tally filter reasons
@@ -1251,6 +1260,12 @@ if __name__ == "__main__":
                         help="Filter out systems whose entry resolution is missing or exceeds this value, in "
                              "Angstroms (matches AlphaFold2's training filter). Default: 9.0; pass "
                              "--max-resolution 0 to disable (keep everything, including null resolution).")
+    parser.add_argument("--require-quality-pass", action="store_true", default=False,
+                        help="Hard-filter out any system where Plinder's system_pass_validation_criteria is "
+                             "False (or missing). Off by default. Note: with this on, every kept system's "
+                             "system_pass_validation_criteria record field is trivially True, which makes the "
+                             "training-time gate_low_quality_t soft-gate a no-op — use one or the other, not "
+                             "both, unless you have a specific reason to.")
     parser.add_argument("--overwrite", action="store_true", default=False,
                         help="Force reprocessing of every system (ignore cached output files) and, at the end "
                              "of a full/unrestricted run, delete any on-disk structures/records/auth_maps files "

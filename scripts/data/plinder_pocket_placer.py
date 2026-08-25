@@ -66,6 +66,12 @@ if __name__ == "__main__":
                         help="Filter out systems whose entry resolution is missing or exceeds this value, in "
                              "Angstroms (matches AlphaFold2's training filter). Default: 9.0; pass "
                              "--max-resolution 0 to disable (keep everything, including null resolution).")
+    parser.add_argument("--require-quality-pass", action="store_true", default=False,
+                        help="Hard-filter out any system where Plinder's system_pass_validation_criteria is "
+                             "False (or missing). Off by default. Note: with this on, every kept system's "
+                             "system_pass_validation_criteria record field is trivially True, which makes the "
+                             "training-time gate_low_quality_t soft-gate a no-op — use one or the other, not "
+                             "both, unless you have a specific reason to.")
     parser.add_argument("--overwrite", action="store_true", default=False,
                         help="Force reprocessing of every system (ignore cached output files) and, at the end "
                              "of a full/unrestricted run, delete any on-disk structures/records/auth_maps files "
