@@ -362,6 +362,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         lap_pe_k=0,
         use_pocket_priority=False,
         compute_etkdg_pos=False,
+        gate_low_quality_t=False,
     ):
         super().__init__()
         self.datasets = datasets
@@ -395,6 +396,7 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.mask_nonstandard = mask_nonstandard
         self.use_pocket_priority = use_pocket_priority
         self.compute_etkdg_pos = compute_etkdg_pos
+        self.gate_low_quality_t = gate_low_quality_t
 
         for dataset in datasets:
             records = dataset.manifest
@@ -458,6 +460,9 @@ class TrainingDataset(torch.utils.data.Dataset):
             struct = mask_nonstandard_residues(struct)
 
         task_data = task.sample_t_and_mask(struct)
+
+        if self.gate_low_quality_t and sample.record.system_pass_validation_criteria is False:
+            task_data["t"] = 0.5 + task_data["t"] / 2
 
         token_data, rigid_data, token_bonds = tokenize_structure(
             struct,

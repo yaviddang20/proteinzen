@@ -593,6 +593,7 @@ class Record(JSONSerializable):
     md: Optional[MDInfo] = None
     affinity: Optional[AffinityInfo] = None
     smiles: Optional[str] = None
+    system_pass_validation_criteria: Optional[bool] = None
 
 @dataclass(frozen=True)
 class ConformerRecord(JSONSerializable):
