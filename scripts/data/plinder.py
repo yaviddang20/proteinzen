@@ -484,6 +484,7 @@ def load_annotation_table(plinder_dir: Path) -> dict:
         "system_proper_ligand_max_molecular_weight",
         "ligand_is_covalent",
         "entry_resolution",
+        "ligand_ccd_code",
     ]
     t = pq.ParquetFile(path).read(columns=cols)
     result = {}
@@ -502,14 +503,24 @@ def dedupe_by_cluster95(
     metric: str = "pli_qcov",
     threshold: int = 95,
 ) -> list:
-    """Keep only the best-resolution representative per high-threshold cluster."""
+    """Keep only the best-resolution representative per (high-threshold cluster,
+    ligand identity) group. The cluster metrics (pli_qcov, pocket_lddt, ...) are
+    protein-pocket/interaction similarity, not ligand chemical identity — two
+    systems can land in the same cluster while binding entirely different ligands
+    that happen to share a conserved local interaction pattern (e.g. ATP/ADP/GTP
+    all engaging a P-loop). Requiring an exact ligand_ccd_code match too means we
+    only dedupe genuine near-duplicates (same ligand, similar pocket), not distinct
+    ligand chemistry that happens to cluster together.
+    """
     clusters95 = load_clusters(plinder_dir, algorithm=algorithm, directed=directed, metric=metric, threshold=threshold)
     id_set = set(system_ids)
-    # Group system_ids by their 95-cluster label; systems not in clusters95 get their own singleton group
-    groups: dict[str, list] = {}
+    # Group system_ids by (95-cluster label, ligand_ccd_code); systems not in
+    # clusters95 get their own singleton group
+    groups: dict[tuple, list] = {}
     for sid in system_ids:
         label = clusters95.get(sid, sid)  # fallback: treat as own cluster
-        groups.setdefault(label, []).append(sid)
+        ligand_ccd = annotations.get(sid, {}).get("ligand_ccd_code")
+        groups.setdefault((label, ligand_ccd), []).append(sid)
 
     def resolution(sid):
         row = annotations.get(sid, {})
