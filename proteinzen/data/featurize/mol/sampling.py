@@ -165,10 +165,11 @@ def smiles_to_struct(
             )
         atom.SetProp("name", atom_name)
 
-    success = compute_3d_conformer(mol)
-    if not success:
-        msg = f"Failed to compute 3D conformer for {smiles}"
-        raise ValueError(msg)
+    if not noise_ligand:
+        success = compute_3d_conformer(mol)
+        if not success:
+            msg = f"Failed to compute 3D conformer for {smiles}"
+            raise ValueError(msg)
 
     mol_no_h = AllChem.RemoveHs(mol)
     Chem.AssignStereochemistry(mol_no_h, cleanIt=True, force=True)
@@ -214,8 +215,9 @@ def smiles_to_struct(
         residue_data.append(astuple(residue))
 
     else:
-        # Get reference conformer coordinates
-        conformer = get_conformer(mol_iter)
+        # Get reference conformer coordinates (unused when noise_ligand, since
+        # coords are random noise regardless — skip fetching it at all then)
+        conformer = None if noise_ligand else get_conformer(mol_iter)
 
         # Parse each atom
         atom_idx = 0
@@ -545,8 +547,9 @@ def mol_to_struct(
         residue_data.append(astuple(residue))
 
     else:
-        # Get reference conformer coordinates
-        conformer = get_conformer(mol_iter)
+        # Get reference conformer coordinates (unused when noise_ligand, since
+        # coords are random noise regardless — skip fetching it at all then)
+        conformer = None if noise_ligand else get_conformer(mol_iter)
 
         # Parse each atom
         atom_idx = 0
