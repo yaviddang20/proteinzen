@@ -2,19 +2,17 @@
 """Evaluate PLINDER placer task — sidechain RMSD.
 
 The placer task fixes the backbone and generates sidechains.  Each sample PDB
-has two MODEL blocks: MODEL 1 = GT, MODEL 2 = predicted.  Backbone atoms
-(N, CA, C, O) are identical between models; sidechain atoms (everything else
-in ATOM records) are generated.
+contains the predicted all-atom structure; GT is loaded from the processed npz.
 
-Metrics reported:
-  sc_rmsd  : RMSD over all sidechain heavy atoms in ATOM records
+Metrics:
+  sc_rmsd  : Kabsch-aligned (on Cα) RMSD over sidechain heavy atoms (non N/CA/C/O)
   COV @1Å / @2Å : fraction of samples with sc_rmsd below threshold
 
 Usage
 -----
 python _scripts/eval_plinder_placer.py \\
-    --samples-dir ./sampling/plinder_placer/<model>/samples \\
-    --data-dir    plinder_placer_processed/val \\
+    --samples-dir ./sampling/plinder_pocket_train/placer/<model>/samples \\
+    --data-dir    plinder_pocket_processed/train \\
     [--delta 1.0 2.0] [--n-jobs 8] [--verbose]
 """
 
@@ -30,111 +28,126 @@ import numpy as np
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from proteinzen.boltz.data import const
+from proteinzen.runtime.sampling.protein_pocket import load_structure_from_npz
+
 _GPU_SUFFIX = re.compile(r'_gpu\d+_batch\d+_idx\d+')
 
 _BACKBONE_ATOMS = frozenset({"N", "CA", "C", "O"})
 
 
 # ============================================================
-# PDB parsing
+# Kabsch
 # ============================================================
 
-def _parse_models(pdb_path: str):
-    """Parse a two-MODEL PDB.
+def kabsch(P: np.ndarray, Q: np.ndarray):
+    """Rotation R and translation t that aligns P onto Q."""
+    cp, cq = P.mean(0), Q.mean(0)
+    H = (P - cp).T @ (Q - cq)
+    U, _, Vt = np.linalg.svd(H)
+    d = np.linalg.det(Vt.T @ U.T)
+    R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+    t = cq - R @ cp
+    return R, t
 
-    Returns two lists of atom dicts (one per model), each dict having:
-      chain, resid, resname, atom_name, element, xyz.
-    Only ATOM records are returned (not HETATM).
-    """
-    models = []
-    current = []
-    in_model = False
 
+def apply_transform(coords: np.ndarray, R: np.ndarray, t: np.ndarray) -> np.ndarray:
+    return (R @ coords.T).T + t
+
+
+def pos_rmsd(A: np.ndarray, B: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(np.sum((A - B) ** 2, axis=-1))))
+
+
+# ============================================================
+# GT extraction from npz
+# ============================================================
+
+def extract_gt_protein_atoms(struct):
+    """Return (atom_names, coords) for present heavy protein atoms in struct order."""
+    protein_id = const.chain_type_ids["PROTEIN"]
+    names, coords = [], []
+    for chain in struct.chains[struct.mask]:
+        if int(chain["mol_type"]) != protein_id:
+            continue
+        a0 = int(chain["atom_idx"])
+        atoms = struct.atoms[a0 : a0 + int(chain["atom_num"])]
+        for atom in atoms:
+            if not atom["is_present"]:
+                continue
+            if atom["element"] == 1:  # hydrogen
+                continue
+            name = "".join(chr(int(c)) for c in atom["name"]).strip()
+            names.append(name)
+            coords.append(atom["coords"].astype(np.float64))
+    return names, (np.stack(coords) if coords else np.zeros((0, 3), dtype=np.float64))
+
+
+# ============================================================
+# PDB parsing — ATOM records only, flat coord array
+# ============================================================
+
+def parse_pdb_prot_coords(pdb_path: str) -> np.ndarray:
+    """Return (N, 3) float64 of all ATOM-record coords in file order."""
+    coords = []
     with open(pdb_path) as fh:
         for line in fh:
-            rec = line[:6].rstrip()
-            if rec == "MODEL":
-                in_model = True
-                current = []
-            elif rec == "ENDMDL":
-                models.append(current)
-                in_model = False
-            elif rec == "ATOM" and in_model:
-                try:
-                    atom_name = line[12:16].strip()
-                    resname   = line[17:20].strip()
-                    chain     = line[21]
-                    resid     = int(line[22:26])
-                    x = float(line[30:38])
-                    y = float(line[38:46])
-                    z = float(line[46:54])
-                    element = line[76:78].strip() if len(line) > 76 else atom_name[0]
-                    if not element:
-                        element = atom_name.lstrip("0123456789")[0] if atom_name else "C"
-                    current.append({
-                        "chain": chain, "resid": resid, "resname": resname,
-                        "atom_name": atom_name, "element": element.capitalize(),
-                        "xyz": np.array([x, y, z], dtype=np.float64),
-                    })
-                except (ValueError, IndexError):
-                    pass
-
-    if not in_model and not models and current:
-        # PDB without MODEL records — treat as single model
-        models.append(current)
-
-    return models
+            if line[:6].rstrip() != "ATOM":
+                continue
+            try:
+                coords.append([float(line[30:38]), float(line[38:46]), float(line[46:54])])
+            except ValueError:
+                pass
+    return np.array(coords, dtype=np.float64) if coords else np.zeros((0, 3), dtype=np.float64)
 
 
-def _atoms_to_coord_dict(atoms):
-    """Map (chain, resid, atom_name) → xyz."""
-    return {(a["chain"], a["resid"], a["atom_name"]): a["xyz"] for a in atoms}
+# ============================================================
+# Per-sample evaluation
+# ============================================================
 
+def eval_sample(pdb_path: str, gt_atom_names: list, gt_coords: np.ndarray):
+    gen_coords = parse_pdb_prot_coords(pdb_path)
 
-def eval_sample(pdb_path: str):
-    """Evaluate one sample PDB.
-
-    Returns dict with sc_rmsd (Å) and n_sc_atoms, or raises on failure.
-    """
-    models = _parse_models(pdb_path)
-    if len(models) < 2:
-        raise ValueError(f"Expected 2 MODEL blocks, got {len(models)}")
-
-    gt_atoms   = models[0]
-    pred_atoms = models[1]
-
-    if len(gt_atoms) != len(pred_atoms):
+    if len(gen_coords) != len(gt_coords):
         raise ValueError(
-            f"Atom count mismatch: GT={len(gt_atoms)} pred={len(pred_atoms)}"
+            f"atom count mismatch: gen={len(gen_coords)} gt={len(gt_coords)}"
         )
+    if len(gt_coords) == 0:
+        raise ValueError("no protein atoms in GT")
 
-    # build coord dict from GT; iterate pred in same order
-    gt_coord   = _atoms_to_coord_dict(gt_atoms)
-    pred_coord = _atoms_to_coord_dict(pred_atoms)
+    is_bb = np.array([n in _BACKBONE_ATOMS for n in gt_atom_names], dtype=bool)
+    is_ca = np.array([n == "CA" for n in gt_atom_names], dtype=bool)
+    n_sc = int((~is_bb).sum())
 
-    common_keys = set(gt_coord) & set(pred_coord)
-    sc_keys = [k for k in common_keys if k[2] not in _BACKBONE_ATOMS]
+    if is_ca.sum() < 3:
+        raise ValueError(f"too few Cα atoms for alignment: {is_ca.sum()}")
+    if n_sc == 0:
+        raise ValueError("no sidechain atoms (all Gly?)")
 
-    if not sc_keys:
-        raise ValueError("No sidechain atoms found")
+    R, t = kabsch(gen_coords[is_ca], gt_coords[is_ca])
+    gen_aligned = apply_transform(gen_coords, R, t)
 
-    sc_gt   = np.stack([gt_coord[k]   for k in sc_keys])
-    sc_pred = np.stack([pred_coord[k] for k in sc_keys])
-
-    rmsd = float(np.sqrt(np.mean(np.sum((sc_gt - sc_pred) ** 2, axis=-1))))
-    return {"sc_rmsd": rmsd, "n_sc_atoms": len(sc_keys)}
+    rmsd = pos_rmsd(gt_coords[~is_bb], gen_aligned[~is_bb])
+    return {"sc_rmsd": rmsd, "n_sc_atoms": n_sc}
 
 
 # ============================================================
-# Per-system evaluation
+# Per-system job
 # ============================================================
 
-def _eval_system_job(system_id: str, pdb_paths: list):
-    """Evaluate all samples for one system. Returns (system_id, records, err)."""
+def _eval_system_job(system_id: str, pdb_paths: list, npz_path: str):
+    try:
+        struct = load_structure_from_npz(npz_path, include_h=False)
+        gt_atom_names, gt_coords = extract_gt_protein_atoms(struct)
+    except Exception as e:
+        return system_id, [], f"npz load error: {e}"
+
     records = []
     for idx, p in enumerate(sorted(pdb_paths)):
         try:
-            r = eval_sample(str(p))
+            r = eval_sample(str(p), gt_atom_names, gt_coords)
             records.append({
                 "system_id": system_id,
                 "sample_idx": idx,
@@ -154,7 +167,7 @@ def _eval_system_job(system_id: str, pdb_paths: list):
 
 
 # ============================================================
-# Aggregation
+# Aggregation helpers
 # ============================================================
 
 def mean_finite(vals):
@@ -195,9 +208,8 @@ def main():
     )
     parser.add_argument("--samples-dir", type=Path, required=True,
                         help="Directory of generated PDB files")
-    parser.add_argument("--data-dir", type=Path, default=None,
-                        help="Plinder processed split dir (for manifest filtering). "
-                             "If omitted, all PDBs in samples-dir are evaluated.")
+    parser.add_argument("--data-dir", type=Path, required=True,
+                        help="Plinder processed split dir (manifest.json + structures/)")
     parser.add_argument("--delta", type=float, nargs="+", default=[1.0, 2.0],
                         help="RMSD thresholds for COV reporting (Å; default: 1.0 2.0)")
     parser.add_argument("--n-jobs", type=int, default=max(1, mp.cpu_count() // 2),
@@ -208,16 +220,14 @@ def main():
                         help="Print per-system details")
     args = parser.parse_args()
 
-    # ---- optional manifest ----
-    system_ids_in_manifest = None
-    if args.data_dir is not None:
-        manifest_path = args.data_dir / "manifest.json"
-        if not manifest_path.exists():
-            sys.exit(f"manifest.json not found at {manifest_path}")
-        with open(manifest_path) as fh:
-            manifest = json.load(fh)
-        system_ids_in_manifest = {rec["id"] for rec in manifest}
-        print(f"Manifest: {len(system_ids_in_manifest)} systems")
+    # ---- manifest ----
+    manifest_path = args.data_dir / "manifest.json"
+    if not manifest_path.exists():
+        sys.exit(f"manifest.json not found at {manifest_path}")
+    with open(manifest_path) as fh:
+        manifest = json.load(fh)
+    system_ids_in_manifest = {rec["id"] for rec in manifest}
+    print(f"Manifest: {len(system_ids_in_manifest)} systems")
 
     # ---- collect PDB files ----
     pdb_files = sorted(args.samples_dir.glob("*.pdb"))
@@ -240,27 +250,33 @@ def main():
     if unmatched:
         print(f"  Warning: {len(unmatched)} PDB(s) had unrecognised names — skipped")
 
-    if system_ids_in_manifest is not None:
-        common = sorted(set(groups) & system_ids_in_manifest)
-        extra   = set(groups) - system_ids_in_manifest
-        missing = system_ids_in_manifest - set(groups)
-        if extra:
-            print(f"  Warning: {len(extra)} sampled systems not in manifest")
-        if missing:
-            print(f"  Note: {len(missing)} manifest systems have no samples")
-    else:
-        common = sorted(groups)
+    common = sorted(set(groups) & system_ids_in_manifest)
+    extra   = set(groups) - system_ids_in_manifest
+    missing = system_ids_in_manifest - set(groups)
+    if extra:
+        print(f"  Warning: {len(extra)} sampled systems not in manifest")
+    if missing:
+        print(f"  Note: {len(missing)} manifest systems have no samples")
 
     print(f"  Systems with generated samples : {len(groups)}")
     print(f"  Systems evaluated              : {len(common)}")
 
-    jobs = [(sid, groups[sid]) for sid in common]
+    # ---- build job list ----
+    jobs = []
+    for sid in common:
+        mid = sid[1:3]
+        npz_path = args.data_dir / "structures" / mid / f"{sid}.npz"
+        if not npz_path.exists():
+            print(f"  SKIP {sid}: npz not found")
+            continue
+        jobs.append((sid, groups[sid], str(npz_path)))
+
     print(f"  Running {len(jobs)} systems with {args.n_jobs} workers...")
 
     # ---- parallel evaluation ----
     results = Parallel(n_jobs=args.n_jobs, backend="loky")(
-        delayed(_eval_system_job)(sid, pdbs)
-        for sid, pdbs in tqdm(jobs, desc="evaluating")
+        delayed(_eval_system_job)(sid, pdbs, npz)
+        for sid, pdbs, npz in tqdm(jobs, desc="evaluating")
     )
 
     # ---- collect ----
@@ -292,7 +308,7 @@ def main():
         all_records.extend(sys_records)
 
     if n_errors:
-        print(f"\nWarning: {n_errors} samples failed (skipped)")
+        print(f"\nWarning: {n_errors} samples failed (skipped in summary)")
 
     if not records_by_system:
         print("No systems evaluated — check paths.")
@@ -304,7 +320,7 @@ def main():
     sys_mean = _mean_per_system(records_by_system, "sc_rmsd")
 
     deltas = args.delta
-    n_sys = len(records_by_system)
+    n_sys  = len(records_by_system)
     n_samp = sum(1 for v in all_sc if np.isfinite(v))
 
     print(f"\n{'='*60}")
@@ -329,7 +345,6 @@ def main():
     for d in deltas:
         print(f"  COV < {d:.1f}Å     : {cov(sys_mean, d)*100:.1f}%")
 
-    # ---- optional JSON output ----
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         out_data = {
