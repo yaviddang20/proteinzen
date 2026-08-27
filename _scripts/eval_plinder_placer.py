@@ -82,7 +82,7 @@ def extract_gt_protein_atoms(struct):
                 continue
             if atom["element"] == 1:  # hydrogen
                 continue
-            name = "".join(chr(int(c)) for c in atom["name"]).strip()
+            name = "".join(chr(int(c) + 32) for c in atom["name"] if c != 0)
             names.append(name)
             coords.append(atom["coords"].astype(np.float64))
     return names, (np.stack(coords) if coords else np.zeros((0, 3), dtype=np.float64))
