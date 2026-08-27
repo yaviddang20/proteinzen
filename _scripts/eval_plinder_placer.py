@@ -145,6 +145,7 @@ def _eval_system_job(system_id: str, pdb_paths: list, npz_path: str):
         return system_id, [], f"npz load error: {e}"
 
     records = []
+    first_error = None
     for idx, p in enumerate(sorted(pdb_paths)):
         try:
             r = eval_sample(str(p), gt_atom_names, gt_coords)
@@ -156,14 +157,17 @@ def _eval_system_job(system_id: str, pdb_paths: list, npz_path: str):
                 "note": "",
             })
         except Exception as e:
+            note = str(e)
+            if first_error is None:
+                first_error = f"{p.name}: {note}"
             records.append({
                 "system_id": system_id,
                 "sample_idx": idx,
                 "sc_rmsd": float("inf"),
                 "n_sc_atoms": 0,
-                "note": str(e),
+                "note": note,
             })
-    return system_id, records, None
+    return system_id, records, None, first_error
 
 
 # ============================================================
@@ -283,8 +287,9 @@ def main():
     all_records: list[dict] = []
     records_by_system: dict[str, list[dict]] = {}
     n_errors = 0
+    first_errors_shown = 0
 
-    for sid, sys_records, err in results:
+    for sid, sys_records, err, first_err in results:
         if err:
             print(f"  SKIP {sid}: {err}")
             continue
@@ -293,6 +298,9 @@ def main():
 
         err_count = sum(1 for r in sys_records if r["note"])
         n_errors += err_count
+        if first_err and first_errors_shown < 5:
+            print(f"  [sample error] {sid} — {first_err}")
+            first_errors_shown += 1
         if args.verbose:
             for r in sys_records:
                 if r["note"]:
