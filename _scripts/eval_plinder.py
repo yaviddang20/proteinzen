@@ -994,16 +994,24 @@ def run_ligand_cond_eval(args):
     args.out_dir.mkdir(parents=True, exist_ok=True)
     refold_input_dir  = args.out_dir / "refold_inputs"
     refold_output_dir = args.out_dir / "refold_outputs"
+    per_sample_dir = args.out_dir / "per_sample"
+    per_sample_dir.mkdir(exist_ok=True)
 
     pdb_files = sorted(samples_dir.glob("*.pdb"))
     if not pdb_files:
         sys.exit(f"No PDB files found in {samples_dir}")
     ligand_name = getattr(args, "ligand_name", "LIG")
+    continue_run = getattr(args, "continue_run", False)
     print(f"Evaluating {len(pdb_files)} generated samples for ligand={ligand_name}")
 
     all_results = []
     for pdb_path in pdb_files:
         stem = pdb_path.stem
+        cache_path = per_sample_dir / f"{stem}.json"
+        if continue_run and cache_path.exists():
+            r = json.loads(cache_path.read_text())
+            all_results.append(r)
+            continue
         m = _GPU_SUFFIX.search(stem)
         sid = stem[:m.start()] if m else stem.rsplit("_", 1)[0]
         smiles = smiles_by_sid.get(sid, global_smiles)
@@ -1024,6 +1032,13 @@ def run_ligand_cond_eval(args):
             }
             print(f"  ERROR {pdb_path.name}: {e}")
 
+        def _ser(v):
+            if isinstance(v, (np.floating, np.float32, np.float64)): return float(v)
+            if isinstance(v, np.integer): return int(v)
+            if isinstance(v, np.bool_): return bool(v)
+            return v
+        cache_path.write_text(json.dumps({k: _ser(v) for k, v in r.items()}, indent=2))
+
         all_results.append(r)
         if args.verbose:
             print(
@@ -1032,12 +1047,6 @@ def run_ligand_cond_eval(args):
                 f"plddt={fmt(r.get('plddt'))}  iptm={fmt(r.get('iptm'))}  "
                 f"sc_rmsd={fmt(r.get('sc_rmsd'))}"
             )
-
-    def _ser(v):
-        if isinstance(v, (np.floating, np.float32, np.float64)): return float(v)
-        if isinstance(v, np.integer): return int(v)
-        if isinstance(v, np.bool_): return bool(v)
-        return v
 
     serial = [{k: _ser(v) for k, v in r.items()} for r in all_results]
     (args.out_dir / "results.json").write_text(json.dumps(serial, indent=2))
@@ -1179,6 +1188,11 @@ def main():
         "--verbose", action="store_true",
         help="Print per-system / per-sample details.",
     )
+    parser.add_argument(
+        "--continue-run", action="store_true", default=False,
+        help="Skip already-evaluated samples (cached in out_dir/per_sample/). "
+             "Default: False (wipe out_dir and rerun everything).",
+    )
     args = parser.parse_args()
 
     if not args.out_dir.exists() and args.task == "protein_cond":
@@ -1186,6 +1200,12 @@ def main():
 
     if args.ref_dir is None:
         sys.exit("--ref-dir is required")
+
+    continue_run = getattr(args, "continue_run", False)
+    if not continue_run and args.out_dir.exists():
+        import shutil
+        shutil.rmtree(args.out_dir)
+        print(f"Cleared existing out_dir: {args.out_dir}")
 
     if args.task == "protein_cond":
         run_protein_cond_eval(args)
