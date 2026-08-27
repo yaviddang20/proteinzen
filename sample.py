@@ -222,6 +222,9 @@ def main(sampler,
                 kept_indices = json.load(f)
 
         dispatcher.batches = [dispatcher.batches[i] for i in kept_indices]
+        if getattr(sampler, "batch_sampler", None) is not None:
+            from proteinzen.runtime.sampling.dispatcher import TaskBatchSampler
+            sampler.batch_sampler = TaskBatchSampler(dispatcher, sampler.batch_size)
     else:
         if os.path.isdir(zen_cfg['samples_dir']):
             shutil.rmtree(zen_cfg['samples_dir'])
