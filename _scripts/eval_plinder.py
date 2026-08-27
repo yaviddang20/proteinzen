@@ -1002,16 +1002,29 @@ def run_ligand_cond_eval(args):
         sys.exit(f"No PDB files found in {samples_dir}")
     ligand_name = getattr(args, "ligand_name", "LIG")
     continue_run = getattr(args, "continue_run", False)
-    print(f"Evaluating {len(pdb_files)} generated samples for ligand={ligand_name}")
+    num_gpus = getattr(args, "num_gpus", 1)
+    print(f"Evaluating {len(pdb_files)} generated samples for ligand={ligand_name} on {num_gpus} GPU(s)")
 
-    all_results = []
+    # Filter out already-cached samples when continuing
+    todo_files = []
+    cached_results = []
     for pdb_path in pdb_files:
-        stem = pdb_path.stem
-        cache_path = per_sample_dir / f"{stem}.json"
+        cache_path = per_sample_dir / f"{pdb_path.stem}.json"
         if continue_run and cache_path.exists():
-            r = json.loads(cache_path.read_text())
-            all_results.append(r)
-            continue
+            cached_results.append(json.loads(cache_path.read_text()))
+        else:
+            todo_files.append(pdb_path)
+
+    def _ser(v):
+        if isinstance(v, (np.floating, np.float32, np.float64)): return float(v)
+        if isinstance(v, np.integer): return int(v)
+        if isinstance(v, np.bool_): return bool(v)
+        return v
+
+    def _eval_one(pdb_path, gpu_id):
+        import os as _os
+        _os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        stem = pdb_path.stem
         m = _GPU_SUFFIX.search(stem)
         sid = stem[:m.start()] if m else stem.rsplit("_", 1)[0]
         smiles = smiles_by_sid.get(sid, global_smiles)
@@ -1026,27 +1039,67 @@ def run_ligand_cond_eval(args):
             )
         except Exception as e:
             r = {
-                "sample_id": pdb_path.stem, "pdb_path": str(pdb_path), "error": str(e),
+                "sample_id": stem, "pdb_path": str(pdb_path), "error": str(e),
                 "frac_lig_contacted": float("nan"),
                 "plddt": float("nan"), "iptm": float("nan"), "sc_rmsd": float("nan"),
             }
             print(f"  ERROR {pdb_path.name}: {e}")
+        (per_sample_dir / f"{stem}.json").write_text(
+            json.dumps({k: _ser(v) for k, v in r.items()}, indent=2)
+        )
+        return r
 
-        def _ser(v):
-            if isinstance(v, (np.floating, np.float32, np.float64)): return float(v)
-            if isinstance(v, np.integer): return int(v)
-            if isinstance(v, np.bool_): return bool(v)
-            return v
-        cache_path.write_text(json.dumps({k: _ser(v) for k, v in r.items()}, indent=2))
+    if num_gpus <= 1:
+        new_results = []
+        for pdb_path in tqdm(todo_files, desc="eval"):
+            r = _eval_one(pdb_path, gpu_id=0)
+            new_results.append(r)
+            if args.verbose:
+                print(
+                    f"  {pdb_path.name}  n_ca={r.get('n_ca')}  "
+                    f"lig_contact={fmt(r.get('frac_lig_contacted'))}  "
+                    f"plddt={fmt(r.get('plddt'))}  iptm={fmt(r.get('iptm'))}  "
+                    f"sc_rmsd={fmt(r.get('sc_rmsd'))}"
+                )
+    else:
+        import multiprocessing as _mp
+        import queue as _queue
 
-        all_results.append(r)
-        if args.verbose:
-            print(
-                f"  {pdb_path.name}  n_ca={r.get('n_ca')}  "
-                f"lig_contact={fmt(r.get('frac_lig_contacted'))}  "
-                f"plddt={fmt(r.get('plddt'))}  iptm={fmt(r.get('iptm'))}  "
-                f"sc_rmsd={fmt(r.get('sc_rmsd'))}"
-            )
+        work_queue = _mp.Queue()
+        result_queue = _mp.Queue()
+        for pdb_path in todo_files:
+            work_queue.put(pdb_path)
+        # sentinel per worker
+        for _ in range(num_gpus):
+            work_queue.put(None)
+
+        def _worker(gpu_id, work_q, result_q):
+            while True:
+                pdb_path = work_q.get()
+                if pdb_path is None:
+                    break
+                r = _eval_one(pdb_path, gpu_id=gpu_id)
+                result_q.put(r)
+
+        procs = [_mp.Process(target=_worker, args=(i, work_queue, result_queue), daemon=True)
+                 for i in range(num_gpus)]
+        for p in procs:
+            p.start()
+        new_results = []
+        for _ in tqdm(range(len(todo_files)), desc="eval"):
+            r = result_queue.get()
+            new_results.append(r)
+            if args.verbose:
+                print(
+                    f"  n_ca={r.get('n_ca')}  "
+                    f"lig_contact={fmt(r.get('frac_lig_contacted'))}  "
+                    f"plddt={fmt(r.get('plddt'))}  iptm={fmt(r.get('iptm'))}  "
+                    f"sc_rmsd={fmt(r.get('sc_rmsd'))}"
+                )
+        for p in procs:
+            p.join()
+
+    all_results = cached_results + new_results
 
     serial = [{k: _ser(v) for k, v in r.items()} for r in all_results]
     (args.out_dir / "results.json").write_text(json.dumps(serial, indent=2))
@@ -1192,6 +1245,11 @@ def main():
         "--continue-run", action="store_true", default=False,
         help="Skip already-evaluated samples (cached in out_dir/per_sample/). "
              "Default: False (wipe out_dir and rerun everything).",
+    )
+    parser.add_argument(
+        "--num-gpus", type=int, default=1,
+        help="[ligand_cond] Number of GPUs to use for parallel Boltz refolding. "
+             "Each GPU runs as a separate worker process. Default: 1.",
     )
     args = parser.parse_args()
 
