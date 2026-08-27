@@ -1,8 +1,10 @@
 """ Train a model """
+import json
 import logging
 import os
 import glob
 import shutil
+import time
 from typing import Dict, Any
 import functools as fn
 
@@ -156,32 +158,70 @@ def main(sampler,
     continue_run = zen_cfg.get('continue_run', False)
     if continue_run:
         os.makedirs(zen_cfg['samples_dir'], exist_ok=True)
-        # Count already-generated PDBs per task name prefix.
-        # File pattern: {task_name}_gpu{rank}_batch{idx}_idx{sid}.pdb
-        from collections import defaultdict, Counter
-        existing_per_task = defaultdict(int)
-        if os.path.isdir(zen_cfg['samples_dir']):
+        dispatcher = sampler.task_dispatcher
+
+        # Lightning's DDP launcher re-execs this whole script once per GPU rank.
+        # Only rank 0 scans samples_dir and decides which samples to keep — every
+        # rank scanning independently races against other ranks concurrently
+        # writing new PDBs into that same directory, so different ranks could
+        # compute different-length dispatcher.batches, which breaks Lightning's
+        # distributed sampler (it assumes all ranks agree on dataset length).
+        is_rank_zero = (
+            int(os.environ.get("NODE_RANK", 0)) == 0
+            and int(os.environ.get("LOCAL_RANK", 0)) == 0
+        )
+        manifest_path = os.path.join(zen_cfg['out_dir'], "continue_run_kept_indices.json")
+
+        if is_rank_zero:
+            try:
+                os.remove(manifest_path)  # drop any stale manifest from a prior run
+            except FileNotFoundError:
+                pass
+
+            # Count already-generated PDBs per task name prefix.
+            # File pattern: {task_name}_gpu{rank}_batch{idx}_idx{sid}.pdb
+            from collections import defaultdict, Counter
+            existing_per_task = defaultdict(int)
             for fname in os.listdir(zen_cfg['samples_dir']):
                 if not fname.endswith('.pdb') or '_traj' in fname:
                     continue
                 if '_gpu' in fname:
                     task_prefix = fname[:fname.index('_gpu')]
                     existing_per_task[task_prefix] += 1
-        # Count how many samples per task are in the full batch list.
-        dispatcher = sampler.task_dispatcher
-        total_per_task = Counter(s['task'] for s in dispatcher.batches)
-        # Trim dispatcher.batches to only the remaining deficit per task.
-        per_task_kept = defaultdict(int)
-        new_batches = []
-        for s in dispatcher.batches:
-            task = s['task']
-            deficit = total_per_task[task] - existing_per_task[task]
-            if per_task_kept[task] < deficit:
-                new_batches.append(s)
-                per_task_kept[task] += 1
-        log.info(f"continue_run: keeping {len(new_batches)}/{len(dispatcher.batches)} samples "
-                 f"(existing: {dict(existing_per_task)})")
-        dispatcher.batches = new_batches
+            # Count how many samples per task are in the full batch list.
+            total_per_task = Counter(s['task'] for s in dispatcher.batches)
+            # Trim to only the remaining deficit per task.
+            per_task_kept = defaultdict(int)
+            kept_indices = []
+            for i, s in enumerate(dispatcher.batches):
+                task = s['task']
+                deficit = total_per_task[task] - existing_per_task[task]
+                if per_task_kept[task] < deficit:
+                    kept_indices.append(i)
+                    per_task_kept[task] += 1
+            log.info(f"continue_run: keeping {len(kept_indices)}/{len(dispatcher.batches)} samples "
+                     f"(existing: {dict(existing_per_task)})")
+            tmp_path = f"{manifest_path}.tmp{os.getpid()}"
+            with open(tmp_path, "w") as f:
+                json.dump(kept_indices, f)
+            os.replace(tmp_path, manifest_path)  # atomic — never a partial read
+        else:
+            # Give rank 0 a head start to delete any stale manifest and finish
+            # its own scan before we start polling for the fresh one.
+            time.sleep(3.0)
+            timeout_s = 600
+            waited = 0.0
+            while not os.path.exists(manifest_path):
+                time.sleep(1.0)
+                waited += 1.0
+                if waited > timeout_s:
+                    raise RuntimeError(
+                        f"Timed out waiting for rank 0 to write {manifest_path} for continue_run"
+                    )
+            with open(manifest_path) as f:
+                kept_indices = json.load(f)
+
+        dispatcher.batches = [dispatcher.batches[i] for i in kept_indices]
     else:
         if os.path.isdir(zen_cfg['samples_dir']):
             shutil.rmtree(zen_cfg['samples_dir'])
