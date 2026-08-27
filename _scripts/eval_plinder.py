@@ -1262,8 +1262,18 @@ def main():
     continue_run = getattr(args, "continue_run", False)
     if not continue_run and args.out_dir.exists():
         import shutil
-        shutil.rmtree(args.out_dir)
-        print(f"Cleared existing out_dir: {args.out_dir}")
+        # Only remove eval artifacts, never the samples directory
+        samples_dir_default = args.out_dir / "samples"
+        for subdir in ["refold_inputs", "refold_outputs", "per_sample",
+                       "aligned_pocket", "aligned_lig"]:
+            p = args.out_dir / subdir
+            if p.exists():
+                shutil.rmtree(p)
+        for f in ["results.json", "summary.txt"]:
+            p = args.out_dir / f
+            if p.exists():
+                p.unlink()
+        print(f"Cleared eval artifacts in: {args.out_dir}")
 
     if args.task == "protein_cond":
         run_protein_cond_eval(args)
