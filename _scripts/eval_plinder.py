@@ -826,39 +826,58 @@ def run_posebusters(pdb_path: str, smiles: str | None = None) -> dict:
         return {"pb_error": str(e)}
 
 
-def _parse_ca_from_cif(cif_path: Path) -> np.ndarray:
+def _parse_ca_and_lig_from_cif(cif_path: Path):
+    """Return (ca_coords, lig_coords) from a Boltz2 CIF. Protein=chain A, ligand=all other chains (heavy atoms only)."""
     import gemmi
     st = gemmi.read_structure(str(cif_path))
-    ca = []
+    ca, lig = [], []
     for model in st:
         for chain in model:
-            if chain.name != "A":
-                continue
-            for res in chain:
-                for atom in res:
-                    if atom.name == "CA":
+            if chain.name == "A":
+                for res in chain:
+                    for atom in res:
+                        if atom.name == "CA":
+                            p = atom.pos
+                            ca.append([p.x, p.y, p.z])
+                            break
+            else:
+                for res in chain:
+                    for atom in res:
+                        if atom.element == gemmi.Element("H"):
+                            continue
                         p = atom.pos
-                        ca.append([p.x, p.y, p.z])
-                        break
+                        lig.append([p.x, p.y, p.z])
         break
-    return np.array(ca, dtype=np.float64)
+    return np.array(ca, dtype=np.float64), np.array(lig, dtype=np.float64)
 
 
-def _kabsch_rmsd(P: np.ndarray, Q: np.ndarray) -> float:
-    assert P.shape == Q.shape and P.ndim == 2
-    p = P - P.mean(0)
-    q = Q - Q.mean(0)
+def _kabsch_align(P: np.ndarray, Q: np.ndarray):
+    """Kabsch: compute rotation R and translation t such that R @ (P - P_mean).T + Q_mean ~= Q. Returns (R, p_mean, q_mean)."""
+    p_mean = P.mean(0)
+    q_mean = Q.mean(0)
+    p = P - p_mean
+    q = Q - q_mean
     H = p.T @ q
     U, _, Vt = np.linalg.svd(H)
     d = np.linalg.det(Vt.T @ U.T)
     D = np.diag([1, 1, d])
     R = Vt.T @ D @ U.T
-    p_rot = p @ R.T
-    return float(np.sqrt(((p_rot - q) ** 2).sum(-1).mean()))
+    return R, p_mean, q_mean
+
+
+def _apply_kabsch(coords: np.ndarray, R: np.ndarray, p_mean: np.ndarray, q_mean: np.ndarray) -> np.ndarray:
+    return (coords - p_mean) @ R.T + q_mean
+
+
+def _kabsch_rmsd(P: np.ndarray, Q: np.ndarray) -> float:
+    assert P.shape == Q.shape and P.ndim == 2
+    R, p_mean, q_mean = _kabsch_align(P, Q)
+    p_rot = _apply_kabsch(P, R, p_mean, q_mean)
+    return float(np.sqrt(((p_rot - Q) ** 2).sum(-1).mean()))
 
 
 def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
-                  sample_id, boltz_cache):
+                  sample_id, boltz_cache, gen_lig=None):
     import yaml as _yaml
     refold_input_dir.mkdir(parents=True, exist_ok=True)
     refold_output_dir.mkdir(parents=True, exist_ok=True)
@@ -882,10 +901,10 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
             subprocess.run(cmd, check=True, capture_output=True, timeout=600)
         except subprocess.CalledProcessError as e:
             return {"plddt": float("nan"), "iptm": float("nan"), "sc_rmsd": float("nan"),
-                    "boltz_error": e.stderr.decode()[-200:]}
+                    "lig_rmsd": float("nan"), "boltz_error": e.stderr.decode()[-200:]}
         except subprocess.TimeoutExpired:
             return {"plddt": float("nan"), "iptm": float("nan"), "sc_rmsd": float("nan"),
-                    "boltz_error": "timeout"}
+                    "lig_rmsd": float("nan"), "boltz_error": "timeout"}
     conf_files = sorted(pred_dir.glob("confidence_*_model_0.json"))
     plddt, iptm = float("nan"), float("nan")
     if conf_files:
@@ -897,32 +916,141 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
             pass
 
     sc_rmsd = float("nan")
+    lig_rmsd = float("nan")
     cif_files = sorted(pred_dir.glob("*_model_0.cif"))
     if cif_files and len(gen_ca) > 0:
         try:
-            refold_ca = _parse_ca_from_cif(cif_files[0])
+            refold_ca, refold_lig = _parse_ca_and_lig_from_cif(cif_files[0])
             if len(refold_ca) == len(gen_ca):
-                sc_rmsd = _kabsch_rmsd(gen_ca, refold_ca)
+                R, p_mean, q_mean = _kabsch_align(gen_ca, refold_ca)
+                gen_ca_rot = _apply_kabsch(gen_ca, R, p_mean, q_mean)
+                sc_rmsd = float(np.sqrt(((gen_ca_rot - refold_ca) ** 2).sum(-1).mean()))
+                if (gen_lig is not None and len(gen_lig) > 0
+                        and len(refold_lig) > 0 and len(refold_lig) == len(gen_lig)):
+                    gen_lig_rot = _apply_kabsch(gen_lig, R, p_mean, q_mean)
+                    lig_rmsd = float(np.sqrt(((gen_lig_rot - refold_lig) ** 2).sum(-1).mean()))
         except Exception:
             pass
 
-    return {"plddt": plddt, "iptm": iptm, "sc_rmsd": sc_rmsd}
+    return {"plddt": plddt, "iptm": iptm, "sc_rmsd": sc_rmsd, "lig_rmsd": lig_rmsd}
+
+
+def _parse_mpnn_fasta(fasta_path: Path) -> list[str]:
+    """Parse sequences from a ProteinMPNN/LigandMPNN FASTA output (skip first/native entry)."""
+    entries = []
+    if not fasta_path.exists():
+        return entries
+    with open(fasta_path) as fh:
+        header, seq_parts = None, []
+        for line in fh:
+            line = line.strip()
+            if line.startswith(">"):
+                if header is not None:
+                    entries.append("".join(seq_parts))
+                header, seq_parts = line, []
+            else:
+                seq_parts.append(line)
+        if header is not None:
+            entries.append("".join(seq_parts))
+    return entries[1:]  # skip native
+
+
+def run_proteinmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, mpnn_script: str) -> list[str]:
+    """Run ProteinMPNN (no ligand context) and return designed sequences."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fasta_path = out_dir / "seqs" / f"{pdb_path.stem}.fa"
+    if not fasta_path.exists():
+        subprocess.run([
+            sys.executable, mpnn_script,
+            "--pdb_path", str(pdb_path),
+            "--out_folder", str(out_dir),
+            "--num_seq_per_target", str(n_seqs),
+            "--sampling_temp", "0.1",
+            "--batch_size", "1",
+        ], check=True, capture_output=True, timeout=300)
+    return _parse_mpnn_fasta(fasta_path)[:n_seqs]
+
+
+def run_ligandmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, ligandmpnn_script: str) -> list[str]:
+    """Run LigandMPNN (ligand-aware) and return designed sequences."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fasta_path = out_dir / "seqs" / f"{pdb_path.stem}.fa"
+    if not fasta_path.exists():
+        subprocess.run([
+            sys.executable, ligandmpnn_script,
+            "--model_type", "ligand_mpnn",
+            "--pdb_path", str(pdb_path),
+            "--out_folder", str(out_dir),
+            "--num_seq_per_target", str(n_seqs),
+            "--sampling_temp", "0.1",
+            "--batch_size", "1",
+        ], check=True, capture_output=True, timeout=300)
+    return _parse_mpnn_fasta(fasta_path)[:n_seqs]
 
 
 def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_dir,
-                            boltz_cache, run_pb, skip_fold, contact_cutoff=4.0):
+                            boltz_cache, run_pb, skip_fold, contact_cutoff=4.0,
+                            mpnn_script=None, ligandmpnn_script=None,
+                            mpnn_n_seqs=3, mpnn_refold_dir=None):
     prot_all, prot_ca, resnames, lig_coords, lig_elements, _ = parse_pdb_ligand_cond(str(pdb_path))
     sequence = resnames_to_seq(resnames)
     frac_lig_contacted, n_prot_contact = pocket_contacts(prot_all, lig_coords, cutoff=contact_cutoff)
     pb = run_posebusters(str(pdb_path), smiles) if run_pb else {}
+    gen_lig = lig_coords.astype(np.float64) if len(lig_coords) > 0 else None
+
     if skip_fold or not sequence:
-        fold = {"plddt": float("nan"), "iptm": float("nan"), "sc_rmsd": float("nan")}
+        fold = {"plddt": float("nan"), "iptm": float("nan"), "sc_rmsd": float("nan"), "lig_rmsd": float("nan")}
     else:
         fold = run_refolding(
             sequence=sequence, smiles=smiles, gen_ca=prot_ca,
             refold_input_dir=refold_input_dir, refold_output_dir=refold_output_dir,
             sample_id=pdb_path.stem, boltz_cache=boltz_cache,
+            gen_lig=gen_lig,
         )
+
+    def _run_mpnn_case(seqs, refold_smiles, tag, base_dir):
+        results = []
+        for i, seq in enumerate(seqs):
+            fold_i = run_refolding(
+                sequence=seq, smiles=refold_smiles, gen_ca=prot_ca,
+                refold_input_dir=base_dir / "refold_inputs",
+                refold_output_dir=base_dir / "refold_outputs",
+                sample_id=f"{pdb_path.stem}_{tag}{i}",
+                boltz_cache=boltz_cache,
+                gen_lig=gen_lig,
+            )
+            results.append(fold_i)
+        rmsds    = [r["sc_rmsd"]  for r in results if np.isfinite(r.get("sc_rmsd",  float("nan")))]
+        ligrmsds = [r["lig_rmsd"] for r in results if np.isfinite(r.get("lig_rmsd", float("nan")))]
+        plddts   = [r["plddt"]    for r in results if np.isfinite(r.get("plddt",    float("nan")))]
+        iptms    = [r["iptm"]     for r in results if np.isfinite(r.get("iptm",     float("nan")))]
+        return {
+            f"{tag}_sc_rmsd_best":  min(rmsds)               if rmsds    else float("nan"),
+            f"{tag}_sc_rmsd_mean":  float(np.mean(rmsds))    if rmsds    else float("nan"),
+            f"{tag}_lig_rmsd_best": min(ligrmsds)             if ligrmsds else float("nan"),
+            f"{tag}_lig_rmsd_mean": float(np.mean(ligrmsds)) if ligrmsds else float("nan"),
+            f"{tag}_plddt_best":    max(plddts)               if plddts   else float("nan"),
+            f"{tag}_plddt_mean":    float(np.mean(plddts))   if plddts   else float("nan"),
+            f"{tag}_iptm_best":     max(iptms)                if iptms    else float("nan"),
+            f"{tag}_iptm_mean":     float(np.mean(iptms))    if iptms    else float("nan"),
+        }
+
+    pmpnn_metrics, lmpnn_metrics = {}, {}
+    if not skip_fold and len(prot_ca) > 0:
+        base = mpnn_refold_dir or refold_output_dir.parent / "mpnn_refold"
+        if mpnn_script:
+            try:
+                seqs = run_proteinmpnn(pdb_path, base / pdb_path.stem / "proteinmpnn", mpnn_n_seqs, mpnn_script)
+                pmpnn_metrics = _run_mpnn_case(seqs, None, "pmpnn", base / pdb_path.stem / "pmpnn_refold")
+            except Exception as e:
+                print(f"  ProteinMPNN error {pdb_path.name}: {e}")
+        if ligandmpnn_script:
+            try:
+                seqs = run_ligandmpnn(pdb_path, base / pdb_path.stem / "ligandmpnn", mpnn_n_seqs, ligandmpnn_script)
+                lmpnn_metrics = _run_mpnn_case(seqs, smiles, "lmpnn", base / pdb_path.stem / "lmpnn_refold")
+            except Exception as e:
+                print(f"  LigandMPNN error {pdb_path.name}: {e}")
+
     return {
         "sample_id": pdb_path.stem,
         "pdb_path": str(pdb_path),
@@ -933,6 +1061,8 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
         "n_prot_contact_atoms": n_prot_contact,
         **pb,
         **fold,
+        **pmpnn_metrics,
+        **lmpnn_metrics,
     }
 
 
@@ -1036,6 +1166,10 @@ def run_ligand_cond_eval(args):
                 run_pb=run_pb,
                 skip_fold=args.no_fold,
                 contact_cutoff=getattr(args, "contact_cutoff", 4.0),
+                mpnn_script=getattr(args, "mpnn_script", None),
+                ligandmpnn_script=getattr(args, "ligandmpnn_script", None),
+                mpnn_n_seqs=getattr(args, "mpnn_n_seqs", 3),
+                mpnn_refold_dir=args.out_dir / "mpnn_refold",
             )
         except Exception as e:
             r = {
@@ -1104,10 +1238,11 @@ def run_ligand_cond_eval(args):
     serial = [{k: _ser(v) for k, v in r.items()} for r in all_results]
     (args.out_dir / "results.json").write_text(json.dumps(serial, indent=2))
 
-    frac_c  = [r.get("frac_lig_contacted") for r in all_results]
-    plddts  = [r.get("plddt")    for r in all_results]
-    iptms   = [r.get("iptm")     for r in all_results]
-    scrmsds = [r.get("sc_rmsd")  for r in all_results]
+    frac_c   = [r.get("frac_lig_contacted") for r in all_results]
+    plddts   = [r.get("plddt")    for r in all_results]
+    iptms    = [r.get("iptm")     for r in all_results]
+    scrmsds  = [r.get("sc_rmsd")  for r in all_results]
+    ligrmsds = [r.get("lig_rmsd") for r in all_results]
 
     contact_cutoff = getattr(args, "contact_cutoff", 4.0)
     sc_deltas = getattr(args, "delta", [2.0, 5.0])
@@ -1121,7 +1256,7 @@ def run_ligand_cond_eval(args):
     lines.append(f"  frac ligand atoms contacted : {fmt(mean_f(frac_c))}")
     lines.append(f"  samples with >50% lig contact: "
                  f"{sum(1 for v in _finite(frac_c) if v > 0.5)}/{len(all_results)}")
-    lines.append(f"\n--- Refolding self-consistency (Boltz2) ---")
+    lines.append(f"\n--- Refolding self-consistency — model sequence (Boltz2) ---")
     if args.no_fold:
         lines.append("  [skipped — remove --no-fold to enable]")
     elif _finite(plddts):
@@ -1130,8 +1265,39 @@ def run_ligand_cond_eval(args):
         lines.append(f"  scRMSD mean   : {fmt(mean_f(scrmsds))} Å")
         for d in sc_deltas:
             lines.append(f"  COV sc_rmsd < {d:.1f} Å : {cov_f(scrmsds, d)*100:.1f}%")
+        if _finite(ligrmsds):
+            lines.append(f"  ligRMSD mean  : {fmt(mean_f(ligrmsds))} Å")
+            for d in sc_deltas:
+                lines.append(f"  COV lig_rmsd < {d:.1f} Å : {cov_f(ligrmsds, d)*100:.1f}%")
     else:
         lines.append("  [all NaN — check boltz errors in results.json]")
+
+    n_mpnn = getattr(args, "mpnn_n_seqs", 3)
+    for tag, label, with_lig in [
+        ("pmpnn", f"ProteinMPNN → refold w/o ligand (n={n_mpnn})", False),
+        ("lmpnn", f"LigandMPNN  → refold w/  ligand (n={n_mpnn})", True),
+    ]:
+        best_sc    = [r.get(f"{tag}_sc_rmsd_best")  for r in all_results]
+        mean_sc    = [r.get(f"{tag}_sc_rmsd_mean")  for r in all_results]
+        best_lig   = [r.get(f"{tag}_lig_rmsd_best") for r in all_results]
+        mean_lig   = [r.get(f"{tag}_lig_rmsd_mean") for r in all_results]
+        best_plddt = [r.get(f"{tag}_plddt_best")    for r in all_results]
+        avg_plddt  = [r.get(f"{tag}_plddt_mean")    for r in all_results]
+        best_iptm  = [r.get(f"{tag}_iptm_best")     for r in all_results]
+        avg_iptm   = [r.get(f"{tag}_iptm_mean")     for r in all_results]
+        if _finite(best_sc):
+            lines.append(f"\n--- Refolding self-consistency — {label} ---")
+            lines.append(f"  pLDDT best : {fmt(mean_f(best_plddt))}   avg : {fmt(mean_f(avg_plddt))}")
+            lines.append(f"  ipTM  best : {fmt(mean_f(best_iptm))}   avg : {fmt(mean_f(avg_iptm))}")
+            lines.append(f"  scRMSD best : {fmt(mean_f(best_sc))} Å   avg : {fmt(mean_f(mean_sc))} Å")
+            for d in sc_deltas:
+                lines.append(f"  COV sc_rmsd < {d:.1f} Å (best) : {cov_f(best_sc, d)*100:.1f}%")
+                lines.append(f"  COV sc_rmsd < {d:.1f} Å (avg)  : {cov_f(mean_sc, d)*100:.1f}%")
+            if _finite(best_lig):
+                lines.append(f"  ligRMSD best : {fmt(mean_f(best_lig))} Å   avg : {fmt(mean_f(mean_lig))} Å")
+                for d in sc_deltas:
+                    lines.append(f"  COV lig_rmsd < {d:.1f} Å (best) : {cov_f(best_lig, d)*100:.1f}%")
+                    lines.append(f"  COV lig_rmsd < {d:.1f} Å (avg)  : {cov_f(mean_lig, d)*100:.1f}%")
 
     pb_keys = [k for k in (all_results[0] if all_results else {}) if k.startswith("pb_")]
     if pb_keys:
@@ -1231,6 +1397,20 @@ def main():
     parser.add_argument(
         "--delta", type=float, nargs="+", default=[2.0, 5.0],
         help="[ligand_cond] scRMSD thresholds for coverage (Å; default: 2.0 5.0).",
+    )
+    parser.add_argument(
+        "--mpnn-script", type=str, default=None,
+        help="[ligand_cond] Path to protein_mpnn_run.py. Runs ProteinMPNN and refolds "
+             "designed sequences WITHOUT ligand context.",
+    )
+    parser.add_argument(
+        "--ligandmpnn-script", type=str, default=None,
+        help="[ligand_cond] Path to LigandMPNN run.py. Runs LigandMPNN and refolds "
+             "designed sequences WITH ligand context.",
+    )
+    parser.add_argument(
+        "--mpnn-n-seqs", type=int, default=3,
+        help="[ligand_cond] Sequences per structure for ProteinMPNN/LigandMPNN (default: 3).",
     )
     # common
     parser.add_argument(
