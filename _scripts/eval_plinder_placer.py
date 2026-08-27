@@ -31,7 +31,10 @@ from tqdm.auto import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from proteinzen.boltz.data import const
-from proteinzen.runtime.sampling.protein_pocket import load_structure_from_npz
+from proteinzen.runtime.sampling.protein_pocket import (
+    load_structure_from_npz,
+    _crop_protein_to_pocket,
+)
 
 _GPU_SUFFIX = re.compile(r'_gpu\d+_batch\d+_idx\d+')
 
@@ -137,12 +140,13 @@ def eval_sample(pdb_path: str, gt_atom_names: list, gt_coords: np.ndarray):
 # Per-system job
 # ============================================================
 
-def _eval_system_job(system_id: str, pdb_paths: list, npz_path: str):
+def _eval_system_job(system_id: str, pdb_paths: list, npz_path: str, max_protein_residues: int):
     try:
         struct = load_structure_from_npz(npz_path, include_h=False)
+        struct = _crop_protein_to_pocket(struct, max_protein_residues)
         gt_atom_names, gt_coords = extract_gt_protein_atoms(struct)
     except Exception as e:
-        return system_id, [], f"npz load error: {e}"
+        return system_id, [], f"npz load error: {e}", None
 
     records = []
     first_error = None
@@ -214,6 +218,8 @@ def main():
                         help="Directory of generated PDB files")
     parser.add_argument("--data-dir", type=Path, required=True,
                         help="Plinder processed split dir (manifest.json + structures/)")
+    parser.add_argument("--max-protein-residues", type=int, default=20,
+                        help="Pocket crop size used during sampling (default: 20)")
     parser.add_argument("--delta", type=float, nargs="+", default=[1.0, 2.0],
                         help="RMSD thresholds for COV reporting (Å; default: 1.0 2.0)")
     parser.add_argument("--n-jobs", type=int, default=max(1, mp.cpu_count() // 2),
@@ -279,7 +285,7 @@ def main():
 
     # ---- parallel evaluation ----
     results = Parallel(n_jobs=args.n_jobs, backend="loky")(
-        delayed(_eval_system_job)(sid, pdbs, npz)
+        delayed(_eval_system_job)(sid, pdbs, npz, args.max_protein_residues)
         for sid, pdbs, npz in tqdm(jobs, desc="evaluating")
     )
 
