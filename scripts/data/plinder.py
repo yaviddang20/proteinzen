@@ -247,6 +247,110 @@ def _drop_chains(structure: "Structure", auth_seq_map: Optional[list], keep_mask
     return new_structure, new_auth_seq_map
 
 
+_WATER_RESNAMES = {"HOH", "DOD"}
+
+
+def split_out_waters(structure: "Structure", auth_seq_map: Optional[list] = None):
+    """Pull water (HOH/DOD) chains out of the structure, so every existing
+    ligand-identification code path (chain-count filters, SDF matching,
+    rot-bond computation, interaction-mask, fusion) never has to know water
+    exists — it only ever sees the water-free structure. Returns
+    (structure_without_water, auth_seq_map_without_water, water_chains), where
+    water_chains is [(chain_row, atoms, residues, auth_entry), ...] in original
+    chain order, for reattach_waters to append back onto the fully-processed
+    structure at the very end.
+    """
+    nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
+    is_water = np.zeros(len(structure.chains), dtype=bool)
+    for i, chain in enumerate(structure.chains):
+        if int(chain["mol_type"]) != nonpolymer_id:
+            continue
+        r0, rn = int(chain["res_idx"]), int(chain["res_num"])
+        if rn == 0:
+            continue
+        names = {str(structure.residues[r]["name"]).strip() for r in range(r0, r0 + rn)}
+        if names and names <= _WATER_RESNAMES:
+            is_water[i] = True
+
+    if not is_water.any():
+        return structure, auth_seq_map, []
+
+    water_chains = []
+    for i in np.nonzero(is_water)[0]:
+        chain = structure.chains[i]
+        a0, an = int(chain["atom_idx"]), int(chain["atom_num"])
+        r0, rn = int(chain["res_idx"]), int(chain["res_num"])
+        auth_entry = auth_seq_map[i] if auth_seq_map is not None else None
+        water_chains.append((
+            chain.copy(),
+            structure.atoms[a0:a0 + an].copy(),
+            structure.residues[r0:r0 + rn].copy(),
+            auth_entry,
+        ))
+
+    new_structure, new_auth_seq_map = _drop_chains(structure, auth_seq_map, ~is_water)
+    return new_structure, new_auth_seq_map, water_chains
+
+
+def reattach_waters(structure: "Structure", auth_seq_map: Optional[list], water_chains: list):
+    """Append previously split-out water chains back onto the (by now fully
+    processed — fused, H-inserted, etc.) structure, with fresh atom/residue/
+    chain indices appended at the end. Mirrors the concatenation-and-reindex
+    pattern used by fuse_protein_chains/_drop_chains.
+    """
+    if not water_chains:
+        return structure, auth_seq_map
+
+    atom_cursor = len(structure.atoms)
+    res_cursor = len(structure.residues)
+    chain_cursor = len(structure.chains)
+
+    new_atom_chunks = [structure.atoms]
+    new_res_chunks = [structure.residues]
+    new_chain_rows = list(structure.chains)
+    new_auth_entries = []
+
+    for chain, atoms, residues, auth_entry in water_chains:
+        atoms = atoms.copy()
+        residues = residues.copy()
+        shift = atom_cursor - int(chain["atom_idx"])
+        if len(residues):
+            residues["atom_idx"] += shift
+            residues["atom_center"] += shift
+            residues["atom_disto"] += shift
+
+        new_chain = chain.copy()
+        new_chain["atom_idx"] = atom_cursor
+        new_chain["res_idx"] = res_cursor
+        new_chain["asym_id"] = chain_cursor
+
+        new_atom_chunks.append(atoms)
+        new_res_chunks.append(residues)
+        new_chain_rows.append(new_chain)
+        new_auth_entries.append(auth_entry)
+
+        atom_cursor += len(atoms)
+        res_cursor += len(residues)
+        chain_cursor += 1
+
+    new_atoms = np.concatenate(new_atom_chunks, dtype=structure.atoms.dtype)
+    new_residues = np.concatenate(new_res_chunks, dtype=structure.residues.dtype)
+    new_chains = np.array([tuple(r) for r in new_chain_rows], dtype=structure.chains.dtype)
+
+    new_structure = replace(
+        structure,
+        atoms=new_atoms,
+        residues=new_residues,
+        chains=new_chains,
+        mask=np.ones(len(new_chains), dtype=bool),
+    )
+    new_auth_seq_map = auth_seq_map
+    if auth_seq_map is not None:
+        new_auth_seq_map = list(auth_seq_map) + new_auth_entries
+
+    return new_structure, new_auth_seq_map
+
+
 def filter_noncontacting_protein_chains(
     structure: "Structure",
     auth_seq_map: Optional[list] = None,
@@ -663,7 +767,7 @@ def is_valid_ligand(mol: Chem.Mol) -> bool:
     # Minimum size
     n_heavy = mol.GetNumAtoms()
     n_carbon = sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() == 6)
-    if n_heavy < 5 or n_carbon < 2:
+    if n_heavy < 5 or n_carbon < 5:
         return False
 
     # Only allow drug-like organic elements; excludes metals and wildcard atoms
@@ -792,6 +896,7 @@ def process_system(
     max_resolution: Optional[float] = 9.0,
     force: bool = False,
     require_quality_pass: bool = False,
+    include_waters: bool = False,
 ) -> None:
     mid = system_mid(system_id)
     struct_path = outdir / "structures" / mid / f"{system_id}.npz"
@@ -822,13 +927,22 @@ def process_system(
 
     try:
         # Parse full complex (protein + ligand chains via CCD)
-        parsed = parse_mmcif(str(cif_path), components=ccd, ignore_connections=False, use_assembly=False)
+        parsed = parse_mmcif(str(cif_path), components=ccd, ignore_connections=False, use_assembly=False,
+                              keep_waters=include_waters)
         structure = parsed.data
         auth_seq_map = parsed.auth_seq_map
     except Exception:
         traceback.print_exc()
         print(f"Failed to parse {system_id}")
         return "parse_error"
+
+    # Water chains are set aside immediately so every downstream ligand-
+    # identification step (chain-count filter, SDF matching, rot-bond data,
+    # interaction mask, fusion) operates exactly as if water were absent —
+    # they get reattached at the very end, right before saving.
+    water_chains = []
+    if include_waters:
+        structure, auth_seq_map, water_chains = split_out_waters(structure, auth_seq_map)
 
     # Skip systems with nucleic acid content (DNA/RNA — not supported by tokenizer)
     # Check both mol_type (correctly parsed chains) and residue names (gemmi misclassification)
@@ -934,6 +1048,18 @@ def process_system(
                 if cdist(present_coords, lig_coords).min() < const.atom_interface_cutoff:
                     interaction_residue_mask[r] = True
 
+    # Reattach water now — after every ligand-identification step (which never
+    # saw it), before ChainInfo/Record construction (which must list every
+    # chain in the final structure, in the same order, for datamodule.py's
+    # positional record.chains <-> struct.chains masking to stay correct).
+    if water_chains:
+        n_res_before_water = len(structure.residues)
+        structure, auth_seq_map = reattach_waters(structure, auth_seq_map, water_chains)
+        n_new_res = len(structure.residues) - n_res_before_water
+        interaction_residue_mask = np.concatenate(
+            [interaction_residue_mask, np.zeros(n_new_res, dtype=bool)]
+        )
+
     # Build ChainInfo list
     cluster_id = clusters.get(system_id, -1)
     affinity_chain_id = None
@@ -1034,7 +1160,7 @@ _worker_state = {}
 
 def _worker_init(plinder_dir, outdir, clusters, annotations, ccd_path, pocket_data_dir=None,
                   allowed_protein_chain_counts=(1,), fuse_multi_chain=False, max_ligand_atoms=200,
-                  max_resolution=9.0, force=False, require_quality_pass=False):
+                  max_resolution=9.0, force=False, require_quality_pass=False, include_waters=False):
     """Load large shared data once per worker process."""
     global _worker_state
     with open(ccd_path, "rb") as f:
@@ -1052,6 +1178,7 @@ def _worker_init(plinder_dir, outdir, clusters, annotations, ccd_path, pocket_da
         "max_resolution": max_resolution,
         "force": force,
         "require_quality_pass": require_quality_pass,
+        "include_waters": include_waters,
     }
 
 
@@ -1068,6 +1195,7 @@ def process_system_worker(system_id: str) -> tuple[str, Optional[str]]:
             max_resolution=s.get("max_resolution", 9.0),
             force=s.get("force", False),
             require_quality_pass=s.get("require_quality_pass", False),
+            include_waters=s.get("include_waters", False),
         )
         return system_id, reason
     except Exception:
@@ -1178,11 +1306,12 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> int:
         max_resolution = None  # disabled
     force = bool(getattr(args, "overwrite", False))
     require_quality_pass = bool(getattr(args, "require_quality_pass", False))
+    include_waters = bool(getattr(args, "include_waters", False))
 
     if num_processes > 1:
         initargs = (plinder_dir, outdir, clusters, annotations, args.ccd_path, pocket_data_dir,
                     allowed_protein_chain_counts, fuse_multi_chain, max_ligand_atoms, max_resolution, force,
-                    require_quality_pass)
+                    require_quality_pass, include_waters)
         with multiprocessing.Pool(
             processes=num_processes,
             initializer=_worker_init,
@@ -1192,7 +1321,7 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> int:
     else:
         _worker_init(plinder_dir, outdir, clusters, annotations, args.ccd_path, pocket_data_dir,
                       allowed_protein_chain_counts, fuse_multi_chain, max_ligand_atoms, max_resolution, force,
-                      require_quality_pass)
+                      require_quality_pass, include_waters)
         results = [process_system_worker(sid) for sid in tqdm(system_ids)]
 
     # Tally filter reasons
@@ -1266,6 +1395,14 @@ if __name__ == "__main__":
                              "system_pass_validation_criteria record field is trivially True, which makes the "
                              "training-time gate_low_quality_t soft-gate a no-op — use one or the other, not "
                              "both, unless you have a specific reason to.")
+    parser.add_argument("--include-waters", action="store_true", default=False,
+                         help="Keep PLIP-detected interacting waters (residue HOH/DOD) as extra NONPOLYMER "
+                              "chains, instead of stripping all water unconditionally (the default, to avoid "
+                              "changing existing datasets/tasks). Waters are excluded from every "
+                              "ligand-identification step (chain-count filter, SDF matching, rot-bond data, "
+                              "interaction mask, fusion) and only reattached at the very end, so they never get "
+                              "mistaken for the ligand. Whether they get noised during training is a separate, "
+                              "task-level flag (noise_waters on SidechainRedesign/PocketPLACERTraining).")
     parser.add_argument("--overwrite", action="store_true", default=False,
                         help="Force reprocessing of every system (ignore cached output files) and, at the end "
                              "of a full/unrestricted run, delete any on-disk structures/records/auth_maps files "
