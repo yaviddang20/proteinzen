@@ -13,6 +13,9 @@ from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
+# Loaded lookup-table files, keyed by absolute cache path.
+_LOAD_CACHE_MEMO: Dict[str, Dict[str, torch.Tensor]] = {}
+
 
 def scale_rotmat(
     rotation_matrix: torch.Tensor, scalar: torch.Tensor, tol: float = 1e-7
@@ -571,10 +574,15 @@ class SO3LookupCache:
             Dictionary of loaded data tensors.
         """
         if self.path_exists:
+            cache_key = os.path.abspath(self.cache_path)
+            cached = _LOAD_CACHE_MEMO.get(cache_key)
+            if cached is not None:
+                return cached
             # Load data and convert to torch tensors.
             npz_data = np.load(self.cache_path)
             torch_dict = {f: torch.from_numpy(npz_data[f]) for f in npz_data.files}
             logger.info(f"Data loaded from {self.cache_path}")
+            _LOAD_CACHE_MEMO[cache_key] = torch_dict
             return torch_dict
         else:
             raise ValueError(f"No cache data found at {self.cache_path}.")
