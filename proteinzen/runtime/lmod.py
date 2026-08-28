@@ -1225,6 +1225,8 @@ class BiomoleculeModule(L.LightningModule):
             rots=ru.Rotation(rot_mats=rotmats_t), trans=trans_t
         ).to_tensor_7()
 
+        initial_seq_noising_mask = batch['token']['seq_noising_mask'].clone()
+
         integrator = EulerIntegrator(
             wrapped_model=BaseModelForward(model),
             diffeq=BaseEulerODEStep(),
@@ -1282,7 +1284,7 @@ class BiomoleculeModule(L.LightningModule):
 
         pred_seq_all = final_denoiser_out['pred_seq']
         gt_seq_all = batch['token']['res_type']
-        seq_noising_mask_all = batch['token']['seq_noising_mask']
+        seq_noising_mask_all = initial_seq_noising_mask
 
         # unrestricted (all rigids, not just heavy atoms) — matches pred_trans_mse's
         # masking in multiframe.py, as opposed to noised_heavy_mask_t which matches
