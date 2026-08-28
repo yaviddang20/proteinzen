@@ -23,8 +23,7 @@ echo "=== Installing Python deps ==="
 micromamba run -n mpnn pip install prody ml-collections
 
 echo "=== Downloading LigandMPNN model weights ==="
-micromamba run -n mpnn python "${DIR}/LigandMPNN/get_model_params.py" \
-    --folder "${DIR}/LigandMPNN/model_params"
+bash "${DIR}/LigandMPNN/get_model_params.sh" "${DIR}/LigandMPNN/model_params"
 
 echo "=== Done. Test with: ==="
 echo "  micromamba run -n mpnn python ${DIR}/LigandMPNN/run.py --help"
