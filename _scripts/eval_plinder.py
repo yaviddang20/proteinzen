@@ -44,18 +44,9 @@ _GPU_SUFFIX = re.compile(r'_gpu\d+_batch\d+_idx\d+')
 _MPNN_ENV   = "mpnn"
 
 
-_BOLTZ_BIN   = None  # resolved once at startup
-_MPNN_PYTHON = None  # resolved once at startup
-
-
-def _resolve_bin(env_name: str, bin_name: str) -> str:
-    """Resolve binary path in a micromamba env once, so callers can invoke it directly."""
-    r = subprocess.run(["micromamba", "run", "-n", env_name, "which", bin_name],
-                       capture_output=True, text=True)
-    path = r.stdout.strip()
-    if not path:
-        raise RuntimeError(f"'{bin_name}' not found in micromamba env '{env_name}'")
-    return path
+_MAMBA_ROOT  = Path(os.environ.get("MAMBA_ROOT_PREFIX", Path.home() / "micromamba"))
+_BOLTZ_BIN   = str(_MAMBA_ROOT / "envs" / "boltz" / "bin" / "boltz")
+_MPNN_PYTHON = str(_MAMBA_ROOT / "envs" / "mpnn"  / "bin" / "python")
 
 try:
     from posebusters import PoseBusters
@@ -913,12 +904,12 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
 
     if not pred_dir.exists():
         input_yaml.write_text(_yaml.dump(boltz_input, default_flow_style=False))
-        cmd = [_BOLTZ_BIN or "boltz", "predict", str(input_yaml), "--out_dir", str(out_dir),
-               "--override"]
-        if boltz_cache:
-            cmd += ["--cache", str(boltz_cache)]
+        cmd = (f"micromamba activate boltz && boltz predict {input_yaml}"
+               f" --out_dir {out_dir} --override"
+               + (f" --cache {boltz_cache}" if boltz_cache else ""))
         try:
-            subprocess.run(cmd, check=True, capture_output=True, timeout=600)
+            subprocess.run(cmd, shell=True, executable="/bin/bash", check=True,
+                           capture_output=True, timeout=600)
         except subprocess.CalledProcessError as e:
             return {"plddt": float("nan"), "iptm": float("nan"), "sc_rmsd": float("nan"),
                     "lig_rmsd": float("nan"), "boltz_error": e.stderr.decode()[-200:]}
@@ -980,17 +971,14 @@ def _run_ligandmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, script: str, mod
     out_dir.mkdir(parents=True, exist_ok=True)
     fasta_path = out_dir / "seqs" / f"{pdb_path.stem}.fa"
     if not fasta_path.exists():
-        subprocess.run([
-            _MPNN_PYTHON or "python",
-            script,
-            "--model_type", model_type,
-            "--pdb_path", str(pdb_path),
-            "--out_folder", str(out_dir),
-            "--number_of_batches", str(n_seqs),
-            "--temperature", "0.1",
-            "--batch_size", "1",
-            "--verbose", "0",
-        ], check=True, timeout=300, cwd=Path(script).parent)
+        cmd = (f"micromamba activate {_MPNN_ENV} && python {script}"
+               f" --model_type {model_type}"
+               f" --pdb_path {pdb_path}"
+               f" --out_folder {out_dir}"
+               f" --number_of_batches {n_seqs}"
+               f" --temperature 0.1 --batch_size 1 --verbose 0")
+        subprocess.run(cmd, shell=True, executable="/bin/bash", check=True,
+                       timeout=300, cwd=Path(script).parent)
     return _parse_mpnn_fasta(fasta_path)[:n_seqs]
 
 
@@ -1150,10 +1138,7 @@ def run_ligand_cond_eval(args):
     if not args.no_posebusters and not HAS_POSEBUSTERS:
         print("Warning: posebusters not installed — skipping (pip install posebusters to enable).")
 
-    # Resolve env binaries once up front so workers call them directly (no micromamba lock)
-    global _BOLTZ_BIN, _MPNN_PYTHON
-    _BOLTZ_BIN   = _resolve_bin("boltz",   "boltz")
-    _MPNN_PYTHON = _resolve_bin(_MPNN_ENV, "python")
+
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     refold_input_dir  = args.out_dir / "refold_inputs"
