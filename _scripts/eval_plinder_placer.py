@@ -5,8 +5,10 @@ The placer task fixes the backbone and generates sidechains.  Each sample PDB
 contains the predicted all-atom structure; GT is loaded from the processed npz.
 
 Metrics:
-  sc_rmsd  : Kabsch-aligned (on Cα) RMSD over sidechain heavy atoms (non N/CA/C/O)
-  COV @1Å / @2Å : fraction of samples with sc_rmsd below threshold
+  sc_rmsd       : Kabsch-aligned (on Cα) RMSD over sidechain heavy atoms (non N/CA/C/O)
+  lig_rmsd      : same alignment applied to ligand heavy atoms
+  combined_rmsd : sidechain + ligand atoms together under same alignment
+  COV @1Å / @2Å : fraction of samples below threshold
 
 Usage
 -----
@@ -68,13 +70,17 @@ def pos_rmsd(A: np.ndarray, B: np.ndarray) -> float:
 # GT extraction from npz
 # ============================================================
 
-def extract_gt_protein_atoms(struct):
-    """Return (atom_names, coords) for present heavy protein atoms in struct order."""
-    protein_id = const.chain_type_ids["PROTEIN"]
-    names, coords = [], []
+def _decode_atom_name(name_bytes) -> str:
+    return "".join(chr(int(c) + 32) for c in name_bytes if c != 0)
+
+
+def extract_gt_atoms(struct):
+    """Return (prot_atom_names, prot_coords, lig_coords) for present heavy atoms."""
+    protein_id    = const.chain_type_ids["PROTEIN"]
+    nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
+    prot_names, prot_coords, lig_coords = [], [], []
     for chain in struct.chains[struct.mask]:
-        if int(chain["mol_type"]) != protein_id:
-            continue
+        mol = int(chain["mol_type"])
         a0 = int(chain["atom_idx"])
         atoms = struct.atoms[a0 : a0 + int(chain["atom_num"])]
         for atom in atoms:
@@ -82,58 +88,79 @@ def extract_gt_protein_atoms(struct):
                 continue
             if atom["element"] == 1:  # hydrogen
                 continue
-            name = "".join(chr(int(c) + 32) for c in atom["name"] if c != 0)
-            names.append(name)
-            coords.append(atom["coords"].astype(np.float64))
-    return names, (np.stack(coords) if coords else np.zeros((0, 3), dtype=np.float64))
+            xyz = atom["coords"].astype(np.float64)
+            if mol == protein_id:
+                prot_names.append(_decode_atom_name(atom["name"]))
+                prot_coords.append(xyz)
+            elif mol == nonpolymer_id:
+                lig_coords.append(xyz)
+    prot_arr = np.stack(prot_coords) if prot_coords else np.zeros((0, 3), dtype=np.float64)
+    lig_arr  = np.stack(lig_coords)  if lig_coords  else np.zeros((0, 3), dtype=np.float64)
+    return prot_names, prot_arr, lig_arr
 
 
 # ============================================================
-# PDB parsing — ATOM records only, flat coord array
+# PDB parsing — ATOM and HETATM coords in file order
 # ============================================================
 
-def parse_pdb_prot_coords(pdb_path: str) -> np.ndarray:
-    """Return (N, 3) float64 of all ATOM-record coords in file order."""
-    coords = []
+def parse_pdb_coords(pdb_path: str):
+    """Return (prot_coords, lig_coords) from ATOM and HETATM records."""
+    prot, lig = [], []
     with open(pdb_path) as fh:
         for line in fh:
-            if line[:6].rstrip() != "ATOM":
-                continue
+            rec = line[:6].rstrip()
             try:
-                coords.append([float(line[30:38]), float(line[38:46]), float(line[46:54])])
-            except ValueError:
-                pass
-    return np.array(coords, dtype=np.float64) if coords else np.zeros((0, 3), dtype=np.float64)
+                xyz = [float(line[30:38]), float(line[38:46]), float(line[46:54])]
+            except (ValueError, IndexError):
+                continue
+            if rec == "ATOM":
+                prot.append(xyz)
+            elif rec == "HETATM":
+                lig.append(xyz)
+    prot_arr = np.array(prot, dtype=np.float64) if prot else np.zeros((0, 3), dtype=np.float64)
+    lig_arr  = np.array(lig,  dtype=np.float64) if lig  else np.zeros((0, 3), dtype=np.float64)
+    return prot_arr, lig_arr
 
 
 # ============================================================
 # Per-sample evaluation
 # ============================================================
 
-def eval_sample(pdb_path: str, gt_atom_names: list, gt_coords: np.ndarray):
-    gen_coords = parse_pdb_prot_coords(pdb_path)
+def eval_sample(pdb_path: str, gt_prot_names: list, gt_prot: np.ndarray, gt_lig: np.ndarray):
+    gen_prot, gen_lig = parse_pdb_coords(pdb_path)
 
-    if len(gen_coords) != len(gt_coords):
-        raise ValueError(
-            f"atom count mismatch: gen={len(gen_coords)} gt={len(gt_coords)}"
-        )
-    if len(gt_coords) == 0:
+    if len(gen_prot) != len(gt_prot):
+        raise ValueError(f"protein atom count mismatch: gen={len(gen_prot)} gt={len(gt_prot)}")
+    if len(gt_prot) == 0:
         raise ValueError("no protein atoms in GT")
 
-    is_bb = np.array([n in _BACKBONE_ATOMS for n in gt_atom_names], dtype=bool)
-    is_ca = np.array([n == "CA" for n in gt_atom_names], dtype=bool)
-    n_sc = int((~is_bb).sum())
+    is_bb = np.array([n in _BACKBONE_ATOMS for n in gt_prot_names], dtype=bool)
+    is_ca = np.array([n == "CA" for n in gt_prot_names], dtype=bool)
 
     if is_ca.sum() < 3:
         raise ValueError(f"too few Cα atoms for alignment: {is_ca.sum()}")
-    if n_sc == 0:
-        raise ValueError("no sidechain atoms (all Gly?)")
 
-    R, t = kabsch(gen_coords[is_ca], gt_coords[is_ca])
-    gen_aligned = apply_transform(gen_coords, R, t)
+    R, t = kabsch(gen_prot[is_ca], gt_prot[is_ca])
+    gen_prot_aligned = apply_transform(gen_prot, R, t)
 
-    rmsd = pos_rmsd(gt_coords[~is_bb], gen_aligned[~is_bb])
-    return {"sc_rmsd": rmsd, "n_sc_atoms": n_sc}
+    n_sc = int((~is_bb).sum())
+    sc_rmsd = pos_rmsd(gt_prot[~is_bb], gen_prot_aligned[~is_bb]) if n_sc > 0 else float("nan")
+
+    lig_rmsd = float("nan")
+    combined_rmsd = float("nan")
+    if len(gt_lig) > 0 and len(gen_lig) == len(gt_lig):
+        gen_lig_aligned = apply_transform(gen_lig, R, t)
+        lig_rmsd = pos_rmsd(gt_lig, gen_lig_aligned)
+        if n_sc > 0:
+            gt_combined  = np.concatenate([gt_prot[~is_bb],          gt_lig],          axis=0)
+            gen_combined = np.concatenate([gen_prot_aligned[~is_bb],  gen_lig_aligned],  axis=0)
+            combined_rmsd = pos_rmsd(gt_combined, gen_combined)
+    elif len(gt_lig) > 0:
+        lig_rmsd = float("inf")
+        combined_rmsd = float("inf")
+
+    return {"sc_rmsd": sc_rmsd, "lig_rmsd": lig_rmsd, "combined_rmsd": combined_rmsd,
+            "n_sc_atoms": n_sc, "n_lig_atoms": len(gt_lig)}
 
 
 # ============================================================
@@ -144,7 +171,7 @@ def _eval_system_job(system_id: str, pdb_paths: list, npz_path: str, max_protein
     try:
         struct = load_structure_from_npz(npz_path, include_h=False)
         struct = _crop_protein_to_pocket(struct, max_protein_residues)
-        gt_atom_names, gt_coords = extract_gt_protein_atoms(struct)
+        gt_prot_names, gt_prot, gt_lig = extract_gt_atoms(struct)
     except Exception as e:
         return system_id, [], f"npz load error: {e}", None
 
@@ -152,12 +179,15 @@ def _eval_system_job(system_id: str, pdb_paths: list, npz_path: str, max_protein
     first_error = None
     for idx, p in enumerate(sorted(pdb_paths)):
         try:
-            r = eval_sample(str(p), gt_atom_names, gt_coords)
+            r = eval_sample(str(p), gt_prot_names, gt_prot, gt_lig)
             records.append({
                 "system_id": system_id,
                 "sample_idx": idx,
                 "sc_rmsd": r["sc_rmsd"],
+                "lig_rmsd": r["lig_rmsd"],
+                "combined_rmsd": r["combined_rmsd"],
                 "n_sc_atoms": r["n_sc_atoms"],
+                "n_lig_atoms": r["n_lig_atoms"],
                 "note": "",
             })
         except Exception as e:
@@ -168,7 +198,10 @@ def _eval_system_job(system_id: str, pdb_paths: list, npz_path: str, max_protein
                 "system_id": system_id,
                 "sample_idx": idx,
                 "sc_rmsd": float("inf"),
+                "lig_rmsd": float("inf"),
+                "combined_rmsd": float("inf"),
                 "n_sc_atoms": 0,
+                "n_lig_atoms": 0,
                 "note": note,
             })
     return system_id, records, None, first_error
@@ -307,16 +340,21 @@ def main():
         if first_err and first_errors_shown < 5:
             print(f"  [sample error] {sid} — {first_err}")
             first_errors_shown += 1
-        if args.verbose:
+            if args.verbose:
             for r in sys_records:
                 if r["note"]:
                     print(f"  [{sid}] sample {r['sample_idx']}: {r['note']}")
-            vals = [r["sc_rmsd"] for r in sys_records if np.isfinite(r["sc_rmsd"])]
-            if vals:
-                print(
-                    f"  {sid}: {len(vals)} samples, "
-                    f"sc_rmsd min={min(vals):.3f} mean={np.mean(vals):.3f} Å"
-                )
+            sc_vals   = [r["sc_rmsd"]       for r in sys_records if np.isfinite(r["sc_rmsd"])]
+            lig_vals  = [r["lig_rmsd"]      for r in sys_records if np.isfinite(r["lig_rmsd"])]
+            comb_vals = [r["combined_rmsd"] for r in sys_records if np.isfinite(r["combined_rmsd"])]
+            if sc_vals:
+                msg = (f"  {sid}: {len(sc_vals)} samples, "
+                       f"sc min={min(sc_vals):.3f} mean={np.mean(sc_vals):.3f} Å")
+                if lig_vals:
+                    msg += f"  lig min={min(lig_vals):.3f} mean={np.mean(lig_vals):.3f} Å"
+                if comb_vals:
+                    msg += f"  comb min={min(comb_vals):.3f} mean={np.mean(comb_vals):.3f} Å"
+                print(msg)
 
         records_by_system[sid] = sys_records
         all_records.extend(sys_records)
@@ -329,35 +367,45 @@ def main():
         return
 
     # ---- aggregate ----
-    all_sc   = [r["sc_rmsd"] for r in all_records]
-    sys_min  = _min_per_system(records_by_system, "sc_rmsd")
-    sys_mean = _mean_per_system(records_by_system, "sc_rmsd")
+    all_sc   = [r["sc_rmsd"]       for r in all_records]
+    all_lig  = [r["lig_rmsd"]      for r in all_records]
+    all_comb = [r["combined_rmsd"] for r in all_records]
+
+    sys_min_sc    = _min_per_system(records_by_system, "sc_rmsd")
+    sys_mean_sc   = _mean_per_system(records_by_system, "sc_rmsd")
+    sys_min_lig   = _min_per_system(records_by_system, "lig_rmsd")
+    sys_mean_lig  = _mean_per_system(records_by_system, "lig_rmsd")
+    sys_min_comb  = _min_per_system(records_by_system, "combined_rmsd")
+    sys_mean_comb = _mean_per_system(records_by_system, "combined_rmsd")
 
     deltas = args.delta
     n_sys  = len(records_by_system)
     n_samp = sum(1 for v in all_sc if np.isfinite(v))
 
+    def _block(label, sc_vals, lig_vals, comb_vals):
+        print(f"\n--- {label} ---")
+        print(f"  n              : {len([v for v in sc_vals if np.isfinite(v)])}")
+        print(f"  sc_rmsd  mean  : {mean_finite(sc_vals):.3f} Å")
+        for d in deltas:
+            print(f"  COV sc  < {d:.1f}Å  : {cov(sc_vals, d)*100:.1f}%")
+        n_lig = sum(1 for v in lig_vals if np.isfinite(v))
+        if n_lig:
+            print(f"  lig_rmsd mean  : {mean_finite(lig_vals):.3f} Å")
+            for d in deltas:
+                print(f"  COV lig < {d:.1f}Å  : {cov(lig_vals, d)*100:.1f}%")
+        n_comb = sum(1 for v in comb_vals if np.isfinite(v))
+        if n_comb:
+            print(f"  combined mean  : {mean_finite(comb_vals):.3f} Å")
+            for d in deltas:
+                print(f"  COV comb< {d:.1f}Å  : {cov(comb_vals, d)*100:.1f}%")
+
     print(f"\n{'='*60}")
     print(f"  PLINDER PLACER EVAL  —  {n_sys} systems,  {n_samp} samples")
     print(f"{'='*60}")
 
-    print(f"\n--- Per-sample (all samples pooled) ---")
-    print(f"  n            : {n_samp}")
-    print(f"  sc_rmsd mean : {mean_finite(all_sc):.3f} Å")
-    for d in deltas:
-        print(f"  COV < {d:.1f}Å     : {cov(all_sc, d)*100:.1f}%")
-
-    print(f"\n--- Per-system best sample (min sc_rmsd) ---")
-    print(f"  n            : {len(sys_min)}")
-    print(f"  sc_rmsd mean : {mean_finite(sys_min):.3f} Å")
-    for d in deltas:
-        print(f"  COV < {d:.1f}Å     : {cov(sys_min, d)*100:.1f}%")
-
-    print(f"\n--- Per-system mean sample ---")
-    print(f"  n            : {len(sys_mean)}")
-    print(f"  sc_rmsd mean : {mean_finite(sys_mean):.3f} Å")
-    for d in deltas:
-        print(f"  COV < {d:.1f}Å     : {cov(sys_mean, d)*100:.1f}%")
+    _block("Per-sample (all samples pooled)",        all_sc,       all_lig,      all_comb)
+    _block("Per-system best sample (min sc_rmsd)",   sys_min_sc,   sys_min_lig,  sys_min_comb)
+    _block("Per-system mean sample",                 sys_mean_sc,  sys_mean_lig, sys_mean_comb)
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -366,16 +414,28 @@ def main():
             "n_samples": n_samp,
             "deltas": deltas,
             "per_sample": {
-                "sc_rmsd_mean": mean_finite(all_sc),
-                "cov": {f"{d:.1f}": cov(all_sc, d) for d in deltas},
+                "sc_rmsd_mean":       mean_finite(all_sc),
+                "lig_rmsd_mean":      mean_finite(all_lig),
+                "combined_rmsd_mean": mean_finite(all_comb),
+                "cov_sc":   {f"{d:.1f}": cov(all_sc,   d) for d in deltas},
+                "cov_lig":  {f"{d:.1f}": cov(all_lig,  d) for d in deltas},
+                "cov_comb": {f"{d:.1f}": cov(all_comb, d) for d in deltas},
             },
             "per_system_best": {
-                "sc_rmsd_mean": mean_finite(sys_min),
-                "cov": {f"{d:.1f}": cov(sys_min, d) for d in deltas},
+                "sc_rmsd_mean":       mean_finite(sys_min_sc),
+                "lig_rmsd_mean":      mean_finite(sys_min_lig),
+                "combined_rmsd_mean": mean_finite(sys_min_comb),
+                "cov_sc":   {f"{d:.1f}": cov(sys_min_sc,   d) for d in deltas},
+                "cov_lig":  {f"{d:.1f}": cov(sys_min_lig,  d) for d in deltas},
+                "cov_comb": {f"{d:.1f}": cov(sys_min_comb, d) for d in deltas},
             },
             "per_system_mean": {
-                "sc_rmsd_mean": mean_finite(sys_mean),
-                "cov": {f"{d:.1f}": cov(sys_mean, d) for d in deltas},
+                "sc_rmsd_mean":       mean_finite(sys_mean_sc),
+                "lig_rmsd_mean":      mean_finite(sys_mean_lig),
+                "combined_rmsd_mean": mean_finite(sys_mean_comb),
+                "cov_sc":   {f"{d:.1f}": cov(sys_mean_sc,   d) for d in deltas},
+                "cov_lig":  {f"{d:.1f}": cov(sys_mean_lig,  d) for d in deltas},
+                "cov_comb": {f"{d:.1f}": cov(sys_mean_comb, d) for d in deltas},
             },
             "samples": [
                 {k: v for k, v in r.items() if k != "note" or v}
