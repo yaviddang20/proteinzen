@@ -881,6 +881,7 @@ def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
     components: dict[str, Mol],
     ignore_connections: bool = False,
     use_assembly: bool = True,
+    keep_waters: bool = False,
 ) -> ParsedStructure:
     """Parse a structure in MMCIF format.
 
@@ -915,7 +916,8 @@ def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
 
     # Clean up the structure
     structure.merge_chain_parts()
-    structure.remove_waters()
+    if not keep_waters:
+        structure.remove_waters()
     structure.remove_hydrogens()
     structure.remove_alternative_conformations()
     structure.remove_empty_chains()
@@ -933,7 +935,7 @@ def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
     entity_ids: dict[str, int] = {}
     for entity_id, entity in enumerate(structure.entities):
         entity: gemmi.Entity
-        if entity.entity_type.name == "Water":
+        if entity.entity_type.name == "Water" and not keep_waters:
             continue
         for subchain_id in entity.subchains:
             entities[subchain_id] = entity
@@ -987,8 +989,8 @@ def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
                 chains.append(parsed_polymer)
                 chain_seqs.append(parsed_polymer.sequence)
 
-        # Parse a non-polymer
-        elif entity_type in {"NonPolymer", "Branched"}:
+        # Parse a non-polymer (or, if kept, water)
+        elif entity_type in {"NonPolymer", "Branched", "Water"}:
             # Skip UNL or other missing ligands
             if any(components.get(lig.name) is None for lig in raw_chain):
                 continue

@@ -72,6 +72,14 @@ if __name__ == "__main__":
                              "system_pass_validation_criteria record field is trivially True, which makes the "
                              "training-time gate_low_quality_t soft-gate a no-op — use one or the other, not "
                              "both, unless you have a specific reason to.")
+    parser.add_argument("--include-waters", action="store_true", default=False,
+                         help="Keep PLIP-detected interacting waters (residue HOH/DOD) as extra NONPOLYMER "
+                              "chains, instead of stripping all water unconditionally (the default, to avoid "
+                              "changing existing datasets/tasks). Waters are excluded from every "
+                              "ligand-identification step (chain-count filter, SDF matching, rot-bond data, "
+                              "interaction mask, fusion) and only reattached at the very end, so they never get "
+                              "mistaken for the ligand. Whether they get noised during training is a separate, "
+                              "task-level flag (noise_waters on SidechainRedesign/PocketPLACERTraining).")
     parser.add_argument("--overwrite", action="store_true", default=False,
                         help="Force reprocessing of every system (ignore cached output files) and, at the end "
                              "of a full/unrestricted run, delete any on-disk structures/records/auth_maps files "

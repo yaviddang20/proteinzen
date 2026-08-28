@@ -81,6 +81,7 @@ class SidechainRedesign(TrainingTask):
                  t_min=0.01,
                  t_max=0.99,
                  name_override=None,
+                 noise_waters=False,
     ):
         assert t_sched in ['lognorm', 'mixed_beta', 'uniform']
         self.prob = prob
@@ -93,6 +94,7 @@ class SidechainRedesign(TrainingTask):
         self.t_min = t_min
         self.t_max = t_max
         self.shift_time_scale = shift_time_scale
+        self.noise_waters = noise_waters
 
         if name_override is not None:
             self.name = name_override
@@ -143,6 +145,10 @@ class SidechainRedesign(TrainingTask):
                         rigid_noise_mask = [False for _ in range(3)]
                     atom_noising_mask.append(rigid_noise_to_atom_noise(residue, atoms, rigid_noise_mask))
                     # print(residue, residue_noising_mask[i], rigid_noise_to_atom_noise(residue, atoms, rigid_noise_mask))
+                elif (not self.noise_waters) and str(residue['name']).strip() in ("HOH", "DOD"):
+                    # kept as fixed context, not noised — only reachable when
+                    # plinder.py was run with --include-waters
+                    atom_noising_mask.append([False for _ in atoms])
                 else:
                     atom_noising_mask.append([True for _ in atoms])
 
