@@ -904,12 +904,12 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
 
     if not pred_dir.exists():
         input_yaml.write_text(_yaml.dump(boltz_input, default_flow_style=False))
-        cmd = ["micromamba", "run", "-n", "boltz",
-               "boltz", "predict", str(input_yaml), "--out_dir", str(out_dir), "--override"]
+        cmd = [_BOLTZ_BIN, "predict", str(input_yaml), "--out_dir", str(out_dir), "--override"]
         if boltz_cache:
             cmd += ["--cache", str(boltz_cache)]
         try:
-            subprocess.run(cmd, check=True, timeout=600)
+            _env = {**os.environ, "SLURM_NTASKS": "1", "SLURM_JOB_NUM_NODES": "1"}
+            subprocess.run(cmd, check=True, timeout=600, env=_env)
         except subprocess.CalledProcessError as e:
             return {"plddt": float("nan"), "iptm": float("nan"), "sc_rmsd": float("nan"),
                     "lig_rmsd": float("nan"), "boltz_error": (e.stderr.decode() if e.stderr else str(e))[-200:]}
@@ -972,8 +972,7 @@ def _run_ligandmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, script: str, mod
     fasta_path = out_dir / "seqs" / f"{pdb_path.stem}.fa"
     if not fasta_path.exists():
         subprocess.run(
-            ["micromamba", "run", "-n", _MPNN_ENV,
-             "python", script,
+            [_MPNN_PYTHON, script,
              "--model_type", model_type,
              "--pdb_path", str(pdb_path),
              "--out_folder", str(out_dir),
@@ -1156,8 +1155,7 @@ def run_ligand_cond_eval(args):
     ligand_name = getattr(args, "ligand_name", "LIG")
     continue_run = getattr(args, "continue_run", False)
     import torch as _torch
-    _detected = _torch.cuda.device_count() if _torch.cuda.is_available() else 1
-    num_gpus = getattr(args, "num_gpus", None) or _detected
+    num_gpus = getattr(args, "num_gpus", None) or max(_torch.cuda.device_count(), 1)
     print(f"Evaluating {len(pdb_files)} generated samples for ligand={ligand_name} on {num_gpus} GPU(s)")
 
     # Filter out already-cached samples when continuing
