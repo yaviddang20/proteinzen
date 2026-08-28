@@ -12,18 +12,26 @@ if [ ! -f "${DIR}/LigandMPNN/run.py" ]; then
     git -C "${DIR}" submodule update --init LigandMPNN
 fi
 
-echo "=== Creating mpnn micromamba env ==="
-micromamba create -n mpnn -y \
-    python=3.10 \
-    pytorch pytorch-cuda=11.8 \
-    numpy \
-    -c pytorch -c nvidia -c conda-forge
+if micromamba env list | grep -q "^mpnn "; then
+    echo "=== mpnn env already exists, skipping create ==="
+else
+    echo "=== Creating mpnn micromamba env ==="
+    micromamba create -n mpnn -y \
+        python=3.10 \
+        pytorch pytorch-cuda=11.8 \
+        numpy \
+        -c pytorch -c nvidia -c conda-forge
+fi
 
-echo "=== Installing Python deps ==="
+echo "=== Installing Python deps (idempotent) ==="
 micromamba run -n mpnn pip install prody ml-collections
 
-echo "=== Downloading LigandMPNN model weights ==="
-bash "${DIR}/LigandMPNN/get_model_params.sh" "${DIR}/LigandMPNN/model_params"
+if [ -d "${DIR}/LigandMPNN/model_params" ] && [ "$(ls -A "${DIR}/LigandMPNN/model_params"/*.pt 2>/dev/null | wc -l)" -gt 0 ]; then
+    echo "=== LigandMPNN weights already present, skipping download ==="
+else
+    echo "=== Downloading LigandMPNN model weights ==="
+    bash "${DIR}/LigandMPNN/get_model_params.sh" "${DIR}/LigandMPNN/model_params"
+fi
 
 echo "=== Done. Test with: ==="
 echo "  micromamba run -n mpnn python ${DIR}/LigandMPNN/run.py --help"
