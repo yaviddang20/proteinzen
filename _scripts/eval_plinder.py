@@ -904,15 +904,15 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
 
     if not pred_dir.exists():
         input_yaml.write_text(_yaml.dump(boltz_input, default_flow_style=False))
-        cmd = (f"micromamba activate boltz && boltz predict {input_yaml}"
-               f" --out_dir {out_dir} --override"
-               + (f" --cache {boltz_cache}" if boltz_cache else ""))
+        cmd = ["micromamba", "run", "-n", "boltz",
+               "boltz", "predict", str(input_yaml), "--out_dir", str(out_dir), "--override"]
+        if boltz_cache:
+            cmd += ["--cache", str(boltz_cache)]
         try:
-            subprocess.run(cmd, shell=True, executable="/bin/bash", check=True,
-                           timeout=600)
+            subprocess.run(cmd, check=True, timeout=600)
         except subprocess.CalledProcessError as e:
             return {"plddt": float("nan"), "iptm": float("nan"), "sc_rmsd": float("nan"),
-                    "lig_rmsd": float("nan"), "boltz_error": e.stderr.decode()[-200:]}
+                    "lig_rmsd": float("nan"), "boltz_error": (e.stderr.decode() if e.stderr else str(e))[-200:]}
         except subprocess.TimeoutExpired:
             return {"plddt": float("nan"), "iptm": float("nan"), "sc_rmsd": float("nan"),
                     "lig_rmsd": float("nan"), "boltz_error": "timeout"}
@@ -971,14 +971,18 @@ def _run_ligandmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, script: str, mod
     out_dir.mkdir(parents=True, exist_ok=True)
     fasta_path = out_dir / "seqs" / f"{pdb_path.stem}.fa"
     if not fasta_path.exists():
-        cmd = (f"micromamba activate {_MPNN_ENV} && python {script}"
-               f" --model_type {model_type}"
-               f" --pdb_path {pdb_path}"
-               f" --out_folder {out_dir}"
-               f" --number_of_batches {n_seqs}"
-               f" --temperature 0.1 --batch_size 1 --verbose 0")
-        subprocess.run(cmd, shell=True, executable="/bin/bash", check=True,
-                       timeout=300, cwd=str(Path(script).parent))
+        subprocess.run(
+            ["micromamba", "run", "-n", _MPNN_ENV,
+             "python", script,
+             "--model_type", model_type,
+             "--pdb_path", str(pdb_path),
+             "--out_folder", str(out_dir),
+             "--number_of_batches", str(n_seqs),
+             "--temperature", "0.1",
+             "--batch_size", "1",
+             "--verbose", "0"],
+            check=True, timeout=300, cwd=str(Path(script).parent)
+        )
     return _parse_mpnn_fasta(fasta_path)[:n_seqs]
 
 
