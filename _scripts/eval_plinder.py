@@ -826,6 +826,12 @@ def run_posebusters(pdb_path: str, smiles: str | None = None) -> dict:
         return {"pb_error": str(e)}
 
 
+def _pb_worker(args_tuple):
+    """Module-level worker so multiprocessing can pickle it."""
+    pdb_path, smiles = args_tuple
+    return str(pdb_path), run_posebusters(str(pdb_path), smiles)
+
+
 def _parse_ca_and_lig_from_cif(cif_path: Path):
     """Return (ca_coords, lig_coords) from a Boltz2 CIF. Protein=chain A, ligand=all other chains (heavy atoms only)."""
     import gemmi
@@ -1166,14 +1172,14 @@ def run_ligand_cond_eval(args):
         import multiprocessing as _mp2
         n_pb_workers = _mp2.cpu_count()
         print(f"Running PoseBusters on {len(todo_files)} samples ({n_pb_workers} workers)...")
-        def _pb_one(pdb_path):
+        def _smiles_for(pdb_path):
             m = _GPU_SUFFIX.search(pdb_path.stem)
             sid = pdb_path.stem[:m.start()] if m else pdb_path.stem.rsplit("_", 1)[0]
-            smiles = smiles_by_sid.get(sid, global_smiles)
-            return str(pdb_path), run_posebusters(str(pdb_path), smiles)
+            return smiles_by_sid.get(sid, global_smiles)
+        pb_args = [(p, _smiles_for(p)) for p in todo_files]
         with _mp2.Pool(n_pb_workers) as pool:
             for pdb_str, pb_result in tqdm(
-                pool.imap_unordered(_pb_one, todo_files, chunksize=4),
+                pool.imap_unordered(_pb_worker, pb_args, chunksize=4),
                 total=len(todo_files), desc="posebusters"
             ):
                 pb_cache[pdb_str] = pb_result
