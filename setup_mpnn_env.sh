@@ -26,10 +26,12 @@ fi
 echo "=== Installing Python deps (idempotent) ==="
 micromamba run -n mpnn pip install prody ml-collections dm-tree
 
-if [ -d "${DIR}/LigandMPNN/model_params" ] && [ "$(ls -A "${DIR}/LigandMPNN/model_params"/*.pt 2>/dev/null | wc -l)" -gt 0 ]; then
-    echo "=== LigandMPNN weights already present, skipping download ==="
+_N_EXPECTED_WEIGHTS=9
+_n_weights=$(ls "${DIR}/LigandMPNN/model_params"/*.pt 2>/dev/null | wc -l)
+if [ "${_n_weights}" -ge "${_N_EXPECTED_WEIGHTS}" ]; then
+    echo "=== LigandMPNN weights already present (${_n_weights} .pt files), skipping download ==="
 else
-    echo "=== Downloading LigandMPNN model weights ==="
+    echo "=== Downloading LigandMPNN model weights (have ${_n_weights}/${_N_EXPECTED_WEIGHTS}) ==="
     bash "${DIR}/LigandMPNN/get_model_params.sh" "${DIR}/LigandMPNN/model_params"
 fi
 
