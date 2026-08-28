@@ -955,13 +955,16 @@ def _parse_mpnn_fasta(fasta_path: Path) -> list[str]:
     return entries[1:]  # skip native
 
 
-def run_proteinmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, mpnn_script: str) -> list[str]:
-    """Run ProteinMPNN (no ligand context) and return designed sequences."""
+_MPNN_ENV = "mpnn"
+
+def _run_ligandmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, script: str, model_type: str) -> list[str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     fasta_path = out_dir / "seqs" / f"{pdb_path.stem}.fa"
     if not fasta_path.exists():
         subprocess.run([
-            sys.executable, mpnn_script,
+            "micromamba", "run", "-n", _MPNN_ENV,
+            "python", script,
+            "--model_type", model_type,
             "--pdb_path", str(pdb_path),
             "--out_folder", str(out_dir),
             "--num_seq_per_target", str(n_seqs),
@@ -969,33 +972,29 @@ def run_proteinmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, mpnn_script: str
             "--batch_size", "1",
         ], check=True, capture_output=True, timeout=300)
     return _parse_mpnn_fasta(fasta_path)[:n_seqs]
+
+
+def run_proteinmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, mpnn_script: str) -> list[str]:
+    """Run LigandMPNN repo with model_type=protein_mpnn (no ligand context)."""
+    return _run_ligandmpnn(pdb_path, out_dir, n_seqs, mpnn_script, "protein_mpnn")
 
 
 def run_ligandmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, ligandmpnn_script: str) -> list[str]:
-    """Run LigandMPNN (ligand-aware) and return designed sequences."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    fasta_path = out_dir / "seqs" / f"{pdb_path.stem}.fa"
-    if not fasta_path.exists():
-        subprocess.run([
-            sys.executable, ligandmpnn_script,
-            "--model_type", "ligand_mpnn",
-            "--pdb_path", str(pdb_path),
-            "--out_folder", str(out_dir),
-            "--num_seq_per_target", str(n_seqs),
-            "--sampling_temp", "0.1",
-            "--batch_size", "1",
-        ], check=True, capture_output=True, timeout=300)
-    return _parse_mpnn_fasta(fasta_path)[:n_seqs]
+    """Run LigandMPNN repo with model_type=ligand_mpnn (ligand-aware)."""
+    return _run_ligandmpnn(pdb_path, out_dir, n_seqs, ligandmpnn_script, "ligand_mpnn")
 
 
 def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_dir,
                             boltz_cache, run_pb, skip_fold, contact_cutoff=4.0,
                             mpnn_script=None, ligandmpnn_script=None,
-                            mpnn_n_seqs=3, mpnn_refold_dir=None):
+                            mpnn_n_seqs=3, mpnn_refold_dir=None, pb_cache=None):
     prot_all, prot_ca, resnames, lig_coords, lig_elements, _ = parse_pdb_ligand_cond(str(pdb_path))
     sequence = resnames_to_seq(resnames)
     frac_lig_contacted, n_prot_contact = pocket_contacts(prot_all, lig_coords, cutoff=contact_cutoff)
-    pb = run_posebusters(str(pdb_path), smiles) if run_pb else {}
+    if pb_cache is not None:
+        pb = pb_cache.get(str(pdb_path), {})
+    else:
+        pb = run_posebusters(str(pdb_path), smiles) if run_pb else {}
     gen_lig = lig_coords.astype(np.float64) if len(lig_coords) > 0 else None
 
     if skip_fold or not sequence:
@@ -1038,13 +1037,13 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
     pmpnn_metrics, lmpnn_metrics = {}, {}
     if not skip_fold and len(prot_ca) > 0:
         base = mpnn_refold_dir or refold_output_dir.parent / "mpnn_refold"
-        if mpnn_script:
+        if mpnn_script and Path(mpnn_script).exists():
             try:
                 seqs = run_proteinmpnn(pdb_path, base / pdb_path.stem / "proteinmpnn", mpnn_n_seqs, mpnn_script)
                 pmpnn_metrics = _run_mpnn_case(seqs, None, "pmpnn", base / pdb_path.stem / "pmpnn_refold")
             except Exception as e:
                 print(f"  ProteinMPNN error {pdb_path.name}: {e}")
-        if ligandmpnn_script:
+        if ligandmpnn_script and Path(ligandmpnn_script).exists():
             try:
                 seqs = run_ligandmpnn(pdb_path, base / pdb_path.stem / "ligandmpnn", mpnn_n_seqs, ligandmpnn_script)
                 lmpnn_metrics = _run_mpnn_case(seqs, smiles, "lmpnn", base / pdb_path.stem / "lmpnn_refold")
@@ -1151,6 +1150,24 @@ def run_ligand_cond_eval(args):
         if isinstance(v, np.bool_): return bool(v)
         return v
 
+    # Pre-run PoseBusters in parallel (CPU-only, doesn't compete with GPU Boltz2)
+    pb_cache: dict = {}
+    if run_pb and todo_files:
+        import multiprocessing as _mp2
+        n_pb_workers = max(1, _mp2.cpu_count() // 2)
+        print(f"Running PoseBusters on {len(todo_files)} samples ({n_pb_workers} workers)...")
+        def _pb_one(pdb_path):
+            m = _GPU_SUFFIX.search(pdb_path.stem)
+            sid = pdb_path.stem[:m.start()] if m else pdb_path.stem.rsplit("_", 1)[0]
+            smiles = smiles_by_sid.get(sid, global_smiles)
+            return str(pdb_path), run_posebusters(str(pdb_path), smiles)
+        with _mp2.Pool(n_pb_workers) as pool:
+            for pdb_str, pb_result in tqdm(
+                pool.imap_unordered(_pb_one, todo_files, chunksize=4),
+                total=len(todo_files), desc="posebusters"
+            ):
+                pb_cache[pdb_str] = pb_result
+
     def _eval_one(pdb_path, gpu_id):
         import os as _os
         _os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -1170,6 +1187,7 @@ def run_ligand_cond_eval(args):
                 ligandmpnn_script=getattr(args, "ligandmpnn_script", None),
                 mpnn_n_seqs=getattr(args, "mpnn_n_seqs", 3),
                 mpnn_refold_dir=args.out_dir / "mpnn_refold",
+                pb_cache=pb_cache,
             )
         except Exception as e:
             r = {
@@ -1398,15 +1416,15 @@ def main():
         "--delta", type=float, nargs="+", default=[2.0, 5.0],
         help="[ligand_cond] scRMSD thresholds for coverage (Å; default: 2.0 5.0).",
     )
+    _repo_root = Path(__file__).parent.parent
+    _default_ligandmpnn = str(_repo_root / "LigandMPNN" / "run.py")
     parser.add_argument(
-        "--mpnn-script", type=str, default=None,
-        help="[ligand_cond] Path to protein_mpnn_run.py. Runs ProteinMPNN and refolds "
-             "designed sequences WITHOUT ligand context.",
+        "--mpnn-script", type=str, default=_default_ligandmpnn,
+        help="[ligand_cond] Path to LigandMPNN run.py for protein_mpnn mode (default: <repo>/LigandMPNN/run.py).",
     )
     parser.add_argument(
-        "--ligandmpnn-script", type=str, default=None,
-        help="[ligand_cond] Path to LigandMPNN run.py. Runs LigandMPNN and refolds "
-             "designed sequences WITH ligand context.",
+        "--ligandmpnn-script", type=str, default=_default_ligandmpnn,
+        help="[ligand_cond] Path to LigandMPNN run.py for ligand_mpnn mode (default: <repo>/LigandMPNN/run.py).",
     )
     parser.add_argument(
         "--mpnn-n-seqs", type=int, default=3,
