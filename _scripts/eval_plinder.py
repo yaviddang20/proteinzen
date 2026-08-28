@@ -976,7 +976,7 @@ def _run_ligandmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, script: str, mod
             "--num_seq_per_target", str(n_seqs),
             "--sampling_temp", "0.1",
             "--batch_size", "1",
-        ], check=True, capture_output=True, timeout=300)
+        ], check=True, timeout=300)
     return _parse_mpnn_fasta(fasta_path)[:n_seqs]
 
 
