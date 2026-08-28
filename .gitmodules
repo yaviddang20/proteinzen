@@ -1,0 +1,3 @@
+[submodule "LigandMPNN"]
+	path = LigandMPNN
+	url = https://github.com/dauparas/LigandMPNN
