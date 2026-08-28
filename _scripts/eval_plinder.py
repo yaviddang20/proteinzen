@@ -706,13 +706,17 @@ def run_protein_cond_eval(args):
 def parse_pdb_ligand_cond(pdb_path: str):
     """Parse PDB into protein and ligand arrays (for ligand_cond task).
 
-    Returns prot_coords, prot_ca, prot_resnames, lig_coords, lig_elements, conect.
+    Returns prot_coords, prot_ca, prot_resnames, lig_coords, lig_elements, conect, prot_by_res.
+    prot_by_res: list of dicts {atom_name: np.array([x,y,z])} one dict per residue in order.
     """
     prot_all, prot_ca, prot_resnames = [], [], []
     lig_coords, lig_elements = [], []
     lig_serial_to_local: dict[int, int] = {}
     raw_conects: list[tuple[int, int]] = []
     seen_ca: set[tuple[str, str]] = set()
+    prot_by_res: list[dict] = []
+    _cur_res_key = None
+    _cur_res_atoms: dict = {}
 
     with open(pdb_path) as fh:
         for line in fh:
@@ -721,7 +725,15 @@ def parse_pdb_ligand_cond(pdb_path: str):
                 try:
                     x, y, z = float(line[30:38]), float(line[38:46]), float(line[46:54])
                     prot_all.append((x, y, z))
-                    if line[12:16] == " CA ":
+                    aname = line[12:16].strip()
+                    res_key = (line[21], line[22:26].strip(), line[26:27].strip())
+                    if res_key != _cur_res_key:
+                        if _cur_res_atoms:
+                            prot_by_res.append(_cur_res_atoms)
+                        _cur_res_key = res_key
+                        _cur_res_atoms = {}
+                    _cur_res_atoms[aname] = np.array([x, y, z], dtype=np.float64)
+                    if aname == "CA":
                         key = (line[21], line[22:26].strip())
                         if key not in seen_ca:
                             seen_ca.add(key)
@@ -752,13 +764,16 @@ def parse_pdb_ligand_cond(pdb_path: str):
 
     def _arr(lst): return np.array(lst, dtype=np.float64) if lst else np.zeros((0, 3))
 
+    if _cur_res_atoms:
+        prot_by_res.append(_cur_res_atoms)
+
     conect: set[tuple[int, int]] = set()
     for s1, s2 in raw_conects:
         if s1 in lig_serial_to_local and s2 in lig_serial_to_local:
             a, b = lig_serial_to_local[s1], lig_serial_to_local[s2]
             conect.add((min(a, b), max(a, b)))
 
-    return _arr(prot_all), _arr(prot_ca), prot_resnames, _arr(lig_coords), lig_elements, conect
+    return _arr(prot_all), _arr(prot_ca), prot_resnames, _arr(lig_coords), lig_elements, conect, prot_by_res
 
 
 _AA3TO1 = {
@@ -788,7 +803,7 @@ def pocket_contacts(prot_coords: np.ndarray, lig_coords: np.ndarray, cutoff: flo
 def run_posebusters(pdb_path: str, smiles: str | None = None) -> dict:
     if not HAS_POSEBUSTERS:
         return {}
-    _, _, _, lig_coords, lig_elements, conect = parse_pdb_ligand_cond(pdb_path)
+    _, _, _, lig_coords, lig_elements, conect, _ = parse_pdb_ligand_cond(pdb_path)
     if len(lig_coords) == 0:
         return {"pb_ligand_parse_failed": True}
     try:
@@ -839,19 +854,26 @@ def _pb_worker(args_tuple):
 
 
 def _parse_ca_and_lig_from_cif(cif_path: Path):
-    """Return (ca_coords, lig_coords) from a Boltz2 CIF. Protein=chain A, ligand=all other chains (heavy atoms only)."""
+    """Return (ca_coords, prot_by_res, lig_coords) from a Boltz2 CIF.
+    Protein=chain A (Cα + per-residue all-heavy-atom dicts), ligand=all other chains (heavy atoms only).
+    """
     import gemmi
     st = gemmi.read_structure(str(cif_path))
     ca, lig = [], []
+    prot_by_res: list[dict] = []
     for model in st:
         for chain in model:
             if chain.name == "A":
                 for res in chain:
+                    res_atoms: dict = {}
                     for atom in res:
+                        if atom.element == gemmi.Element("H"):
+                            continue
+                        p = atom.pos
+                        res_atoms[atom.name] = np.array([p.x, p.y, p.z], dtype=np.float64)
                         if atom.name == "CA":
-                            p = atom.pos
                             ca.append([p.x, p.y, p.z])
-                            break
+                    prot_by_res.append(res_atoms)
             else:
                 for res in chain:
                     for atom in res:
@@ -860,7 +882,7 @@ def _parse_ca_and_lig_from_cif(cif_path: Path):
                         p = atom.pos
                         lig.append([p.x, p.y, p.z])
         break
-    return np.array(ca, dtype=np.float64), np.array(lig, dtype=np.float64)
+    return np.array(ca, dtype=np.float64), prot_by_res, np.array(lig, dtype=np.float64)
 
 
 def _kabsch_align(P: np.ndarray, Q: np.ndarray):
@@ -889,7 +911,7 @@ def _kabsch_rmsd(P: np.ndarray, Q: np.ndarray) -> float:
 
 
 def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
-                  sample_id, boltz_cache, gen_lig=None):
+                  sample_id, boltz_cache, gen_lig=None, gen_prot_by_res=None):
     import yaml as _yaml
     refold_input_dir.mkdir(parents=True, exist_ok=True)
     refold_output_dir.mkdir(parents=True, exist_ok=True)
@@ -911,11 +933,12 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
             _env = {**os.environ, "SLURM_NTASKS": "1", "SLURM_JOB_NUM_NODES": "1"}
             subprocess.run(cmd, check=True, timeout=600, env=_env)
         except subprocess.CalledProcessError as e:
-            return {"plddt": float("nan"), "iptm": float("nan"), "sc_rmsd": float("nan"),
-                    "lig_rmsd": float("nan"), "boltz_error": (e.stderr.decode() if e.stderr else str(e))[-200:]}
+            return {"plddt": float("nan"), "iptm": float("nan"), "ca_rmsd": float("nan"),
+                    "aa_rmsd": float("nan"), "lig_rmsd": float("nan"),
+                    "boltz_error": (e.stderr.decode() if e.stderr else str(e))[-200:]}
         except subprocess.TimeoutExpired:
-            return {"plddt": float("nan"), "iptm": float("nan"), "sc_rmsd": float("nan"),
-                    "lig_rmsd": float("nan"), "boltz_error": "timeout"}
+            return {"plddt": float("nan"), "iptm": float("nan"), "ca_rmsd": float("nan"),
+                    "aa_rmsd": float("nan"), "lig_rmsd": float("nan"), "boltz_error": "timeout"}
     conf_files = sorted(pred_dir.glob("confidence_*_model_0.json"))
     plddt, iptm = float("nan"), float("nan")
     if conf_files:
@@ -926,16 +949,28 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
         except Exception:
             pass
 
-    sc_rmsd = float("nan")
+    ca_rmsd = float("nan")
+    aa_rmsd = float("nan")
     lig_rmsd = float("nan")
     cif_files = sorted(pred_dir.glob("*_model_0.cif"))
     if cif_files and len(gen_ca) > 0:
         try:
-            refold_ca, refold_lig = _parse_ca_and_lig_from_cif(cif_files[0])
+            refold_ca, refold_prot_by_res, refold_lig = _parse_ca_and_lig_from_cif(cif_files[0])
             if len(refold_ca) == len(gen_ca):
                 R, p_mean, q_mean = _kabsch_align(gen_ca, refold_ca)
                 gen_ca_rot = _apply_kabsch(gen_ca, R, p_mean, q_mean)
-                sc_rmsd = float(np.sqrt(((gen_ca_rot - refold_ca) ** 2).sum(-1).mean()))
+                ca_rmsd = float(np.sqrt(((gen_ca_rot - refold_ca) ** 2).sum(-1).mean()))
+                if (gen_prot_by_res is not None
+                        and len(refold_prot_by_res) == len(gen_prot_by_res)):
+                    gt_all, ref_all = [], []
+                    for gen_res, ref_res in zip(gen_prot_by_res, refold_prot_by_res):
+                        for aname, gc in gen_res.items():
+                            if aname in ref_res:
+                                gt_all.append(gc)
+                                ref_all.append(ref_res[aname])
+                    if len(gt_all) >= 3:
+                        gen_aa_rot = _apply_kabsch(np.array(gt_all), R, p_mean, q_mean)
+                        aa_rmsd = float(np.sqrt(((gen_aa_rot - np.array(ref_all)) ** 2).sum(-1).mean()))
                 if (gen_lig is not None and len(gen_lig) > 0
                         and len(refold_lig) > 0 and len(refold_lig) == len(gen_lig)):
                     gen_lig_rot = _apply_kabsch(gen_lig, R, p_mean, q_mean)
@@ -943,7 +978,7 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
         except Exception:
             pass
 
-    return {"plddt": plddt, "iptm": iptm, "sc_rmsd": sc_rmsd, "lig_rmsd": lig_rmsd}
+    return {"plddt": plddt, "iptm": iptm, "ca_rmsd": ca_rmsd, "aa_rmsd": aa_rmsd, "lig_rmsd": lig_rmsd}
 
 
 def _parse_mpnn_fasta(fasta_path: Path) -> list[str]:
@@ -999,7 +1034,7 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
                             boltz_cache, run_pb, skip_fold, contact_cutoff=4.0,
                             mpnn_script=None, ligandmpnn_script=None,
                             mpnn_n_seqs=3, mpnn_refold_dir=None, pb_cache=None):
-    prot_all, prot_ca, resnames, lig_coords, lig_elements, _ = parse_pdb_ligand_cond(str(pdb_path))
+    prot_all, prot_ca, resnames, lig_coords, lig_elements, _, prot_by_res = parse_pdb_ligand_cond(str(pdb_path))
     sequence = resnames_to_seq(resnames)
     frac_lig_contacted, n_prot_contact = pocket_contacts(prot_all, lig_coords, cutoff=contact_cutoff)
     if pb_cache is not None:
@@ -1008,7 +1043,8 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
         pb = run_posebusters(str(pdb_path), smiles) if run_pb else {}
     gen_lig = lig_coords.astype(np.float64) if len(lig_coords) > 0 else None
 
-    _nan_fold = {"plddt": float("nan"), "iptm": float("nan"), "sc_rmsd": float("nan"), "lig_rmsd": float("nan")}
+    _nan_fold = {"plddt": float("nan"), "iptm": float("nan"), "ca_rmsd": float("nan"),
+                 "aa_rmsd": float("nan"), "lig_rmsd": float("nan")}
     if skip_fold or not sequence:
         fold        = _nan_fold.copy()
         fold_nolig  = _nan_fold.copy()
@@ -1017,13 +1053,13 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
             sequence=sequence, smiles=smiles, gen_ca=prot_ca,
             refold_input_dir=refold_input_dir, refold_output_dir=refold_output_dir,
             sample_id=pdb_path.stem, boltz_cache=boltz_cache,
-            gen_lig=gen_lig,
+            gen_lig=gen_lig, gen_prot_by_res=prot_by_res,
         )
         fold_nolig = run_refolding(
             sequence=sequence, smiles=None, gen_ca=prot_ca,
             refold_input_dir=refold_input_dir, refold_output_dir=refold_output_dir,
             sample_id=f"{pdb_path.stem}_nolig", boltz_cache=boltz_cache,
-            gen_lig=None,
+            gen_lig=None, gen_prot_by_res=prot_by_res,
         )
     fold_nolig = {f"nolig_{k}": v for k, v in fold_nolig.items()}
 
@@ -1036,22 +1072,26 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
                 refold_output_dir=base_dir / "refold_outputs",
                 sample_id=f"{pdb_path.stem}_{tag}{i}",
                 boltz_cache=boltz_cache,
-                gen_lig=gen_lig,
+                gen_lig=gen_lig, gen_prot_by_res=prot_by_res,
             )
             results.append(fold_i)
-        rmsds    = [r["sc_rmsd"]  for r in results if np.isfinite(r.get("sc_rmsd",  float("nan")))]
+        carmsds  = [r["ca_rmsd"]  for r in results if np.isfinite(r.get("ca_rmsd",  float("nan")))]
+        aarmsds  = [r["aa_rmsd"]  for r in results if np.isfinite(r.get("aa_rmsd",  float("nan")))]
         ligrmsds = [r["lig_rmsd"] for r in results if np.isfinite(r.get("lig_rmsd", float("nan")))]
         plddts   = [r["plddt"]    for r in results if np.isfinite(r.get("plddt",    float("nan")))]
         iptms    = [r["iptm"]     for r in results if np.isfinite(r.get("iptm",     float("nan")))]
         return {
-            f"{tag}_sc_rmsd_best":  min(rmsds)               if rmsds    else float("nan"),
-            f"{tag}_sc_rmsd_mean":  float(np.mean(rmsds))    if rmsds    else float("nan"),
+            f"{tag}_seqs":          seqs,
+            f"{tag}_ca_rmsd_best":  min(carmsds)              if carmsds  else float("nan"),
+            f"{tag}_ca_rmsd_mean":  float(np.mean(carmsds))   if carmsds  else float("nan"),
+            f"{tag}_aa_rmsd_best":  min(aarmsds)              if aarmsds  else float("nan"),
+            f"{tag}_aa_rmsd_mean":  float(np.mean(aarmsds))   if aarmsds  else float("nan"),
             f"{tag}_lig_rmsd_best": min(ligrmsds)             if ligrmsds else float("nan"),
-            f"{tag}_lig_rmsd_mean": float(np.mean(ligrmsds)) if ligrmsds else float("nan"),
-            f"{tag}_plddt_best":    max(plddts)               if plddts   else float("nan"),
-            f"{tag}_plddt_mean":    float(np.mean(plddts))   if plddts   else float("nan"),
-            f"{tag}_iptm_best":     max(iptms)                if iptms    else float("nan"),
-            f"{tag}_iptm_mean":     float(np.mean(iptms))    if iptms    else float("nan"),
+            f"{tag}_lig_rmsd_mean": float(np.mean(ligrmsds))  if ligrmsds else float("nan"),
+            f"{tag}_plddt_best":    max(plddts)                if plddts   else float("nan"),
+            f"{tag}_plddt_mean":    float(np.mean(plddts))    if plddts   else float("nan"),
+            f"{tag}_iptm_best":     max(iptms)                 if iptms    else float("nan"),
+            f"{tag}_iptm_mean":     float(np.mean(iptms))     if iptms    else float("nan"),
         }
 
     pmpnn_metrics, lmpnn_metrics = {}, {}
@@ -1153,18 +1193,42 @@ def run_ligand_cond_eval(args):
     if not pdb_files:
         sys.exit(f"No PDB files found in {samples_dir}")
     ligand_name = getattr(args, "ligand_name", "LIG")
-    continue_run = getattr(args, "continue_run", False)
+    overwrite = getattr(args, "overwrite", False)
     import torch as _torch
     num_gpus = getattr(args, "num_gpus", None) or max(_torch.cuda.device_count(), 1)
     print(f"Evaluating {len(pdb_files)} generated samples for ligand={ligand_name} on {num_gpus} GPU(s)")
 
-    # Filter out already-cached samples when continuing
+    use_mpnn      = bool(getattr(args, "mpnn_script",       None) and Path(getattr(args, "mpnn_script",       "")).exists())
+    use_lmpnn     = bool(getattr(args, "ligandmpnn_script", None) and Path(getattr(args, "ligandmpnn_script", "")).exists())
+
+    def _is_complete(r: dict) -> bool:
+        """True if the cached JSON has all keys we'd compute in this run."""
+        required = ["ca_rmsd", "aa_rmsd", "nolig_ca_rmsd", "nolig_aa_rmsd"]
+        if use_mpnn:
+            required += ["pmpnn_seqs", "pmpnn_ca_rmsd_best", "pmpnn_aa_rmsd_best"]
+        if use_lmpnn:
+            required += ["lmpnn_seqs", "lmpnn_ca_rmsd_best", "lmpnn_aa_rmsd_best"]
+        return all(k in r for k in required)
+
+    # Load all existing per-sample JSONs:
+    #   - populate pb_cache (so PB never re-runs even for stale samples)
+    #   - decide which samples need re-running
+    pb_cache: dict = {}
     todo_files = []
     cached_results = []
     for pdb_path in pdb_files:
         cache_path = per_sample_dir / f"{pdb_path.stem}.json"
-        if continue_run and cache_path.exists():
-            cached_results.append(json.loads(cache_path.read_text()))
+        if not overwrite and cache_path.exists():
+            r = json.loads(cache_path.read_text())
+            # Always harvest PB results so the pre-pass skips them
+            pb_hit = {k: v for k, v in r.items() if k.startswith("pb_")}
+            if pb_hit:
+                pb_cache[str(pdb_path)] = pb_hit
+            if _is_complete(r):
+                cached_results.append(r)
+            else:
+                # Stale — re-run (Boltz/MPNN skip if their disk outputs exist)
+                todo_files.append(pdb_path)
         else:
             todo_files.append(pdb_path)
 
@@ -1174,23 +1238,25 @@ def run_ligand_cond_eval(args):
         if isinstance(v, np.bool_): return bool(v)
         return v
 
-    # Pre-run PoseBusters in parallel (CPU-only, doesn't compete with GPU Boltz2)
-    pb_cache: dict = {}
+    # Pre-run PoseBusters in parallel — only for files not already in pb_cache
+    def _smiles_for(pdb_path):
+        m = _GPU_SUFFIX.search(pdb_path.stem)
+        sid = pdb_path.stem[:m.start()] if m else pdb_path.stem.rsplit("_", 1)[0]
+        return smiles_by_sid.get(sid, global_smiles)
+
     if run_pb and todo_files:
-        import multiprocessing as _mp2
-        n_pb_workers = _mp2.cpu_count()
-        print(f"Running PoseBusters on {len(todo_files)} samples ({n_pb_workers} workers)...")
-        def _smiles_for(pdb_path):
-            m = _GPU_SUFFIX.search(pdb_path.stem)
-            sid = pdb_path.stem[:m.start()] if m else pdb_path.stem.rsplit("_", 1)[0]
-            return smiles_by_sid.get(sid, global_smiles)
-        pb_args = [(p, _smiles_for(p)) for p in todo_files]
-        with _mp2.Pool(n_pb_workers) as pool:
-            for pdb_str, pb_result in tqdm(
-                pool.imap_unordered(_pb_worker, pb_args, chunksize=4),
-                total=len(todo_files), desc="posebusters"
-            ):
-                pb_cache[pdb_str] = pb_result
+        pb_todo = [p for p in todo_files if str(p) not in pb_cache]
+        if pb_todo:
+            import multiprocessing as _mp2
+            n_pb_workers = _mp2.cpu_count()
+            print(f"Running PoseBusters on {len(pb_todo)} samples ({n_pb_workers} workers)...")
+            pb_args = [(p, _smiles_for(p)) for p in pb_todo]
+            with _mp2.Pool(n_pb_workers) as pool:
+                for pdb_str, pb_result in tqdm(
+                    pool.imap_unordered(_pb_worker, pb_args, chunksize=4),
+                    total=len(pb_todo), desc="posebusters"
+                ):
+                    pb_cache[pdb_str] = pb_result
 
     def _eval_one(pdb_path, gpu_id):
         import os as _os
@@ -1217,7 +1283,8 @@ def run_ligand_cond_eval(args):
             r = {
                 "sample_id": stem, "pdb_path": str(pdb_path), "error": str(e),
                 "frac_lig_contacted": float("nan"),
-                "plddt": float("nan"), "iptm": float("nan"), "sc_rmsd": float("nan"),
+                "plddt": float("nan"), "iptm": float("nan"),
+                "ca_rmsd": float("nan"), "aa_rmsd": float("nan"),
             }
             print(f"  ERROR {pdb_path.name}: {e}")
         (per_sample_dir / f"{stem}.json").write_text(
@@ -1235,7 +1302,7 @@ def run_ligand_cond_eval(args):
                     f"  {pdb_path.name}  n_ca={r.get('n_ca')}  "
                     f"lig_contact={fmt(r.get('frac_lig_contacted'))}  "
                     f"plddt={fmt(r.get('plddt'))}  iptm={fmt(r.get('iptm'))}  "
-                    f"sc_rmsd={fmt(r.get('sc_rmsd'))}"
+                    f"ca_rmsd={fmt(r.get('ca_rmsd'))}  aa_rmsd={fmt(r.get('aa_rmsd'))}"
                 )
     else:
         import multiprocessing as _mp
@@ -1270,7 +1337,7 @@ def run_ligand_cond_eval(args):
                     f"  n_ca={r.get('n_ca')}  "
                     f"lig_contact={fmt(r.get('frac_lig_contacted'))}  "
                     f"plddt={fmt(r.get('plddt'))}  iptm={fmt(r.get('iptm'))}  "
-                    f"sc_rmsd={fmt(r.get('sc_rmsd'))}"
+                    f"ca_rmsd={fmt(r.get('ca_rmsd'))}  aa_rmsd={fmt(r.get('aa_rmsd'))}"
                 )
         for p in procs:
             p.join()
@@ -1280,14 +1347,16 @@ def run_ligand_cond_eval(args):
     serial = [{k: _ser(v) for k, v in r.items()} for r in all_results]
     (args.out_dir / "results.json").write_text(json.dumps(serial, indent=2))
 
-    frac_c        = [r.get("frac_lig_contacted") for r in all_results]
-    plddts        = [r.get("plddt")         for r in all_results]
-    iptms         = [r.get("iptm")          for r in all_results]
-    scrmsds       = [r.get("sc_rmsd")       for r in all_results]
-    ligrmsds      = [r.get("lig_rmsd")      for r in all_results]
-    nolig_plddts  = [r.get("nolig_plddt")   for r in all_results]
-    nolig_iptms   = [r.get("nolig_iptm")    for r in all_results]
-    nolig_scrmsds = [r.get("nolig_sc_rmsd") for r in all_results]
+    frac_c         = [r.get("frac_lig_contacted") for r in all_results]
+    plddts         = [r.get("plddt")          for r in all_results]
+    iptms          = [r.get("iptm")           for r in all_results]
+    carmsds        = [r.get("ca_rmsd")        for r in all_results]
+    aarmsds        = [r.get("aa_rmsd")        for r in all_results]
+    ligrmsds       = [r.get("lig_rmsd")       for r in all_results]
+    nolig_plddts   = [r.get("nolig_plddt")    for r in all_results]
+    nolig_iptms    = [r.get("nolig_iptm")     for r in all_results]
+    nolig_carmsds  = [r.get("nolig_ca_rmsd")  for r in all_results]
+    nolig_aarmsds  = [r.get("nolig_aa_rmsd")  for r in all_results]
 
     contact_cutoff = getattr(args, "contact_cutoff", 4.0)
     sc_deltas = getattr(args, "delta", [2.0, 5.0])
@@ -1307,9 +1376,11 @@ def run_ligand_cond_eval(args):
     elif _finite(plddts):
         lines.append(f"  pLDDT mean    : {fmt(mean_f(plddts))}")
         lines.append(f"  ipTM  mean    : {fmt(mean_f(iptms))}")
-        lines.append(f"  scRMSD mean   : {fmt(mean_f(scrmsds))} Å")
+        lines.append(f"  caRMSD mean   : {fmt(mean_f(carmsds))} Å")
+        lines.append(f"  aaRMSD mean   : {fmt(mean_f(aarmsds))} Å")
         for d in sc_deltas:
-            lines.append(f"  COV sc_rmsd < {d:.1f} Å : {cov_f(scrmsds, d)*100:.1f}%")
+            lines.append(f"  COV ca_rmsd < {d:.1f} Å : {cov_f(carmsds, d)*100:.1f}%")
+            lines.append(f"  COV aa_rmsd < {d:.1f} Å : {cov_f(aarmsds, d)*100:.1f}%")
         if _finite(ligrmsds):
             lines.append(f"  ligRMSD mean  : {fmt(mean_f(ligrmsds))} Å")
             for d in sc_deltas:
@@ -1323,9 +1394,11 @@ def run_ligand_cond_eval(args):
     elif _finite(nolig_plddts):
         lines.append(f"  pLDDT mean    : {fmt(mean_f(nolig_plddts))}")
         lines.append(f"  ipTM  mean    : {fmt(mean_f(nolig_iptms))}")
-        lines.append(f"  scRMSD mean   : {fmt(mean_f(nolig_scrmsds))} Å")
+        lines.append(f"  caRMSD mean   : {fmt(mean_f(nolig_carmsds))} Å")
+        lines.append(f"  aaRMSD mean   : {fmt(mean_f(nolig_aarmsds))} Å")
         for d in sc_deltas:
-            lines.append(f"  COV sc_rmsd < {d:.1f} Å : {cov_f(nolig_scrmsds, d)*100:.1f}%")
+            lines.append(f"  COV ca_rmsd < {d:.1f} Å : {cov_f(nolig_carmsds, d)*100:.1f}%")
+            lines.append(f"  COV aa_rmsd < {d:.1f} Å : {cov_f(nolig_aarmsds, d)*100:.1f}%")
     else:
         lines.append("  [all NaN — check boltz errors in results.json]")
 
@@ -1334,22 +1407,27 @@ def run_ligand_cond_eval(args):
         ("pmpnn", f"ProteinMPNN → refold w/o ligand (n={n_mpnn})", False),
         ("lmpnn", f"LigandMPNN  → refold w/  ligand (n={n_mpnn})", True),
     ]:
-        best_sc    = [r.get(f"{tag}_sc_rmsd_best")  for r in all_results]
-        mean_sc    = [r.get(f"{tag}_sc_rmsd_mean")  for r in all_results]
+        best_ca    = [r.get(f"{tag}_ca_rmsd_best")  for r in all_results]
+        mean_ca    = [r.get(f"{tag}_ca_rmsd_mean")  for r in all_results]
+        best_aa    = [r.get(f"{tag}_aa_rmsd_best")  for r in all_results]
+        mean_aa    = [r.get(f"{tag}_aa_rmsd_mean")  for r in all_results]
         best_lig   = [r.get(f"{tag}_lig_rmsd_best") for r in all_results]
         mean_lig   = [r.get(f"{tag}_lig_rmsd_mean") for r in all_results]
         best_plddt = [r.get(f"{tag}_plddt_best")    for r in all_results]
         avg_plddt  = [r.get(f"{tag}_plddt_mean")    for r in all_results]
         best_iptm  = [r.get(f"{tag}_iptm_best")     for r in all_results]
         avg_iptm   = [r.get(f"{tag}_iptm_mean")     for r in all_results]
-        if _finite(best_sc):
+        if _finite(best_ca):
             lines.append(f"\n--- Refolding self-consistency — {label} ---")
             lines.append(f"  pLDDT best : {fmt(mean_f(best_plddt))}   avg : {fmt(mean_f(avg_plddt))}")
             lines.append(f"  ipTM  best : {fmt(mean_f(best_iptm))}   avg : {fmt(mean_f(avg_iptm))}")
-            lines.append(f"  scRMSD best : {fmt(mean_f(best_sc))} Å   avg : {fmt(mean_f(mean_sc))} Å")
+            lines.append(f"  caRMSD best : {fmt(mean_f(best_ca))} Å   avg : {fmt(mean_f(mean_ca))} Å")
+            lines.append(f"  aaRMSD best : {fmt(mean_f(best_aa))} Å   avg : {fmt(mean_f(mean_aa))} Å")
             for d in sc_deltas:
-                lines.append(f"  COV sc_rmsd < {d:.1f} Å (best) : {cov_f(best_sc, d)*100:.1f}%")
-                lines.append(f"  COV sc_rmsd < {d:.1f} Å (avg)  : {cov_f(mean_sc, d)*100:.1f}%")
+                lines.append(f"  COV ca_rmsd < {d:.1f} Å (best) : {cov_f(best_ca, d)*100:.1f}%")
+                lines.append(f"  COV ca_rmsd < {d:.1f} Å (avg)  : {cov_f(mean_ca, d)*100:.1f}%")
+                lines.append(f"  COV aa_rmsd < {d:.1f} Å (best) : {cov_f(best_aa, d)*100:.1f}%")
+                lines.append(f"  COV aa_rmsd < {d:.1f} Å (avg)  : {cov_f(mean_aa, d)*100:.1f}%")
             if _finite(best_lig):
                 lines.append(f"  ligRMSD best : {fmt(mean_f(best_lig))} Å   avg : {fmt(mean_f(mean_lig))} Å")
                 for d in sc_deltas:
@@ -1479,9 +1557,9 @@ def main():
         help="Print per-system / per-sample details.",
     )
     parser.add_argument(
-        "--continue-run", action="store_true", default=False,
-        help="Skip already-evaluated samples (cached in out_dir/per_sample/). "
-             "Default: False (wipe out_dir and rerun everything).",
+        "--overwrite", action="store_true", default=False,
+        help="Wipe existing eval outputs and rerun everything. "
+             "Default: False (preserve existing results, only re-run stale/missing samples).",
     )
     parser.add_argument(
         "--num-gpus", type=int, default=None,
@@ -1496,8 +1574,8 @@ def main():
     if args.ref_dir is None:
         sys.exit("--ref-dir is required")
 
-    continue_run = getattr(args, "continue_run", False)
-    if not continue_run and args.out_dir.exists():
+    overwrite = getattr(args, "overwrite", False)
+    if overwrite and args.out_dir.exists():
         import shutil
         # Only remove eval artifacts, never the samples directory
         samples_dir_default = args.out_dir / "samples"

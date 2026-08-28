@@ -155,8 +155,8 @@ def main(sampler,
     )
     traj_dir = os.path.join(zen_cfg['out_dir'], "traj")
 
-    continue_run = zen_cfg.get('continue_run', False)
-    if continue_run:
+    overwrite = zen_cfg.get('overwrite', False)
+    if not overwrite:
         os.makedirs(zen_cfg['samples_dir'], exist_ok=True)
         dispatcher = sampler.task_dispatcher
 
@@ -170,7 +170,7 @@ def main(sampler,
             int(os.environ.get("NODE_RANK", 0)) == 0
             and int(os.environ.get("LOCAL_RANK", 0)) == 0
         )
-        manifest_path = os.path.join(zen_cfg['out_dir'], "continue_run_kept_indices.json")
+        manifest_path = os.path.join(zen_cfg['out_dir'], "kept_indices.json")
 
         if is_rank_zero:
             try:
@@ -199,7 +199,7 @@ def main(sampler,
                 if per_task_kept[task] < deficit:
                     kept_indices.append(i)
                     per_task_kept[task] += 1
-            log.info(f"continue_run: keeping {len(kept_indices)}/{len(dispatcher.batches)} samples "
+            log.info(f"resuming: keeping {len(kept_indices)}/{len(dispatcher.batches)} samples "
                      f"(existing: {dict(existing_per_task)})")
             tmp_path = f"{manifest_path}.tmp{os.getpid()}"
             with open(tmp_path, "w") as f:
@@ -216,7 +216,7 @@ def main(sampler,
                 waited += 1.0
                 if waited > timeout_s:
                     raise RuntimeError(
-                        f"Timed out waiting for rank 0 to write {manifest_path} for continue_run"
+                        f"Timed out waiting for rank 0 to write {manifest_path}"
                     )
             with open(manifest_path) as f:
                 kept_indices = json.load(f)

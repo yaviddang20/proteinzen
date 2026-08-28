@@ -143,6 +143,8 @@ def eval_sample(pdb_path: str, gt_prot_names: list, gt_prot: np.ndarray, gt_lig:
     R, t = kabsch(gen_prot[is_ca], gt_prot[is_ca])
     gen_prot_aligned = apply_transform(gen_prot, R, t)
 
+    ca_rmsd = pos_rmsd(gt_prot[is_ca], gen_prot_aligned[is_ca])
+    aa_rmsd = pos_rmsd(gt_prot, gen_prot_aligned)
     n_sc = int((~is_bb).sum())
     sc_rmsd = pos_rmsd(gt_prot[~is_bb], gen_prot_aligned[~is_bb]) if n_sc > 0 else float("nan")
 
@@ -159,7 +161,8 @@ def eval_sample(pdb_path: str, gt_prot_names: list, gt_prot: np.ndarray, gt_lig:
         lig_rmsd = float("inf")
         combined_rmsd = float("inf")
 
-    return {"sc_rmsd": sc_rmsd, "lig_rmsd": lig_rmsd, "combined_rmsd": combined_rmsd,
+    return {"ca_rmsd": ca_rmsd, "aa_rmsd": aa_rmsd, "sc_rmsd": sc_rmsd,
+            "lig_rmsd": lig_rmsd, "combined_rmsd": combined_rmsd,
             "n_sc_atoms": n_sc, "n_lig_atoms": len(gt_lig)}
 
 
@@ -183,6 +186,8 @@ def _eval_system_job(system_id: str, pdb_paths: list, npz_path: str, max_protein
             records.append({
                 "system_id": system_id,
                 "sample_idx": idx,
+                "ca_rmsd": r["ca_rmsd"],
+                "aa_rmsd": r["aa_rmsd"],
                 "sc_rmsd": r["sc_rmsd"],
                 "lig_rmsd": r["lig_rmsd"],
                 "combined_rmsd": r["combined_rmsd"],
@@ -197,6 +202,8 @@ def _eval_system_job(system_id: str, pdb_paths: list, npz_path: str, max_protein
             records.append({
                 "system_id": system_id,
                 "sample_idx": idx,
+                "ca_rmsd": float("inf"),
+                "aa_rmsd": float("inf"),
                 "sc_rmsd": float("inf"),
                 "lig_rmsd": float("inf"),
                 "combined_rmsd": float("inf"),
@@ -341,14 +348,18 @@ def main():
             print(f"  [sample error] {sid} — {first_err}")
             first_errors_shown += 1
             if args.verbose:
-            for r in sys_records:
-                if r["note"]:
-                    print(f"  [{sid}] sample {r['sample_idx']}: {r['note']}")
+                for r in sys_records:
+                    if r["note"]:
+                        print(f"  [{sid}] sample {r['sample_idx']}: {r['note']}")
+            ca_vals   = [r["ca_rmsd"]       for r in sys_records if np.isfinite(r["ca_rmsd"])]
+            aa_vals   = [r["aa_rmsd"]       for r in sys_records if np.isfinite(r["aa_rmsd"])]
             sc_vals   = [r["sc_rmsd"]       for r in sys_records if np.isfinite(r["sc_rmsd"])]
             lig_vals  = [r["lig_rmsd"]      for r in sys_records if np.isfinite(r["lig_rmsd"])]
             comb_vals = [r["combined_rmsd"] for r in sys_records if np.isfinite(r["combined_rmsd"])]
             if sc_vals:
                 msg = (f"  {sid}: {len(sc_vals)} samples, "
+                       f"ca min={min(ca_vals):.3f} mean={np.mean(ca_vals):.3f} Å  "
+                       f"aa min={min(aa_vals):.3f} mean={np.mean(aa_vals):.3f} Å  "
                        f"sc min={min(sc_vals):.3f} mean={np.mean(sc_vals):.3f} Å")
                 if lig_vals:
                     msg += f"  lig min={min(lig_vals):.3f} mean={np.mean(lig_vals):.3f} Å"
@@ -367,10 +378,16 @@ def main():
         return
 
     # ---- aggregate ----
+    all_ca   = [r["ca_rmsd"]       for r in all_records]
+    all_aa   = [r["aa_rmsd"]       for r in all_records]
     all_sc   = [r["sc_rmsd"]       for r in all_records]
     all_lig  = [r["lig_rmsd"]      for r in all_records]
     all_comb = [r["combined_rmsd"] for r in all_records]
 
+    sys_min_ca    = _min_per_system(records_by_system, "ca_rmsd")
+    sys_mean_ca   = _mean_per_system(records_by_system, "ca_rmsd")
+    sys_min_aa    = _min_per_system(records_by_system, "aa_rmsd")
+    sys_mean_aa   = _mean_per_system(records_by_system, "aa_rmsd")
     sys_min_sc    = _min_per_system(records_by_system, "sc_rmsd")
     sys_mean_sc   = _mean_per_system(records_by_system, "sc_rmsd")
     sys_min_lig   = _min_per_system(records_by_system, "lig_rmsd")
@@ -382,11 +399,15 @@ def main():
     n_sys  = len(records_by_system)
     n_samp = sum(1 for v in all_sc if np.isfinite(v))
 
-    def _block(label, sc_vals, lig_vals, comb_vals):
+    def _block(label, ca_vals, aa_vals, sc_vals, lig_vals, comb_vals):
         print(f"\n--- {label} ---")
         print(f"  n              : {len([v for v in sc_vals if np.isfinite(v)])}")
+        print(f"  ca_rmsd  mean  : {mean_finite(ca_vals):.3f} Å")
+        print(f"  aa_rmsd  mean  : {mean_finite(aa_vals):.3f} Å")
         print(f"  sc_rmsd  mean  : {mean_finite(sc_vals):.3f} Å")
         for d in deltas:
+            print(f"  COV ca  < {d:.1f}Å  : {cov(ca_vals, d)*100:.1f}%")
+            print(f"  COV aa  < {d:.1f}Å  : {cov(aa_vals, d)*100:.1f}%")
             print(f"  COV sc  < {d:.1f}Å  : {cov(sc_vals, d)*100:.1f}%")
         n_lig = sum(1 for v in lig_vals if np.isfinite(v))
         if n_lig:
@@ -403,9 +424,12 @@ def main():
     print(f"  PLINDER PLACER EVAL  —  {n_sys} systems,  {n_samp} samples")
     print(f"{'='*60}")
 
-    _block("Per-sample (all samples pooled)",        all_sc,       all_lig,      all_comb)
-    _block("Per-system best sample (min sc_rmsd)",   sys_min_sc,   sys_min_lig,  sys_min_comb)
-    _block("Per-system mean sample",                 sys_mean_sc,  sys_mean_lig, sys_mean_comb)
+    _block("Per-sample (all samples pooled)",
+           all_ca,      all_aa,      all_sc,       all_lig,      all_comb)
+    _block("Per-system best sample (min sc_rmsd)",
+           sys_min_ca,  sys_min_aa,  sys_min_sc,   sys_min_lig,  sys_min_comb)
+    _block("Per-system mean sample",
+           sys_mean_ca, sys_mean_aa, sys_mean_sc,  sys_mean_lig, sys_mean_comb)
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -414,25 +438,37 @@ def main():
             "n_samples": n_samp,
             "deltas": deltas,
             "per_sample": {
+                "ca_rmsd_mean":       mean_finite(all_ca),
+                "aa_rmsd_mean":       mean_finite(all_aa),
                 "sc_rmsd_mean":       mean_finite(all_sc),
                 "lig_rmsd_mean":      mean_finite(all_lig),
                 "combined_rmsd_mean": mean_finite(all_comb),
+                "cov_ca":   {f"{d:.1f}": cov(all_ca,   d) for d in deltas},
+                "cov_aa":   {f"{d:.1f}": cov(all_aa,   d) for d in deltas},
                 "cov_sc":   {f"{d:.1f}": cov(all_sc,   d) for d in deltas},
                 "cov_lig":  {f"{d:.1f}": cov(all_lig,  d) for d in deltas},
                 "cov_comb": {f"{d:.1f}": cov(all_comb, d) for d in deltas},
             },
             "per_system_best": {
+                "ca_rmsd_mean":       mean_finite(sys_min_ca),
+                "aa_rmsd_mean":       mean_finite(sys_min_aa),
                 "sc_rmsd_mean":       mean_finite(sys_min_sc),
                 "lig_rmsd_mean":      mean_finite(sys_min_lig),
                 "combined_rmsd_mean": mean_finite(sys_min_comb),
+                "cov_ca":   {f"{d:.1f}": cov(sys_min_ca,   d) for d in deltas},
+                "cov_aa":   {f"{d:.1f}": cov(sys_min_aa,   d) for d in deltas},
                 "cov_sc":   {f"{d:.1f}": cov(sys_min_sc,   d) for d in deltas},
                 "cov_lig":  {f"{d:.1f}": cov(sys_min_lig,  d) for d in deltas},
                 "cov_comb": {f"{d:.1f}": cov(sys_min_comb, d) for d in deltas},
             },
             "per_system_mean": {
+                "ca_rmsd_mean":       mean_finite(sys_mean_ca),
+                "aa_rmsd_mean":       mean_finite(sys_mean_aa),
                 "sc_rmsd_mean":       mean_finite(sys_mean_sc),
                 "lig_rmsd_mean":      mean_finite(sys_mean_lig),
                 "combined_rmsd_mean": mean_finite(sys_mean_comb),
+                "cov_ca":   {f"{d:.1f}": cov(sys_mean_ca,   d) for d in deltas},
+                "cov_aa":   {f"{d:.1f}": cov(sys_mean_aa,   d) for d in deltas},
                 "cov_sc":   {f"{d:.1f}": cov(sys_mean_sc,   d) for d in deltas},
                 "cov_lig":  {f"{d:.1f}": cov(sys_mean_lig,  d) for d in deltas},
                 "cov_comb": {f"{d:.1f}": cov(sys_mean_comb, d) for d in deltas},
