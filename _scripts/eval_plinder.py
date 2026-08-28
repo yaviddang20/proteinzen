@@ -997,8 +997,10 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
         pb = run_posebusters(str(pdb_path), smiles) if run_pb else {}
     gen_lig = lig_coords.astype(np.float64) if len(lig_coords) > 0 else None
 
+    _nan_fold = {"plddt": float("nan"), "iptm": float("nan"), "sc_rmsd": float("nan"), "lig_rmsd": float("nan")}
     if skip_fold or not sequence:
-        fold = {"plddt": float("nan"), "iptm": float("nan"), "sc_rmsd": float("nan"), "lig_rmsd": float("nan")}
+        fold        = _nan_fold.copy()
+        fold_nolig  = _nan_fold.copy()
     else:
         fold = run_refolding(
             sequence=sequence, smiles=smiles, gen_ca=prot_ca,
@@ -1006,6 +1008,13 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
             sample_id=pdb_path.stem, boltz_cache=boltz_cache,
             gen_lig=gen_lig,
         )
+        fold_nolig = run_refolding(
+            sequence=sequence, smiles=None, gen_ca=prot_ca,
+            refold_input_dir=refold_input_dir, refold_output_dir=refold_output_dir,
+            sample_id=f"{pdb_path.stem}_nolig", boltz_cache=boltz_cache,
+            gen_lig=None,
+        )
+    fold_nolig = {f"nolig_{k}": v for k, v in fold_nolig.items()}
 
     def _run_mpnn_case(seqs, refold_smiles, tag, base_dir):
         results = []
@@ -1060,6 +1069,7 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
         "n_prot_contact_atoms": n_prot_contact,
         **pb,
         **fold,
+        **fold_nolig,
         **pmpnn_metrics,
         **lmpnn_metrics,
     }
@@ -1154,7 +1164,7 @@ def run_ligand_cond_eval(args):
     pb_cache: dict = {}
     if run_pb and todo_files:
         import multiprocessing as _mp2
-        n_pb_workers = max(1, _mp2.cpu_count() // 2)
+        n_pb_workers = _mp2.cpu_count()
         print(f"Running PoseBusters on {len(todo_files)} samples ({n_pb_workers} workers)...")
         def _pb_one(pdb_path):
             m = _GPU_SUFFIX.search(pdb_path.stem)
@@ -1256,11 +1266,14 @@ def run_ligand_cond_eval(args):
     serial = [{k: _ser(v) for k, v in r.items()} for r in all_results]
     (args.out_dir / "results.json").write_text(json.dumps(serial, indent=2))
 
-    frac_c   = [r.get("frac_lig_contacted") for r in all_results]
-    plddts   = [r.get("plddt")    for r in all_results]
-    iptms    = [r.get("iptm")     for r in all_results]
-    scrmsds  = [r.get("sc_rmsd")  for r in all_results]
-    ligrmsds = [r.get("lig_rmsd") for r in all_results]
+    frac_c        = [r.get("frac_lig_contacted") for r in all_results]
+    plddts        = [r.get("plddt")         for r in all_results]
+    iptms         = [r.get("iptm")          for r in all_results]
+    scrmsds       = [r.get("sc_rmsd")       for r in all_results]
+    ligrmsds      = [r.get("lig_rmsd")      for r in all_results]
+    nolig_plddts  = [r.get("nolig_plddt")   for r in all_results]
+    nolig_iptms   = [r.get("nolig_iptm")    for r in all_results]
+    nolig_scrmsds = [r.get("nolig_sc_rmsd") for r in all_results]
 
     contact_cutoff = getattr(args, "contact_cutoff", 4.0)
     sc_deltas = getattr(args, "delta", [2.0, 5.0])
@@ -1287,6 +1300,18 @@ def run_ligand_cond_eval(args):
             lines.append(f"  ligRMSD mean  : {fmt(mean_f(ligrmsds))} Å")
             for d in sc_deltas:
                 lines.append(f"  COV lig_rmsd < {d:.1f} Å : {cov_f(ligrmsds, d)*100:.1f}%")
+    else:
+        lines.append("  [all NaN — check boltz errors in results.json]")
+
+    lines.append(f"\n--- Refolding self-consistency — model sequence w/o ligand (Boltz2) ---")
+    if args.no_fold:
+        lines.append("  [skipped — remove --no-fold to enable]")
+    elif _finite(nolig_plddts):
+        lines.append(f"  pLDDT mean    : {fmt(mean_f(nolig_plddts))}")
+        lines.append(f"  ipTM  mean    : {fmt(mean_f(nolig_iptms))}")
+        lines.append(f"  scRMSD mean   : {fmt(mean_f(nolig_scrmsds))} Å")
+        for d in sc_deltas:
+            lines.append(f"  COV sc_rmsd < {d:.1f} Å : {cov_f(nolig_scrmsds, d)*100:.1f}%")
     else:
         lines.append("  [all NaN — check boltz errors in results.json]")
 
