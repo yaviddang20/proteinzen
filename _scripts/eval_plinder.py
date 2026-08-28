@@ -973,8 +973,8 @@ def _run_ligandmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, script: str, mod
             "--model_type", model_type,
             "--pdb_path", str(pdb_path),
             "--out_folder", str(out_dir),
-            "--num_seq_per_target", str(n_seqs),
-            "--sampling_temp", "0.1",
+            "--number_of_batches", str(n_seqs),
+            "--temperature", "0.1",
             "--batch_size", "1",
         ], check=True, timeout=300)
     return _parse_mpnn_fasta(fasta_path)[:n_seqs]
@@ -1147,7 +1147,9 @@ def run_ligand_cond_eval(args):
         sys.exit(f"No PDB files found in {samples_dir}")
     ligand_name = getattr(args, "ligand_name", "LIG")
     continue_run = getattr(args, "continue_run", False)
-    num_gpus = getattr(args, "num_gpus", 1)
+    import torch as _torch
+    _detected = _torch.cuda.device_count() if _torch.cuda.is_available() else 1
+    num_gpus = getattr(args, "num_gpus", None) or _detected
     print(f"Evaluating {len(pdb_files)} generated samples for ligand={ligand_name} on {num_gpus} GPU(s)")
 
     # Filter out already-cached samples when continuing
@@ -1476,7 +1478,7 @@ def main():
              "Default: False (wipe out_dir and rerun everything).",
     )
     parser.add_argument(
-        "--num-gpus", type=int, default=1,
+        "--num-gpus", type=int, default=None,
         help="[ligand_cond] Number of GPUs to use for parallel Boltz refolding. "
              "Each GPU runs as a separate worker process. Default: 1.",
     )

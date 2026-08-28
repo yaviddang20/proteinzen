@@ -19,12 +19,12 @@ else
     micromamba create -n mpnn -y \
         python=3.10 \
         pytorch pytorch-cuda=11.8 \
-        numpy \
+        "numpy<1.24" \
         -c pytorch -c nvidia -c conda-forge
 fi
 
 echo "=== Installing Python deps (idempotent) ==="
-micromamba run -n mpnn pip install prody ml-collections
+micromamba run -n mpnn pip install prody ml-collections dm-tree
 
 if [ -d "${DIR}/LigandMPNN/model_params" ] && [ "$(ls -A "${DIR}/LigandMPNN/model_params"/*.pt 2>/dev/null | wc -l)" -gt 0 ]; then
     echo "=== LigandMPNN weights already present, skipping download ==="
