@@ -1579,7 +1579,7 @@ def main():
         import shutil
         # Only remove eval artifacts, never the samples directory
         samples_dir_default = args.out_dir / "samples"
-        for subdir in ["refold_inputs", "refold_outputs", "per_sample",
+        for subdir in ["refold_inputs", "refold_outputs", "mpnn_refold", "per_sample",
                        "aligned_pocket", "aligned_lig"]:
             p = args.out_dir / subdir
             if p.exists():
