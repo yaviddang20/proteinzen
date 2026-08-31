@@ -518,6 +518,7 @@ class BiomoleculeModule(L.LightningModule):
                  postalign_noise=False,
                  epoch_sample_every_n_epochs=5,
                  epoch_sample_num_steps=100,
+                 epoch_sample_traj_npz=False,
                  seq_noise_schedule=False,
                  # use_stabilized_high_t_loss=False
                  lora_config=None,
@@ -603,6 +604,7 @@ class BiomoleculeModule(L.LightningModule):
         self.accumulate_grad_batches = accumulate_grad_batches
         self.epoch_sample_every_n_epochs = epoch_sample_every_n_epochs
         self.epoch_sample_num_steps = epoch_sample_num_steps
+        self.epoch_sample_traj_npz = epoch_sample_traj_npz
         self.seq_noise_schedule = seq_noise_schedule
         self._epoch_sample_train_batch = None
         self._epoch_sample_val_batch = None
@@ -1361,21 +1363,38 @@ class BiomoleculeModule(L.LightningModule):
                     token_residue_idx=res_idx_np_all[i],
                 )
 
-            traj_npz_path = path.replace('.pdb', '_traj.npz')
-            np.savez_compressed(
-                traj_npz_path,
-                prot_traj=np.stack([s[i] for s in prot_traj_np]),
-                clean_traj=np.stack([s[i] for s in clean_traj_np]),
-                rigids_mask=rigids_mask_np[i],
-                ref_elements=ref_elements_np[i],
-                is_atom_mask=is_atom_mask_np[i],
-                sc_idx=sc_idx_np_all[i],
-                to_tok=to_tok_np_all[i],
-                seq_idx=seq_idx_np_all[i],
-                res_type=res_type_np_all[i],
-                asym_id=asym_id_np_all[i],
-                res_idx=res_idx_np_all[i],
-            )
+            if self.epoch_sample_traj_npz:
+                traj_npz_path = path.replace('.pdb', '_traj.npz')
+                np.savez_compressed(
+                    traj_npz_path,
+                    prot_traj=np.stack([s[i] for s in prot_traj_np]),
+                    clean_traj=np.stack([s[i] for s in clean_traj_np]),
+                    rigids_mask=rigids_mask_np[i],
+                    ref_elements=ref_elements_np[i],
+                    is_atom_mask=is_atom_mask_np[i],
+                    sc_idx=sc_idx_np_all[i],
+                    to_tok=to_tok_np_all[i],
+                    seq_idx=seq_idx_np_all[i],
+                    res_type=res_type_np_all[i],
+                    asym_id=asym_id_np_all[i],
+                    res_idx=res_idx_np_all[i],
+                )
+            else:
+                for traj_np, traj_suffix in [
+                    (prot_traj_np, '_traj_noise.pdb'),
+                    (clean_traj_np, '_traj_clean.pdb'),
+                ]:
+                    traj_path = path.replace('.pdb', traj_suffix)
+                    with open(traj_path, 'w') as f:
+                        for step_idx, step_rigid7 in enumerate(traj_np):
+                            step_records = _build_all_atom_records(
+                                step_rigid7[i], rigids_mask_np[i], ref_elements_np[i], is_atom_mask_np[i],
+                                sc_idx_np_all[i], to_tok_np_all[i], seq_idx_np_all[i],
+                                res_type_np_all[i], asym_id_np_all[i],
+                                token_residue_idx=res_idx_np_all[i],
+                            )
+                            _write_model_block(f, step_records, step_idx + 1)
+                        f.write("END\n")
 
             self._log.info(f"Epoch {epoch} integration sample ({split})[{i}] written: {path} (mse={mse_all_rigids_i:.3f}, heavy_atoms_mse={mse_i:.3f}, kabsch={mse_kabsch_i:.3f}, seq_recovery={seq_recovery_i:.3f})")
 
