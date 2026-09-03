@@ -1298,6 +1298,10 @@ class BiomoleculeModule(L.LightningModule):
             n_noised_all = noised_all_mask_t[i].long().sum().clamp(min=1)
 
             align_mask_i = noised_heavy_mask_t[i]
+            if align_mask_i.sum() == 0:
+                record_id = batch.get('record_id', [None])[i]
+                self._log.warning(f"Skipping epoch sample: no noised heavy atoms for record_id={record_id} epoch={epoch} rank={rank} split={split}")
+                continue
             align_batch_i = torch.zeros(align_mask_i.sum(), dtype=torch.long, device=align_mask_i.device)
             _, _, R_i = align_structures(pred_trans_t[i][align_mask_i], align_batch_i, gt_trans_t[i][align_mask_i])
             pred_mean_i = pred_trans_t[i][align_mask_i].mean(0)
