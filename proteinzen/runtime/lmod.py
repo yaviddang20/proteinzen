@@ -995,13 +995,20 @@ class BiomoleculeModule(L.LightningModule):
             )
 
         if run_epoch_sample:
-            if self._epoch_sample_train_batch is not None:
-                n = max(1, self._epoch_sample_train_batch['rigids']['rigids_mask'].shape[0] // 2)
-                self._run_epoch_sample(self._epoch_sample_train_batch, "train", max_samples=n)
-            n = max(1, batch['rigids']['rigids_mask'].shape[0] // 2)
-            self._run_epoch_sample(batch, "val", max_samples=n)
-            n = max(1, self._epoch_sample_val_batch['rigids']['rigids_mask'].shape[0] // 2)
-            self._run_epoch_sample(self._epoch_sample_val_batch, "val_ref", max_samples=n)
+            for _split, _stash in [
+                ("train", self._epoch_sample_train_batch),
+                ("val", batch),
+                ("val_ref", self._epoch_sample_val_batch),
+            ]:
+                if _stash is None:
+                    continue
+                try:
+                    n = max(1, _stash['rigids']['rigids_mask'].shape[0] // 2)
+                    self._run_epoch_sample(_stash, _split, max_samples=n)
+                except Exception as e:
+                    log.warning(f"epoch_sample {_split} failed (epoch {self.trainer.current_epoch}): {e}")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
     def _collect_val_pdb_data(self, batch, outputs, t_val: float, n_samples: int = 5, subdir: str = "val_pdbs"):
         """Extract all GPU tensors to CPU numpy."""
