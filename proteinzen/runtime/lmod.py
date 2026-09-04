@@ -511,6 +511,7 @@ class BiomoleculeModule(L.LightningModule):
                  no_seq_loss=False,
                  distogram_loss=False,
                  pred_local_fafe_loss=False,
+                 pred_lig_rmsd_loss=False,
                  pae_loss=False,
                  use_interface_fafe_loss=False,
                  use_interchain_fafe_loss=False,
@@ -566,6 +567,7 @@ class BiomoleculeModule(L.LightningModule):
         self.automatic_optimization = True
         self.distogram_loss = distogram_loss
         self.pred_local_fafe_loss = pred_local_fafe_loss
+        self.pred_lig_rmsd_loss = pred_lig_rmsd_loss
         self.pae_loss = pae_loss
         self.use_interface_fafe_loss = use_interface_fafe_loss
         self.use_interchain_fafe_loss = use_interchain_fafe_loss
@@ -1747,6 +1749,9 @@ class BiomoleculeModule(L.LightningModule):
 
         if self.pred_local_fafe_loss:
             loss = loss + 0.1 * frame_fm_loss_dict['pred_local_trans_fafe_loss'] + 0.1 * frame_fm_loss_dict['pred_local_rot_fafe_loss']
+
+        if self.pred_lig_rmsd_loss:
+            loss = loss + 0.1 * frame_fm_loss_dict['pred_lig_rmsd_loss']
 
         if self.pae_loss:
             loss = loss + 0.1 * frame_fm_loss_dict['pae_cross_entropy']

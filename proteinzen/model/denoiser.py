@@ -828,6 +828,9 @@ class IpaDenoiser(nn.Module):
                  distogram_max_bin=22,
                  pair_trans_fafe_min_bin=0,
                  pair_trans_fafe_max_bin=31,
+                 pred_lig_rmsd=False,
+                 num_lig_rmsd_bins=50,
+                 lig_rmsd_max_bin=10.0,
                  ):
         super().__init__()
         # self.diffuser = diffuser
@@ -989,6 +992,18 @@ class IpaDenoiser(nn.Module):
         else:
             self.local_trans_fafe_head = None
             self.local_rot_fafe_head = None
+
+        self.num_lig_rmsd_bins = num_lig_rmsd_bins
+        self.lig_rmsd_max_bin = lig_rmsd_max_bin
+        if pred_lig_rmsd:
+            self.lig_rmsd_head = nn.Sequential(
+                LayerNorm(c_frame),
+                Linear(c_frame, c_frame),
+                nn.ReLU(),
+                Linear(c_frame, num_lig_rmsd_bins),
+            )
+        else:
+            self.lig_rmsd_head = None
 
         if predict_final_rot and not accumulate_rot_vf_output:
             self.final_rot_head = nn.Sequential(
@@ -1218,6 +1233,13 @@ class IpaDenoiser(nn.Module):
 
         if self.local_rot_fafe_head is not None:
             metrics["local_rot_fafe_logits"] = self.local_rot_fafe_head(rigids_embed)
+
+        if self.lig_rmsd_head is not None:
+            metrics["lig_rmsd_logits"] = self.lig_rmsd_head(rigids_embed)
+            metrics["lig_rmsd_bin_centers"] = torch.linspace(
+                0.0, self.lig_rmsd_max_bin, self.num_lig_rmsd_bins,
+                device=rigids_embed.device
+            )
 
         return metrics
 

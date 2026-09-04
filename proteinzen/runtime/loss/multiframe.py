@@ -731,6 +731,9 @@ def multiframe_fm_loss_dense_batch(
     if "local_trans_fafe_logits" in denoiser_outputs and "local_rot_fafe_logits" in denoiser_outputs:
         ret.update(local_fafe_losses(inputs, denoiser_outputs, fafe_dict))
 
+    if "lig_rmsd_logits" in denoiser_outputs:
+        ret.update(lig_rmsd_loss(inputs, denoiser_outputs, pred_frame_trans, gt_frame_trans))
+
     if "pair_trans_fafe_logits" in denoiser_outputs:
         ret.update(pae_losses(inputs, denoiser_outputs))
 
@@ -875,6 +878,56 @@ def local_fafe_losses(
     return {
         "pred_local_trans_fafe_loss": local_trans_fafe_cross_entropy,
         "pred_local_rot_fafe_loss": local_rot_fafe_cross_entropy,
+    }
+
+
+def lig_rmsd_loss(inputs, denoiser_outputs, pred_frame_trans, gt_frame_trans):
+    """Per-atom ligand RMSD prediction loss (PLACER-style).
+
+    Predicts binned per-atom displacement for ligand atoms only. At inference,
+    (softmax(logits) * bin_centers).sum(-1) gives expected per-atom RMSD.
+    """
+    lig_rmsd_logits = denoiser_outputs["lig_rmsd_logits"]    # [B, N_rigids, num_bins]
+    bin_centers = denoiser_outputs["lig_rmsd_bin_centers"]   # [num_bins]
+    num_bins = lig_rmsd_logits.shape[-1]
+
+    rigids_mask = inputs['rigids']['rigids_mask']                    # [B, N_rigids]
+    is_atom = inputs['rigids']['rigids_is_atom_mask'].bool()         # [B, N_rigids]
+    rigids_to_token = inputs['rigids']['rigids_to_token']            # [B, N_rigids]
+    token_mol_type = inputs['token']['mol_type']                     # [B, N_tokens]
+
+    N_tokens = token_mol_type.shape[1]
+    tok_clamped = rigids_to_token.clamp(0, N_tokens - 1)
+    rigid_mol_type = token_mol_type.gather(1, tok_clamped)           # [B, N_rigids]
+
+    _NONPOLYMER = 3  # const.chain_type_ids["NONPOLYMER"]
+    lig_mask = (rigids_mask & is_atom & (rigid_mol_type == _NONPOLYMER)).float()
+
+    # Per-atom L2 displacement (Å)
+    per_atom_dist = torch.sqrt(
+        torch.square(pred_frame_trans.detach() - gt_frame_trans).sum(dim=-1) + 1e-8
+    )  # [B, N_rigids]
+
+    # Discretise into bins
+    bin_width = bin_centers[-1] / max(num_bins - 1, 1)
+    bin_idx = (per_atom_dist / bin_width).long().clamp(0, num_bins - 1)  # [B, N_rigids]
+
+    ce = F.cross_entropy(
+        lig_rmsd_logits.transpose(-1, -2),  # [B, num_bins, N_rigids]
+        bin_idx,                             # [B, N_rigids]
+        reduction='none',
+    )  # [B, N_rigids]
+
+    n_lig = lig_mask.sum(dim=-1).clamp(min=1)
+    ce_loss = (ce * lig_mask).sum(dim=-1) / n_lig  # [B]
+
+    probs = torch.softmax(lig_rmsd_logits.detach(), dim=-1)
+    expected_rmsd_per_atom = (probs * bin_centers).sum(dim=-1)       # [B, N_rigids]
+    pred_lig_rmsd = (expected_rmsd_per_atom * lig_mask).sum(dim=-1) / n_lig  # [B]
+
+    return {
+        "pred_lig_rmsd_loss": ce_loss,
+        "pred_lig_rmsd": pred_lig_rmsd,
     }
 
 
