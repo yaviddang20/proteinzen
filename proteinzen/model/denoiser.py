@@ -1490,7 +1490,10 @@ class IpaMultiRigidDenoiser(nn.Module):
                  use_entity_id_unmasking=False,
                  pred_distogram=False,
                  pred_local_fafe=False,
-                 pred_pae=False
+                 pred_pae=False,
+                 pred_lig_rmsd=False,
+                 num_lig_rmsd_bins=50,
+                 lig_rmsd_max_bin=10.0,
                  ):
         super().__init__()
 
@@ -1554,6 +1557,9 @@ class IpaMultiRigidDenoiser(nn.Module):
             pred_distogram=pred_distogram,
             pred_local_fafe=pred_local_fafe,
             pred_bb_fafe=pred_pae,
+            pred_lig_rmsd=pred_lig_rmsd,
+            num_lig_rmsd_bins=num_lig_rmsd_bins,
+            lig_rmsd_max_bin=lig_rmsd_max_bin,
         )
 
         self.embedder = Embedder(
@@ -1763,6 +1769,9 @@ class IpaMultiRigidDenoiser(nn.Module):
             ret["local_trans_fafe_logits"] = score_dict['local_trans_fafe_logits']
         if "local_rot_fafe_logits" in score_dict:
             ret["local_rot_fafe_logits"] = score_dict['local_rot_fafe_logits']
+        if "lig_rmsd_logits" in score_dict:
+            ret["lig_rmsd_logits"] = score_dict['lig_rmsd_logits']
+            ret["lig_rmsd_bin_centers"] = score_dict['lig_rmsd_bin_centers']
         if "pair_trans_fafe_logits" in score_dict:
             ret["pair_trans_fafe_logits"] = score_dict['pair_trans_fafe_logits']
             ret['pair_trans_fafe_bin_lower'] = score_dict['pair_trans_fafe_bin_lower']
