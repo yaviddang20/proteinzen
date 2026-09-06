@@ -352,6 +352,7 @@ def config_sampling_hydra_store():
         identity_rot_noise=False,
         continue_run=False,
         overwrite=False,
+        checkpoint_stem=None,
         hydra_defaults=[
             {"sampler": "default"},
             {"corrupter": "default"},

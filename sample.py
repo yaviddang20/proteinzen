@@ -117,11 +117,14 @@ def main(sampler,
         else:
             continue
 
-    epoch_list = sorted(epoch_list, key=lambda x: x[1])
-    epoch_list, _ = zip(*epoch_list)
-    ckpt_path = epoch_list[zen_cfg["checkpoint_idx"]]
-    # if has_best:
-    #     ckpt_path = best_ckpt_path
+    ckpt_stem = zen_cfg.get("checkpoint_stem", None)
+    if ckpt_stem:
+        ckpt_dir = os.path.join(run_dir, f"lightning_logs/version_{version_num}/checkpoints")
+        ckpt_path = os.path.join(ckpt_dir, f"{ckpt_stem}.ckpt")
+    else:
+        epoch_list = sorted(epoch_list, key=lambda x: x[1])
+        epoch_list, _ = zip(*epoch_list)
+        ckpt_path = epoch_list[zen_cfg["checkpoint_idx"]]
     print(ckpt_path)
     zen_cfg['ckpt_path'] = ckpt_path
 
