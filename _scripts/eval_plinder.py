@@ -1232,6 +1232,12 @@ def run_ligand_cond_eval(args):
         else:
             todo_files.append(pdb_path)
 
+    if getattr(args, "aggregate_only", False):
+        if todo_files:
+            print(f"--aggregate-only: skipping {len(todo_files)} not-yet-cached/stale sample(s), "
+                  f"aggregating {len(cached_results)} already-cached result(s) only")
+        todo_files = []
+
     def _ser(v):
         if isinstance(v, (np.floating, np.float32, np.float64)): return float(v)
         if isinstance(v, np.integer): return int(v)
@@ -1560,6 +1566,13 @@ def main():
         "--overwrite", action="store_true", default=False,
         help="Wipe existing eval outputs and rerun everything. "
              "Default: False (preserve existing results, only re-run stale/missing samples).",
+    )
+    parser.add_argument(
+        "--aggregate-only", action="store_true", default=False,
+        help="Skip evaluating any not-yet-cached/stale samples (no Boltz/MPNN/PoseBusters "
+             "runs) and just write results.json/summary.txt from whatever per-sample JSONs "
+             "are already cached on disk. Use this to check current progress on a slow eval "
+             "without triggering more compute.",
     )
     parser.add_argument(
         "--num-gpus", type=int, default=None,
