@@ -2058,6 +2058,26 @@ class BiomoleculeModule(L.LightningModule):
         pred_trans_1 = pred_rigids.get_trans() + global_shift[..., None, :]
         pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
 
+        # Compute per-sample predicted ligand RMSD scalar from confidence head if present.
+        pred_lig_rmsd_per_sample = None
+        if "lig_rmsd_logits" in denoiser_out:
+            rigids_data_b = batch['rigids']
+            token_data_b = batch['token']
+            rigids_mask_b = rigids_data_b['rigids_mask'].bool()
+            is_atom_b = rigids_data_b['rigids_is_atom_mask'].bool()
+            rigids_to_token_b = rigids_data_b['rigids_to_token']
+            token_mol_type_b = token_data_b['mol_type']
+            N_tokens_b = token_mol_type_b.shape[1]
+            tok_clamped_b = rigids_to_token_b.clamp(0, N_tokens_b - 1)
+            rigid_mol_type_b = token_mol_type_b.gather(1, tok_clamped_b)
+            _NONPOLYMER = 3
+            lig_mask_b = (rigids_mask_b & is_atom_b & (rigid_mol_type_b == _NONPOLYMER)).float()
+            bin_centers_b = denoiser_out["lig_rmsd_bin_centers"]
+            probs_b = torch.softmax(denoiser_out["lig_rmsd_logits"], dim=-1)
+            expected_b = (probs_b * bin_centers_b).sum(-1)
+            n_lig_b = lig_mask_b.sum(-1).clamp(min=1)
+            pred_lig_rmsd_per_sample = ((expected_b * lig_mask_b).sum(-1) / n_lig_b).cpu().numpy()
+
         ret = []
 
         # data_list = batch.to_data_list()
@@ -2139,6 +2159,7 @@ class BiomoleculeModule(L.LightningModule):
                 "fixed_seq_chain_idx": fixed_seq_chain_idx,
                 "name": batch["task"][i],
                 "smiles": batch["smiles"][i],
+                "pred_lig_rmsd": float(pred_lig_rmsd_per_sample[i]) if pred_lig_rmsd_per_sample is not None else None,
             })
 
         return ret
@@ -2296,6 +2317,25 @@ class BiomoleculeSamplingModule(L.LightningModule):
         pred_tensor7 = pred_rigids.to_tensor_7().numpy(force=True)
         pred_seq = final_denoiser_out["pred_seq"].numpy(force=True)
 
+        pred_lig_rmsd_per_sample = None
+        if "lig_rmsd_logits" in final_denoiser_out:
+            rigids_data_b = batch['rigids']
+            token_data_b = batch['token']
+            rigids_mask_b = rigids_data_b['rigids_mask'].bool()
+            is_atom_b = rigids_data_b['rigids_is_atom_mask'].bool()
+            rigids_to_token_b = rigids_data_b['rigids_to_token']
+            token_mol_type_b = token_data_b['mol_type']
+            N_tokens_b = token_mol_type_b.shape[1]
+            tok_clamped_b = rigids_to_token_b.clamp(0, N_tokens_b - 1)
+            rigid_mol_type_b = token_mol_type_b.gather(1, tok_clamped_b)
+            _NONPOLYMER = 3
+            lig_mask_b = (rigids_mask_b & is_atom_b & (rigid_mol_type_b == _NONPOLYMER)).float()
+            bin_centers_b = final_denoiser_out["lig_rmsd_bin_centers"]
+            probs_b = torch.softmax(final_denoiser_out["lig_rmsd_logits"], dim=-1)
+            expected_b = (probs_b * bin_centers_b).sum(-1)
+            n_lig_b = lig_mask_b.sum(-1).clamp(min=1)
+            pred_lig_rmsd_per_sample = ((expected_b * lig_mask_b).sum(-1) / n_lig_b).cpu().numpy()
+
         task_name = batch['task'][0]
         non_copy_task_names = {"protein_conditioned_generate_ligand", "ligand_conditioned_generate_protein"}
 
@@ -2376,6 +2416,7 @@ class BiomoleculeSamplingModule(L.LightningModule):
                 "fixed_seq_chain_idx": fixed_seq_chain_idx,
                 "name": batch["task"][i],
                 "smiles": batch["smiles"][i],
+                "pred_lig_rmsd": float(pred_lig_rmsd_per_sample[i]) if pred_lig_rmsd_per_sample is not None else None,
             })
 
         return ret
@@ -2548,6 +2589,7 @@ class PDBWriter(BasePredictionWriter):
                 "fixed_bb_chain": [chain_mapping[int(i)] for i in sample_data['fixed_bb_chain_idx']],
                 "fixed_seq_res_idx": [i+1 for i in sample_data['fixed_seq_res_idx'].tolist()],  # 1-indexed chain for pyrosetta
                 "fixed_seq_chain": [chain_mapping[int(i)] for i in sample_data['fixed_seq_chain_idx']],
+                "pred_lig_rmsd": sample_data.get('pred_lig_rmsd'),
             }
             curr_sample_id += 1
 
