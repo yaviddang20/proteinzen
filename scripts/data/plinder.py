@@ -1265,14 +1265,22 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> int:
 
     system_ids = [sid for sid, s in split.items() if s in args.splits]
 
+    # Tally filter reasons — seeded here (before per-system processing) so
+    # systems silently dropped by dedup steps get a recorded reason too,
+    # instead of only ever showing up in the before/after count printed above.
+    filtered_ids: dict[str, list[str]] = {}
+
     if getattr(args, "dedupe_assemblies", False):
-        before = len(system_ids)
+        before_ids = set(system_ids)
         system_ids = dedupe_assemblies(system_ids)
-        print(f"dedupe_assemblies: {before} → {len(system_ids)}")
+        dropped = sorted(before_ids - set(system_ids))
+        if dropped:
+            filtered_ids["dedupe_assemblies"] = dropped
+        print(f"dedupe_assemblies: {len(before_ids)} → {len(system_ids)}")
 
     dedup_threshold = getattr(args, "dedup_cluster_threshold", None)
     if dedup_threshold:
-        before = len(system_ids)
+        before_ids = set(system_ids)
         system_ids = dedupe_by_cluster95(
             system_ids,
             plinder_dir,
@@ -1282,13 +1290,19 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> int:
             metric=getattr(args, "cluster_metric", "pli_qcov"),
             threshold=dedup_threshold,
         )
-        print(f"dedupe_by_cluster{dedup_threshold}: {before} → {len(system_ids)}")
+        dropped = sorted(before_ids - set(system_ids))
+        if dropped:
+            filtered_ids[f"dedupe_cluster{dedup_threshold}"] = dropped
+        print(f"dedupe_by_cluster{dedup_threshold}: {len(before_ids)} → {len(system_ids)}")
 
     if hasattr(args, "system_ids_file") and args.system_ids_file is not None:
         allowed = set(Path(args.system_ids_file).read_text().split())
-        before = len(system_ids)
+        before_ids = set(system_ids)
         system_ids = [sid for sid in system_ids if sid in allowed]
-        print(f"system_ids_file: {before} → {len(system_ids)} after pocket filter")
+        dropped = sorted(before_ids - set(system_ids))
+        if dropped:
+            filtered_ids["not_in_pocket_allowlist"] = dropped
+        print(f"system_ids_file: {len(before_ids)} → {len(system_ids)} after pocket filter")
 
     if args.max_systems is not None:
         system_ids = system_ids[:args.max_systems]
@@ -1324,8 +1338,7 @@ def process(args, clusters: dict, annotations: dict, split: dict) -> int:
                       require_quality_pass, include_waters)
         results = [process_system_worker(sid) for sid in tqdm(system_ids)]
 
-    # Tally filter reasons
-    filtered_ids: dict[str, list[str]] = {}
+    # Tally per-system filter reasons (dedup drops were already seeded above)
     for sid, reason in results:
         if reason is not None:
             filtered_ids.setdefault(reason, []).append(sid)
