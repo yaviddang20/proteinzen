@@ -703,7 +703,7 @@ class BiomoleculeModule(L.LightningModule):
                 on_epoch=True,
                 prog_bar=False,
                 batch_size=value.shape[0],
-                sync_dist=False,
+                sync_dist=True,
             )
 
         # ---- t-stratified losses (TRAIN ONLY) ----
@@ -730,7 +730,7 @@ class BiomoleculeModule(L.LightningModule):
                     on_epoch=True,
                     prog_bar=False,
                     batch_size=t.shape[0],
-                    sync_dist=False,
+                    sync_dist=True,
                 )
 
             # t-stratified per-task losses
@@ -751,7 +751,7 @@ class BiomoleculeModule(L.LightningModule):
                     on_epoch=True,
                     prog_bar=False,
                     batch_size=t_per_sample.shape[0],
-                    sync_dist=False,
+                    sync_dist=True,
                 )
 
         # ---- val: per-task losses (val uses fixed t values via stage name) ----
@@ -764,7 +764,7 @@ class BiomoleculeModule(L.LightningModule):
                     on_epoch=True,
                     prog_bar=False,
                     batch_size=value.shape[0],
-                    sync_dist=False,
+                    sync_dist=True,
                 )
 
         # ---- final logging ----
@@ -774,7 +774,7 @@ class BiomoleculeModule(L.LightningModule):
             on_epoch=True,
             prog_bar=True,
             batch_size=batch["t"].shape[0],
-            sync_dist=False,
+            sync_dist=True,
         )
 
     def _shared_step(self, batch, return_outputs=False, skip_prealign=False):
@@ -1102,7 +1102,7 @@ class BiomoleculeModule(L.LightningModule):
                 "val/composite_pred_trans_mse",
                 composite,
                 prog_bar=True,
-                sync_dist=False,
+                sync_dist=True,
             )
 
     def on_train_epoch_end(self):
@@ -1410,13 +1410,13 @@ class BiomoleculeModule(L.LightningModule):
         integration_seq_recovery = float(np.mean(all_seq_recovery))
         integration_bond_length_rmse = float(bond_length_rmse(batch, final_denoiser_out))
         integration_bond_angle_rmse = float(bond_angle_rmse(batch, final_denoiser_out))
-        self.log(f"integration_{split}/{task_name}/seq_recovery", integration_seq_recovery, prog_bar=False, sync_dist=False)
-        self.log(f"integration_{split}/{task_name}/mse", integration_mse_all_rigids, prog_bar=False, sync_dist=False)
-        self.log(f"integration_{split}/{task_name}/mse_kabsch", integration_mse_kabsch, prog_bar=False, sync_dist=False)
-        self.log(f"integration_{split}/{task_name}/heavy_atoms_mse", integration_mse, prog_bar=False, sync_dist=False)
-        self.log(f"integration_{split}/{task_name}/heavy_atoms_mse_kabsch", float(np.mean(all_mse_kabsch_heavy)), prog_bar=False, sync_dist=False)
-        self.log(f"integration_{split}/{task_name}/bond_length_rmse", integration_bond_length_rmse, prog_bar=False, sync_dist=False)
-        self.log(f"integration_{split}/{task_name}/bond_angle_rmse", integration_bond_angle_rmse, prog_bar=False, sync_dist=False)
+        self.log(f"integration_{split}/{task_name}/seq_recovery", integration_seq_recovery, prog_bar=False, sync_dist=True)
+        self.log(f"integration_{split}/{task_name}/mse", integration_mse_all_rigids, prog_bar=False, sync_dist=True)
+        self.log(f"integration_{split}/{task_name}/mse_kabsch", integration_mse_kabsch, prog_bar=False, sync_dist=True)
+        self.log(f"integration_{split}/{task_name}/heavy_atoms_mse", integration_mse, prog_bar=False, sync_dist=True)
+        self.log(f"integration_{split}/{task_name}/heavy_atoms_mse_kabsch", float(np.mean(all_mse_kabsch_heavy)), prog_bar=False, sync_dist=True)
+        self.log(f"integration_{split}/{task_name}/bond_length_rmse", integration_bond_length_rmse, prog_bar=False, sync_dist=True)
+        self.log(f"integration_{split}/{task_name}/bond_angle_rmse", integration_bond_angle_rmse, prog_bar=False, sync_dist=True)
         model.train()
 
     #     return loss_dict
@@ -1840,7 +1840,7 @@ class BiomoleculeModule(L.LightningModule):
             on_step=None,
             on_epoch=True,
             batch_size=1,
-            sync_dist=False
+            sync_dist=True
         )
 
 
