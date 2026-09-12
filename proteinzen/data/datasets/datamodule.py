@@ -25,6 +25,11 @@ from proteinzen.boltz.data.sample.sampler import Sample
 
 from proteinzen.data.featurize.cropper import Cropper
 from proteinzen.data.featurize.tokenize import tokenize_structure, Tokenized
+from proteinzen.data.datasets.sidechain_ensemble import (
+    load_auth_seq_map,
+    load_ensemble_substitution,
+    apply_sidechain_ensemble,
+)
 # from proteinzen.data.featurize.assembler import featurize_training, collate
 from proteinzen.data.featurize.assembler import featurize, collate
 
@@ -363,6 +368,8 @@ class TrainingDataset(torch.utils.data.Dataset):
         use_pocket_priority=False,
         compute_etkdg_pos=False,
         gate_low_quality_t=False,
+        sidechain_ensemble_dir=None,
+        sidechain_ensemble_prob=0.0,
     ):
         super().__init__()
         self.datasets = datasets
@@ -397,6 +404,8 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.use_pocket_priority = use_pocket_priority
         self.compute_etkdg_pos = compute_etkdg_pos
         self.gate_low_quality_t = gate_low_quality_t
+        self.sidechain_ensemble_dir = Path(sidechain_ensemble_dir) if sidechain_ensemble_dir else None
+        self.sidechain_ensemble_prob = sidechain_ensemble_prob
 
         for dataset in datasets:
             records = dataset.manifest
@@ -458,6 +467,12 @@ class TrainingDataset(torch.utils.data.Dataset):
 
         if self.mask_nonstandard:
             struct = mask_nonstandard_residues(struct)
+
+        if self.sidechain_ensemble_dir is not None and np.random.random() < self.sidechain_ensemble_prob:
+            substitution = load_ensemble_substitution(self.sidechain_ensemble_dir, sample.record.id, rng=np.random)
+            if substitution is not None:
+                auth_seq_map = load_auth_seq_map(dataset.data_dir, dataset.mode, sample.record.id)
+                struct = apply_sidechain_ensemble(struct, auth_seq_map, substitution)
 
         task_data = task.sample_t_and_mask(struct)
 
