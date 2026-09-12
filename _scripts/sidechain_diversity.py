@@ -168,6 +168,12 @@ def generate_ensemble(pdb_path: Path, out_dir: Path, n_samples=5, ntrials=10000,
         pose.dump_pdb(str(out_dir / f"sample_{idx:03d}.pdb"))
         rec["sample_index"] = idx
 
+    pdb_info = input_pose.pdb_info()
+    pose_resnum_map = {
+        i: [pdb_info.chain(i), pdb_info.number(i)]
+        for i in range(1, input_pose.total_residue() + 1)
+    }
+
     meta = {
         "input_pdb": str(pdb_path),
         "n_residues": input_pose.total_residue(),
@@ -175,6 +181,7 @@ def generate_ensemble(pdb_path: Path, out_dir: Path, n_samples=5, ntrials=10000,
         "first_shell_resnums": sorted(first_shell),
         "second_shell_resnums": sorted(second_shell),
         "packable_resnums": packable,
+        "pose_resnum_map": pose_resnum_map,
         "n_samples_requested": n_samples,
         "n_samples_accepted": len(accepted),
         "attempts": attempts,
