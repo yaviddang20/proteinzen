@@ -102,10 +102,18 @@ def rotamer_changed(pose_a, pose_b, resnum, chi_tol_deg=20.0):
 
 def generate_ensemble(pdb_path: Path, out_dir: Path, n_samples=5, ntrials=10000,
                        temperature=1.0, cutoff=5.0, max_retries=10,
-                       min_frac_changed=0.02, min_sc_rmsd_between_samples=0.2):
+                       min_frac_changed=0.02, min_sc_rmsd_between_samples=0.2,
+                       residue_type_set=None):
+    """residue_type_set: optional pyrosetta.rosetta.core.chemical.PoseResidueTypeSet
+    (or any ResidueTypeSet) extended with on-the-fly-registered ligand types, for
+    structures whose ligand isn't in Rosetta's default fa_standard params library.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    input_pose = pose_from_pdb(str(pdb_path))
+    if residue_type_set is not None:
+        input_pose = pyrosetta.rosetta.core.import_pose.pose_from_file(residue_type_set, str(pdb_path))
+    else:
+        input_pose = pose_from_pdb(str(pdb_path))
     scorefxn = pyrosetta.get_score_function()
     scorefxn(input_pose)
 

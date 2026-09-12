@@ -9,6 +9,10 @@ Usage (called once per SLURM array task — see sidechain_diversity.sbatch):
         --out-root ./diversity_out \
         --chunk-index $SLURM_ARRAY_TASK_ID --num-chunks 20 \
         --num-workers 96
+
+Pass --custom-ligand-sdf-dir to also register on-the-fly Rosetta residue
+types (built from CCD-derived SDFs, one per ligand code) for structures
+whose ligand isn't in Rosetta's default fa_standard params library.
 """
 import argparse
 import multiprocessing
@@ -19,12 +23,41 @@ import pyrosetta
 from sidechain_diversity import generate_ensemble
 
 _ARGS = None
+_CUSTOM_RTS = None
+
+
+def _build_custom_residue_type_set(sdf_dir: Path):
+    from pyrosetta.rosetta.core.chemical import PoseResidueTypeSet, ChemicalManager
+    from pyrosetta.rosetta.core.chemical.sdf import SDFParser, convert_to_ResidueType
+    from pyrosetta.rosetta.std import ifstream
+
+    base_rts = ChemicalManager.get_instance().residue_type_set("fa_standard")
+    pose_rts = PoseResidueTypeSet(base_rts)
+    parser = SDFParser()
+
+    n_ok, n_failed = 0, 0
+    for sdf_path in sorted(sdf_dir.glob("*.sdf")):
+        try:
+            strm = ifstream(str(sdf_path))
+            mols = parser.parse(strm)
+            mrt = convert_to_ResidueType(mols, "fa_standard")
+            if mrt is None:
+                n_failed += 1
+                continue
+            pose_rts.add_base_residue_type(mrt)
+            n_ok += 1
+        except Exception:
+            n_failed += 1
+    print(f"Custom ligand residue types: {n_ok} registered, {n_failed} failed to convert", flush=True)
+    return pose_rts
 
 
 def _worker_init(args):
-    global _ARGS
+    global _ARGS, _CUSTOM_RTS
     _ARGS = args
     pyrosetta.init("-mute all")
+    if args.custom_ligand_sdf_dir is not None:
+        _CUSTOM_RTS = _build_custom_residue_type_set(args.custom_ligand_sdf_dir)
 
 
 def _process_one(pdb_path: str):
@@ -39,10 +72,11 @@ def _process_one(pdb_path: str):
             n_samples=args.n_samples, ntrials=args.ntrials,
             temperature=args.temperature, cutoff=args.cutoff,
             max_retries=args.max_retries, min_frac_changed=args.min_frac_changed,
+            residue_type_set=_CUSTOM_RTS,
         )
         return pdb_path.name, "ok"
     except Exception as e:
-        return pdb_path.name, f"error: {e}"
+        return pdb_path.name, f"error: {type(e).__name__}: {e}"
 
 
 if __name__ == "__main__":
@@ -59,6 +93,8 @@ if __name__ == "__main__":
     parser.add_argument("--max-retries", type=int, default=10)
     parser.add_argument("--min-frac-changed", type=float, default=0.02)
     parser.add_argument("--overwrite", action="store_true", default=False)
+    parser.add_argument("--custom-ligand-sdf-dir", type=Path, default=None,
+                         help="Dir of <ligand_ccd_code>.sdf files to register as extra Rosetta residue types")
     args = parser.parse_args()
 
     all_paths = [line.strip() for line in args.pdb_list.read_text().splitlines() if line.strip()]
