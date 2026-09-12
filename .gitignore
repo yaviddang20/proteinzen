@@ -112,6 +112,13 @@ ENV/
 # custom
 /plinder
 /plinder_processed
+/plinder_pocket_processed
+/plinder_pocket_processed_high_quality
+/plinder_pocket_processed_water
+/plinder_pocket_placer_processed
+/plinder_pocket_placer_processed_high_quality
+/plinder_pocket_processed_sc_ensembles
+/plinder_pocket_alpha_spheres
 ccd.pkl
 /geom_drugs_boltz
 /sampling
