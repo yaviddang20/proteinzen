@@ -314,7 +314,17 @@ def main():
     parser.add_argument("--num-samples", type=int, default=10,
                         help="Protein samples to generate per conformer (default: 10)")
     parser.add_argument("--n-prot-res", type=int, default=64,
-                        help="Number of dummy protein residues in the scaffold (default: 64)")
+                        help="Number of dummy protein residues in the throwaway scaffold NPZ "
+                             "(default: 64). Purely a placeholder to satisfy "
+                             "LigandPocketConditionedSampling's chain-type check -- it gets "
+                             "cropped to 0 residues internally and has NO effect on generated "
+                             "design sizes. See --min-prot-res/--max-prot-res for that.")
+    parser.add_argument("--min-prot-res", type=int, default=150,
+                        help="Minimum generated protein length, sampled per design "
+                             "(default: 150, matches LigandPocketConditionedSampling's own default).")
+    parser.add_argument("--max-prot-res", type=int, default=250,
+                        help="Maximum generated protein length, sampled per design "
+                             "(default: 250, matches LigandPocketConditionedSampling's own default).")
     parser.add_argument("--trans-std", type=float, default=16.0,
                         help="Translation noise std for protein backbone (default: 16.0)")
     parser.add_argument("--include-h", action="store_true",
@@ -356,7 +366,8 @@ def main():
                 "num_samples": args.num_samples,
                 "trans_std": args.trans_std,
                 "include_h": args.include_h,
-                "max_protein_residues": args.n_prot_res,
+                "min_protein_residues": args.min_prot_res,
+                "max_protein_residues": args.max_prot_res,
             })
 
     out_path = args.out_yaml.parent / (args.out_yaml.name + "_ligand_cond.yaml")
