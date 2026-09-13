@@ -45,5 +45,4 @@ python ${REPO_ROOT}/sample.py \
 #    ligand RMSD, ligand centroid displacement, protein/ligand pLDDT split, success
 #    fractions overall and per ligand code. Writes into the SAME out_dir as samples/.
 python ${REPO_ROOT}/_scripts/eval_pallatom_ligand_cond.py \
-    --out-dir ${out_dir} \
-    --ligand-codes ${ligand_codes}
+    --out-dir ${out_dir}

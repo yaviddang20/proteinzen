@@ -36,8 +36,6 @@ from tqdm.auto import tqdm
 sys.path.insert(0, str(Path(__file__).parent))
 from eval_plinder import KNOWN_SMILES, _GPU_SUFFIX, eval_ligand_cond_sample  # noqa: E402
 
-PALLATOM_LIGANDS = ["FAD", "FMN", "SAM", "DOG", "SRO", "LDP", "IAI", "OQO"]
-
 
 def _ligand_code_for(pdb_path: Path) -> str:
     """Recover the CCD code from a sample filename built by
@@ -98,7 +96,11 @@ def main():
     parser.add_argument("--samples-dir", type=Path, default=None,
                         help="Directory of generated PDBs for ALL ligand codes together. "
                              "Defaults to {out_dir}/samples if not set.")
-    parser.add_argument("--ligand-codes", nargs="+", default=PALLATOM_LIGANDS)
+    parser.add_argument("--ligand-codes", nargs="+", default=None,
+                        help="Restrict to these ligand codes only. Default: auto-discover "
+                             "from the sample filenames themselves (whatever "
+                             "make_ligand_cond_yaml.py was actually run with) -- no need "
+                             "to repeat the ligand list here.")
     parser.add_argument("--boltz-cache", type=Path, default=None)
     parser.add_argument("--contact-cutoff", type=float, default=4.0)
     parser.add_argument("--overwrite", action="store_true", default=False)
@@ -118,21 +120,18 @@ def main():
         sys.exit(f"No PDB files found in {args.samples_dir}")
 
     by_code: dict[str, list[Path]] = {}
-    unmatched = []
     for p in pdb_files:
-        code = _ligand_code_for(p)
-        if code not in args.ligand_codes:
-            unmatched.append(p.name)
-            continue
-        by_code.setdefault(code, []).append(p)
-    if unmatched:
-        print(f"Warning: {len(unmatched)} PDB(s) didn't match any requested ligand code "
-              f"(e.g. {unmatched[0]}) -- skipped")
-    for code in args.ligand_codes:
+        by_code.setdefault(_ligand_code_for(p), []).append(p)
+
+    ligand_codes = args.ligand_codes or sorted(by_code.keys())
+    unknown = [c for c in ligand_codes if c not in by_code]
+    if unknown:
+        print(f"Warning: requested ligand code(s) with no samples found: {unknown}")
+    for code in ligand_codes:
         print(f"  {code}: {len(by_code.get(code, []))} samples found")
 
     all_results = []
-    for code in args.ligand_codes:
+    for code in ligand_codes:
         files = by_code.get(code, [])
         if not files:
             continue
@@ -169,7 +168,7 @@ def main():
     ]
     report.extend(_report(all_results, "OVERALL"))
     report.append("")
-    for code in args.ligand_codes:
+    for code in ligand_codes:
         code_results = [r for r in all_results if r.get("ligand_code") == code]
         if not code_results:
             continue
