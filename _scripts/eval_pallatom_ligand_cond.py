@@ -90,9 +90,14 @@ def _report(results: list[dict], label: str) -> list[str]:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--samples-dir", type=Path, required=True,
-                        help="Directory of generated PDBs for ALL ligand codes together")
-    parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--out-dir", type=Path, required=True,
+                        help="The same directory sample.py wrote samples/ into -- eval "
+                             "artifacts (refold_inputs/, per_sample/, results.json, "
+                             "summary.txt) are written alongside samples/ in this same "
+                             "directory, not a separate eval tree (matches run_eval_plinder.sh).")
+    parser.add_argument("--samples-dir", type=Path, default=None,
+                        help="Directory of generated PDBs for ALL ligand codes together. "
+                             "Defaults to {out_dir}/samples if not set.")
     parser.add_argument("--ligand-codes", nargs="+", default=PALLATOM_LIGANDS)
     parser.add_argument("--boltz-cache", type=Path, default=None)
     parser.add_argument("--contact-cutoff", type=float, default=4.0)
@@ -101,6 +106,7 @@ def main():
                         help="Skip evaluating any not-yet-cached samples; just aggregate what's cached.")
     args = parser.parse_args()
 
+    args.samples_dir = args.samples_dir or (args.out_dir / "samples")
     args.out_dir.mkdir(parents=True, exist_ok=True)
     refold_input_dir = args.out_dir / "refold_inputs"
     refold_output_dir = args.out_dir / "refold_outputs"
