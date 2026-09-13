@@ -11,15 +11,22 @@ trans_std=16.0
 ligand_codes="FAD FMN SAM DOG SRO LDP IAI OQO"
 num_samples=100
 
-# One directory per model, reused for everything (tasks yaml, samples/, and eval
-# artifacts alongside it) -- same convention as run_eval_plinder.sh / run_eval_plinder_placer.sh.
-out_dir=${REPO_ROOT}/sampling/plinder_pallatom/${model_name}
-mkdir -p ${out_dir}
+# yaml_dir: shared, model-independent task definition (same convention as
+# sample_ligand_cond.sh) -- the ligand conformers/dummy scaffold don't depend on
+# which checkpoint you sample against, so it lives one level above any given
+# model's output and can be reused across models without regenerating it.
+yaml_dir=${REPO_ROOT}/sampling/plinder/pallatom
+mkdir -p ${yaml_dir}
+
+# out_dir: per-model, one level under yaml_dir. Used for BOTH sample.py's own
+# output AND the eval step below -- one directory per model, not a separate
+# eval/ tree (same convention as run_eval_plinder.sh / run_eval_plinder_placer.sh).
+out_dir=${yaml_dir}/${model_name}
 
 # 1) Build sampling tasks: 100 designs x each of the 8 Pallatom-Ligand benchmark ligands
 python ${REPO_ROOT}/_scripts/make_ligand_cond_yaml.py \
     --ligand-codes ${ligand_codes} \
-    --out-yaml ${out_dir}/pallatom \
+    --out-yaml ${yaml_dir}/pallatom \
     --num-samples ${num_samples} \
     --trans-std ${trans_std} \
     --include-h
@@ -28,7 +35,7 @@ python ${REPO_ROOT}/_scripts/make_ligand_cond_yaml.py \
 python ${REPO_ROOT}/sample.py \
     model_dir=${REPO_ROOT}/outputs/${model_name}/train \
     out_dir=${out_dir} \
-    sampler.tasks_yaml=${out_dir}/pallatom_ligand_cond.yaml \
+    sampler.tasks_yaml=${yaml_dir}/pallatom_ligand_cond.yaml \
     sampler.batch_size=16 \
     sampler.trans_std=${trans_std} \
     sampler.include_h=true \
