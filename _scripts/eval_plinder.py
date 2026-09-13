@@ -60,6 +60,14 @@ KNOWN_SMILES = {
     "NAD": "NC(=O)c1ccc[n+](C2OC(COP(=O)(O)OP(=O)(O)OCC3OC(C(O)C3O)n3cnc4c(N)ncnc34)C(O)C2O)c1",
     "ATP": "Nc1ncnc2n(cnc12)[C@@H]1O[C@H](COP(=O)(O)OP(=O)(O)OP(=O)(O))[C@@H](O)[C@H]1O",
     "HEM": "CC1=C(CCC(=O)O)C2=CC3=NC(=CC4=NC(=CC5=NC(=CC1=N2)C(=C5CCC(=O)O)C)C(=C4C)C=C)C(=C3C)C=C",
+    # Pallatom-Ligand benchmark set (verified from ccd.pkl, the same authoritative
+    # CCD/RDKit dictionary used elsewhere in this repo for ligand chemistry lookups)
+    "FMN": "Cc1cc2nc3c(=O)[nH]c(=O)nc-3n(C[C@H](O)[C@H](O)[C@H](O)COP(=O)(O)O)c2cc1C",
+    "DOG": "C[C@]12CC[C@H](O)C[C@H]1CC[C@@H]1[C@@H]2C[C@@H](O)[C@]2(C)[C@@H](C3=CC(=O)OC3)CC[C@]12O",
+    "SRO": "NCCc1c[nH]c2ccc(O)cc12",
+    "LDP": "NCCc1ccc(O)c(O)c1",
+    "IAI": "Cn1ncc(C(=O)NCc2cocn2)c1C(=O)Nc1ccn2cc(-c3ccccc3)nc2n1",
+    "OQO": "Cc1nc(N)ccc1-c1cnn([C@H](CC2CC2)c2ccc(-c3c(-n4cnnn4)ccc(Cl)c3F)c[n+]2[O-])c1",
 }
 
 
@@ -854,12 +862,16 @@ def _pb_worker(args_tuple):
 
 
 def _parse_ca_and_lig_from_cif(cif_path: Path):
-    """Return (ca_coords, prot_by_res, lig_coords) from a Boltz2 CIF.
+    """Return (ca_coords, prot_by_res, lig_coords, prot_plddt, lig_plddt) from a Boltz2 CIF.
     Protein=chain A (Cα + per-residue all-heavy-atom dicts), ligand=all other chains (heavy atoms only).
+    Boltz2 writes per-token pLDDT into the B-factor column (see boltz's to_mmcif(..., plddts=...)),
+    so prot_plddt/lig_plddt (mean over Cα / mean over ligand heavy atoms, resp.) come for free
+    from the same parse -- no extra I/O beyond what was already being read for coordinates.
     """
     import gemmi
     st = gemmi.read_structure(str(cif_path))
     ca, lig = [], []
+    prot_bfactors, lig_bfactors = [], []
     prot_by_res: list[dict] = []
     for model in st:
         for chain in model:
@@ -873,6 +885,7 @@ def _parse_ca_and_lig_from_cif(cif_path: Path):
                         res_atoms[atom.name] = np.array([p.x, p.y, p.z], dtype=np.float64)
                         if atom.name == "CA":
                             ca.append([p.x, p.y, p.z])
+                            prot_bfactors.append(atom.b_iso)
                     prot_by_res.append(res_atoms)
             else:
                 for res in chain:
@@ -881,8 +894,12 @@ def _parse_ca_and_lig_from_cif(cif_path: Path):
                             continue
                         p = atom.pos
                         lig.append([p.x, p.y, p.z])
+                        lig_bfactors.append(atom.b_iso)
         break
-    return np.array(ca, dtype=np.float64), prot_by_res, np.array(lig, dtype=np.float64)
+    prot_plddt = float(np.mean(prot_bfactors)) if prot_bfactors else float("nan")
+    lig_plddt = float(np.mean(lig_bfactors)) if lig_bfactors else float("nan")
+    return (np.array(ca, dtype=np.float64), prot_by_res, np.array(lig, dtype=np.float64),
+            prot_plddt, lig_plddt)
 
 
 def _kabsch_align(P: np.ndarray, Q: np.ndarray):
@@ -910,6 +927,32 @@ def _kabsch_rmsd(P: np.ndarray, Q: np.ndarray) -> float:
     return float(np.sqrt(((p_rot - Q) ** 2).sum(-1).mean()))
 
 
+def _lig_correspondence_rmsd(smiles, coords_a: np.ndarray, coords_b: np.ndarray) -> float:
+    """RMSD between two ALREADY-positioned coordinate sets, resolving only
+    chemically-valid atom correspondence (symmetry/atom-order ambiguity) via RDKit
+    substructure-match permutations -- deliberately does NOT independently re-align
+    either set (unlike _lig_rmsd_and_coords / lig_rmsd_sym, used by the protein_cond
+    path, which do an extra per-permutation Kabsch fit). Falls back to plain
+    positional RMSD if the SMILES can't be parsed or atom counts don't match.
+    """
+    if coords_a.shape != coords_b.shape or len(coords_a) == 0:
+        return pos_rmsd(coords_a, coords_b) if coords_a.shape == coords_b.shape else float("nan")
+    mol_template = None
+    if smiles:
+        try:
+            mol_template = Chem.MolFromSmiles(smiles)
+            if mol_template is not None:
+                mol_template = Chem.RemoveHs(mol_template)
+        except Exception:
+            mol_template = None
+    if mol_template is None or mol_template.GetNumAtoms() != len(coords_a):
+        return pos_rmsd(coords_a, coords_b)
+    perms = _get_permutations(mol_template, coords_a, coords_b)
+    if perms is None:
+        return pos_rmsd(coords_a, coords_b)
+    return min(pos_rmsd(coords_a, coords_b[p]) for p in perms)
+
+
 def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
                   sample_id, boltz_cache, gen_lig=None, gen_prot_by_res=None):
     import yaml as _yaml
@@ -935,10 +978,13 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
         except subprocess.CalledProcessError as e:
             return {"plddt": float("nan"), "iptm": float("nan"), "ca_rmsd": float("nan"),
                     "aa_rmsd": float("nan"), "lig_rmsd": float("nan"),
+                    "lig_displacement": float("nan"), "prot_plddt": float("nan"), "lig_plddt": float("nan"),
                     "boltz_error": (e.stderr.decode() if e.stderr else str(e))[-200:]}
         except subprocess.TimeoutExpired:
             return {"plddt": float("nan"), "iptm": float("nan"), "ca_rmsd": float("nan"),
-                    "aa_rmsd": float("nan"), "lig_rmsd": float("nan"), "boltz_error": "timeout"}
+                    "aa_rmsd": float("nan"), "lig_rmsd": float("nan"),
+                    "lig_displacement": float("nan"), "prot_plddt": float("nan"), "lig_plddt": float("nan"),
+                    "boltz_error": "timeout"}
     conf_files = sorted(pred_dir.glob("confidence_*_model_0.json"))
     plddt, iptm = float("nan"), float("nan")
     if conf_files:
@@ -952,10 +998,13 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
     ca_rmsd = float("nan")
     aa_rmsd = float("nan")
     lig_rmsd = float("nan")
+    lig_displacement = float("nan")
+    prot_plddt = float("nan")
+    lig_plddt = float("nan")
     cif_files = sorted(pred_dir.glob("*_model_0.cif"))
     if cif_files and len(gen_ca) > 0:
         try:
-            refold_ca, refold_prot_by_res, refold_lig = _parse_ca_and_lig_from_cif(cif_files[0])
+            refold_ca, refold_prot_by_res, refold_lig, prot_plddt, lig_plddt = _parse_ca_and_lig_from_cif(cif_files[0])
             if len(refold_ca) == len(gen_ca):
                 R, p_mean, q_mean = _kabsch_align(gen_ca, refold_ca)
                 gen_ca_rot = _apply_kabsch(gen_ca, R, p_mean, q_mean)
@@ -973,12 +1022,17 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
                         aa_rmsd = float(np.sqrt(((gen_aa_rot - np.array(ref_all)) ** 2).sum(-1).mean()))
                 if (gen_lig is not None and len(gen_lig) > 0
                         and len(refold_lig) > 0 and len(refold_lig) == len(gen_lig)):
+                    # Protein-only Kabsch already computed above (R, p_mean, q_mean); the
+                    # ligand is carried along by that SAME rigid transform, never
+                    # independently re-aligned -- only atom correspondence is resolved below.
                     gen_lig_rot = _apply_kabsch(gen_lig, R, p_mean, q_mean)
-                    lig_rmsd = float(np.sqrt(((gen_lig_rot - refold_lig) ** 2).sum(-1).mean()))
+                    lig_rmsd = _lig_correspondence_rmsd(smiles, refold_lig, gen_lig_rot)
+                    lig_displacement = float(np.linalg.norm(gen_lig_rot.mean(0) - refold_lig.mean(0)))
         except Exception:
             pass
 
-    return {"plddt": plddt, "iptm": iptm, "ca_rmsd": ca_rmsd, "aa_rmsd": aa_rmsd, "lig_rmsd": lig_rmsd}
+    return {"plddt": plddt, "iptm": iptm, "ca_rmsd": ca_rmsd, "aa_rmsd": aa_rmsd, "lig_rmsd": lig_rmsd,
+            "lig_displacement": lig_displacement, "prot_plddt": prot_plddt, "lig_plddt": lig_plddt}
 
 
 def _parse_mpnn_fasta(fasta_path: Path) -> list[str]:

@@ -43,13 +43,23 @@ import yaml
 KNOWN_SMILES = {
     "SAM": "C[S+](CC[C@@H]([NH3+])C(=O)[O-])[C@@H]1O[C@@H]([C@H](O)[C@@H]1O)n1cnc2c(N)ncnc12",
     "FAD": "Cc1cc2nc3c(=O)[nH]c(=O)nc3n(C[C@H](O)[C@H](O)[C@H](O)COP(=O)(O)OP(=O)(O)OC[C@H]3O[C@@H](n4cnc5c(N)ncnc54)[C@H](O)[C@@H]3O)c2cc1C",
-    "IAI": "ICC(=O)N",
+    # NOTE: was "ICC(=O)N" (iodoacetamide) -- WRONG. The actual CCD ligand "IAI" is a
+    # different, larger molecule. Corrected from ccd.pkl, the authoritative CCD/RDKit
+    # dictionary used elsewhere in this repo.
+    "IAI": "Cn1ncc(C(=O)NCc2cocn2)c1C(=O)Nc1ccn2cc(-c3ccccc3)nc2n1",
     "NAD": "NC(=O)c1ccc[n+](C2OC(COP(=O)(O)OP(=O)(O)OCC3OC(C(O)C3O)n3cnc4c(N)ncnc34)C(O)C2O)c1",
     "ATP": "Nc1ncnc2n(cnc12)[C@@H]1O[C@H](COP(=O)(O)OP(=O)(O)OP(=O)(O))[C@@H](O)[C@H]1O",
     "HEM": "CC1=C(CCC(=O)O)C2=CC3=NC(=CC4=NC(=CC5=NC(=CC1=N2)C(=C5CCC(=O)O)C)C(=C4C)C=C)C(=C3C)C=C",
+    # Pallatom-Ligand benchmark set (verified from ccd.pkl)
+    "FMN": "Cc1cc2nc3c(=O)[nH]c(=O)nc-3n(C[C@H](O)[C@H](O)[C@H](O)COP(=O)(O)O)c2cc1C",
+    "DOG": "C[C@]12CC[C@H](O)C[C@H]1CC[C@@H]1[C@@H]2C[C@@H](O)[C@]2(C)[C@@H](C3=CC(=O)OC3)CC[C@]12O",
+    "SRO": "NCCc1c[nH]c2ccc(O)cc12",
+    "LDP": "NCCc1ccc(O)c(O)c1",
+    "OQO": "Cc1nc(N)ccc1-c1cnn([C@H](CC2CC2)c2ccc(-c3c(-n4cnnn4)ccc(Cl)c3F)c[n+]2[O-])c1",
 }
 
 TARGET_LIGANDS = ["SAM", "FAD", "IAI"]
+PALLATOM_LIGANDS = ["FAD", "FMN", "SAM", "DOG", "SRO", "LDP", "IAI", "OQO"]
 
 # ── NPZ construction ─────────────────────────────────────────────────────────
 
