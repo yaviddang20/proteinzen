@@ -319,12 +319,13 @@ def main():
                              "LigandPocketConditionedSampling's chain-type check -- it gets "
                              "cropped to 0 residues internally and has NO effect on generated "
                              "design sizes. See --min-prot-res/--max-prot-res for that.")
-    parser.add_argument("--min-prot-res", type=int, default=150,
+    parser.add_argument("--min-prot-res", type=int, default=128,
                         help="Minimum generated protein length, sampled per design "
-                             "(default: 150, matches LigandPocketConditionedSampling's own default).")
-    parser.add_argument("--max-prot-res", type=int, default=250,
+                             "(default: 128 -- fixed-length, matching the Pallatom-Ligand "
+                             "benchmark's protocol; set min != max for a random size range instead).")
+    parser.add_argument("--max-prot-res", type=int, default=128,
                         help="Maximum generated protein length, sampled per design "
-                             "(default: 250, matches LigandPocketConditionedSampling's own default).")
+                             "(default: 128 -- see --min-prot-res).")
     parser.add_argument("--trans-std", type=float, default=16.0,
                         help="Translation noise std for protein backbone (default: 16.0)")
     parser.add_argument("--include-h", action="store_true",
