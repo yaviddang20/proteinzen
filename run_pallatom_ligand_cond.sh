@@ -15,7 +15,7 @@ num_samples=100
 # sample_ligand_cond.sh) -- the ligand conformers/dummy scaffold don't depend on
 # which checkpoint you sample against, so it lives one level above any given
 # model's output and can be reused across models without regenerating it.
-yaml_dir=${REPO_ROOT}/sampling/plinder/pallatom
+yaml_dir=${REPO_ROOT}/sampling/pallatom
 mkdir -p ${yaml_dir}
 
 # out_dir: per-model, one level under yaml_dir. Used for BOTH sample.py's own

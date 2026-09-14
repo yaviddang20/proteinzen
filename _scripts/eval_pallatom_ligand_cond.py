@@ -1,15 +1,31 @@
 #!/usr/bin/env python
 """Pallatom-style evaluation for the ligand_cond task: fixed-ligand, generated-protein
 binder design, evaluated via Boltz2 single-sequence (msa=empty, no templates/pocket
-constraints) refolding self-consistency.
+constraints) refolding self-consistency -- following Wang et al. 2026,
+"Pallatom-Ligand: an All-Atom Diffusion Model for Designing Ligand-Binding Proteins"
+(ICLR 2026), Section 4.1-4.2 (verified directly against the paper text).
 
 Reuses eval_plinder.py's ligand_cond machinery (eval_ligand_cond_sample, KNOWN_SMILES,
 run_refolding, etc. -- including its Cα-only Kabsch alignment with the ligand carried
 along rigidly, never independently re-aligned, and its RDKit-substructure-match-based
 chemically-valid atom correspondence for ligand RMSD). This script adds only what's
-specific to the Pallatom-Ligand benchmark: grouping one combined samples/ directory by
-CCD code, applying the three Pallatom success-rate formulas, and reporting fractions
-overall and per ligand (with denominators and prediction failures).
+specific to the Pallatom-Ligand benchmark:
+  - Grouping one combined samples/ directory by CCD code.
+  - LigandMPNN redesign of non-pocket residues (6A cutoff, pocket residues fixed) on
+    top of the model's own raw generated sequence -- the paper's protocol, since
+    Pallatom-Ligand (like our own ligand_cond task) co-generates sequence+structure
+    directly and only additionally redesigns the non-binding-interface residues.
+  - The three Pallatom success formulas (fold/pocket/pose_success), computed for BOTH
+    the raw sequence and the LigandMPNN-redesigned sequence, reported separately.
+  - Per-ligand-code success rates, and an overall rate computed as the average of the
+    per-ligand rates (matching the paper's "Avg." row), not a pooled fraction.
+
+Note: the paper itself uses AlphaFold3 (no MSA, 5 models/sequence) for structure
+prediction; we substitute Boltz2 (no MSA, 1 model/sequence) since AF3 isn't
+self-hostable -- same protocol, different (open) folding engine, so absolute numbers
+aren't directly comparable to the paper's, only structurally analogous. Boltz2's
+single-model-per-input also sidesteps the paper's unspecified "which of 5 AF3 models
+counts as the result" choice entirely.
 
 Usage
 -----
@@ -36,6 +52,13 @@ from tqdm.auto import tqdm
 sys.path.insert(0, str(Path(__file__).parent))
 from eval_plinder import KNOWN_SMILES, _GPU_SUFFIX, eval_ligand_cond_sample  # noqa: E402
 
+RAW_SUCCESS_KEYS = [("fold_success", "fold_success"),
+                    ("pocket_success", "pocket_success"),
+                    ("pose_success", "pose_success")]
+MPNN_SUCCESS_KEYS = [("fold_success", "fold_success_mpnn"),
+                     ("pocket_success", "pocket_success_mpnn"),
+                     ("pose_success", "pose_success_mpnn")]
+
 
 def _ligand_code_for(pdb_path: Path) -> str:
     """Recover the CCD code from a sample filename built by
@@ -54,35 +77,66 @@ def _finite(v) -> bool:
         return False
 
 
+def _success_flags(protein_rmsd, protein_plddt, ligand_displacement, ligand_plddt, ligand_rmsd):
+    """The three Pallatom-Ligand success formulas, verbatim from the paper (Sec 4.1):
+    Protein-Fold Success: Ca-RMSD < 2A and protein-pLDDT > 80.
+    Ligand-Pocket Success: Protein-Fold Success and ligand-Dcenter < 4A and ligand-pLDDT > 80.
+    Ligand-Pose Success: Protein-Fold Success and ligand-RMSD < 2A."""
+    fold = bool(_finite(protein_rmsd) and _finite(protein_plddt)
+                and protein_rmsd < 2 and protein_plddt > 80)
+    pocket = bool(fold and _finite(ligand_displacement) and _finite(ligand_plddt)
+                  and ligand_displacement < 4 and ligand_plddt > 80)
+    pose = bool(fold and _finite(ligand_rmsd) and ligand_rmsd < 2)
+    return fold, pocket, pose
+
+
 def compute_success(r: dict) -> dict:
-    protein_rmsd = r.get("ca_rmsd")
-    protein_plddt = r.get("prot_plddt")
-    ligand_displacement = r.get("lig_displacement")
-    ligand_plddt = r.get("lig_plddt")
-    ligand_rmsd = r.get("lig_rmsd")
-
-    fold_success = bool(
-        _finite(protein_rmsd) and _finite(protein_plddt)
-        and protein_rmsd < 2 and protein_plddt > 80
+    """Success flags for the raw generated sequence, plus (if LigandMPNN redesign was
+    run) a second set for the redesigned sequence."""
+    fold, pocket, pose = _success_flags(
+        r.get("ca_rmsd"), r.get("prot_plddt"), r.get("lig_displacement"), r.get("lig_plddt"), r.get("lig_rmsd"),
     )
-    pocket_success = bool(
-        fold_success and _finite(ligand_displacement) and _finite(ligand_plddt)
-        and ligand_displacement < 4 and ligand_plddt > 80
-    )
-    pose_success = bool(fold_success and _finite(ligand_rmsd) and ligand_rmsd < 2)
-    return {"fold_success": fold_success, "pocket_success": pocket_success, "pose_success": pose_success}
+    out = {"fold_success": fold, "pocket_success": pocket, "pose_success": pose}
+
+    if "lmpnn_ca_rmsd_best" in r:
+        fold_m, pocket_m, pose_m = _success_flags(
+            r.get("lmpnn_ca_rmsd_best"), r.get("lmpnn_prot_plddt_best"),
+            r.get("lmpnn_lig_displacement_best"), r.get("lmpnn_lig_plddt_best"),
+            r.get("lmpnn_lig_rmsd_best"),
+        )
+        out.update({"fold_success_mpnn": fold_m, "pocket_success_mpnn": pocket_m, "pose_success_mpnn": pose_m})
+    return out
 
 
-def _report(results: list[dict], label: str) -> list[str]:
+def _ligand_rate(results: list[dict], key: str) -> float:
+    n = len(results)
+    return (sum(1 for r in results if r.get(key)) / n) if n else float("nan")
+
+
+def _report_per_ligand(results: list[dict], label: str, success_keys) -> list[str]:
     n = len(results)
     n_failed = sum(1 for r in results if "boltz_error" in r or not _finite(r.get("ca_rmsd")))
-    n_fold = sum(1 for r in results if r.get("fold_success"))
-    n_pocket = sum(1 for r in results if r.get("pocket_success"))
-    n_pose = sum(1 for r in results if r.get("pose_success"))
     lines = [f"{label}: n={n}  prediction_failures={n_failed}"]
-    for name, count in [("fold_success", n_fold), ("pocket_success", n_pocket), ("pose_success", n_pose)]:
+    for name, key in success_keys:
+        count = sum(1 for r in results if r.get(key))
         pct = f"{count/n*100:.1f}%" if n else "n/a"
         lines.append(f"  {name:<15}: {count}/{n}  ({pct})")
+    return lines
+
+
+def _report_overall(by_code: dict, label: str, success_keys) -> list[str]:
+    """Average of each ligand's own rate -- matches the paper's 'Avg.' row exactly
+    (rather than a pooled fraction over all samples, which only coincides with this
+    when every ligand has the same sample count)."""
+    groups = [v for v in by_code.values() if v]
+    n_total = sum(len(v) for v in groups)
+    all_results = [r for v in groups for r in v]
+    n_failed = sum(1 for r in all_results if "boltz_error" in r or not _finite(r.get("ca_rmsd")))
+    lines = [f"{label}: n={n_total} across {len(groups)} ligand(s)  prediction_failures={n_failed}"]
+    for name, key in success_keys:
+        rates = [_ligand_rate(v, key) for v in groups]
+        avg = float(np.mean(rates)) if rates else float("nan")
+        lines.append(f"  {name:<15}: {avg*100:.1f}%  (average across {len(rates)} ligands)")
     return lines
 
 
@@ -103,6 +157,20 @@ def main():
                              "to repeat the ligand list here.")
     parser.add_argument("--boltz-cache", type=Path, default=None)
     parser.add_argument("--contact-cutoff", type=float, default=4.0)
+    _repo_root = Path(__file__).parent.parent
+    _default_ligandmpnn = str(_repo_root / "LigandMPNN" / "run.py")
+    parser.add_argument("--ligandmpnn-script", type=str, default=_default_ligandmpnn,
+                        help="Path to LigandMPNN run.py, used for the paper's pocket-fixed "
+                             f"redesign step (default: {_default_ligandmpnn}). Pass an "
+                             "empty string or nonexistent path to skip the +MPNN variant "
+                             "entirely and only report the raw generated-sequence success rates.")
+    parser.add_argument("--mpnn-n-seqs", type=int, default=1,
+                        help="Sequences designed by LigandMPNN per structure (default: 1, "
+                             "matching the paper's protocol of exactly one designed "
+                             "sequence -- not a best-of-N pick).")
+    parser.add_argument("--mpnn-cutoff", type=float, default=6.0,
+                        help="Distance (A) defining pocket residues that stay fixed during "
+                             "LigandMPNN redesign (default: 6.0, matches the paper).")
     parser.add_argument("--overwrite", action="store_true", default=False)
     parser.add_argument("--aggregate-only", action="store_true", default=False,
                         help="Skip evaluating any not-yet-cached samples; just aggregate what's cached.")
@@ -130,7 +198,12 @@ def main():
     for code in ligand_codes:
         print(f"  {code}: {len(by_code.get(code, []))} samples found")
 
-    all_results = []
+    run_mpnn = bool(args.ligandmpnn_script and Path(args.ligandmpnn_script).exists())
+    if not run_mpnn:
+        print(f"Note: LigandMPNN script not found at {args.ligandmpnn_script!r} -- "
+              f"only raw generated-sequence success rates will be reported.")
+
+    results_by_code: dict[str, list[dict]] = {}
     for code in ligand_codes:
         files = by_code.get(code, [])
         if not files:
@@ -139,6 +212,7 @@ def main():
         if smiles is None:
             print(f"  {code}: no SMILES in KNOWN_SMILES -- skipping entirely")
             continue
+        code_results = []
         for pdb_path in tqdm(files, desc=code):
             cache_path = per_sample_dir / f"{pdb_path.stem}.json"
             if not args.overwrite and cache_path.exists():
@@ -151,13 +225,17 @@ def main():
                     refold_input_dir=refold_input_dir, refold_output_dir=refold_output_dir,
                     boltz_cache=args.boltz_cache, run_pb=False, skip_fold=False,
                     contact_cutoff=args.contact_cutoff,
+                    ligandmpnn_script=args.ligandmpnn_script if run_mpnn else None,
+                    mpnn_n_seqs=args.mpnn_n_seqs, mpnn_cutoff=args.mpnn_cutoff,
                 )
                 r["ligand_code"] = code
                 cache_path.write_text(json.dumps(r, indent=2, default=str))
             r.setdefault("ligand_code", code)
             r.update(compute_success(r))
-            all_results.append(r)
+            code_results.append(r)
+        results_by_code[code] = code_results
 
+    all_results = [r for v in results_by_code.values() for r in v]
     (args.out_dir / "results.json").write_text(json.dumps(all_results, indent=2, default=str))
 
     report = [
@@ -165,15 +243,27 @@ def main():
         "Pallatom-style criteria, Boltz2 single-sequence evaluation",
         "=" * 70,
         "",
+        "--- RAW (model's own generated sequence, no redesign) ---",
+        "",
     ]
-    report.extend(_report(all_results, "OVERALL"))
+    report.extend(_report_overall(results_by_code, "OVERALL", RAW_SUCCESS_KEYS))
     report.append("")
-    for code in ligand_codes:
-        code_results = [r for r in all_results if r.get("ligand_code") == code]
+    for code, code_results in results_by_code.items():
         if not code_results:
             continue
-        report.append(f"--- {code} ---")
-        report.extend(_report(code_results, code))
+        report.extend(_report_per_ligand(code_results, code, RAW_SUCCESS_KEYS))
+    report.append("")
+
+    if run_mpnn:
+        report.append(f"--- +MPNN (LigandMPNN redesign of non-pocket residues, "
+                      f"{args.mpnn_cutoff:.0f}A cutoff) ---")
+        report.append("")
+        report.extend(_report_overall(results_by_code, "OVERALL", MPNN_SUCCESS_KEYS))
+        report.append("")
+        for code, code_results in results_by_code.items():
+            if not code_results:
+                continue
+            report.extend(_report_per_ligand(code_results, code, MPNN_SUCCESS_KEYS))
         report.append("")
 
     summary = "\n".join(report) + "\n"

@@ -714,8 +714,11 @@ def run_protein_cond_eval(args):
 def parse_pdb_ligand_cond(pdb_path: str):
     """Parse PDB into protein and ligand arrays (for ligand_cond task).
 
-    Returns prot_coords, prot_ca, prot_resnames, lig_coords, lig_elements, conect, prot_by_res.
+    Returns prot_coords, prot_ca, prot_resnames, lig_coords, lig_elements, conect,
+    prot_by_res, prot_res_keys.
     prot_by_res: list of dicts {atom_name: np.array([x,y,z])} one dict per residue in order.
+    prot_res_keys: list of (chain, resnum) strings, aligned 1:1 with prot_by_res --
+    e.g. ("A", "12"), giving LigandMPNN-format tokens via f"{chain}{resnum}".
     """
     prot_all, prot_ca, prot_resnames = [], [], []
     lig_coords, lig_elements = [], []
@@ -723,6 +726,7 @@ def parse_pdb_ligand_cond(pdb_path: str):
     raw_conects: list[tuple[int, int]] = []
     seen_ca: set[tuple[str, str]] = set()
     prot_by_res: list[dict] = []
+    prot_res_keys: list[tuple[str, str]] = []
     _cur_res_key = None
     _cur_res_atoms: dict = {}
 
@@ -738,6 +742,7 @@ def parse_pdb_ligand_cond(pdb_path: str):
                     if res_key != _cur_res_key:
                         if _cur_res_atoms:
                             prot_by_res.append(_cur_res_atoms)
+                            prot_res_keys.append((_cur_res_key[0], _cur_res_key[1]))
                         _cur_res_key = res_key
                         _cur_res_atoms = {}
                     _cur_res_atoms[aname] = np.array([x, y, z], dtype=np.float64)
@@ -774,6 +779,7 @@ def parse_pdb_ligand_cond(pdb_path: str):
 
     if _cur_res_atoms:
         prot_by_res.append(_cur_res_atoms)
+        prot_res_keys.append((_cur_res_key[0], _cur_res_key[1]))
 
     conect: set[tuple[int, int]] = set()
     for s1, s2 in raw_conects:
@@ -781,7 +787,26 @@ def parse_pdb_ligand_cond(pdb_path: str):
             a, b = lig_serial_to_local[s1], lig_serial_to_local[s2]
             conect.add((min(a, b), max(a, b)))
 
-    return _arr(prot_all), _arr(prot_ca), prot_resnames, _arr(lig_coords), lig_elements, conect, prot_by_res
+    return (_arr(prot_all), _arr(prot_ca), prot_resnames, _arr(lig_coords), lig_elements, conect,
+            prot_by_res, prot_res_keys)
+
+
+def pocket_fixed_residues(prot_by_res: list[dict], prot_res_keys: list, lig_coords: np.ndarray,
+                          cutoff: float = 6.0) -> str:
+    """LigandMPNN --fixed_residues string ("A12 A13 B2 ...") for residues with any
+    atom within `cutoff` of any ligand atom -- the Pallatom-Ligand paper's protocol:
+    fix pocket residues, let LigandMPNN redesign everything else."""
+    if len(lig_coords) == 0:
+        return ""
+    tokens = []
+    for res_atoms, (chain, resnum) in zip(prot_by_res, prot_res_keys):
+        if not res_atoms:
+            continue
+        res_coords = np.array(list(res_atoms.values()))
+        min_dist = np.linalg.norm(res_coords[:, None, :] - lig_coords[None, :, :], axis=-1).min()
+        if min_dist <= cutoff:
+            tokens.append(f"{chain}{resnum}")
+    return " ".join(tokens)
 
 
 _AA3TO1 = {
@@ -811,7 +836,7 @@ def pocket_contacts(prot_coords: np.ndarray, lig_coords: np.ndarray, cutoff: flo
 def run_posebusters(pdb_path: str, smiles: str | None = None) -> dict:
     if not HAS_POSEBUSTERS:
         return {}
-    _, _, _, lig_coords, lig_elements, conect, _ = parse_pdb_ligand_cond(pdb_path)
+    _, _, _, lig_coords, lig_elements, conect, _, _ = parse_pdb_ligand_cond(pdb_path)
     if len(lig_coords) == 0:
         return {"pb_ligand_parse_failed": True}
     try:
@@ -1056,21 +1081,22 @@ def _parse_mpnn_fasta(fasta_path: Path) -> list[str]:
 
 
 
-def _run_ligandmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, script: str, model_type: str) -> list[str]:
+def _run_ligandmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, script: str, model_type: str,
+                    fixed_residues: str = "") -> list[str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     fasta_path = out_dir / "seqs" / f"{pdb_path.stem}.fa"
     if not fasta_path.exists():
-        subprocess.run(
-            [_MPNN_PYTHON, script,
-             "--model_type", model_type,
-             "--pdb_path", str(pdb_path),
-             "--out_folder", str(out_dir),
-             "--number_of_batches", str(n_seqs),
-             "--temperature", "0.1",
-             "--batch_size", "1",
-             "--verbose", "0"],
-            check=True, timeout=300, cwd=str(Path(script).parent)
-        )
+        cmd = [_MPNN_PYTHON, script,
+               "--model_type", model_type,
+               "--pdb_path", str(pdb_path),
+               "--out_folder", str(out_dir),
+               "--number_of_batches", str(n_seqs),
+               "--temperature", "0.1",
+               "--batch_size", "1",
+               "--verbose", "0"]
+        if fixed_residues:
+            cmd += ["--fixed_residues", fixed_residues]
+        subprocess.run(cmd, check=True, timeout=300, cwd=str(Path(script).parent))
     return _parse_mpnn_fasta(fasta_path)[:n_seqs]
 
 
@@ -1079,16 +1105,29 @@ def run_proteinmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, mpnn_script: str
     return _run_ligandmpnn(pdb_path, out_dir, n_seqs, mpnn_script, "protein_mpnn")
 
 
-def run_ligandmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, ligandmpnn_script: str) -> list[str]:
-    """Run LigandMPNN repo with model_type=ligand_mpnn (ligand-aware)."""
-    return _run_ligandmpnn(pdb_path, out_dir, n_seqs, ligandmpnn_script, "ligand_mpnn")
+def run_ligandmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, ligandmpnn_script: str,
+                   fixed_residues: str = "") -> list[str]:
+    """Run LigandMPNN repo with model_type=ligand_mpnn (ligand-aware).
+    fixed_residues: LigandMPNN --fixed_residues token string ("A12 A13 ..."), e.g. from
+    pocket_fixed_residues() -- the Pallatom-Ligand paper's protocol of fixing pocket
+    residues (default 6A) and letting LigandMPNN redesign everything else."""
+    return _run_ligandmpnn(pdb_path, out_dir, n_seqs, ligandmpnn_script, "ligand_mpnn",
+                           fixed_residues=fixed_residues)
 
 
 def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_dir,
                             boltz_cache, run_pb, skip_fold, contact_cutoff=4.0,
                             mpnn_script=None, ligandmpnn_script=None,
-                            mpnn_n_seqs=3, mpnn_refold_dir=None, pb_cache=None):
-    prot_all, prot_ca, resnames, lig_coords, lig_elements, _, prot_by_res = parse_pdb_ligand_cond(str(pdb_path))
+                            mpnn_n_seqs=3, mpnn_refold_dir=None, pb_cache=None,
+                            mpnn_cutoff=None):
+    """mpnn_cutoff: None (default) preserves the original behavior -- LigandMPNN
+    redesigns the full sequence, no fixed residues. Pass a distance in Angstroms
+    (e.g. 6.0) to instead fix residues within that cutoff of the ligand and let
+    LigandMPNN redesign only the rest -- the Pallatom-Ligand paper's protocol, used
+    by eval_pallatom_ligand_cond.py. Opt-in only: general callers of this function
+    (e.g. run_eval_plinder.sh's ligand_cond eval) are unaffected unless they pass this."""
+    (prot_all, prot_ca, resnames, lig_coords, lig_elements, _,
+     prot_by_res, prot_res_keys) = parse_pdb_ligand_cond(str(pdb_path))
     sequence = resnames_to_seq(resnames)
     frac_lig_contacted, n_prot_contact = pocket_contacts(prot_all, lig_coords, cutoff=contact_cutoff)
     if pb_cache is not None:
@@ -1134,6 +1173,9 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
         ligrmsds = [r["lig_rmsd"] for r in results if np.isfinite(r.get("lig_rmsd", float("nan")))]
         plddts   = [r["plddt"]    for r in results if np.isfinite(r.get("plddt",    float("nan")))]
         iptms    = [r["iptm"]     for r in results if np.isfinite(r.get("iptm",     float("nan")))]
+        ligdisps   = [r["lig_displacement"] for r in results if np.isfinite(r.get("lig_displacement", float("nan")))]
+        protplddts = [r["prot_plddt"]       for r in results if np.isfinite(r.get("prot_plddt",       float("nan")))]
+        ligplddts  = [r["lig_plddt"]        for r in results if np.isfinite(r.get("lig_plddt",        float("nan")))]
         return {
             f"{tag}_seqs":          seqs,
             f"{tag}_ca_rmsd_best":  min(carmsds)              if carmsds  else float("nan"),
@@ -1146,6 +1188,12 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
             f"{tag}_plddt_mean":    float(np.mean(plddts))    if plddts   else float("nan"),
             f"{tag}_iptm_best":     max(iptms)                 if iptms    else float("nan"),
             f"{tag}_iptm_mean":     float(np.mean(iptms))     if iptms    else float("nan"),
+            f"{tag}_lig_displacement_best": min(ligdisps)            if ligdisps   else float("nan"),
+            f"{tag}_lig_displacement_mean": float(np.mean(ligdisps)) if ligdisps   else float("nan"),
+            f"{tag}_prot_plddt_best":       max(protplddts)          if protplddts else float("nan"),
+            f"{tag}_prot_plddt_mean":       float(np.mean(protplddts)) if protplddts else float("nan"),
+            f"{tag}_lig_plddt_best":        max(ligplddts)           if ligplddts  else float("nan"),
+            f"{tag}_lig_plddt_mean":        float(np.mean(ligplddts)) if ligplddts else float("nan"),
         }
 
     pmpnn_metrics, lmpnn_metrics = {}, {}
@@ -1159,7 +1207,16 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
                 print(f"  ProteinMPNN error {pdb_path.name}: {e}")
         if ligandmpnn_script and Path(ligandmpnn_script).exists():
             try:
-                seqs = run_ligandmpnn(pdb_path, base / pdb_path.stem / "ligandmpnn", mpnn_n_seqs, ligandmpnn_script)
+                # Opt-in only (mpnn_cutoff is None by default): Pallatom-Ligand protocol
+                # of fixing pocket residues (within mpnn_cutoff of the ligand) and letting
+                # LigandMPNN redesign everything else. When mpnn_cutoff is None, behavior
+                # is unchanged from before -- full, unrestricted redesign.
+                fixed_residues = (
+                    pocket_fixed_residues(prot_by_res, prot_res_keys, lig_coords, cutoff=mpnn_cutoff)
+                    if mpnn_cutoff is not None else ""
+                )
+                seqs = run_ligandmpnn(pdb_path, base / pdb_path.stem / "ligandmpnn", mpnn_n_seqs, ligandmpnn_script,
+                                      fixed_residues=fixed_residues)
                 lmpnn_metrics = _run_mpnn_case(seqs, smiles, "lmpnn", base / pdb_path.stem / "lmpnn_refold")
             except Exception as e:
                 print(f"  LigandMPNN error {pdb_path.name}: {e}")
