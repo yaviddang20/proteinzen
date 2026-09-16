@@ -360,11 +360,14 @@ def main():
 
     # ---- load pred_lig_rmsd from samples_metadata.json ----
     meta_path = args.metadata_path or (args.samples_dir / "samples_metadata.json")
+    if not meta_path.exists():
+        meta_path = args.samples_dir.parent / "samples_metadata.json"
     pred_lig_rmsds: dict[str, float | None] = {}
     if meta_path.exists():
         with open(meta_path) as fh:
             meta = json.load(fh)
-        for stem, entry in meta.items():
+        for key, entry in meta.items():
+            stem = Path(key).stem  # normalize — key may be full path or bare stem
             v = entry.get("pred_lig_rmsd")
             if v is not None:
                 pred_lig_rmsds[stem] = float(v)
@@ -529,7 +532,50 @@ def main():
             },
         }
     else:
-        print("\n  [PLACER selection metrics skipped — no pred_lig_rmsd values found]")
+        print(f"\n  [PLACER selection metrics skipped — no pred_lig_rmsd values found in {meta_path}]")
+
+    # ---- build summary text ----
+    def _sumline(label, val_str):
+        return f"  {label:<40}: {val_str}"
+
+    slines = [
+        f"PLINDER PLACER EVAL — {n_sys} systems, {n_samp} samples",
+        "",
+        "Per-sample (all samples pooled)",
+    ]
+    for d in deltas:
+        slines.append(_sumline(f"COV sc  < {d:.1f} Å", f"{cov(all_sc,  d)*100:.1f}%"))
+        slines.append(_sumline(f"COV lig < {d:.1f} Å", f"{cov(all_lig, d)*100:.1f}%"))
+    slines += [
+        _sumline("sc_rmsd  mean",  f"{mean_finite(all_sc):.3f} Å"),
+        _sumline("lig_rmsd mean",  f"{mean_finite(all_lig):.3f} Å"),
+        "",
+        "Per-system best sample (min sc_rmsd)",
+    ]
+    for d in deltas:
+        slines.append(_sumline(f"COV sc  < {d:.1f} Å (best)", f"{cov(sys_min_sc,  d)*100:.1f}%"))
+        slines.append(_sumline(f"COV lig < {d:.1f} Å (best)", f"{cov(sys_min_lig, d)*100:.1f}%"))
+    slines += [
+        _sumline("sc_rmsd  mean (best)",  f"{mean_finite(sys_min_sc):.3f} Å"),
+        _sumline("lig_rmsd mean (best)",  f"{mean_finite(sys_min_lig):.3f} Å"),
+    ]
+    if placer_out:
+        slines += [
+            "",
+            "PLACER selection (by pred_lig_rmsd)",
+            _sumline("pred_lig_rmsd MAE",  f"{placer_out['pred_lig_rmsd_mae']:.3f} Å"),
+            _sumline("Spearman r",          f"{placer_out['spearman_r']:.3f}  (p={placer_out['spearman_p']:.2e})"),
+            _sumline("Pearson  r",          f"{placer_out['pearson_r']:.3f}  (p={placer_out['pearson_p']:.2e})"),
+        ]
+        for d in deltas:
+            slines.append(_sumline(f"COV lig < {d:.1f} Å (selected)", f"{placer_out['selection_by_pred']['cov_lig'][f'{d:.1f}']*100:.1f}%"))
+            slines.append(_sumline(f"COV lig < {d:.1f} Å (oracle)",   f"{placer_out['oracle']['cov_lig'][f'{d:.1f}']*100:.1f}%"))
+        slines += [
+            _sumline("lig_rmsd mean (selected)", f"{placer_out['selection_by_pred']['lig_rmsd_mean']:.3f} Å"),
+            _sumline("lig_rmsd mean (oracle)",   f"{placer_out['oracle']['lig_rmsd_mean']:.3f} Å"),
+        ]
+    summary = "\n".join(slines) + "\n"
+    print("\n" + summary)
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -581,7 +627,10 @@ def main():
         }
         with open(args.out, "w") as fh:
             json.dump(out_data, fh, indent=2)
-        print(f"\nResults written to {args.out}")
+        summary_path = args.out.with_name(args.out.stem + "_summary.txt")
+        summary_path.write_text(summary)
+        print(f"Results: {args.out}")
+        print(f"Summary: {summary_path}")
 
 
 if __name__ == "__main__":
