@@ -927,6 +927,37 @@ def _parse_ca_and_lig_from_cif(cif_path: Path):
             prot_plddt, lig_plddt)
 
 
+def _min_cross_chain_pae(pred_dir: Path, sample_id: str, n_prot_tokens: int, n_lig_tokens: int) -> float:
+    """Read Boltz2's pae_{sample_id}_model_0.npz -- written by the SAME `boltz predict`
+    call already run for coordinates/pLDDT, so this needs no extra refold -- and reduce it
+    to the single scalar that both RFdiffusion3 ("min chain-pair PAE", Butcher et al. 2025,
+    Fig 3c caption: "min chain pair PAE < 1.5") and Proteina-Complexa ("min ipAE" =
+    "the minimum entry of the cross-chain elements in the pAE matrix", Didi et al. 2026,
+    Appendix F) use in their small-molecule success criteria. Both papers define the same
+    underlying statistic under different names/thresholds/folding engines.
+
+    Assumes the fixed 2-chain refold input built by run_refolding (protein chain "A"
+    first, ligand chain "B" second): protein is tokenized per-residue, ligand per-heavy-atom
+    (boltz/data/tokenize/boltz2.py), so the token boundary is exactly (n_prot_tokens,
+    n_lig_tokens) -- taken from the already-parsed CIF (len(refold_ca), len(refold_lig))
+    rather than re-derived, and checked against the npz's actual shape before trusting it.
+    """
+    pae_files = sorted(pred_dir.glob(f"pae_{sample_id}_model_0.npz"))
+    if not pae_files or n_lig_tokens == 0:
+        return float("nan")
+    try:
+        pae = np.load(pae_files[0])["pae"]
+        n_total = n_prot_tokens + n_lig_tokens
+        if pae.ndim != 2 or pae.shape[0] != n_total or pae.shape[1] != n_total:
+            return float("nan")
+        cross_a = pae[:n_prot_tokens, n_prot_tokens:]
+        cross_b = pae[n_prot_tokens:, :n_prot_tokens]
+        vals = [x.min() for x in (cross_a, cross_b) if x.size]
+        return float(min(vals)) if vals else float("nan")
+    except Exception:
+        return float("nan")
+
+
 def _kabsch_align(P: np.ndarray, Q: np.ndarray):
     """Kabsch: compute rotation R and translation t such that R @ (P - P_mean).T + Q_mean ~= Q. Returns (R, p_mean, q_mean)."""
     p_mean = P.mean(0)
@@ -1004,11 +1035,13 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
             return {"plddt": float("nan"), "iptm": float("nan"), "ca_rmsd": float("nan"),
                     "aa_rmsd": float("nan"), "lig_rmsd": float("nan"),
                     "lig_displacement": float("nan"), "prot_plddt": float("nan"), "lig_plddt": float("nan"),
+                    "min_ipae": float("nan"),
                     "boltz_error": (e.stderr.decode() if e.stderr else str(e))[-200:]}
         except subprocess.TimeoutExpired:
             return {"plddt": float("nan"), "iptm": float("nan"), "ca_rmsd": float("nan"),
                     "aa_rmsd": float("nan"), "lig_rmsd": float("nan"),
                     "lig_displacement": float("nan"), "prot_plddt": float("nan"), "lig_plddt": float("nan"),
+                    "min_ipae": float("nan"),
                     "boltz_error": "timeout"}
     conf_files = sorted(pred_dir.glob("confidence_*_model_0.json"))
     plddt, iptm = float("nan"), float("nan")
@@ -1026,10 +1059,12 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
     lig_displacement = float("nan")
     prot_plddt = float("nan")
     lig_plddt = float("nan")
+    min_ipae = float("nan")
     cif_files = sorted(pred_dir.glob("*_model_0.cif"))
     if cif_files and len(gen_ca) > 0:
         try:
             refold_ca, refold_prot_by_res, refold_lig, prot_plddt, lig_plddt = _parse_ca_and_lig_from_cif(cif_files[0])
+            min_ipae = _min_cross_chain_pae(pred_dir, sample_id, len(refold_ca), len(refold_lig))
             if len(refold_ca) == len(gen_ca):
                 R, p_mean, q_mean = _kabsch_align(gen_ca, refold_ca)
                 gen_ca_rot = _apply_kabsch(gen_ca, R, p_mean, q_mean)
@@ -1057,7 +1092,8 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
             pass
 
     return {"plddt": plddt, "iptm": iptm, "ca_rmsd": ca_rmsd, "aa_rmsd": aa_rmsd, "lig_rmsd": lig_rmsd,
-            "lig_displacement": lig_displacement, "prot_plddt": prot_plddt, "lig_plddt": lig_plddt}
+            "lig_displacement": lig_displacement, "prot_plddt": prot_plddt, "lig_plddt": lig_plddt,
+            "min_ipae": min_ipae}
 
 
 def _parse_mpnn_fasta(fasta_path: Path) -> list[str]:
@@ -1176,6 +1212,7 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
         ligdisps   = [r["lig_displacement"] for r in results if np.isfinite(r.get("lig_displacement", float("nan")))]
         protplddts = [r["prot_plddt"]       for r in results if np.isfinite(r.get("prot_plddt",       float("nan")))]
         ligplddts  = [r["lig_plddt"]        for r in results if np.isfinite(r.get("lig_plddt",        float("nan")))]
+        minipaes   = [r["min_ipae"]         for r in results if np.isfinite(r.get("min_ipae",         float("nan")))]
         return {
             f"{tag}_seqs":          seqs,
             f"{tag}_ca_rmsd_best":  min(carmsds)              if carmsds  else float("nan"),
@@ -1194,6 +1231,8 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
             f"{tag}_prot_plddt_mean":       float(np.mean(protplddts)) if protplddts else float("nan"),
             f"{tag}_lig_plddt_best":        max(ligplddts)           if ligplddts  else float("nan"),
             f"{tag}_lig_plddt_mean":        float(np.mean(ligplddts)) if ligplddts else float("nan"),
+            f"{tag}_min_ipae_best":         min(minipaes)            if minipaes   else float("nan"),
+            f"{tag}_min_ipae_mean":         float(np.mean(minipaes)) if minipaes   else float("nan"),
         }
 
     pmpnn_metrics, lmpnn_metrics = {}, {}

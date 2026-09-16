@@ -5,6 +5,22 @@ constraints) refolding self-consistency -- following Wang et al. 2026,
 "Pallatom-Ligand: an All-Atom Diffusion Model for Designing Ligand-Binding Proteins"
 (ICLR 2026), Section 4.1-4.2 (verified directly against the paper text).
 
+Also reports (from the SAME refold, no extra work) the small-molecule success criteria
+used by two related, directly-comparable-in-spirit papers, since the metrics they need
+(iPTM, min cross-chain PAE) come from the exact same Boltz2 refold call already made for
+Pallatom's own criteria -- there's no reason to force a choice of one protocol, so all
+three are always computed and printed side by side, labeled by name:
+  - RFdiffusion3 (Butcher et al. 2025, bioRxiv, Fig 3c caption): backbone RMSD<1.5A &
+    ligand RMSD<5A & min chain-pair PAE<1.5 & iPTM>0.8. Uses AF3.
+  - Proteina-Complexa (Didi et al. 2026, ICLR 2026, Sec 3.3/Appendix F): min-ipAE<2 &
+    binder Ca RMSD<2A & ligand RMSD<5A. Uses RF3. "min ipAE" is defined there as "the
+    minimum entry of the cross-chain elements in the pAE matrix" -- the same statistic
+    RFD3 calls "min chain-pair PAE", just a different name/threshold/folding engine.
+Both use looser ligand-RMSD (<5A) than Pallatom-Ligand's <2A pose criterion -- the
+single biggest reason absolute numbers aren't comparable across all three. Substituting
+Boltz2 for AF3/RF3 means none of these numbers are directly comparable to the papers'
+own reported figures either way -- only structurally analogous.
+
 Reuses eval_plinder.py's ligand_cond machinery (eval_ligand_cond_sample, KNOWN_SMILES,
 run_refolding, etc. -- including its Cα-only Kabsch alignment with the ligand carried
 along rigidly, never independently re-aligned, and its RDKit-substructure-match-based
@@ -59,6 +75,11 @@ MPNN_SUCCESS_KEYS = [("fold_success", "fold_success_mpnn"),
                      ("pocket_success", "pocket_success_mpnn"),
                      ("pose_success", "pose_success_mpnn")]
 
+RFD3_RAW_KEYS = [("rfd3_success", "rfd3_success")]
+RFD3_MPNN_KEYS = [("rfd3_success", "rfd3_success_mpnn")]
+COMPLEXA_RAW_KEYS = [("complexa_success", "complexa_success")]
+COMPLEXA_MPNN_KEYS = [("complexa_success", "complexa_success_mpnn")]
+
 
 def _ligand_code_for(pdb_path: Path) -> str:
     """Recover the CCD code from a sample filename built by
@@ -90,13 +111,34 @@ def _success_flags(protein_rmsd, protein_plddt, ligand_displacement, ligand_pldd
     return fold, pocket, pose
 
 
+def _rfd3_success(ca_rmsd, lig_rmsd, min_ipae, iptm) -> bool:
+    """RFdiffusion3's small-molecule success criterion, verbatim (Butcher et al. 2025,
+    Fig 3c caption): backbone RMSD<1.5A & backbone-aligned ligand RMSD<5A & min
+    chain-pair PAE<1.5 & iPTM>0.8."""
+    return bool(_finite(ca_rmsd) and _finite(lig_rmsd) and _finite(min_ipae) and _finite(iptm)
+                and ca_rmsd < 1.5 and lig_rmsd < 5 and min_ipae < 1.5 and iptm > 0.8)
+
+
+def _complexa_success(ca_rmsd, lig_rmsd, min_ipae) -> bool:
+    """Proteina-Complexa's small-molecule success criterion, verbatim (Didi et al. 2026,
+    Appendix F): min ipAE<2 & binder Ca (sc)RMSD<2A & binder-aligned ligand (sc)RMSD<5A."""
+    return bool(_finite(ca_rmsd) and _finite(lig_rmsd) and _finite(min_ipae)
+                and min_ipae < 2 and ca_rmsd < 2 and lig_rmsd < 5)
+
+
 def compute_success(r: dict) -> dict:
     """Success flags for the raw generated sequence, plus (if LigandMPNN redesign was
-    run) a second set for the redesigned sequence."""
+    run) a second set for the redesigned sequence. Computes all three papers' success
+    criteria every time (Pallatom-Ligand, RFdiffusion3, Proteina-Complexa) -- they all
+    come free from the same refold, so there's no reason to make the caller pick one."""
     fold, pocket, pose = _success_flags(
         r.get("ca_rmsd"), r.get("prot_plddt"), r.get("lig_displacement"), r.get("lig_plddt"), r.get("lig_rmsd"),
     )
-    out = {"fold_success": fold, "pocket_success": pocket, "pose_success": pose}
+    out = {
+        "fold_success": fold, "pocket_success": pocket, "pose_success": pose,
+        "rfd3_success": _rfd3_success(r.get("ca_rmsd"), r.get("lig_rmsd"), r.get("min_ipae"), r.get("iptm")),
+        "complexa_success": _complexa_success(r.get("ca_rmsd"), r.get("lig_rmsd"), r.get("min_ipae")),
+    }
 
     if "lmpnn_ca_rmsd_best" in r:
         fold_m, pocket_m, pose_m = _success_flags(
@@ -105,6 +147,13 @@ def compute_success(r: dict) -> dict:
             r.get("lmpnn_lig_rmsd_best"),
         )
         out.update({"fold_success_mpnn": fold_m, "pocket_success_mpnn": pocket_m, "pose_success_mpnn": pose_m})
+        out["rfd3_success_mpnn"] = _rfd3_success(
+            r.get("lmpnn_ca_rmsd_best"), r.get("lmpnn_lig_rmsd_best"),
+            r.get("lmpnn_min_ipae_best"), r.get("lmpnn_iptm_best"),
+        )
+        out["complexa_success_mpnn"] = _complexa_success(
+            r.get("lmpnn_ca_rmsd_best"), r.get("lmpnn_lig_rmsd_best"), r.get("lmpnn_min_ipae_best"),
+        )
     return out
 
 
@@ -238,32 +287,46 @@ def main():
     all_results = [r for v in results_by_code.values() for r in v]
     (args.out_dir / "results.json").write_text(json.dumps(all_results, indent=2, default=str))
 
+    benchmarks = [
+        ("PALLATOM-LIGAND (Wang et al. 2026): fold/pocket/pose, AF3 in the paper", RAW_SUCCESS_KEYS, MPNN_SUCCESS_KEYS),
+        ("RFDIFFUSION3 (Butcher et al. 2025): backbone_RMSD<1.5A & lig_RMSD<5A & "
+         "min_chain_pair_PAE<1.5 & iPTM>0.8, AF3 in the paper", RFD3_RAW_KEYS, RFD3_MPNN_KEYS),
+        ("PROTEINA-COMPLEXA (Didi et al. 2026): min_ipAE<2 & binder_RMSD<2A & "
+         "lig_RMSD<5A, RF3 in the paper", COMPLEXA_RAW_KEYS, COMPLEXA_MPNN_KEYS),
+    ]
+
     report = [
         "=" * 70,
-        "Pallatom-style criteria, Boltz2 single-sequence evaluation",
+        "Small-molecule binder success criteria, Boltz2 single-sequence refold",
+        "(same refold for all three -- only the success formula differs; see docstring",
+        " for why absolute numbers aren't directly comparable across papers)",
         "=" * 70,
         "",
-        "--- RAW (model's own generated sequence, no redesign) ---",
-        "",
     ]
-    report.extend(_report_overall(results_by_code, "OVERALL", RAW_SUCCESS_KEYS))
-    report.append("")
-    for code, code_results in results_by_code.items():
-        if not code_results:
-            continue
-        report.extend(_report_per_ligand(code_results, code, RAW_SUCCESS_KEYS))
-    report.append("")
-
-    if run_mpnn:
-        report.append(f"--- +MPNN (LigandMPNN redesign of non-pocket residues, "
-                      f"{args.mpnn_cutoff:.0f}A cutoff) ---")
+    for label, raw_keys, mpnn_keys in benchmarks:
+        report.append(f"### {label}")
         report.append("")
-        report.extend(_report_overall(results_by_code, "OVERALL", MPNN_SUCCESS_KEYS))
+        report.append("--- RAW (model's own generated sequence, no redesign) ---")
+        report.append("")
+        report.extend(_report_overall(results_by_code, "OVERALL", raw_keys))
         report.append("")
         for code, code_results in results_by_code.items():
             if not code_results:
                 continue
-            report.extend(_report_per_ligand(code_results, code, MPNN_SUCCESS_KEYS))
+            report.extend(_report_per_ligand(code_results, code, raw_keys))
+        report.append("")
+
+        if run_mpnn:
+            report.append(f"--- +MPNN (LigandMPNN redesign of non-pocket residues, "
+                          f"{args.mpnn_cutoff:.0f}A cutoff) ---")
+            report.append("")
+            report.extend(_report_overall(results_by_code, "OVERALL", mpnn_keys))
+            report.append("")
+            for code, code_results in results_by_code.items():
+                if not code_results:
+                    continue
+                report.extend(_report_per_ligand(code_results, code, mpnn_keys))
+            report.append("")
         report.append("")
 
     summary = "\n".join(report) + "\n"
