@@ -22,10 +22,13 @@ dataset_stats.yaml with per-split and total system counts.
 """
 
 import argparse
+import collections
+import json
 import multiprocessing
 import os
 from pathlib import Path
 
+import numpy as np
 import rdkit
 import yaml
 
@@ -72,6 +75,9 @@ if __name__ == "__main__":
                              "system_pass_validation_criteria record field is trivially True, which makes the "
                              "training-time gate_low_quality_t soft-gate a no-op — use one or the other, not "
                              "both, unless you have a specific reason to.")
+    parser.add_argument("--plip-sif", type=str, default=None,
+                        help="Path to PLIP singularity .sif file. If provided alongside --include-waters, "
+                             "water-mediated interaction counts are computed via PLIP and added to water_stats.json.")
     parser.add_argument("--include-waters", action="store_true", default=False,
                          help="Keep PLIP-detected interacting waters (residue HOH/DOD) as extra NONPOLYMER "
                               "chains, instead of stripping all water unconditionally (the default, to avoid "
@@ -138,3 +144,68 @@ if __name__ == "__main__":
     with open(args.outdir / "dataset_stats.yaml", "w") as f:
         yaml.dump(stats, f, default_flow_style=False, sort_keys=False)
     print(f"Wrote dataset stats to {args.outdir / 'dataset_stats.yaml'}")
+
+    if args.include_waters:
+        print("\nComputing water stats...")
+        _WATER_NAMES = {"HOH", "DOD"}
+
+        # collect (npz_path, system_id, plinder_system_cif) tuples
+        system_entries = []
+        for split_name in ["train", "val", "test"]:
+            struct_root = args.outdir / split_name / "structures"
+            for npz_path in struct_root.rglob("*.npz"):
+                system_id = npz_path.stem
+                cif_path = args.plinder_dir / "systems" / system_id / "system.cif"
+                system_entries.append((npz_path, system_id, cif_path))
+
+        def _water_stats_worker(entry):
+            npz_path, system_id, cif_path = entry
+            result = {"system_id": system_id, "n_waters": 0, "n_water_bridges": 0}
+            try:
+                data = np.load(npz_path, allow_pickle=False)
+                residues = data["residues"]
+                result["n_waters"] = int(np.isin(residues["name"], list(_WATER_NAMES)).sum())
+            except Exception:
+                pass
+            if cif_path.exists() and args.plip_sif:
+                try:
+                    import subprocess, tempfile, os
+                    script = (
+                        "from openbabel import openbabel; "
+                        "conv = openbabel.OBConversion(); conv.SetInAndOutFormats('cif','pdb'); "
+                        f"mol = openbabel.OBMol(); conv.ReadFile(mol, '{cif_path}'); "
+                        "import tempfile, os; f=tempfile.NamedTemporaryFile(suffix='.pdb',delete=False); tmp=f.name; f.close(); "
+                        "conv.WriteFile(mol, tmp); "
+                        "from plip.structure.preparation import PDBComplex; "
+                        "pc = PDBComplex(); pc.load_pdb(tmp); pc.analyze(); "
+                        "os.unlink(tmp); "
+                        "total = sum(len(v.water_bridges) for v in pc.interaction_sets.values()); "
+                        "print(total)"
+                    )
+                    r = subprocess.run(
+                        ["singularity", "exec", "--bind", "/mnt/scratch",
+                         args.plip_sif, "python3", "-c", script],
+                        capture_output=True, text=True, timeout=60
+                    )
+                    lines = [l.strip() for l in r.stdout.strip().splitlines() if l.strip().lstrip('-').isdigit()]
+                    if lines:
+                        result["n_water_bridges"] = int(lines[-1])
+                except Exception:
+                    pass
+            return result
+
+        with multiprocessing.Pool(args.num_processes) as pool:
+            results = list(pool.imap_unordered(_water_stats_worker, system_entries, chunksize=32))
+
+        water_counts = collections.Counter(r["n_waters"] for r in results)
+        bridge_counts = collections.Counter(r["n_water_bridges"] for r in results)
+        water_stats = {
+            "total_systems": len(results),
+            "systems_with_waters": sum(v for k, v in water_counts.items() if k > 0),
+            "water_count_histogram": {str(k): v for k, v in sorted(water_counts.items())},
+            "systems_with_water_bridges": sum(v for k, v in bridge_counts.items() if k > 0),
+            "water_bridge_count_histogram": {str(k): v for k, v in sorted(bridge_counts.items())},
+        }
+        with open(args.outdir / "water_stats.json", "w") as f:
+            json.dump(water_stats, f, indent=2)
+        print(f"Wrote water stats to {args.outdir / 'water_stats.json'}")
