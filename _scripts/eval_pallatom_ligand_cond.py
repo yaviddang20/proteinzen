@@ -80,17 +80,23 @@ RFD3_MPNN_KEYS = [("rfd3_success", "rfd3_success_mpnn")]
 COMPLEXA_RAW_KEYS = [("complexa_success", "complexa_success")]
 COMPLEXA_MPNN_KEYS = [("complexa_success", "complexa_success_mpnn")]
 
-# Raw fields (from eval_ligand_cond_sample's return dict) that every *current* code
-# version is expected to produce. A per-sample cache JSON missing any of these predates
-# that field (e.g. cached before min_ipae/RFD3/Complexa support was added) and is treated
-# as stale -- add to this tuple whenever a new field is wired into eval_ligand_cond_sample
-# / run_refolding so old caches get auto-backfilled instead of silently reporting
-# missing metrics as failures.
-REQUIRED_RAW_KEYS = ("min_ipae",)
+# Bump this whenever a code change could alter the *value* of an already-cached field
+# for samples cached under an earlier version -- not just when a new field is added.
+# A presence-only check (e.g. "does this cache have a min_ipae key") is NOT enough: a
+# cache can already have a key with a wrong/NaN value baked in from a run that happened
+# between two fixes (e.g. min_ipae landed, then a separate lig_rmsd bug was fixed later --
+# caches written in that window have min_ipae but permanently-stale NaN lig_rmsd, and a
+# presence check would never catch that). Stamping every fresh compute with the current
+# version and comparing on load makes staleness explicit instead of inferred.
+#   1: pre-RFD3/Complexa (no min_ipae at all)
+#   2: min_ipae/RFD3/Complexa added (ece27d1) -- but _clone_with_coords could still throw
+#      on ligand RMSD (silently caught -> lig_rmsd/lig_displacement NaN)
+#   3: _clone_with_coords conformer fix (028d6db) -- lig_rmsd actually computes
+CACHE_SCHEMA_VERSION = 3
 
 
 def _cache_is_complete(r: dict) -> bool:
-    return all(k in r for k in REQUIRED_RAW_KEYS)
+    return r.get("_cache_schema_version") == CACHE_SCHEMA_VERSION
 
 
 def _ligand_code_for(pdb_path: Path) -> str:
@@ -304,6 +310,7 @@ def main():
                     force=args.overwrite,
                 )
                 r["ligand_code"] = code
+                r["_cache_schema_version"] = CACHE_SCHEMA_VERSION
                 cache_path.write_text(json.dumps(r, indent=2, default=str))
             r.setdefault("ligand_code", code)
             r.update(compute_success(r))
