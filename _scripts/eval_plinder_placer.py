@@ -28,6 +28,7 @@ from pathlib import Path
 
 import numpy as np
 from joblib import Parallel, delayed
+from scipy import stats as scipy_stats
 from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -170,7 +171,9 @@ def eval_sample(pdb_path: str, gt_prot_names: list, gt_prot: np.ndarray, gt_lig:
 # Per-system job
 # ============================================================
 
-def _eval_system_job(system_id: str, pdb_paths: list, npz_path: str, max_protein_residues: int):
+def _eval_system_job(system_id: str, pdb_paths: list, npz_path: str, max_protein_residues: int,
+                     pred_lig_rmsds: dict):
+    """pred_lig_rmsds: dict from pdb stem -> float|None (from samples_metadata.json)."""
     try:
         struct = load_structure_from_npz(npz_path, include_h=False)
         struct = _crop_protein_to_pocket(struct, max_protein_residues)
@@ -181,11 +184,13 @@ def _eval_system_job(system_id: str, pdb_paths: list, npz_path: str, max_protein
     records = []
     first_error = None
     for idx, p in enumerate(sorted(pdb_paths)):
+        pred_rmsd = pred_lig_rmsds.get(p.stem)
         try:
             r = eval_sample(str(p), gt_prot_names, gt_prot, gt_lig)
             records.append({
                 "system_id": system_id,
                 "sample_idx": idx,
+                "pdb_stem": p.stem,
                 "ca_rmsd": r["ca_rmsd"],
                 "aa_rmsd": r["aa_rmsd"],
                 "sc_rmsd": r["sc_rmsd"],
@@ -193,6 +198,7 @@ def _eval_system_job(system_id: str, pdb_paths: list, npz_path: str, max_protein
                 "combined_rmsd": r["combined_rmsd"],
                 "n_sc_atoms": r["n_sc_atoms"],
                 "n_lig_atoms": r["n_lig_atoms"],
+                "pred_lig_rmsd": pred_rmsd,
                 "note": "",
             })
         except Exception as e:
@@ -202,6 +208,7 @@ def _eval_system_job(system_id: str, pdb_paths: list, npz_path: str, max_protein
             records.append({
                 "system_id": system_id,
                 "sample_idx": idx,
+                "pdb_stem": p.stem,
                 "ca_rmsd": float("inf"),
                 "aa_rmsd": float("inf"),
                 "sc_rmsd": float("inf"),
@@ -209,6 +216,7 @@ def _eval_system_job(system_id: str, pdb_paths: list, npz_path: str, max_protein
                 "combined_rmsd": float("inf"),
                 "n_sc_atoms": 0,
                 "n_lig_atoms": 0,
+                "pred_lig_rmsd": pred_rmsd,
                 "note": note,
             })
     return system_id, records, None, first_error
@@ -246,6 +254,32 @@ def _mean_per_system(records_by_system, key):
     return means
 
 
+def _select_by_pred_lig_rmsd(records_by_system):
+    """PLACER-style: pick sample with lowest pred_lig_rmsd; return its true lig_rmsd."""
+    selected_lig = []
+    n_has_pred = 0
+    for recs in records_by_system.values():
+        eligible = [r for r in recs if r.get("pred_lig_rmsd") is not None
+                    and np.isfinite(r["lig_rmsd"])]
+        if not eligible:
+            continue
+        n_has_pred += 1
+        best = min(eligible, key=lambda r: r["pred_lig_rmsd"])
+        selected_lig.append(best["lig_rmsd"])
+    return selected_lig, n_has_pred
+
+
+def _pred_vs_true_lig_rmsd_pairs(all_records):
+    """Collect (pred, true) pairs for MAE / correlation — only where both are finite."""
+    pairs = []
+    for r in all_records:
+        p = r.get("pred_lig_rmsd")
+        t = r.get("lig_rmsd")
+        if p is not None and t is not None and np.isfinite(p) and np.isfinite(t):
+            pairs.append((float(p), float(t)))
+    return pairs
+
+
 # ============================================================
 # Main
 # ============================================================
@@ -266,6 +300,9 @@ def main():
                         help="Parallel workers (default: half of CPU count)")
     parser.add_argument("--out", type=Path, default=None,
                         help="Optional path to write results JSON")
+    parser.add_argument("--metadata-path", type=Path, default=None,
+                        help="Path to samples_metadata.json (default: {samples-dir}/samples_metadata.json). "
+                             "If absent or pred_lig_rmsd is missing, PLACER selection metrics are skipped.")
     parser.add_argument("--verbose", action="store_true",
                         help="Print per-system details")
     args = parser.parse_args()
@@ -321,11 +358,26 @@ def main():
             continue
         jobs.append((sid, groups[sid], str(npz_path)))
 
+    # ---- load pred_lig_rmsd from samples_metadata.json ----
+    meta_path = args.metadata_path or (args.samples_dir / "samples_metadata.json")
+    pred_lig_rmsds: dict[str, float | None] = {}
+    if meta_path.exists():
+        with open(meta_path) as fh:
+            meta = json.load(fh)
+        for stem, entry in meta.items():
+            v = entry.get("pred_lig_rmsd")
+            if v is not None:
+                pred_lig_rmsds[stem] = float(v)
+        n_with_pred = sum(1 for v in pred_lig_rmsds.values() if v is not None)
+        print(f"  pred_lig_rmsd found for {n_with_pred}/{len(meta)} samples in metadata")
+    else:
+        print(f"  samples_metadata.json not found — PLACER selection metrics will be skipped")
+
     print(f"  Running {len(jobs)} systems with {args.n_jobs} workers...")
 
     # ---- parallel evaluation ----
     results = Parallel(n_jobs=args.n_jobs, backend="loky")(
-        delayed(_eval_system_job)(sid, pdbs, npz, args.max_protein_residues)
+        delayed(_eval_system_job)(sid, pdbs, npz, args.max_protein_residues, pred_lig_rmsds)
         for sid, pdbs, npz in tqdm(jobs, desc="evaluating")
     )
 
@@ -431,6 +483,54 @@ def main():
     _block("Per-system mean sample",
            sys_mean_ca, sys_mean_aa, sys_mean_sc,  sys_mean_lig, sys_mean_comb)
 
+    # ---- PLACER selection metrics (only if pred_lig_rmsd is available) ----
+    placer_out: dict = {}
+    pairs = _pred_vs_true_lig_rmsd_pairs(all_records)
+    if pairs:
+        pred_arr = np.array([p for p, _ in pairs])
+        true_arr = np.array([t for _, t in pairs])
+        mae = float(np.mean(np.abs(pred_arr - true_arr)))
+        spearman_r, spearman_p = scipy_stats.spearmanr(pred_arr, true_arr)
+        pearson_r, pearson_p = scipy_stats.pearsonr(pred_arr, true_arr)
+
+        sel_lig, n_sys_with_pred = _select_by_pred_lig_rmsd(records_by_system)
+        oracle_lig = sys_min_lig  # best achievable per system
+
+        print(f"\n--- PLACER selection (pred_lig_rmsd head) ---")
+        print(f"  systems with pred_lig_rmsd     : {n_sys_with_pred}")
+        print(f"  sample pairs (pred vs true lig) : {len(pairs)}")
+        print(f"  pred_lig_rmsd MAE              : {mae:.3f} Å")
+        print(f"  Spearman r                     : {spearman_r:.3f}  (p={spearman_p:.2e})")
+        print(f"  Pearson  r                     : {pearson_r:.3f}  (p={pearson_p:.2e})")
+        print(f"  -- Selection by min pred_lig_rmsd (n={len(sel_lig)} systems) --")
+        print(f"  selected lig_rmsd mean         : {mean_finite(sel_lig):.3f} Å")
+        for d in deltas:
+            print(f"  COV lig < {d:.1f}Å (selected)     : {cov(sel_lig, d)*100:.1f}%")
+        print(f"  -- Oracle (min true lig_rmsd) --")
+        print(f"  oracle lig_rmsd mean           : {mean_finite(oracle_lig):.3f} Å")
+        for d in deltas:
+            print(f"  COV lig < {d:.1f}Å (oracle)       : {cov(oracle_lig, d)*100:.1f}%")
+
+        placer_out = {
+            "n_systems_with_pred": n_sys_with_pred,
+            "n_pairs": len(pairs),
+            "pred_lig_rmsd_mae": mae,
+            "spearman_r": float(spearman_r),
+            "spearman_p": float(spearman_p),
+            "pearson_r": float(pearson_r),
+            "pearson_p": float(pearson_p),
+            "selection_by_pred": {
+                "lig_rmsd_mean": mean_finite(sel_lig),
+                "cov_lig": {f"{d:.1f}": cov(sel_lig, d) for d in deltas},
+            },
+            "oracle": {
+                "lig_rmsd_mean": mean_finite(oracle_lig),
+                "cov_lig": {f"{d:.1f}": cov(oracle_lig, d) for d in deltas},
+            },
+        }
+    else:
+        print("\n  [PLACER selection metrics skipped — no pred_lig_rmsd values found]")
+
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         out_data = {
@@ -473,6 +573,7 @@ def main():
                 "cov_lig":  {f"{d:.1f}": cov(sys_mean_lig,  d) for d in deltas},
                 "cov_comb": {f"{d:.1f}": cov(sys_mean_comb, d) for d in deltas},
             },
+            "placer_selection": placer_out if placer_out else None,
             "samples": [
                 {k: v for k, v in r.items() if k != "note" or v}
                 for r in all_records
