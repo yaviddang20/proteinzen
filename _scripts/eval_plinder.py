@@ -1010,7 +1010,10 @@ def _lig_correspondence_rmsd(smiles, coords_a: np.ndarray, coords_b: np.ndarray)
 
 
 def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
-                  sample_id, boltz_cache, gen_lig=None, gen_prot_by_res=None):
+                  sample_id, boltz_cache, gen_lig=None, gen_prot_by_res=None, force=False):
+    """force=True bypasses the pred_dir.exists() cache and always re-runs `boltz predict`,
+    even if a prediction is already on disk. Default False preserves existing behavior for
+    every caller that doesn't pass this explicitly."""
     import yaml as _yaml
     refold_input_dir.mkdir(parents=True, exist_ok=True)
     refold_output_dir.mkdir(parents=True, exist_ok=True)
@@ -1023,7 +1026,7 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
     out_dir = refold_output_dir / sample_id
     pred_dir = out_dir / f"boltz_results_{sample_id}" / "predictions" / sample_id
 
-    if not pred_dir.exists():
+    if force or not pred_dir.exists():
         input_yaml.write_text(_yaml.dump(boltz_input, default_flow_style=False))
         cmd = [_BOLTZ_BIN, "predict", str(input_yaml), "--out_dir", str(out_dir), "--override"]
         if boltz_cache:
@@ -1118,10 +1121,10 @@ def _parse_mpnn_fasta(fasta_path: Path) -> list[str]:
 
 
 def _run_ligandmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, script: str, model_type: str,
-                    fixed_residues: str = "") -> list[str]:
+                    fixed_residues: str = "", force: bool = False) -> list[str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     fasta_path = out_dir / "seqs" / f"{pdb_path.stem}.fa"
-    if not fasta_path.exists():
+    if force or not fasta_path.exists():
         cmd = [_MPNN_PYTHON, script,
                "--model_type", model_type,
                "--pdb_path", str(pdb_path),
@@ -1136,32 +1139,37 @@ def _run_ligandmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, script: str, mod
     return _parse_mpnn_fasta(fasta_path)[:n_seqs]
 
 
-def run_proteinmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, mpnn_script: str) -> list[str]:
+def run_proteinmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, mpnn_script: str, force: bool = False) -> list[str]:
     """Run LigandMPNN repo with model_type=protein_mpnn (no ligand context)."""
-    return _run_ligandmpnn(pdb_path, out_dir, n_seqs, mpnn_script, "protein_mpnn")
+    return _run_ligandmpnn(pdb_path, out_dir, n_seqs, mpnn_script, "protein_mpnn", force=force)
 
 
 def run_ligandmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, ligandmpnn_script: str,
-                   fixed_residues: str = "") -> list[str]:
+                   fixed_residues: str = "", force: bool = False) -> list[str]:
     """Run LigandMPNN repo with model_type=ligand_mpnn (ligand-aware).
     fixed_residues: LigandMPNN --fixed_residues token string ("A12 A13 ..."), e.g. from
     pocket_fixed_residues() -- the Pallatom-Ligand paper's protocol of fixing pocket
     residues (default 6A) and letting LigandMPNN redesign everything else."""
     return _run_ligandmpnn(pdb_path, out_dir, n_seqs, ligandmpnn_script, "ligand_mpnn",
-                           fixed_residues=fixed_residues)
+                           fixed_residues=fixed_residues, force=force)
 
 
 def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_dir,
                             boltz_cache, run_pb, skip_fold, contact_cutoff=4.0,
                             mpnn_script=None, ligandmpnn_script=None,
                             mpnn_n_seqs=3, mpnn_refold_dir=None, pb_cache=None,
-                            mpnn_cutoff=None):
+                            mpnn_cutoff=None, force=False):
     """mpnn_cutoff: None (default) preserves the original behavior -- LigandMPNN
     redesigns the full sequence, no fixed residues. Pass a distance in Angstroms
     (e.g. 6.0) to instead fix residues within that cutoff of the ligand and let
     LigandMPNN redesign only the rest -- the Pallatom-Ligand paper's protocol, used
     by eval_pallatom_ligand_cond.py. Opt-in only: general callers of this function
-    (e.g. run_eval_plinder.sh's ligand_cond eval) are unaffected unless they pass this."""
+    (e.g. run_eval_plinder.sh's ligand_cond eval) are unaffected unless they pass this.
+
+    force: True bypasses every on-disk cache this function touches (Boltz refolds via
+    run_refolding, and ProteinMPNN/LigandMPNN sequence generation) and always recomputes
+    from scratch. Default False preserves existing caching behavior for every caller
+    that doesn't pass this explicitly."""
     (prot_all, prot_ca, resnames, lig_coords, lig_elements, _,
      prot_by_res, prot_res_keys) = parse_pdb_ligand_cond(str(pdb_path))
     sequence = resnames_to_seq(resnames)
@@ -1182,13 +1190,13 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
             sequence=sequence, smiles=smiles, gen_ca=prot_ca,
             refold_input_dir=refold_input_dir, refold_output_dir=refold_output_dir,
             sample_id=pdb_path.stem, boltz_cache=boltz_cache,
-            gen_lig=gen_lig, gen_prot_by_res=prot_by_res,
+            gen_lig=gen_lig, gen_prot_by_res=prot_by_res, force=force,
         )
         fold_nolig = run_refolding(
             sequence=sequence, smiles=None, gen_ca=prot_ca,
             refold_input_dir=refold_input_dir, refold_output_dir=refold_output_dir,
             sample_id=f"{pdb_path.stem}_nolig", boltz_cache=boltz_cache,
-            gen_lig=None, gen_prot_by_res=prot_by_res,
+            gen_lig=None, gen_prot_by_res=prot_by_res, force=force,
         )
     fold_nolig = {f"nolig_{k}": v for k, v in fold_nolig.items()}
 
@@ -1201,7 +1209,7 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
                 refold_output_dir=base_dir / "refold_outputs",
                 sample_id=f"{pdb_path.stem}_{tag}{i}",
                 boltz_cache=boltz_cache,
-                gen_lig=gen_lig, gen_prot_by_res=prot_by_res,
+                gen_lig=gen_lig, gen_prot_by_res=prot_by_res, force=force,
             )
             results.append(fold_i)
         carmsds  = [r["ca_rmsd"]  for r in results if np.isfinite(r.get("ca_rmsd",  float("nan")))]
@@ -1240,7 +1248,8 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
         base = mpnn_refold_dir or refold_output_dir.parent / "mpnn_refold"
         if mpnn_script and Path(mpnn_script).exists():
             try:
-                seqs = run_proteinmpnn(pdb_path, base / pdb_path.stem / "proteinmpnn", mpnn_n_seqs, mpnn_script)
+                seqs = run_proteinmpnn(pdb_path, base / pdb_path.stem / "proteinmpnn", mpnn_n_seqs, mpnn_script,
+                                       force=force)
                 pmpnn_metrics = _run_mpnn_case(seqs, None, "pmpnn", base / pdb_path.stem / "pmpnn_refold")
             except Exception as e:
                 print(f"  ProteinMPNN error {pdb_path.name}: {e}")
@@ -1255,7 +1264,7 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
                     if mpnn_cutoff is not None else ""
                 )
                 seqs = run_ligandmpnn(pdb_path, base / pdb_path.stem / "ligandmpnn", mpnn_n_seqs, ligandmpnn_script,
-                                      fixed_residues=fixed_residues)
+                                      fixed_residues=fixed_residues, force=force)
                 lmpnn_metrics = _run_mpnn_case(seqs, smiles, "lmpnn", base / pdb_path.stem / "lmpnn_refold")
             except Exception as e:
                 print(f"  LigandMPNN error {pdb_path.name}: {e}")

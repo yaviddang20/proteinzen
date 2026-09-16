@@ -80,6 +80,18 @@ RFD3_MPNN_KEYS = [("rfd3_success", "rfd3_success_mpnn")]
 COMPLEXA_RAW_KEYS = [("complexa_success", "complexa_success")]
 COMPLEXA_MPNN_KEYS = [("complexa_success", "complexa_success_mpnn")]
 
+# Raw fields (from eval_ligand_cond_sample's return dict) that every *current* code
+# version is expected to produce. A per-sample cache JSON missing any of these predates
+# that field (e.g. cached before min_ipae/RFD3/Complexa support was added) and is treated
+# as stale -- add to this tuple whenever a new field is wired into eval_ligand_cond_sample
+# / run_refolding so old caches get auto-backfilled instead of silently reporting
+# missing metrics as failures.
+REQUIRED_RAW_KEYS = ("min_ipae",)
+
+
+def _cache_is_complete(r: dict) -> bool:
+    return all(k in r for k in REQUIRED_RAW_KEYS)
+
 
 def _ligand_code_for(pdb_path: Path) -> str:
     """Recover the CCD code from a sample filename built by
@@ -264,11 +276,24 @@ def main():
         code_results = []
         for pdb_path in tqdm(files, desc=code):
             cache_path = per_sample_dir / f"{pdb_path.stem}.json"
+            r = None
             if not args.overwrite and cache_path.exists():
-                r = json.loads(cache_path.read_text())
-            elif args.aggregate_only:
-                continue
-            else:
+                cached = json.loads(cache_path.read_text())
+                # aggregate_only never triggers a (re)compute, even for a stale cache --
+                # it means "just report on whatever's on disk". Otherwise, a cache missing
+                # a currently-expected field (see REQUIRED_RAW_KEYS) is auto-backfilled
+                # below rather than silently reported as a metric failure.
+                if args.aggregate_only or _cache_is_complete(cached):
+                    r = cached
+            if r is None:
+                if args.aggregate_only:
+                    continue
+                # force=args.overwrite: --overwrite means a COMPLETE redo, including
+                # re-running Boltz/LigandMPNN. Without it (e.g. backfilling a stale
+                # cache's missing fields), eval_ligand_cond_sample still only re-derives
+                # metrics from whatever Boltz/LigandMPNN output already exists on disk --
+                # run_refolding/_run_ligandmpnn independently skip the actual subprocess
+                # calls unless force=True.
                 r = eval_ligand_cond_sample(
                     pdb_path=pdb_path, smiles=smiles,
                     refold_input_dir=refold_input_dir, refold_output_dir=refold_output_dir,
@@ -276,6 +301,7 @@ def main():
                     contact_cutoff=args.contact_cutoff,
                     ligandmpnn_script=args.ligandmpnn_script if run_mpnn else None,
                     mpnn_n_seqs=args.mpnn_n_seqs, mpnn_cutoff=args.mpnn_cutoff,
+                    force=args.overwrite,
                 )
                 r["ligand_code"] = code
                 cache_path.write_text(json.dumps(r, indent=2, default=str))
