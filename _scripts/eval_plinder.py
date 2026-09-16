@@ -264,6 +264,12 @@ def _clone_with_coords(mol, coords: np.ndarray):
     if mol is None or mol.GetNumAtoms() != len(coords):
         return None
     rw = Chem.RWMol(Chem.Mol(mol))
+    if rw.GetNumConformers() == 0:
+        # A mol built straight from SMILES (e.g. _lig_correspondence_rmsd's mol_template)
+        # has zero conformers -- GetConformer() below would raise "Bad Conformer Id".
+        # Every atom position gets overwritten right after anyway, so any placeholder
+        # conformer works.
+        rw.AddConformer(Chem.Conformer(rw.GetNumAtoms()), assignId=True)
     conf = rw.GetConformer()
     for i, (x, y, z) in enumerate(coords):
         conf.SetAtomPosition(i, (float(x), float(y), float(z)))
@@ -1178,7 +1184,17 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
         pb = pb_cache.get(str(pdb_path), {})
     else:
         pb = run_posebusters(str(pdb_path), smiles) if run_pb else {}
-    gen_lig = lig_coords.astype(np.float64) if len(lig_coords) > 0 else None
+    # Heavy atoms only, matching _parse_ca_and_lig_from_cif's convention for the refolded
+    # ligand (Boltz2's own CIF has no explicit ligand H). Generated PDBs here can include
+    # explicit ligand H (sample.py --include-h), so without this filter len(gen_lig) !=
+    # len(refold_lig) for essentially every sample and run_refolding's
+    # `len(refold_lig) == len(gen_lig)` gate never passes -- lig_rmsd/lig_displacement
+    # come out NaN even though ca_rmsd/iptm/min_ipae (unaffected by this gate) are fine.
+    if len(lig_coords) > 0:
+        heavy_mask = np.array([e.strip().upper() != "H" for e in lig_elements])
+        gen_lig = lig_coords[heavy_mask].astype(np.float64) if heavy_mask.any() else None
+    else:
+        gen_lig = None
 
     _nan_fold = {"plddt": float("nan"), "iptm": float("nan"), "ca_rmsd": float("nan"),
                  "aa_rmsd": float("nan"), "lig_rmsd": float("nan")}
