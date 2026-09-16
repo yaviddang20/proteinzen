@@ -367,7 +367,7 @@ def main():
         with open(meta_path) as fh:
             meta = json.load(fh)
         for key, entry in meta.items():
-            stem = Path(key).stem  # normalize — key may be full path or bare stem
+            stem = Path(key).name  # normalize — key may be full path or bare stem; .name keeps dots intact
             v = entry.get("pred_lig_rmsd")
             if v is not None:
                 pred_lig_rmsds[stem] = float(v)
