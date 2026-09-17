@@ -1131,8 +1131,23 @@ class BiomoleculeModule(L.LightningModule):
         gt_rigids_1 = ru.Rigid.from_tensor_7(rigids_data['rigids_1'])
         gt_trans = gt_rigids_1.get_trans()
 
-        # Center GT coords to match corrupt_dense_batch (trans_1 = trans_1 - center)
+        use_placer = torch.tensor(
+            [getattr(t, "use_placer_centering", False) for t in batch["task"]],
+            dtype=torch.bool, device=device,
+        )
+
+        # Center GT coords to match corrupt_dense_batch (trans_1 = trans_1 - center).
+        # The origin is where the noise prior is centered, so PLACER tasks must use the
+        # fixed-region centroid that training uses (center_on_motif_then_hotspots falls
+        # back to it); centering on all rigids pulls the origin toward the ligand.
         center = (gt_trans * rigids_mask[..., None]).sum(dim=1) / rigids_mask.long().sum(dim=1)[..., None].clamp(min=1)
+        fixed_mask = rigids_mask.bool() & (~rigids_noising_mask.bool())
+        fixed_center = (
+            (gt_trans * fixed_mask[..., None].to(gt_trans.dtype)).sum(dim=1)
+            / fixed_mask.sum(dim=1)[..., None].clamp(min=1)
+        )
+        use_fixed_center = use_placer & fixed_mask.any(dim=-1)
+        center = torch.where(use_fixed_center[:, None], fixed_center, center)
         gt_trans = gt_trans - center[:, None, :]
         rigids_data['rigids_1'] = ru.Rigid(
             rots=gt_rigids_1.get_rots(), trans=gt_trans
@@ -1151,10 +1166,6 @@ class BiomoleculeModule(L.LightningModule):
         trans_t = trans_t - trans_t.mean(dim=1, keepdim=True)
 
         # PLACER centering — mirror corrupt_dense_batch logic
-        use_placer = torch.tensor(
-            [getattr(t, "use_placer_centering", False) for t in batch["task"]],
-            dtype=torch.bool, device=device,
-        )
         if use_placer.any():
             sc_idx = rigids_data['rigids_sidechain_idx']
             tok_idx = rigids_data['rigids_to_token']
