@@ -96,7 +96,13 @@ def _ligand_coords_from_sdf(sdf_text: str):
     return np.array([list(conf.GetAtomPosition(i)) for i in range(mol.GetNumAtoms())])
 
 
-def extract_real_representatives(reps_json: Path, out_dir: Path):
+def extract_real_representatives(reps_json: Path, out_dir: Path, full_backbone: bool = False):
+    """full_backbone=True: skip the 6A pocket cutoff entirely and write the whole,
+    unmodified receptor.pdb -- for comparing full generated backbones against full
+    real receptor backbones instead of (much smaller, harder-to-align) pocket-only
+    fragments. See module docstring / --full-backbone for why this exists: GTalign's
+    own --dev-min-length defaults to 20, silently skipping shorter references, and
+    many 6A pockets fall below that."""
     reps = json.loads(reps_json.read_text())
     n_ok, n_fail = 0, 0
     for code, entries in reps.items():
@@ -107,6 +113,22 @@ def extract_real_representatives(reps_json: Path, out_dir: Path):
             pdb_id = entry["pdb_id"]
             prefix = pdb_id[1:3]
             zip_path = SYSTEMS_DIR / f"{prefix}.zip"
+            try:
+                receptor_text = subprocess.run(
+                    ["unzip", "-p", str(zip_path), f"{system_id}/receptor.pdb"],
+                    check=True, capture_output=True, text=True,
+                ).stdout
+            except subprocess.CalledProcessError as e:
+                print(f"  FAILED to extract {system_id} from {zip_path}: {e}")
+                n_fail += 1
+                continue
+
+            out_path = code_dir / f"{system_id.replace('/', '_')}{'_full' if full_backbone else '_pocket'}.pdb"
+            if full_backbone:
+                out_path.write_text(receptor_text)
+                n_ok += 1
+                continue
+
             # The system_id's last field can itself be several underscore-joined ligand
             # chains (e.g. "1.B_1.C" for a multi-chain ligand/cofactor pair) -- confirmed
             # by inspection that ligand_files/ then has ONE SDF PER CHAIN (1.B.sdf,
@@ -114,10 +136,6 @@ def extract_real_representatives(reps_json: Path, out_dir: Path):
             # their coordinates for the pocket-distance cutoff.
             ligand_chains = system_id.split("__")[-1].split("_")
             try:
-                receptor_text = subprocess.run(
-                    ["unzip", "-p", str(zip_path), f"{system_id}/receptor.pdb"],
-                    check=True, capture_output=True, text=True,
-                ).stdout
                 lig_coords_list = []
                 for lc in ligand_chains:
                     sdf_text = subprocess.run(
@@ -126,14 +144,13 @@ def extract_real_representatives(reps_json: Path, out_dir: Path):
                     ).stdout
                     lig_coords_list.append(_ligand_coords_from_sdf(sdf_text))
             except subprocess.CalledProcessError as e:
-                print(f"  FAILED to extract {system_id} from {zip_path}: {e}")
+                print(f"  FAILED to extract ligand for {system_id} from {zip_path}: {e}")
                 n_fail += 1
                 continue
 
             prot_by_res, prot_res_keys, lines = _parse_receptor_pdb(receptor_text)
             lig_coords = np.concatenate(lig_coords_list) if lig_coords_list else np.zeros((0, 3))
             keep = _pocket_residues_from_coords(prot_by_res, prot_res_keys, lig_coords)
-            out_path = code_dir / f"{system_id.replace('/', '_')}_pocket.pdb"
             if _write_pocket_pdb(lines, keep, out_path):
                 n_ok += 1
             else:
@@ -143,16 +160,22 @@ def extract_real_representatives(reps_json: Path, out_dir: Path):
     print(f"\nTotal: {n_ok} ok, {n_fail} failed")
 
 
-def extract_generated_samples(samples_dir: Path, out_dir: Path):
+def extract_generated_samples(samples_dir: Path, out_dir: Path, full_backbone: bool = False):
     """Grouped by ligand code (same _ligand_code_for convention as
     eval_pallatom_ligand_cond.py / pairwise_tmscore.py) so the output layout
-    matches real_binder_pockets/<CODE>/ for a direct cross-comparison."""
+    matches real_binder_pockets/<CODE>/ for a direct cross-comparison.
+    full_backbone=True: see extract_real_representatives."""
     from eval_pallatom_ligand_cond import _ligand_code_for  # noqa: E402 (local import, heavy chain)
     n_ok, n_fail = 0, 0
     for pdb_path in sorted(samples_dir.glob("*.pdb")):
         code = _ligand_code_for(pdb_path)
         code_dir = out_dir / code
         code_dir.mkdir(parents=True, exist_ok=True)
+        if full_backbone:
+            out_path = code_dir / f"{pdb_path.stem}_full.pdb"
+            out_path.write_text(pdb_path.read_text())
+            n_ok += 1
+            continue
         (prot_all, prot_ca, resnames, lig_coords, lig_elements, _,
          prot_by_res, prot_res_keys) = parse_pdb_ligand_cond(str(pdb_path))
         keep = _pocket_residues_from_coords(prot_by_res, prot_res_keys, lig_coords)
@@ -172,16 +195,22 @@ def main():
     p_real = sub.add_parser("real-representatives")
     p_real.add_argument("--reps-json", type=Path, required=True)
     p_real.add_argument("--out-dir", type=Path, required=True)
+    p_real.add_argument("--full-backbone", action="store_true",
+                        help="Write the whole receptor.pdb instead of a 6A pocket-only "
+                             "cutout. Use this if pocket-only GTalign comparisons are "
+                             "failing a lot -- pocket fragments are often < GTalign's "
+                             "own --dev-min-length=20 default and get silently skipped.")
 
     p_gen = sub.add_parser("generated-samples")
     p_gen.add_argument("--samples-dir", type=Path, required=True)
     p_gen.add_argument("--out-dir", type=Path, required=True)
+    p_gen.add_argument("--full-backbone", action="store_true")
 
     args = p.parse_args()
     if args.mode == "real-representatives":
-        extract_real_representatives(args.reps_json, args.out_dir)
+        extract_real_representatives(args.reps_json, args.out_dir, full_backbone=args.full_backbone)
     else:
-        extract_generated_samples(args.samples_dir, args.out_dir)
+        extract_generated_samples(args.samples_dir, args.out_dir, full_backbone=args.full_backbone)
 
 
 if __name__ == "__main__":
