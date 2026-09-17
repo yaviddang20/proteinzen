@@ -53,11 +53,14 @@ def _name_from_description(desc: str) -> str:
     return Path(desc).stem
 
 
-def run_gtalign(query_dir: Path, out_dir: Path, gtalign_bin: str, nhits: int):
+def run_gtalign(query_dir: Path, out_dir: Path, gtalign_bin: str, nhits: int, ref_dir: Path = None):
+    """ref_dir=None (default): self-vs-self all-pairwise (--rfs=query_dir). Pass a
+    different ref_dir for a cross-set comparison (e.g. generated designs' pockets
+    vs a fixed set of real reference pockets) -- see compare_generated_to_real_pockets.py."""
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         gtalign_bin, "-v",
-        f"--qrs={query_dir}", f"--rfs={query_dir}",
+        f"--qrs={query_dir}", f"--rfs={ref_dir if ref_dir is not None else query_dir}",
         "-s", "0",                # report ALL pairs, not just TM-score>=0.5 (the default)
         f"--nhits={nhits}",       # must cover every structure or results get truncated
         "--outfmt=1",             # JSON
