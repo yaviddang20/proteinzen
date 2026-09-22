@@ -14,7 +14,7 @@ eval "$(micromamba shell hook --shell bash)"
 micromamba activate "${ENV_NAME}"
 
 for split in train test; do
-    SAMPLES_DIR="${DIR}/sampling/plinder_pocket_${split}/placer/${MODEL}/samples"
+    SAMPLES_DIR="${DIR}/sampling/plinder_pocket_high_quality_${split}/placer/${MODEL}/samples"
     if [ ! -d "${SAMPLES_DIR}" ]; then
         echo "=== plinder placer / ${split} — skipping (no samples at ${SAMPLES_DIR}) ==="
         continue
@@ -22,7 +22,7 @@ for split in train test; do
     echo "=== plinder placer / ${split} ==="
     python "${DIR}/_scripts/eval_plinder_placer.py" \
         --samples-dir "${SAMPLES_DIR}" \
-        --data-dir    "${DIR}/plinder_pocket_processed/${split}" \
-        --out         "${DIR}/sampling/plinder_pocket_${split}/placer/${MODEL}/eval_results.json" \
+        --data-dir    "${DIR}/plinder_pocket_processed_high_quality/${split}" \
+        --out         "${DIR}/sampling/plinder_pocket_high_quality_${split}/placer/${MODEL}/eval_results.json" \
         "$@"
 done
