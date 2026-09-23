@@ -453,9 +453,6 @@ class MultiSE3Interpolant:
             atom_data['atom14_alt_gt_positions'] = atom_data['atom14_alt_gt_positions'] - center[..., None, None, :]
             atom_data['atom14_alt_gt_positions'] *= atom_data['atom14_mask'][..., None]
 
-        # PLACER-style per-rigid anchor centering: shift trans_0 so each noised rigid's
-        # noise is centered at its nearest fixed backbone rigid (same token for sidechains,
-        # nearest by distance for ligand atoms) rather than the global origin.
         use_placer = torch.tensor(
             [getattr(t, "use_placer_centering", False) for t in batch["task"]],
             dtype=torch.bool, device=trans_0.device,
@@ -484,7 +481,6 @@ class MultiSE3Interpolant:
                 bb_tok = tok_idx[b, bb_indices]
                 bb_trans = trans_1[b, bb_indices]  # already centered
 
-                # sidechain rigids (sc_idx>0): center at same-token backbone CA
                 sc_noised = rigids_noising_mask[b].bool() & (sc_idx[b] > 0)
                 if sc_noised.any():
                     sc_indices = sc_noised.nonzero(as_tuple=True)[0]
@@ -492,19 +488,6 @@ class MultiSE3Interpolant:
                     tok_to_bb = torch.zeros(max_tok, 3, device=trans_0.device)
                     tok_to_bb[bb_tok] = bb_trans
                     trans_0[b, sc_indices] += tok_to_bb[tok_idx[b, sc_indices]]
-
-                # ligand rigids (sc_idx==0, noised): PLACER self-anchors within the
-                # ligand subgraph. Anchor keeps its own noise; others center at anchor's
-                # noised position (matches inference — GT unknown at test time).
-                anchor_noised_mask = rigids_noising_mask[b].bool() & (sc_idx[b] == 0)
-                lig_noised = rigids_noising_mask[b].bool() & (sc_idx[b] == 0)
-                if lig_noised.any():
-                    anchor_pool = anchor_noised_mask.nonzero(as_tuple=True)[0]
-                    anchor_idx = anchor_pool[torch.randint(len(anchor_pool), (1,), device=trans_0.device).item()]
-                    anchor_noised = trans_0[b, anchor_idx].clone()
-                    other = anchor_pool[anchor_pool != anchor_idx]
-                    if len(other) > 0:
-                        trans_0[b, other] += anchor_noised
 
         do_prealign = torch.tensor(
             [False if skip_prealign else getattr(t, "prealign_noise", self.prealign_noise) for t in batch["task"]],

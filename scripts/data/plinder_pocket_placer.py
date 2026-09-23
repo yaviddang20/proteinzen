@@ -149,7 +149,6 @@ if __name__ == "__main__":
         print("\nComputing water stats...")
         _WATER_NAMES = {"HOH", "DOD"}
 
-        # collect (npz_path, system_id, plinder_system_cif) tuples
         system_entries = []
         for split_name in ["train", "val", "test"]:
             struct_root = args.outdir / split_name / "structures"

@@ -173,7 +173,6 @@ def eval_sample(pdb_path: str, gt_prot_names: list, gt_prot: np.ndarray, gt_lig:
 
 def _eval_system_job(system_id: str, pdb_paths: list, npz_path: str, max_protein_residues: int,
                      pred_lig_rmsds: dict):
-    """pred_lig_rmsds: dict from pdb stem -> float|None (from samples_metadata.json)."""
     try:
         struct = load_structure_from_npz(npz_path, include_h=False)
         struct = _crop_protein_to_pocket(struct, max_protein_residues)
@@ -255,7 +254,6 @@ def _mean_per_system(records_by_system, key):
 
 
 def _select_by_pred_lig_rmsd(records_by_system):
-    """PLACER-style: pick sample with lowest pred_lig_rmsd; return its true lig_rmsd."""
     selected_lig = []
     n_has_pred = 0
     for recs in records_by_system.values():
@@ -270,7 +268,6 @@ def _select_by_pred_lig_rmsd(records_by_system):
 
 
 def _pred_vs_true_lig_rmsd_pairs(all_records):
-    """Collect (pred, true) pairs for MAE / correlation — only where both are finite."""
     pairs = []
     for r in all_records:
         p = r.get("pred_lig_rmsd")
@@ -358,7 +355,6 @@ def main():
             continue
         jobs.append((sid, groups[sid], str(npz_path)))
 
-    # ---- load pred_lig_rmsd from samples_metadata.json ----
     meta_path = args.metadata_path or (args.samples_dir / "samples_metadata.json")
     if not meta_path.exists():
         meta_path = args.samples_dir.parent / "samples_metadata.json"
@@ -367,7 +363,7 @@ def main():
         with open(meta_path) as fh:
             meta = json.load(fh)
         for key, entry in meta.items():
-            stem = Path(key).name  # normalize — key may be full path or bare stem; .name keeps dots intact
+            stem = Path(key).name
             v = entry.get("pred_lig_rmsd")
             if v is not None:
                 pred_lig_rmsds[stem] = float(v)
@@ -486,7 +482,6 @@ def main():
     _block("Per-system mean sample",
            sys_mean_ca, sys_mean_aa, sys_mean_sc,  sys_mean_lig, sys_mean_comb)
 
-    # ---- PLACER selection metrics (only if pred_lig_rmsd is available) ----
     placer_out: dict = {}
     pairs = _pred_vs_true_lig_rmsd_pairs(all_records)
     if pairs:
@@ -534,7 +529,6 @@ def main():
     else:
         print(f"\n  [PLACER selection metrics skipped — no pred_lig_rmsd values found in {meta_path}]")
 
-    # ---- build summary text ----
     def _sumline(label, val_str):
         return f"  {label:<40}: {val_str}"
 

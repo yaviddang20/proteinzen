@@ -1136,10 +1136,7 @@ class BiomoleculeModule(L.LightningModule):
             dtype=torch.bool, device=device,
         )
 
-        # Center GT coords to match corrupt_dense_batch (trans_1 = trans_1 - center).
-        # The origin is where the noise prior is centered, so PLACER tasks must use the
-        # fixed-region centroid that training uses (center_on_motif_then_hotspots falls
-        # back to it); centering on all rigids pulls the origin toward the ligand.
+        # Center GT coords to match corrupt_dense_batch (trans_1 = trans_1 - center)
         center = (gt_trans * rigids_mask[..., None]).sum(dim=1) / rigids_mask.long().sum(dim=1)[..., None].clamp(min=1)
         fixed_mask = rigids_mask.bool() & (~rigids_noising_mask.bool())
         fixed_center = (
@@ -1195,15 +1192,6 @@ class BiomoleculeModule(L.LightningModule):
                     tok_to_bb = torch.zeros(max_tok, 3, device=device)
                     tok_to_bb[bb_tok] = bb_trans
                     trans_t[b, sc_indices] += tok_to_bb[tok_idx[b, sc_indices]]
-                anchor_noised_mask = rigids_noising_mask[b].bool() & (sc_idx[b] == 0)
-                lig_noised = rigids_noising_mask[b].bool() & (sc_idx[b] == 0)
-                if lig_noised.any():
-                    anchor_pool = anchor_noised_mask.nonzero(as_tuple=True)[0]
-                    anchor_idx = anchor_pool[torch.randint(len(anchor_pool), (1,), device=device).item()]
-                    anchor_noised = trans_t[b, anchor_idx].clone()
-                    other = anchor_pool[anchor_pool != anchor_idx]
-                    if len(other) > 0:
-                        trans_t[b, other] += anchor_noised
 
         trans_t = torch.where(rigids_noising_mask[..., None], trans_t, gt_trans)
 
