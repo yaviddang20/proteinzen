@@ -91,12 +91,42 @@ def diversity_summary(tmscore_dir: Path, codes: list[str]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def cluster_summary(tmscore_dir: Path, codes: list[str], thresholds: list[float]) -> str:
-    header = f"{'ligand':<6}"
+def load_successful_names(results_json: Path, success_key: str) -> set[str]:
+    """results.json (from eval_pallatom_ligand_cond.py) -> set of sample_ids
+    where r[success_key] is truthy. Field names verified directly against a
+    real results.json: sample_id, ligand_code, fold_success/pocket_success/
+    pose_success/rfd3_success/complexa_success (+ _mpnn variants)."""
+    records = json.loads(results_json.read_text())
+    missing_key = [r["sample_id"] for r in records if success_key not in r]
+    if missing_key:
+        raise SystemExit(f"--success-key {success_key!r} not found on {len(missing_key)} record(s) "
+                          f"(e.g. {missing_key[0]}) -- check the key name against results.json.")
+    return {r["sample_id"] for r in records if r.get(success_key)}
+
+
+def _restrict_to_successes(mat: np.ndarray, names: list[str], successful_names: set[str] | None):
+    """successful_names=None -> no filtering (cluster among ALL samples).
+    Otherwise, subset mat/names down to only the names present in successful_names --
+    a cluster made entirely of failed designs isn't a "unique success" and
+    shouldn't be counted/saved as one."""
+    if successful_names is None:
+        return mat, names
+    keep = [i for i, n in enumerate(names) if n in successful_names]
+    if not keep:
+        return np.zeros((0, 0)), []
+    sub = mat[np.ix_(keep, keep)]
+    return sub, [names[i] for i in keep]
+
+
+def cluster_summary(tmscore_dir: Path, codes: list[str], thresholds: list[float],
+                     successful_names_by_code: dict[str, set[str]] | None = None) -> str:
+    filtered = successful_names_by_code is not None
+    header = f"{'ligand':<6} {'n':>4}"
     for t in thresholds:
         header += f"  cc@{t:<4}  greedy@{t:<4}"
     lines = [
-        "Cluster counts from pairwise TM-score matrices",
+        "Cluster counts from pairwise TM-score matrices"
+        + (" -- SUCCESSFUL SAMPLES ONLY (matches RFD3/Complexa's '# unique successes')" if filtered else ""),
         f"tmscore_dir: {tmscore_dir}",
         "cc = connected components (chaining-prone, see module docstring)",
         "greedy = greedy set-cover a la MMseqs2/CD-HIT (recommended '# unique')",
@@ -105,8 +135,16 @@ def cluster_summary(tmscore_dir: Path, codes: list[str], thresholds: list[float]
     ]
     for code in codes:
         mat = np.load(tmscore_dir / f"tmscore_matrix_{code}.npy")
+        names = json.loads((tmscore_dir / f"tmscore_names_{code}.json").read_text())
+        succ = successful_names_by_code.get(code) if filtered else None
+        mat, names = _restrict_to_successes(mat, names, succ)
+        n = len(names)
+        row = f"{code:<6} {n:>4}"
+        if n == 0:
+            row += "".join(f"  {'-':>7}  {'-':>10}" for _ in thresholds)
+            lines.append(row)
+            continue
         mat_filled = np.where(np.isfinite(mat), mat, 0.0)  # missing pairs treated as "not similar"
-        row = f"{code:<6}"
         for t in thresholds:
             adj = mat_filled >= t
             np.fill_diagonal(adj, False)
@@ -118,16 +156,25 @@ def cluster_summary(tmscore_dir: Path, codes: list[str], thresholds: list[float]
 
 
 def save_cluster_representatives(tmscore_dir: Path, samples_dir: Path, out_dir: Path,
-                                  codes: list[str], threshold: float) -> None:
+                                  codes: list[str], threshold: float,
+                                  successful_names_by_code: dict[str, set[str]] | None = None) -> None:
     """For each ligand, greedy-set-cover cluster at `threshold` and copy one
     representative PDB per cluster into out_dir/<code>/ -- for visualizing
     "how many genuinely distinct solutions did we generate" rather than
-    scrolling through near-duplicate samples."""
+    scrolling through near-duplicate samples. Pass successful_names_by_code to
+    cluster only among successes -- a cluster of only-failures isn't a
+    "novel"/"unique" result worth a representative."""
     import shutil
+    filtered = successful_names_by_code is not None
 
     for code in codes:
         mat = np.load(tmscore_dir / f"tmscore_matrix_{code}.npy")
         names = json.loads((tmscore_dir / f"tmscore_names_{code}.json").read_text())
+        succ = successful_names_by_code.get(code) if filtered else None
+        mat, names = _restrict_to_successes(mat, names, succ)
+        if not names:
+            print(f"{code}: 0 successful samples -- nothing to cluster/save")
+            continue
         mat_filled = np.where(np.isfinite(mat), mat, 0.0)
         adj = mat_filled >= threshold
         np.fill_diagonal(adj, False)
@@ -144,7 +191,8 @@ def save_cluster_representatives(tmscore_dir: Path, samples_dir: Path, out_dir: 
                 saved += 1
             else:
                 missing.append(name)
-        print(f"{code}: {saved}/{len(centers)} cluster representatives (@TM>={threshold}) -> {code_out}"
+        tag = " (successful samples only)" if filtered else ""
+        print(f"{code}: {saved}/{len(centers)} cluster representatives{tag} (@TM>={threshold}) -> {code_out}"
               + (f"  [{len(missing)} source PDB(s) not found, e.g. {missing[0]}]" if missing else ""))
 
 
@@ -168,6 +216,17 @@ def main():
                         "Zhang & Skolnick's 'same fold' cutoff / GTalign's own --cls-threshold default).")
     p.add_argument("--representatives-out", type=Path, default=None,
                    help="Where to write representative PDBs (default: --tmscore-dir/cluster_representatives).")
+    p.add_argument("--results-json", type=Path, default=None,
+                   help="eval_pallatom_ligand_cond.py's results.json. If given, clustering (both "
+                        "cluster_summary.txt and --save-representatives) is restricted to samples "
+                        "where --success-key is true -- a cluster made entirely of failed designs "
+                        "isn't a 'unique success' and shouldn't be counted as one (matches how "
+                        "RFD3/Complexa's own '# unique successes' is actually defined). Without "
+                        "this, clustering runs over ALL samples regardless of pass/fail.")
+    p.add_argument("--success-key", default="fold_success",
+                   help="Which results.json field counts as 'success' when --results-json is given. "
+                        "One of fold_success/pocket_success/pose_success/rfd3_success/complexa_success "
+                        "(or the _mpnn variants). Default: fold_success.")
     args = p.parse_args()
 
     if args.save_representatives and args.samples_dir is None:
@@ -179,17 +238,27 @@ def main():
     if not codes:
         raise SystemExit(f"no tmscore_matrix_*.npy found in {args.tmscore_dir}")
 
+    successful_names_by_code = None
+    if args.results_json is not None:
+        all_successful = load_successful_names(args.results_json, args.success_key)
+        # split the flat set into per-code sets by cross-referencing tmscore_names_<code>.json
+        successful_names_by_code = {}
+        for code in codes:
+            names = json.loads((args.tmscore_dir / f"tmscore_names_{code}.json").read_text())
+            successful_names_by_code[code] = {n for n in names if n in all_successful}
+
     div_text = diversity_summary(args.tmscore_dir, codes)
     (args.tmscore_dir / "diversity_summary.txt").write_text(div_text)
     print(div_text)
 
-    clu_text = cluster_summary(args.tmscore_dir, codes, args.thresholds)
+    clu_text = cluster_summary(args.tmscore_dir, codes, args.thresholds, successful_names_by_code)
     (args.tmscore_dir / "cluster_summary.txt").write_text(clu_text)
     print(clu_text)
 
     if args.save_representatives:
         rep_out = args.representatives_out or (args.tmscore_dir / "cluster_representatives")
-        save_cluster_representatives(args.tmscore_dir, args.samples_dir, rep_out, codes, args.rep_threshold)
+        save_cluster_representatives(args.tmscore_dir, args.samples_dir, rep_out, codes,
+                                      args.rep_threshold, successful_names_by_code)
 
 
 if __name__ == "__main__":

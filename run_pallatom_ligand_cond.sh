@@ -3,9 +3,9 @@ source $dir/env_vars.sh
 eval "$(micromamba shell hook --shell bash)"
 micromamba activate $ENV_NAME
 
-model_name=binder_zen_geom_plinder_pocket_ligand_cond_no_prealign_seq_noise
-version_num=1639285
-checkpoint_stem='epoch=1880-step=248500'
+model_name=binder_zen_geom_plinder_pocket_rosetta_repack_ligand_cond_no_prealign_seq_noise
+version_num=1752118
+checkpoint_stem='epoch=2826-step=306500'
 trans_std=16.0
 
 # use_preset_conformers: toggle between the original RDKit-generated-conformer
