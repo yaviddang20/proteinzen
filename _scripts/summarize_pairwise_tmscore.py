@@ -50,20 +50,21 @@ def connected_components(adj: np.ndarray) -> int:
     return n_components
 
 
-def greedy_set_cover(adj: np.ndarray) -> int:
+def greedy_set_cover(adj: np.ndarray) -> list[int]:
+    """Returns the chosen cluster-center indices (len() of this = cluster count)."""
     n = adj.shape[0]
     assigned = np.zeros(n, dtype=bool)
-    n_clusters = 0
+    centers = []
     while not assigned.all():
         remaining = ~assigned
         degree = (adj & remaining[None, :]).sum(axis=1)
         degree[assigned] = -1
         center = int(np.argmax(degree))
-        n_clusters += 1
+        centers.append(center)
         assigned[center] = True
         neighbors = np.nonzero(adj[center] & remaining)[0]
         assigned[neighbors] = True
-    return n_clusters
+    return centers
 
 
 def diversity_summary(tmscore_dir: Path, codes: list[str]) -> str:
@@ -110,10 +111,41 @@ def cluster_summary(tmscore_dir: Path, codes: list[str], thresholds: list[float]
             adj = mat_filled >= t
             np.fill_diagonal(adj, False)
             cc = connected_components(adj)
-            gc = greedy_set_cover(adj)
+            gc = len(greedy_set_cover(adj))
             row += f"  {cc:>7}  {gc:>10}"
         lines.append(row)
     return "\n".join(lines) + "\n"
+
+
+def save_cluster_representatives(tmscore_dir: Path, samples_dir: Path, out_dir: Path,
+                                  codes: list[str], threshold: float) -> None:
+    """For each ligand, greedy-set-cover cluster at `threshold` and copy one
+    representative PDB per cluster into out_dir/<code>/ -- for visualizing
+    "how many genuinely distinct solutions did we generate" rather than
+    scrolling through near-duplicate samples."""
+    import shutil
+
+    for code in codes:
+        mat = np.load(tmscore_dir / f"tmscore_matrix_{code}.npy")
+        names = json.loads((tmscore_dir / f"tmscore_names_{code}.json").read_text())
+        mat_filled = np.where(np.isfinite(mat), mat, 0.0)
+        adj = mat_filled >= threshold
+        np.fill_diagonal(adj, False)
+        centers = greedy_set_cover(adj)
+
+        code_out = out_dir / code
+        code_out.mkdir(parents=True, exist_ok=True)
+        saved, missing = 0, []
+        for idx in centers:
+            name = names[idx]
+            src = samples_dir / f"{name}.pdb"
+            if src.exists():
+                shutil.copy(src, code_out / f"{name}.pdb")
+                saved += 1
+            else:
+                missing.append(name)
+        print(f"{code}: {saved}/{len(centers)} cluster representatives (@TM>={threshold}) -> {code_out}"
+              + (f"  [{len(missing)} source PDB(s) not found, e.g. {missing[0]}]" if missing else ""))
 
 
 def main():
@@ -123,7 +155,23 @@ def main():
     p.add_argument("--codes", nargs="+", default=None,
                    help="Ligand codes to summarize. Default: auto-discover from tmscore_matrix_*.npy filenames.")
     p.add_argument("--thresholds", nargs="+", type=float, default=[0.4, 0.5, 0.6])
+    p.add_argument("--save-representatives", action="store_true",
+                   help="Also copy one representative PDB per greedy-set-cover cluster "
+                        "(at --rep-threshold) into --tmscore-dir/cluster_representatives/<code>/, "
+                        "for visualizing '# genuinely distinct designs' rather than scrolling "
+                        "through near-duplicates. Requires --samples-dir.")
+    p.add_argument("--samples-dir", type=Path, default=None,
+                   help="Directory of the original sample PDBs (same one passed to "
+                        "pairwise_tmscore.py's --samples-dir). Required with --save-representatives.")
+    p.add_argument("--rep-threshold", type=float, default=0.5,
+                   help="TM-score clustering threshold for --save-representatives (default: 0.5, "
+                        "Zhang & Skolnick's 'same fold' cutoff / GTalign's own --cls-threshold default).")
+    p.add_argument("--representatives-out", type=Path, default=None,
+                   help="Where to write representative PDBs (default: --tmscore-dir/cluster_representatives).")
     args = p.parse_args()
+
+    if args.save_representatives and args.samples_dir is None:
+        raise SystemExit("--save-representatives requires --samples-dir")
 
     codes = args.codes or sorted(
         f.stem.replace("tmscore_matrix_", "") for f in args.tmscore_dir.glob("tmscore_matrix_*.npy")
@@ -138,6 +186,10 @@ def main():
     clu_text = cluster_summary(args.tmscore_dir, codes, args.thresholds)
     (args.tmscore_dir / "cluster_summary.txt").write_text(clu_text)
     print(clu_text)
+
+    if args.save_representatives:
+        rep_out = args.representatives_out or (args.tmscore_dir / "cluster_representatives")
+        save_cluster_representatives(args.tmscore_dir, args.samples_dir, rep_out, codes, args.rep_threshold)
 
 
 if __name__ == "__main__":
