@@ -1235,7 +1235,7 @@ class IpaDenoiser(nn.Module):
             metrics["local_rot_fafe_logits"] = self.local_rot_fafe_head(rigids_embed)
 
         if self.lig_rmsd_head is not None:
-            metrics["lig_rmsd_logits"] = self.lig_rmsd_head(rigids_embed)
+            metrics["lig_rmsd_logits"] = self.lig_rmsd_head(rigids_embed.detach())
             metrics["lig_rmsd_bin_centers"] = torch.linspace(
                 0.0, self.lig_rmsd_max_bin, self.num_lig_rmsd_bins,
                 device=rigids_embed.device
