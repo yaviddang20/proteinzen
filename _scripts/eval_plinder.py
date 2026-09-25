@@ -1128,6 +1128,9 @@ def _parse_mpnn_fasta(fasta_path: Path) -> list[str]:
 
 def _run_ligandmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, script: str, model_type: str,
                     fixed_residues: str = "", force: bool = False) -> list[str]:
+    # LigandMPNN runs with cwd=its own dir, so relative paths must be made absolute
+    pdb_path = Path(pdb_path).resolve()
+    out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     fasta_path = out_dir / "seqs" / f"{pdb_path.stem}.fa"
     if force or not fasta_path.exists():

@@ -92,7 +92,7 @@ COMPLEXA_MPNN_KEYS = [("complexa_success", "complexa_success_mpnn")]
 #   2: min_ipae/RFD3/Complexa added (ece27d1) -- but _clone_with_coords could still throw
 #      on ligand RMSD (silently caught -> lig_rmsd/lig_displacement NaN)
 #   3: _clone_with_coords conformer fix (028d6db) -- lig_rmsd actually computes
-CACHE_SCHEMA_VERSION = 3
+CACHE_SCHEMA_VERSION = 4
 
 
 def _cache_is_complete(r: dict) -> bool:
