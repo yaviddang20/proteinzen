@@ -61,7 +61,7 @@ python ${REPO_ROOT}/sample.py \
     integrator=euler \
     diffeq=base_euler_ode \
     save_traj=true \
-    +lmodule.seq_noise_schedule=true \
+    +unmask_seq=true \
     overwrite=false \
     "checkpoint_stem='${checkpoint_stem}'"
 
