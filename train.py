@@ -169,6 +169,9 @@ if __name__ == '__main__':
     config_hydra_store()
     torch.set_float32_matmul_precision("medium")
 
+    if os.environ.get("PZ_SYNC_DEBUG") and torch.cuda.is_available():
+        torch.cuda.set_sync_debug_mode("warn")
+
     # we use 1.2 so we can use .cache at the root dir
     # and change into the output directory at main()
     zen(main).hydra_main(
