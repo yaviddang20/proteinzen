@@ -138,11 +138,27 @@ def main(sampler,
     model_cfg = load_from_yaml(config_path)
     model = instantiate(model_cfg['model'])
 
+    # Progressive sequence commit (Integrator.unmask_seq): opt-in via +unmask_seq=true.
+    # Off by default so existing sampling runs are unchanged. NOTE the direction: this
+    # commit schedule reveals MORE sequence as t rises, while lmodule.seq_noise_schedule
+    # in TRAINING reveals LESS as t rises (lmod.py _shared_step), so enabling it does not
+    # reproduce the training-time sequence visibility -- treat it as an experiment.
+    unmask_seq = bool(zen_cfg.get('unmask_seq', False))
+    legacy_lmodule_cfg = zen_cfg.get('lmodule') or {}
+    if legacy_lmodule_cfg.get('seq_noise_schedule') and not unmask_seq:
+        print(
+            "WARNING: +lmodule.seq_noise_schedule has NO effect in sample.py (it is only read "
+            "by the training module). Pass +unmask_seq=true to enable progressive sequence "
+            "commit at sampling."
+        )
+    integrator_extra_kwargs = {"unmask_seq": True} if unmask_seq else {}
+
     # create sampling module
     def integrator_init(model):
         return integrator(
             wrapped_model=model_wrapper(model),
-            diffeq=diffeq
+            diffeq=diffeq,
+            **integrator_extra_kwargs,
         )
     model = BiomoleculeSamplingModule(
         model,
