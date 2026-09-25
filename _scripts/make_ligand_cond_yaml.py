@@ -140,7 +140,38 @@ _NONPOLYMER_CHAIN_TYPE = 3
 _UNK_RES_TYPE = 22  # const.token_ids["UNK"]
 
 
-def _build_npz(smiles: str, n_prot_res: int, seed: int) -> dict:
+# Ligand codes with a REAL crystal-sourced conformer available (verified directly
+# against the actual RCSB deposit -- not inferred from a filename convention; see
+# _scripts/preset_ligand_conformers/README.md for exact provenance/verification).
+# Only these two are backed by a file today -- --use-preset-conformer errors out
+# for any other code rather than silently falling back to the RDKit-generated
+# conformer, since that would defeat the point of asking for a verified pose.
+PRESET_LIGAND_PDBS = {
+    "OQO": Path(__file__).parent / "preset_ligand_conformers" / "OQO.pdb",
+    "IAI": Path(__file__).parent / "preset_ligand_conformers" / "IAI.pdb",
+}
+
+
+def _mol_from_preset_pdb(pdb_path: Path):
+    """Load a ligand RDKit mol with a REAL, crystal-observed conformer -- heavy
+    atoms + bonds parsed directly from a minimal HETATM/CONECT PDB block
+    extracted from an actual PDB deposit. No conformer embedding happens here;
+    the coordinates are exactly the deposited bound pose (mirrors how
+    RFdiffusionAA/RFD3/BoltzDesign1 source their own benchmark ligand geometry,
+    per the ligand-conformer-sourcing investigation this was built from)."""
+    from rdkit import Chem
+    block = pdb_path.read_text()
+    mol = Chem.MolFromPDBBlock(block, removeHs=True, sanitize=False)
+    if mol is None:
+        raise ValueError(f"RDKit could not parse preset ligand PDB: {pdb_path}")
+    try:
+        Chem.SanitizeMol(mol)
+    except Exception:
+        pass
+    return mol
+
+
+def _build_npz(smiles: str, n_prot_res: int, seed: int, preset_pdb_path: Path = None) -> dict:
     """Build a minimal Structure NPZ dict from a ligand SMILES.
 
     Layout:
@@ -150,18 +181,24 @@ def _build_npz(smiles: str, n_prot_res: int, seed: int) -> dict:
       residues[1 : 1+N_prot]     — one UNK residue per protein position
       chains[0]                   — NONPOLYMER (ligand)
       chains[1]                   — PROTEIN (dummy scaffold)
+
+    preset_pdb_path: if given, skip SMILES->conformer embedding entirely and use
+    a real crystal-sourced pose instead (see PRESET_LIGAND_PDBS / _mol_from_preset_pdb).
     """
     from rdkit import Chem
     from rdkit.Chem import AllChem
 
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        raise ValueError(f"RDKit could not parse SMILES: {smiles[:60]}")
-    mol = AllChem.RemoveHs(mol)
-    mol = Chem.AddHs(mol)
-    AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
-    AllChem.MMFFOptimizeMolecule(mol)
-    mol = AllChem.RemoveHs(mol)
+    if preset_pdb_path is not None:
+        mol = _mol_from_preset_pdb(preset_pdb_path)
+    else:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            raise ValueError(f"RDKit could not parse SMILES: {smiles[:60]}")
+        mol = AllChem.RemoveHs(mol)
+        mol = Chem.AddHs(mol)
+        AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
+        AllChem.MMFFOptimizeMolecule(mol)
+        mol = AllChem.RemoveHs(mol)
 
     conf = mol.GetConformer()
     n_lig = mol.GetNumAtoms()
@@ -332,9 +369,20 @@ def main():
                         help="Include hydrogen atoms")
     parser.add_argument("--npz-dir", type=Path, default=None,
                         help="Directory to save ligand NPZ files (default: <out-yaml parent>/ligand_npz)")
+    parser.add_argument("--use-preset-conformer", action="store_true",
+                        help="Use a REAL crystal-sourced ligand conformer instead of an "
+                             f"RDKit-generated one. Only backed by a verified file for "
+                             f"{sorted(PRESET_LIGAND_PDBS)} today -- errors out for any other "
+                             "--ligand-codes rather than silently falling back.")
     args = parser.parse_args()
 
     codes = args.ligand_codes or TARGET_LIGANDS
+    if args.use_preset_conformer:
+        missing = [c for c in codes if c.upper() not in PRESET_LIGAND_PDBS]
+        if missing:
+            sys.exit(f"--use-preset-conformer: no verified preset conformer for {missing} "
+                      f"(only {sorted(PRESET_LIGAND_PDBS)} available). "
+                      f"Pass --ligand-codes {' '.join(sorted(PRESET_LIGAND_PDBS))} or drop --use-preset-conformer.")
     if args.smiles and len(codes) > 1:
         sys.exit("--smiles can only be used with a single --ligand-codes value")
 
@@ -349,11 +397,17 @@ def main():
             print(f"  {code}: no SMILES — skipping. Pass --smiles or add to KNOWN_SMILES.")
             continue
 
+        preset_path = PRESET_LIGAND_PDBS.get(code.upper()) if args.use_preset_conformer else None
+        if preset_path is not None and args.n_conformers > 1:
+            print(f"  {code}: WARNING -- preset conformer is a single fixed pose, "
+                  f"all {args.n_conformers} 'conformers' will be identical.")
+
         for conf_idx in range(args.n_conformers):
             seed = hash(code) % (2**31) + conf_idx
             npz_path = npz_dir / f"{code}_conf{conf_idx}.npz"
             try:
-                npz_data = _build_npz(smiles, n_prot_res=args.n_prot_res, seed=seed)
+                npz_data = _build_npz(smiles, n_prot_res=args.n_prot_res, seed=seed,
+                                       preset_pdb_path=preset_path)
                 np.savez_compressed(str(npz_path), **npz_data)
                 print(f"  {code} conf{conf_idx}: {npz_data['atoms'].shape[0]} atoms → {npz_path.name}")
             except Exception as e:

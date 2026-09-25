@@ -8,14 +8,30 @@ version_num=1639285
 checkpoint_stem='epoch=1880-step=248500'
 trans_std=16.0
 
-ligand_codes="FAD FMN SAM DOG SRO LDP IAI OQO"
+# use_preset_conformers: toggle between the original RDKit-generated-conformer
+# run (all 8 Pallatom-Ligand ligands) and a real-crystal-sourced-conformer run
+# restricted to the 2 ligands we've actually verified a real PDB source for
+# (OQO=PDB 7v11, IAI=PDB 5sdv -- see _scripts/preset_ligand_conformers/). Do NOT
+# add more codes here without a verified preset file first -- make_ligand_cond_yaml.py
+# will error out rather than silently fabricate one.
+use_preset_conformers=true
+
+if [ "$use_preset_conformers" = "true" ]; then
+    ligand_codes="OQO IAI"
+    preset_flag="--use-preset-conformer"
+    run_name=pallatom_preset
+else
+    ligand_codes="FAD FMN SAM DOG SRO LDP IAI OQO"
+    preset_flag=""
+    run_name=pallatom
+fi
 num_samples=100
 
 # yaml_dir: shared, model-independent task definition (same convention as
 # sample_ligand_cond.sh) -- the ligand conformers/dummy scaffold don't depend on
 # which checkpoint you sample against, so it lives one level above any given
 # model's output and can be reused across models without regenerating it.
-yaml_dir=${REPO_ROOT}/sampling/pallatom
+yaml_dir=${REPO_ROOT}/sampling/${run_name}
 mkdir -p ${yaml_dir}
 
 # out_dir: per-model, one level under yaml_dir. Used for BOTH sample.py's own
@@ -23,13 +39,14 @@ mkdir -p ${yaml_dir}
 # eval/ tree (same convention as run_eval_plinder.sh / run_eval_plinder_placer.sh).
 out_dir=${yaml_dir}/${model_name}
 
-# 1) Build sampling tasks: 100 designs x each of the 8 Pallatom-Ligand benchmark ligands
+# 1) Build sampling tasks: 100 designs x each ligand
 python ${REPO_ROOT}/_scripts/make_ligand_cond_yaml.py \
     --ligand-codes ${ligand_codes} \
     --out-yaml ${yaml_dir}/pallatom \
     --num-samples ${num_samples} \
     --trans-std ${trans_std} \
-    --include-h
+    --include-h \
+    ${preset_flag}
 
 # 2) Generate designs
 python ${REPO_ROOT}/sample.py \
