@@ -11,6 +11,7 @@
 set -euo pipefail
 
 MODE="${1:-torch}"
+shift || true   # remaining args pass through to train.py
 
 dir=$(realpath "$(dirname "${BASH_SOURCE[0]}")")
 source $dir/../env_vars.sh
@@ -25,7 +26,8 @@ case "$MODE" in
     ddp)    ;;
     simple) export CUDA_VISIBLE_DEVICES=0; PROFILER=simple ;;
     sync)   export CUDA_VISIBLE_DEVICES=0; MAX_STEPS=3; PROFILER=null; export PZ_SYNC_DEBUG=1 ;;
-    *)      echo "unknown mode: $MODE (want torch|ddp|simple|sync)"; exit 1 ;;
+    none)   export CUDA_VISIBLE_DEVICES=0; PROFILER=null ;;
+    *)      echo "unknown mode: $MODE (want torch|ddp|simple|sync|none)"; exit 1 ;;
 esac
 
 echo "=== mode=$MODE CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-all} max_steps=$MAX_STEPS profiler=$PROFILER ==="
@@ -87,4 +89,5 @@ python ${REPO_ROOT}/train.py \
     experiment.lightning.accumulate_grad_batches=1 \
     experiment.checkpointer.train_time_interval=null \
     experiment.checkpointer.every_n_train_steps=100000 \
-    hydra.run.dir="'${REPO_ROOT}/outputs/_profile/${MODE}'"
+    hydra.run.dir="'${REPO_ROOT}/outputs/_profile/${MODE}'" \
+    "$@"
