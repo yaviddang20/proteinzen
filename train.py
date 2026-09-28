@@ -172,6 +172,12 @@ if __name__ == '__main__':
     if os.environ.get("PZ_SYNC_DEBUG") and torch.cuda.is_available():
         torch.cuda.set_sync_debug_mode("warn")
 
+    _mem_snapshot = os.environ.get("PZ_MEM_SNAPSHOT")
+    if _mem_snapshot and torch.cuda.is_available():
+        import atexit
+        torch.cuda.memory._record_memory_history(max_entries=200000)
+        atexit.register(lambda: torch.cuda.memory._dump_snapshot(_mem_snapshot))
+
     # we use 1.2 so we can use .cache at the root dir
     # and change into the output directory at main()
     zen(main).hydra_main(
