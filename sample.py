@@ -245,14 +245,53 @@ def main(sampler,
             from proteinzen.runtime.sampling.dispatcher import TaskBatchSampler
             sampler.batch_sampler = TaskBatchSampler(dispatcher, sampler.batch_size)
     else:
-        if os.path.isdir(zen_cfg['samples_dir']):
-            shutil.rmtree(zen_cfg['samples_dir'])
-        os.makedirs(zen_cfg['samples_dir'], exist_ok=True)
-        if os.path.isdir(traj_dir):
-            shutil.rmtree(traj_dir)
-        refold_dir = os.path.join(zen_cfg['out_dir'], "refold_outputs")
-        if os.path.isdir(refold_dir):
-            shutil.rmtree(refold_dir)
+        # Same DDP hazard as above: Lightning re-execs this whole script once per
+        # GPU rank, so without gating, every rank would independently rmtree/mkdir
+        # the SAME samples_dir/traj_dir/refold_dir at the same time -- one rank's
+        # rmtree can hit a directory another rank already removed or is mid-write
+        # into, crashing that rank's process while the others hang in DDP init
+        # waiting on it (surfaces as an NCCL watchdog timeout, not the real error).
+        # Only rank 0 does the actual cleanup; other ranks wait on a marker file.
+        is_rank_zero = (
+            int(os.environ.get("NODE_RANK", 0)) == 0
+            and int(os.environ.get("LOCAL_RANK", 0)) == 0
+        )
+        clear_done_path = os.path.join(zen_cfg['out_dir'], "overwrite_cleared.json")
+
+        if is_rank_zero:
+            try:
+                os.remove(clear_done_path)  # drop any stale marker from a prior run
+            except FileNotFoundError:
+                pass
+
+            if os.path.isdir(zen_cfg['samples_dir']):
+                shutil.rmtree(zen_cfg['samples_dir'])
+            os.makedirs(zen_cfg['samples_dir'], exist_ok=True)
+            if os.path.isdir(traj_dir):
+                shutil.rmtree(traj_dir)
+            refold_dir = os.path.join(zen_cfg['out_dir'], "refold_outputs")
+            if os.path.isdir(refold_dir):
+                shutil.rmtree(refold_dir)
+
+            tmp_path = f"{clear_done_path}.tmp{os.getpid()}"
+            with open(tmp_path, "w") as f:
+                json.dump({"cleared": True}, f)
+            os.replace(tmp_path, clear_done_path)  # atomic -- never a partial read
+        else:
+            # Give rank 0 a head start to finish rmtree/mkdir before we start
+            # polling for the marker -- otherwise we could see the directory
+            # mid-cleanup and race rank 0's own rmtree/mkdir.
+            time.sleep(3.0)
+            timeout_s = 600
+            waited = 0.0
+            while not os.path.exists(clear_done_path):
+                time.sleep(1.0)
+                waited += 1.0
+                if waited > timeout_s:
+                    raise RuntimeError(
+                        f"Timed out waiting for rank 0 to clear samples_dir "
+                        f"(marker: {clear_done_path})"
+                    )
 
     # record run params
     shutil.copy(
