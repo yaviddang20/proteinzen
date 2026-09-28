@@ -245,6 +245,25 @@ def load_input(record: Record, data_dir, include_h: bool = False):
     return struct, rot_bond_data, interaction_residue_mask, pocket_residue_mask
 
 
+def _bucket_pad_sizes(tokenized_data, max_tokens, max_rigids,
+                      token_bucket, rigid_bucket):
+    """Round this sample's real size up to the next bucket, capped at the max.
+
+    Padding every sample to max_tokens wastes N^2 work in the pair track when the
+    typical sample is far smaller; bucketing keeps the number of distinct shapes
+    small enough that torch.compile does not thrash.
+    """
+    if not token_bucket and not rigid_bucket:
+        return max_tokens, max_rigids
+    n_tok = len(tokenized_data.tokens)
+    n_rig = int(np.sum(tokenized_data.tokens["rigid_num"]))
+    if token_bucket:
+        max_tokens = min(max_tokens, -(-n_tok // token_bucket) * token_bucket)
+    if rigid_bucket:
+        max_rigids = min(max_rigids, -(-n_rig // rigid_bucket) * rigid_bucket)
+    return max_tokens, max_rigids
+
+
 def _build_priority_token_mask(token_data, struct, interaction_residue_mask):
     """Map per-residue interaction mask to per-token priority mask."""
     if interaction_residue_mask is None:
@@ -354,6 +373,8 @@ class TrainingDataset(torch.utils.data.Dataset):
         datasets,
         max_crop_residues,
         max_crop_rigids,
+        pad_token_bucket=None,
+        pad_rigid_bucket=None,
         use_cropper=True,
         samples_per_epoch=1000,  # this is PER GPU
         crop_min_neighbors=0,
@@ -375,6 +396,8 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.datasets = datasets
         self.max_crop_residues = max_crop_residues
         self.max_crop_rigids = max_crop_rigids
+        self.pad_token_bucket = pad_token_bucket
+        self.pad_rigid_bucket = pad_rigid_bucket
         self.samples_per_epoch = samples_per_epoch
 
         if dataset_probs is None:
@@ -527,11 +550,18 @@ class TrainingDataset(torch.utils.data.Dataset):
         # if len(tokenized_data.tokens) == 0:
         #     return self.__getitem__(idx)
 
+        pad_tokens, pad_rigids = _bucket_pad_sizes(
+            tokenized_data,
+            self.max_crop_residues,
+            self.max_crop_rigids,
+            self.pad_token_bucket,
+            self.pad_rigid_bucket,
+        )
         features = featurize(
             tokenized_data,
             task_data,
-            max_tokens=self.max_crop_residues,
-            max_rigids=self.max_crop_rigids
+            max_tokens=pad_tokens,
+            max_rigids=pad_rigids
         )
         features['task'] = task
         features['structure'] = struct
@@ -600,6 +630,8 @@ class ValidationDataset(torch.utils.data.Dataset):
         datasets,
         max_crop_residues,
         max_crop_rigids,
+        pad_token_bucket=None,
+        pad_rigid_bucket=None,
         use_cropper=True,
         samples_per_epoch=1000,  # this is PER GPU
         crop_min_neighbors=0,
@@ -618,6 +650,8 @@ class ValidationDataset(torch.utils.data.Dataset):
         self.datasets = datasets
         self.max_crop_residues = max_crop_residues
         self.max_crop_rigids = max_crop_rigids
+        self.pad_token_bucket = pad_token_bucket
+        self.pad_rigid_bucket = pad_rigid_bucket
         self.samples_per_epoch = samples_per_epoch
         if dataset_probs is None:
             self.dataset_probs = [1/len(datasets) for _ in datasets]
@@ -764,11 +798,18 @@ class ValidationDataset(torch.utils.data.Dataset):
         if len(tokenized_data.tokens) == 0:
             return self.__getitem__(idx)
 
+        pad_tokens, pad_rigids = _bucket_pad_sizes(
+            tokenized_data,
+            self.max_crop_residues,
+            self.max_crop_rigids,
+            self.pad_token_bucket,
+            self.pad_rigid_bucket,
+        )
         features = featurize(
             tokenized_data,
             task_data,
-            max_tokens=self.max_crop_residues,
-            max_rigids=self.max_crop_rigids
+            max_tokens=pad_tokens,
+            max_rigids=pad_rigids
         )
         features['task'] = task
         features['structure'] = struct

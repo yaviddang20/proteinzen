@@ -137,6 +137,8 @@ def main(model,
         ('placer_lig_trans_prior_std',        'datasets.0.task_sampler.task_list.0.lig_trans_prior_std'),
         ('max_crop_residues',                 'max_crop_residues'),
         ('max_crop_rigids',                   'max_crop_rigids'),
+        ('pad_token_bucket',                  'pad_token_bucket'),
+        ('pad_rigid_bucket',                  'pad_rigid_bucket'),
     ]:
         val = dataset.get(cli_key, None)
         if val is not None:
