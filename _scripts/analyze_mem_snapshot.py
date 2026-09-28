@@ -12,8 +12,10 @@ import argparse
 import pickle
 from collections import defaultdict
 
-_ALLOC = {"alloc", "segment_alloc"}
-_FREE = {"free_completed", "segment_free"}
+# segment_* events are caching-allocator pools that contain the tensor-level
+# alloc events; counting both double-counts memory.
+_ALLOC = {"alloc"}
+_FREE = {"free_completed"}
 
 
 def _site(frames, skip_torch=True):
