@@ -4,6 +4,7 @@ from typing import Optional
 from dataclasses import asdict
 
 import numpy as np
+import os
 import torch
 from torch import Tensor, from_numpy
 import torch.nn.functional as F
@@ -401,6 +402,14 @@ def collate(data_list):
         )
         rigids_lens.append(
             data['rigids']['rigids_seq_idx'].numel()
+        )
+    if os.environ.get("PZ_PAD_DEBUG"):
+        print(
+            f"[pad] tokens max={max(token_lens)} sum={sum(token_lens)} "
+            f"waste={1 - sum(token_lens) / (max(token_lens) * len(token_lens)):.2f} "
+            f"lens={sorted(token_lens)} | rigids max={max(rigids_lens)} "
+            f"waste={1 - sum(rigids_lens) / (max(rigids_lens) * len(rigids_lens)):.2f}",
+            flush=True,
         )
     padded_data_list = [
         pad(data, max(token_lens), max(rigids_lens))
