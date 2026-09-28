@@ -404,11 +404,15 @@ def collate(data_list):
             data['rigids']['rigids_seq_idx'].numel()
         )
     if os.environ.get("PZ_PAD_DEBUG"):
+        real_tok, real_rig = [], []
+        for d in data_list:
+            tm = d['token'].get('token_mask')
+            rm = d['rigids'].get('rigids_mask')
+            real_tok.append(int(tm.sum()) if tm is not None else -1)
+            real_rig.append(int(rm.sum()) if rm is not None else -1)
         print(
-            f"[pad] tokens max={max(token_lens)} sum={sum(token_lens)} "
-            f"waste={1 - sum(token_lens) / (max(token_lens) * len(token_lens)):.2f} "
-            f"lens={sorted(token_lens)} | rigids max={max(rigids_lens)} "
-            f"waste={1 - sum(rigids_lens) / (max(rigids_lens) * len(rigids_lens)):.2f}",
+            f"[pad] alloc_tokens={max(token_lens)} real_tokens={sorted(real_tok)} "
+            f"alloc_rigids={max(rigids_lens)} real_rigids={sorted(real_rig)}",
             flush=True,
         )
     padded_data_list = [
