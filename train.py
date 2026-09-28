@@ -135,6 +135,8 @@ def main(model,
     for cli_key, yaml_path in [
         ('placer_side_chain_trans_prior_std', 'datasets.0.task_sampler.task_list.0.side_chain_trans_prior_std'),
         ('placer_lig_trans_prior_std',        'datasets.0.task_sampler.task_list.0.lig_trans_prior_std'),
+        ('max_crop_residues',                 'max_crop_residues'),
+        ('max_crop_rigids',                   'max_crop_rigids'),
     ]:
         val = dataset.get(cli_key, None)
         if val is not None:
