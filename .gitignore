@@ -170,3 +170,16 @@ scripts/submit_scripts/train/tmp*
 scripts/submit_scripts/test/*
 scripts/submit_scripts/debug/*
 LigandMPNN/model_params/
+
+# cloned third-party tools, container images, and scratch/generated PDB
+# dumps that accumulate on CoreHPC checkouts -- not source, never meant
+# to be committed (some are multi-GB .sif images)
+/SurfDock/
+/Uni-Core/
+/boltz/
+/boltz_cache/
+/binder_design_test/
+*.sif
+/cluster_viz_pdbs/
+/fused_pdbs/
+/crops*.pdb
