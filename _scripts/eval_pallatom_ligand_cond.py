@@ -316,6 +316,18 @@ def main():
     import torch as _torch
     num_gpus = args.num_gpus or max(_torch.cuda.device_count(), 1)
 
+    def _cache_id(code, pdb_path):
+        """--per-ligand-dirs sources each ligand's PDBs from a separate <CODE>/ directory
+        supplied by an external tool, whose own filename convention has no reason to
+        embed our ligand code (unlike our own sample.py, whose filenames always start
+        with the code) -- Complexa's OQO and IAI output was found to use byte-identical
+        filenames. Prefixing the code here keeps the per-sample cache AND every
+        refold/MPNN working directory eval_ligand_cond_sample derives from sample_id
+        collision-free across ligands. Flat (non---per-ligand-dirs) mode is unaffected:
+        its filenames already embed the code by construction, so the prefix is skipped
+        to avoid invalidating existing caches for every other caller of this script."""
+        return f"{code}__{pdb_path.stem}" if args.per_ligand_dirs else pdb_path.stem
+
     def _run_one(pdb_path, code, smiles, gpu_id):
         """Runs on a specific GPU (pinned via CUDA_VISIBLE_DEVICES, which run_refolding's
         subprocess.run(..., env=_env) call -- env built from os.environ -- forwards through
@@ -334,10 +346,11 @@ def main():
             ligandmpnn_script=args.ligandmpnn_script if run_mpnn else None,
             mpnn_n_seqs=args.mpnn_n_seqs, mpnn_cutoff=args.mpnn_cutoff,
             force=args.overwrite, skip_nolig=True,
+            sample_id=_cache_id(code, pdb_path),
         )
         r["ligand_code"] = code
         r["_cache_schema_version"] = CACHE_SCHEMA_VERSION
-        cache_path = per_sample_dir / f"{pdb_path.stem}.json"
+        cache_path = per_sample_dir / f"{_cache_id(code, pdb_path)}.json"
         cache_path.write_text(json.dumps(r, indent=2, default=str))
         return r
 
@@ -353,7 +366,7 @@ def main():
             continue
         results_by_code[code] = []
         for pdb_path in files:
-            cache_path = per_sample_dir / f"{pdb_path.stem}.json"
+            cache_path = per_sample_dir / f"{_cache_id(code, pdb_path)}.json"
             r = None
             stale = cache_path.exists() and _cache_is_stale(cache_path, pdb_path)
             if not args.overwrite and cache_path.exists() and not (stale and not args.aggregate_only):

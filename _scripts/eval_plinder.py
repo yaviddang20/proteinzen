@@ -1213,7 +1213,8 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
                             boltz_cache, run_pb, skip_fold, contact_cutoff=4.0,
                             mpnn_script=None, ligandmpnn_script=None,
                             mpnn_n_seqs=3, mpnn_refold_dir=None, pb_cache=None,
-                            mpnn_cutoff=None, force=False, skip_nolig=False):
+                            mpnn_cutoff=None, force=False, skip_nolig=False,
+                            sample_id=None):
     """mpnn_cutoff: None (default) preserves the original behavior -- LigandMPNN
     redesigns the full sequence, no fixed residues. Pass a distance in Angstroms
     (e.g. 6.0) to instead fix residues within that cutoff of the ligand and let
@@ -1230,7 +1231,17 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
     (no Boltz call, fold_nolig fields come back NaN). Default False preserves existing
     behavior for every caller that doesn't pass this explicitly -- only
     eval_pallatom_ligand_cond.py opts in, since none of its three success formulas use
-    the nolig_* fields."""
+    the nolig_* fields.
+
+    sample_id: identifier used for every refold_input/refold_output/mpnn-working-dir path
+    and cache key derived in this function. Default None falls back to pdb_path.stem,
+    preserving existing behavior for every caller that doesn't pass this explicitly.
+    Callers whose different populations can share a raw filename (e.g.
+    eval_pallatom_ligand_cond.py's --per-ligand-dirs, where an external tool's own output
+    naming doesn't include the ligand code -- Complexa's OQO and IAI directories were
+    found to use byte-identical filenames) must pass a collision-free id explicitly, or
+    every refold/MPNN cache in this function silently collides across populations."""
+    sid = sample_id if sample_id is not None else pdb_path.stem
     (prot_all, prot_ca, resnames, lig_coords, lig_elements, _,
      prot_by_res, prot_res_keys) = parse_pdb_ligand_cond(str(pdb_path))
     sequence = resnames_to_seq(resnames)
@@ -1260,7 +1271,7 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
         fold = run_refolding(
             sequence=sequence, smiles=smiles, gen_ca=prot_ca,
             refold_input_dir=refold_input_dir, refold_output_dir=refold_output_dir,
-            sample_id=pdb_path.stem, boltz_cache=boltz_cache,
+            sample_id=sid, boltz_cache=boltz_cache,
             gen_lig=gen_lig, gen_prot_by_res=prot_by_res, force=force,
         )
         if skip_nolig:
@@ -1269,7 +1280,7 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
             fold_nolig = run_refolding(
                 sequence=sequence, smiles=None, gen_ca=prot_ca,
                 refold_input_dir=refold_input_dir, refold_output_dir=refold_output_dir,
-                sample_id=f"{pdb_path.stem}_nolig", boltz_cache=boltz_cache,
+                sample_id=f"{sid}_nolig", boltz_cache=boltz_cache,
                 gen_lig=None, gen_prot_by_res=prot_by_res, force=force,
             )
     fold_nolig = {f"nolig_{k}": v for k, v in fold_nolig.items()}
@@ -1281,7 +1292,7 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
                 sequence=seq, smiles=refold_smiles, gen_ca=prot_ca,
                 refold_input_dir=base_dir / "refold_inputs",
                 refold_output_dir=base_dir / "refold_outputs",
-                sample_id=f"{pdb_path.stem}_{tag}{i}",
+                sample_id=f"{sid}_{tag}{i}",
                 boltz_cache=boltz_cache,
                 gen_lig=gen_lig, gen_prot_by_res=prot_by_res, force=force,
             )
@@ -1322,9 +1333,9 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
         base = mpnn_refold_dir or refold_output_dir.parent / "mpnn_refold"
         if mpnn_script and Path(mpnn_script).exists():
             try:
-                seqs = run_proteinmpnn(pdb_path, base / pdb_path.stem / "proteinmpnn", mpnn_n_seqs, mpnn_script,
+                seqs = run_proteinmpnn(pdb_path, base / sid / "proteinmpnn", mpnn_n_seqs, mpnn_script,
                                        force=force)
-                pmpnn_metrics = _run_mpnn_case(seqs, None, "pmpnn", base / pdb_path.stem / "pmpnn_refold")
+                pmpnn_metrics = _run_mpnn_case(seqs, None, "pmpnn", base / sid / "pmpnn_refold")
             except Exception as e:
                 print(f"  ProteinMPNN error {pdb_path.name}: {e}")
         if ligandmpnn_script and Path(ligandmpnn_script).exists():
@@ -1337,9 +1348,9 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
                     pocket_fixed_residues(prot_by_res, prot_res_keys, lig_coords, cutoff=mpnn_cutoff)
                     if mpnn_cutoff is not None else ""
                 )
-                seqs = run_ligandmpnn(pdb_path, base / pdb_path.stem / "ligandmpnn", mpnn_n_seqs, ligandmpnn_script,
+                seqs = run_ligandmpnn(pdb_path, base / sid / "ligandmpnn", mpnn_n_seqs, ligandmpnn_script,
                                       fixed_residues=fixed_residues, force=force)
-                lmpnn_metrics = _run_mpnn_case(seqs, smiles, "lmpnn", base / pdb_path.stem / "lmpnn_refold")
+                lmpnn_metrics = _run_mpnn_case(seqs, smiles, "lmpnn", base / sid / "lmpnn_refold")
             except Exception as e:
                 print(f"  LigandMPNN error {pdb_path.name}: {e}")
 
