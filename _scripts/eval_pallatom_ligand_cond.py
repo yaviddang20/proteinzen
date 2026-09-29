@@ -101,6 +101,20 @@ def _cache_is_complete(r: dict) -> bool:
     return r.get("_cache_schema_version") == CACHE_SCHEMA_VERSION
 
 
+def _cache_is_stale(cache_path: Path, pdb_path: Path) -> bool:
+    """True if the cache predates the PDB it's supposedly caching. sample.py's sample
+    filenames are purely positional (ligand+conformer+GPU+batch+index -- no content hash
+    or run id), so a later run using the same batch/GPU-sharding parameters can reuse the
+    exact same filenames as an earlier, unrelated run. A leftover per-sample cache entry
+    from that earlier run then silently looks like a valid, complete cache hit for the
+    new PDB's content -- _cache_is_complete only checks schema version, not whether the
+    cache actually corresponds to the file it's keyed by. mtime comparison catches this."""
+    try:
+        return cache_path.stat().st_mtime < pdb_path.stat().st_mtime
+    except OSError:
+        return False
+
+
 def _ligand_code_for(pdb_path: Path) -> str:
     """Recover the CCD code from a sample filename built by
     make_ligand_cond_yaml.py (task name f"{code}_conf{i}") + sample.py's
@@ -341,13 +355,21 @@ def main():
         for pdb_path in files:
             cache_path = per_sample_dir / f"{pdb_path.stem}.json"
             r = None
-            if not args.overwrite and cache_path.exists():
+            stale = cache_path.exists() and _cache_is_stale(cache_path, pdb_path)
+            if not args.overwrite and cache_path.exists() and not (stale and not args.aggregate_only):
                 cached = json.loads(cache_path.read_text())
                 # aggregate_only never triggers a (re)compute, even for a stale cache --
-                # it means "just report on whatever's on disk". Otherwise, a cache missing
-                # a currently-expected field (see REQUIRED_RAW_KEYS) is auto-backfilled
-                # below rather than silently reported as a metric failure.
+                # it means "just report on whatever's on disk" (though we still flag it
+                # below so a stale number isn't silently mistaken for current). Otherwise,
+                # a cache missing a currently-expected field (see REQUIRED_RAW_KEYS) is
+                # auto-backfilled below rather than silently reported as a metric failure,
+                # and a cache older than the PDB it's keyed by (sample.py's filenames are
+                # purely positional, so a later run can reuse an earlier run's exact
+                # filenames) is treated as not-cached and recomputed instead of trusted.
                 if args.aggregate_only or _cache_is_complete(cached):
+                    if stale and args.aggregate_only:
+                        print(f"  WARNING: {cache_path.name} predates {pdb_path.name} -- "
+                              f"stale cache from an earlier/different run, reporting anyway.")
                     r = cached
             if r is None:
                 if args.aggregate_only:
