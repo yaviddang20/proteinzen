@@ -250,6 +250,14 @@ def main():
     parser.add_argument("--overwrite", action="store_true", default=False)
     parser.add_argument("--aggregate-only", action="store_true", default=False,
                         help="Skip evaluating any not-yet-cached samples; just aggregate what's cached.")
+    parser.add_argument("--num-gpus", type=int, default=None,
+                        help="Number of GPUs to shard the Boltz2/LigandMPNN work across "
+                             "(one worker process per GPU, each pinned via "
+                             "CUDA_VISIBLE_DEVICES). Default: auto-detect via "
+                             "torch.cuda.device_count() (falls back to 1 if that's 0 or "
+                             "torch/CUDA aren't available). Matches eval_plinder.py's own "
+                             "--num-gpus sharding, ported here since this script previously "
+                             "ran strictly single-GPU regardless of node size.")
     args = parser.parse_args()
 
     args.samples_dir = args.samples_dir or (args.out_dir / "samples")
@@ -291,7 +299,36 @@ def main():
         print(f"Note: LigandMPNN script not found at {args.ligandmpnn_script!r} -- "
               f"only raw generated-sequence success rates will be reported.")
 
+    import torch as _torch
+    num_gpus = args.num_gpus or max(_torch.cuda.device_count(), 1)
+
+    def _run_one(pdb_path, code, smiles, gpu_id):
+        """Runs on a specific GPU (pinned via CUDA_VISIBLE_DEVICES, which run_refolding's
+        subprocess.run(..., env=_env) call -- env built from os.environ -- forwards through
+        to the boltz2_kit apptainer container, same as eval_plinder.py's own multi-GPU path).
+        force=args.overwrite: --overwrite means a COMPLETE redo, including re-running
+        Boltz/LigandMPNN. Without it, eval_ligand_cond_sample still only re-derives metrics
+        from whatever Boltz/LigandMPNN output already exists on disk -- run_refolding/
+        _run_ligandmpnn independently skip the actual subprocess calls unless force=True."""
+        import os as _os
+        _os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        r = eval_ligand_cond_sample(
+            pdb_path=pdb_path, smiles=smiles,
+            refold_input_dir=refold_input_dir, refold_output_dir=refold_output_dir,
+            boltz_cache=args.boltz_cache, run_pb=False, skip_fold=False,
+            contact_cutoff=args.contact_cutoff,
+            ligandmpnn_script=args.ligandmpnn_script if run_mpnn else None,
+            mpnn_n_seqs=args.mpnn_n_seqs, mpnn_cutoff=args.mpnn_cutoff,
+            force=args.overwrite, skip_nolig=True,
+        )
+        r["ligand_code"] = code
+        r["_cache_schema_version"] = CACHE_SCHEMA_VERSION
+        cache_path = per_sample_dir / f"{pdb_path.stem}.json"
+        cache_path.write_text(json.dumps(r, indent=2, default=str))
+        return r
+
     results_by_code: dict[str, list[dict]] = {}
+    todo: list[tuple] = []  # (pdb_path, code, smiles)
     for code in ligand_codes:
         files = by_code.get(code, [])
         if not files:
@@ -300,8 +337,8 @@ def main():
         if smiles is None:
             print(f"  {code}: no SMILES in KNOWN_SMILES -- skipping entirely")
             continue
-        code_results = []
-        for pdb_path in tqdm(files, desc=code):
+        results_by_code[code] = []
+        for pdb_path in files:
             cache_path = per_sample_dir / f"{pdb_path.stem}.json"
             r = None
             if not args.overwrite and cache_path.exists():
@@ -315,28 +352,54 @@ def main():
             if r is None:
                 if args.aggregate_only:
                     continue
-                # force=args.overwrite: --overwrite means a COMPLETE redo, including
-                # re-running Boltz/LigandMPNN. Without it (e.g. backfilling a stale
-                # cache's missing fields), eval_ligand_cond_sample still only re-derives
-                # metrics from whatever Boltz/LigandMPNN output already exists on disk --
-                # run_refolding/_run_ligandmpnn independently skip the actual subprocess
-                # calls unless force=True.
-                r = eval_ligand_cond_sample(
-                    pdb_path=pdb_path, smiles=smiles,
-                    refold_input_dir=refold_input_dir, refold_output_dir=refold_output_dir,
-                    boltz_cache=args.boltz_cache, run_pb=False, skip_fold=False,
-                    contact_cutoff=args.contact_cutoff,
-                    ligandmpnn_script=args.ligandmpnn_script if run_mpnn else None,
-                    mpnn_n_seqs=args.mpnn_n_seqs, mpnn_cutoff=args.mpnn_cutoff,
-                    force=args.overwrite,
-                )
-                r["ligand_code"] = code
-                r["_cache_schema_version"] = CACHE_SCHEMA_VERSION
-                cache_path.write_text(json.dumps(r, indent=2, default=str))
-            r.setdefault("ligand_code", code)
-            r.update(compute_success(r))
-            code_results.append(r)
-        results_by_code[code] = code_results
+                todo.append((pdb_path, code, smiles))
+            else:
+                r.setdefault("ligand_code", code)
+                r.update(compute_success(r))
+                results_by_code[code].append(r)
+
+    if todo:
+        print(f"Evaluating {len(todo)} not-yet-cached sample(s) on {num_gpus} GPU(s)")
+        if num_gpus <= 1:
+            for pdb_path, code, smiles in tqdm(todo, desc="eval"):
+                r = _run_one(pdb_path, code, smiles, gpu_id=0)
+                r.update(compute_success(r))
+                results_by_code[code].append(r)
+        else:
+            import multiprocessing as _mp
+
+            work_queue = _mp.Queue()
+            result_queue = _mp.Queue()
+            for item in todo:
+                work_queue.put(item)
+            for _ in range(num_gpus):  # one sentinel per worker
+                work_queue.put(None)
+
+            def _worker(gpu_id, work_q, result_q):
+                while True:
+                    item = work_q.get()
+                    if item is None:
+                        break
+                    pdb_path, code, smiles = item
+                    try:
+                        r = _run_one(pdb_path, code, smiles, gpu_id)
+                    except Exception as e:
+                        r = {"sample_id": pdb_path.stem, "pdb_path": str(pdb_path),
+                             "ligand_code": code, "error": str(e),
+                             "ca_rmsd": float("nan")}
+                        print(f"  ERROR {pdb_path.name}: {e}")
+                    result_q.put((code, r))
+
+            procs = [_mp.Process(target=_worker, args=(i, work_queue, result_queue), daemon=True)
+                     for i in range(num_gpus)]
+            for p in procs:
+                p.start()
+            for _ in tqdm(range(len(todo)), desc="eval"):
+                code, r = result_queue.get()
+                r.update(compute_success(r))
+                results_by_code[code].append(r)
+            for p in procs:
+                p.join()
 
     all_results = [r for v in results_by_code.values() for r in v]
     (args.out_dir / "results.json").write_text(json.dumps(all_results, indent=2, default=str))

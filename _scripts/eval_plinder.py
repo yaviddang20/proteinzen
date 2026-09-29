@@ -1213,7 +1213,7 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
                             boltz_cache, run_pb, skip_fold, contact_cutoff=4.0,
                             mpnn_script=None, ligandmpnn_script=None,
                             mpnn_n_seqs=3, mpnn_refold_dir=None, pb_cache=None,
-                            mpnn_cutoff=None, force=False):
+                            mpnn_cutoff=None, force=False, skip_nolig=False):
     """mpnn_cutoff: None (default) preserves the original behavior -- LigandMPNN
     redesigns the full sequence, no fixed residues. Pass a distance in Angstroms
     (e.g. 6.0) to instead fix residues within that cutoff of the ligand and let
@@ -1224,7 +1224,13 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
     force: True bypasses every on-disk cache this function touches (Boltz refolds via
     run_refolding, and ProteinMPNN/LigandMPNN sequence generation) and always recomputes
     from scratch. Default False preserves existing caching behavior for every caller
-    that doesn't pass this explicitly."""
+    that doesn't pass this explicitly.
+
+    skip_nolig: True skips the extra ligand-free refold of the raw sequence entirely
+    (no Boltz call, fold_nolig fields come back NaN). Default False preserves existing
+    behavior for every caller that doesn't pass this explicitly -- only
+    eval_pallatom_ligand_cond.py opts in, since none of its three success formulas use
+    the nolig_* fields."""
     (prot_all, prot_ca, resnames, lig_coords, lig_elements, _,
      prot_by_res, prot_res_keys) = parse_pdb_ligand_cond(str(pdb_path))
     sequence = resnames_to_seq(resnames)
@@ -1257,12 +1263,15 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
             sample_id=pdb_path.stem, boltz_cache=boltz_cache,
             gen_lig=gen_lig, gen_prot_by_res=prot_by_res, force=force,
         )
-        fold_nolig = run_refolding(
-            sequence=sequence, smiles=None, gen_ca=prot_ca,
-            refold_input_dir=refold_input_dir, refold_output_dir=refold_output_dir,
-            sample_id=f"{pdb_path.stem}_nolig", boltz_cache=boltz_cache,
-            gen_lig=None, gen_prot_by_res=prot_by_res, force=force,
-        )
+        if skip_nolig:
+            fold_nolig = _nan_fold.copy()
+        else:
+            fold_nolig = run_refolding(
+                sequence=sequence, smiles=None, gen_ca=prot_ca,
+                refold_input_dir=refold_input_dir, refold_output_dir=refold_output_dir,
+                sample_id=f"{pdb_path.stem}_nolig", boltz_cache=boltz_cache,
+                gen_lig=None, gen_prot_by_res=prot_by_res, force=force,
+            )
     fold_nolig = {f"nolig_{k}": v for k, v in fold_nolig.items()}
 
     def _run_mpnn_case(seqs, refold_smiles, tag, base_dir):
