@@ -468,11 +468,11 @@ class MultiSE3Interpolant:
                     continue
                 # directly sample per-type noise for placer tasks
                 if side_chain_std_batch is not None and not torch.isnan(side_chain_std_batch[b]):
-                    sc_noised = rigids_noising_mask[b].bool() & (sc_idx[b] > 0)
+                    sc_noised = rigids_noising_mask[b].bool() & (sc_idx[b] > 0) & rigids_mask[b].bool()
                     if sc_noised.any():
                         trans_0[b, sc_noised] = torch.randn(sc_noised.sum(), 3, device=trans_0.device) * side_chain_std_batch[b]
                 if lig_std_batch is not None and not torch.isnan(lig_std_batch[b]):
-                    lig_noised = rigids_noising_mask[b].bool() & (sc_idx[b] == 0)
+                    lig_noised = rigids_noising_mask[b].bool() & (sc_idx[b] == 0) & rigids_mask[b].bool()
                     if lig_noised.any():
                         lig_indices = lig_noised.nonzero(as_tuple=True)[0]
                         anchor_idx = lig_indices[torch.randint(len(lig_indices), (1,), device=trans_0.device).item()]
@@ -487,7 +487,7 @@ class MultiSE3Interpolant:
                 bb_tok = tok_idx[b, bb_indices]
                 bb_trans = trans_1[b, bb_indices]  # already centered
 
-                sc_noised = rigids_noising_mask[b].bool() & (sc_idx[b] > 0)
+                sc_noised = rigids_noising_mask[b].bool() & (sc_idx[b] > 0) & rigids_mask[b].bool()
                 if sc_noised.any():
                     sc_indices = sc_noised.nonzero(as_tuple=True)[0]
                     max_tok = int(tok_idx[b].max().item()) + 1
