@@ -962,7 +962,44 @@ class BiomoleculeSamplingDataModule(L.LightningDataModule):
             dist_sampler = None
         if self.batch_sampler is not None:
             if world_size > 1:
-                sharded_idxs = self.batch_sampler.batch_idxs[rank::world_size]
+                # batch_idxs[rank::world_size] assigns purely by LIST POSITION.
+                # TaskBatchSampler emits each task's samples as consecutive chunks
+                # of at most batch_size -- if num_samples isn't a multiple of
+                # batch_size, every task emits one full-size chunk followed by
+                # one small leftover chunk, in that fixed order. When world_size
+                # is a multiple of that period (e.g. 8 ranks, period-2 full/
+                # leftover pattern), a plain stride slice locks EVERY rank into
+                # picking only one type for its entire run (adding an even
+                # stride never changes an index's parity) -- e.g. even ranks get
+                # every full (16-sample) chunk, odd ranks get every leftover
+                # (4-sample) chunk. That gave some ranks ~4x the total workload
+                # of others, and PDBWriter.write_on_epoch_end's all_gather_object
+                # barrier then blocks the light ranks until the heavy ranks'
+                # NCCL watchdog times out (~30min).
+                #
+                # Fix: greedy longest-processing-time-first load balancing --
+                # sort chunks largest-first, always hand the next chunk to
+                # whichever rank currently has the least assigned. Cost is
+                # len(chunk) (sample count), NOT real per-sample token count:
+                # each rank independently reconstructs its own dispatcher, and
+                # LigandPocketConditionedSampling.sample_data() draws protein
+                # length with an unseeded random.randint per sample, so actual
+                # token counts differ across ranks' own reconstructions -- but
+                # chunk structure (task order, num_samples, batch_size) is
+                # identical everywhere. Every rank must compute the IDENTICAL
+                # assignment from data that's actually deterministic/shared, or
+                # different ranks could disagree on which chunk is whose
+                # (duplicate or dropped work). sorted()+min() are both stable/
+                # deterministic given the same input, so all ranks agree.
+                chunks = self.batch_sampler.batch_idxs
+                order = sorted(range(len(chunks)), key=lambda i: -len(chunks[i]))
+                loads = [0] * world_size
+                assigned = [[] for _ in range(world_size)]
+                for i in order:
+                    r = min(range(world_size), key=lambda r: loads[r])
+                    assigned[r].append(chunks[i])
+                    loads[r] += len(chunks[i])
+                sharded_idxs = assigned[rank]
                 sampler = type(self.batch_sampler).__new__(type(self.batch_sampler))
                 sampler.batch_idxs = sharded_idxs
             else:
