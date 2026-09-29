@@ -445,6 +445,7 @@ class PocketPLACERSampling(SamplingTask):
                 struct,
                 task_masks=task_masks,
                 trans_std=self.trans_std,
+                lig_anchor_std=self.trans_std,
             )
 
             bb_trans_by_token = {

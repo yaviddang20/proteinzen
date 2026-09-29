@@ -185,11 +185,13 @@ class SampleTemplateTokenizer:
         self,
         struct,
         task_masks,
-        trans_std=16
+        trans_std=16,
+        lig_anchor_std=None
     ):
         self.struct = struct
         self.task_masks = task_masks
         self.trans_std = trans_std
+        self.lig_anchor_std = lig_anchor_std
 
         self.bond_graph = nx.Graph([(bond["atom_1"], bond["atom_2"]) for bond in self.struct.bonds])
 
@@ -554,6 +556,17 @@ class SampleTemplateTokenizer:
             num_noise_rigids = rigid_data['rigids_noising_mask'].sum()
             noise_trans = np.random.randn(num_noise_rigids, 3) * self.trans_std
             noise_quat = Rotation.random(num_noise_rigids).as_quat(canonical=True, scalar_first=True)
+            if self.lig_anchor_std is not None:
+                noised_idx = np.where(rigid_data['rigids_noising_mask'])[0]
+                lig_sel = rigid_data['sidechain_idx'][noised_idx] == 0
+                if lig_sel.any():
+                    # PLACER-style: collapse the ligand onto one of its own atoms, whose
+                    # true position is known here but not centered yet (only fixed rigids were)
+                    anchor_row = np.random.choice(np.where(lig_sel)[0])
+                    anchor_gt = rigid_data['tensor7'][noised_idx[anchor_row], 4:] - fixed_rigids_com
+                    anchor_pos = anchor_gt + np.random.randn(3) * self.lig_anchor_std
+                    n_lig = int(lig_sel.sum())
+                    noise_trans[lig_sel] = anchor_pos[None] + np.random.randn(n_lig, 3) * self.lig_anchor_std
             noise_tensor7 = np.concatenate([noise_quat, noise_trans], axis=-1)
             rigid_data['tensor7'][rigid_data['rigids_noising_mask']] = noise_tensor7
         else:
@@ -594,6 +607,7 @@ def sample_noise_from_struct_template(  # noqa: C901, PLR0915
     struct: Structure,
     task_masks: Optional[dict[str, np.ndarray]] = None,
     trans_std=16,
+    lig_anchor_std=None,
 ):
     """ Sample a t=0 initial datapoint from a structure template.
 
@@ -629,7 +643,7 @@ def sample_noise_from_struct_template(  # noqa: C901, PLR0915
             "t": 0.0,
         }
     tokenizer = SampleTemplateTokenizer(
-        struct, task_masks, trans_std
+        struct, task_masks, trans_std, lig_anchor_std
     )
     return tokenizer.tokenize()
 

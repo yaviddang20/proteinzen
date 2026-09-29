@@ -1179,7 +1179,13 @@ class BiomoleculeModule(L.LightningModule):
                 if lig_std_batch is not None and not torch.isnan(lig_std_batch[b]):
                     lig_noised = rigids_noising_mask[b].bool() & (sc_idx[b] == 0)
                     if lig_noised.any():
-                        trans_t[b, lig_noised] = torch.randn(lig_noised.sum(), 3, device=device) * lig_std_batch[b]
+                        lig_indices = lig_noised.nonzero(as_tuple=True)[0]
+                        anchor_idx = lig_indices[torch.randint(len(lig_indices), (1,), device=device).item()]
+                        anchor_pos = gt_trans[b, anchor_idx] + torch.randn(3, device=device) * lig_std_batch[b]
+                        trans_t[b, lig_indices] = (
+                            anchor_pos[None]
+                            + torch.randn(len(lig_indices), 3, device=device) * lig_std_batch[b]
+                        )
                 bb_indices = bb_mask[b].nonzero(as_tuple=True)[0]
                 if len(bb_indices) == 0:
                     continue
