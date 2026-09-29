@@ -45,8 +45,43 @@ _MPNN_ENV   = "mpnn"
 
 
 _MAMBA_ROOT  = Path(os.environ.get("MAMBA_ROOT_PREFIX", Path.home() / "micromamba"))
-_BOLTZ_BIN   = str(_MAMBA_ROOT / "envs" / "boltz" / "bin" / "boltz")
+_BOLTZ_BIN   = str(_MAMBA_ROOT / "envs" / "boltz" / "bin" / "boltz")  # unused now that
+# run_refolding uses the boltz2_kit apptainer container instead -- kept only in case
+# something else still imports this name.
 _MPNN_PYTHON = str(_MAMBA_ROOT / "envs" / "mpnn"  / "bin" / "python")
+
+# Anthropic's optimized Boltz-2 (github.com/anthropics/uplifting-biomolecular-modeling),
+# same single-sequence YAML input format as stock Boltz, same output filenames
+# (confidence_*_model_0.json / *_model_0.cif / pae_*_model_0.npz), just a different
+# output directory layout (out_dir/by_seed/<id>/s0/ instead of
+# out_dir/boltz_results_<id>/predictions/<id>/) -- verified directly against a real
+# run, not assumed. Replaces the stock `boltz predict` CLI call in run_refolding.
+_KIT_ROOT    = Path("/mnt/scratch/user/daviyang/uplifting-biomolecular-modeling")
+_KIT_WEIGHTS = Path("/mnt/scratch/user/daviyang/weights")
+_KIT_OUT     = Path("/mnt/scratch/user/daviyang/kit_out")
+
+
+_kit_gpu_config_cache = None
+
+
+def _pick_kit_gpu_config() -> str:
+    """h100 vs h200 --config: the kit tolerates a mismatch (just prints a note) for
+    close variants (e.g. H100 NVL's 95GB vs the h100 class's 81GB), but pick the
+    right one when we can rather than rely on that tolerance. Cheap, runs once
+    per process (module-level cache)."""
+    global _kit_gpu_config_cache
+    if _kit_gpu_config_cache is not None:
+        return _kit_gpu_config_cache
+    config = "h100"
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=10)
+        if "H200" in out.stdout:
+            config = "h200"
+    except Exception:
+        pass
+    _kit_gpu_config_cache = config
+    return config
 
 try:
     from posebusters import PoseBusters
@@ -1030,15 +1065,26 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
 
     input_yaml = refold_input_dir / f"{sample_id}.yaml"
     out_dir = refold_output_dir / sample_id
-    pred_dir = out_dir / f"boltz_results_{sample_id}" / "predictions" / sample_id
+    pred_dir = out_dir / "by_seed" / sample_id / "s0"
 
     if force or not pred_dir.exists():
         input_yaml.write_text(_yaml.dump(boltz_input, default_flow_style=False))
-        cmd = [_BOLTZ_BIN, "predict", str(input_yaml), "--out_dir", str(out_dir), "--override"]
-        if boltz_cache:
-            cmd += ["--cache", str(boltz_cache)]
+        # boltz_cache is unused here -- the kit's weights are pinned/baked in via
+        # BOLTZ_CACHE below, not a per-call --cache flag like stock boltz had.
+        gpu_config = _pick_kit_gpu_config()
+        cmd = [
+            "apptainer", "run", "--nv",
+            "--bind", f"{_KIT_WEIGHTS / 'boltz2'}:/weights/boltz2",
+            "--bind", f"{_KIT_OUT / 'boltz2' / 'out'}:/kit/boltz2/out",
+            "--bind", "/mnt/scratch/user/daviyang",
+            str(_KIT_ROOT / "boltz2.sif"),
+            "pred", "--config", gpu_config, "--mode", "fast",
+            "--input", str(input_yaml), "--out_dir", str(out_dir),
+        ]
         try:
-            _env = {**os.environ, "SLURM_NTASKS": "1", "SLURM_JOB_NUM_NODES": "1"}
+            _env = {**os.environ, "SLURM_NTASKS": "1", "SLURM_JOB_NUM_NODES": "1",
+                    "BOLTZ_CACHE": "/weights/boltz2",
+                    "MODEL_OPT_JIT_ROOT": str(_KIT_OUT / "boltz2" / "jit")}
             subprocess.run(cmd, check=True, timeout=600, env=_env)
         except subprocess.CalledProcessError as e:
             return {"plddt": float("nan"), "iptm": float("nan"), "ca_rmsd": float("nan"),
