@@ -71,10 +71,10 @@ python ${REPO_ROOT}/train.py \
     lmodule.use_cosine_annealing=true \
     lmodule.cosine_annealing_T_max=1000 \
     corrupter.prealign_noise=false \
-    corrupter.use_stochastic_centering=true \
+    corrupter.use_stochastic_centering=false \
     corrupter.center_on_motif_then_hotspots=true \
     corrupter.trans_prior_std=3 \
-    corrupter.sig_perturb=2 \
+    corrupter.sig_perturb=0 \
     corrupter.use_uniform_rot_noise=true \
     corrupter.rots_use_brownian_path=true \
     dataset.config="'${REPO_ROOT}/configs/train/data/plinder_pocket_placer.yaml'" \
