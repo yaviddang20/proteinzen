@@ -219,6 +219,13 @@ def main():
     parser.add_argument("--samples-dir", type=Path, default=None,
                         help="Directory of generated PDBs for ALL ligand codes together. "
                              "Defaults to {out_dir}/samples if not set.")
+    parser.add_argument("--per-ligand-dirs", action="store_true",
+                        help="Treat --samples-dir as <samples_dir>/<LIGAND_CODE>/**/*.pdb "
+                             "(recursive, so a nested raw_pdbs/-style subfolder works too) "
+                             "instead of parsing our own sample.py filename convention. "
+                             "For evaluating external baselines (Pallatom-Ligand, RFD3, "
+                             "BoltzDesign1, Complexa, ...) whose own output is organized "
+                             "one directory per ligand code rather than named like ours.")
     parser.add_argument("--ligand-codes", nargs="+", default=None,
                         help="Restrict to these ligand codes only. Default: auto-discover "
                              "from the sample filenames themselves (whatever "
@@ -252,13 +259,25 @@ def main():
     per_sample_dir = args.out_dir / "per_sample"
     per_sample_dir.mkdir(exist_ok=True)
 
-    pdb_files = sorted(args.samples_dir.glob("*.pdb"))
-    if not pdb_files:
-        sys.exit(f"No PDB files found in {args.samples_dir}")
-
     by_code: dict[str, list[Path]] = {}
-    for p in pdb_files:
-        by_code.setdefault(_ligand_code_for(p), []).append(p)
+    if args.per_ligand_dirs:
+        if not args.samples_dir.is_dir():
+            sys.exit(f"--per-ligand-dirs: {args.samples_dir} is not a directory")
+        for code_dir in sorted(args.samples_dir.iterdir()):
+            if not code_dir.is_dir():
+                continue
+            pdbs = sorted(code_dir.rglob("*.pdb"))
+            if pdbs:
+                by_code[code_dir.name.upper()] = pdbs
+        pdb_files = [p for v in by_code.values() for p in v]
+        if not pdb_files:
+            sys.exit(f"--per-ligand-dirs: no PDB files found under {args.samples_dir}/<CODE>/**")
+    else:
+        pdb_files = sorted(args.samples_dir.glob("*.pdb"))
+        if not pdb_files:
+            sys.exit(f"No PDB files found in {args.samples_dir}")
+        for p in pdb_files:
+            by_code.setdefault(_ligand_code_for(p), []).append(p)
 
     ligand_codes = args.ligand_codes or sorted(by_code.keys())
     unknown = [c for c in ligand_codes if c not in by_code]
