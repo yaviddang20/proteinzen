@@ -10,14 +10,17 @@ trans_std=16.0
 
 # use_preset_conformers: toggle between the original RDKit-generated-conformer
 # run (all 8 Pallatom-Ligand ligands) and a real-crystal-sourced-conformer run
-# restricted to the 2 ligands we've actually verified a real PDB source for
-# (OQO=PDB 7v11, IAI=PDB 5sdv -- see _scripts/preset_ligand_conformers/). Do NOT
-# add more codes here without a verified preset file first -- make_ligand_cond_yaml.py
-# will error out rather than silently fabricate one.
+# restricted to the 4 ligands we've actually verified a real PDB source for
+# (OQO=PDB 7v11, IAI=PDB 5sdv: single unambiguous real bound pose; FAD=PDB 1CJ3,
+# SAM=PDB 1QAO: medoid of the largest real conformational cluster, since these
+# two common cofactors have no single dominant bound pose -- see
+# _scripts/preset_ligand_conformers/README.md). Do NOT add more codes here
+# without a verified preset file first -- make_ligand_cond_yaml.py will error
+# out rather than silently fabricate one.
 use_preset_conformers=true
 
 if [ "$use_preset_conformers" = "true" ]; then
-    ligand_codes="OQO IAI"
+    ligand_codes="OQO IAI FAD SAM"
     preset_flag="--use-preset-conformer"
     run_name=pallatom_preset
 else
