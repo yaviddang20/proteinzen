@@ -50,7 +50,7 @@ python ${REPO_ROOT}/train.py \
     corrupter.sig_perturb=2 \
     corrupter.use_uniform_rot_noise=true \
     corrupter.rots_use_brownian_path=true \
-    dataset.config="'${REPO_ROOT}/configs/train/data/plinder_pocket_rosetta_repack_ligand_cond_croprange.yaml'" \
+    dataset.config="'${REPO_ROOT}/configs/train/data/plinder_pocket_rosetta_repack_ligand_cond_crop128_256.yaml'" \
     +dataset.val_config="'${REPO_ROOT}/configs/train/data/plinder_pocket_rosetta_repack_ligand_cond_crop192_val.yaml'" \
     dataset.include_h=false \
     experiment.optim.lr=0.0001 \
@@ -60,6 +60,6 @@ python ${REPO_ROOT}/train.py \
     experiment.lightning.accumulate_grad_batches=3 \
     experiment.checkpointer.train_time_interval=null \
     experiment.checkpointer.every_n_train_steps=500 \
-    hydra.run.dir="'${REPO_ROOT}/outputs/binder_zen_geom_plinder_pocket_rosetta_repack_ligand_cond_no_prealign_croprange/train'" \
+    hydra.run.dir="'${REPO_ROOT}/outputs/binder_zen_geom_plinder_pocket_rosetta_repack_ligand_cond_no_prealign_no_h_crop128_256/train'" \
     "experiment.warm_start='${REPO_ROOT}/outputs/binder_zen_geom_plinder_pocket_rosetta_repack_ligand_cond_no_prealign/train/lightning_logs/version_1973147/checkpoints/last.ckpt'"
     # "experiment.warm_start='${REPO_ROOT}/outputs/binder_zen_geom_identityRot_256_conformer_3std_stereo_hydrogen_no_prealign/train/lightning_logs/version_1103568/checkpoints/last_no_opt.ckpt'"
