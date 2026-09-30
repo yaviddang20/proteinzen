@@ -254,13 +254,20 @@ def _bucket_pad_sizes(tokenized_data, max_tokens, max_rigids,
     small enough that torch.compile does not thrash.
     """
     if not token_bucket and not rigid_bucket:
+        if max_tokens is None or max_rigids is None:
+            raise ValueError(
+                "max_crop_residues/max_crop_rigids are unset, so pad_token_bucket and "
+                "pad_rigid_bucket are required to determine padded shapes"
+            )
         return max_tokens, max_rigids
     n_tok = len(tokenized_data.tokens)
     n_rig = int(np.sum(tokenized_data.tokens["rigid_num"]))
     if token_bucket:
-        max_tokens = min(max_tokens, -(-n_tok // token_bucket) * token_bucket)
+        bucketed = -(-n_tok // token_bucket) * token_bucket
+        max_tokens = bucketed if max_tokens is None else min(max_tokens, bucketed)
     if rigid_bucket:
-        max_rigids = min(max_rigids, -(-n_rig // rigid_bucket) * rigid_bucket)
+        bucketed = -(-n_rig // rigid_bucket) * rigid_bucket
+        max_rigids = bucketed if max_rigids is None else min(max_rigids, bucketed)
     return max_tokens, max_rigids
 
 
@@ -371,8 +378,9 @@ class TrainingDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         datasets,
-        max_crop_residues,
-        max_crop_rigids,
+        max_crop_residues=None,
+        max_crop_rigids=None,
+        crop_max_protein_residues_range=None,
         pad_token_bucket=None,
         pad_rigid_bucket=None,
         use_cropper=True,
@@ -396,6 +404,10 @@ class TrainingDataset(torch.utils.data.Dataset):
         self.datasets = datasets
         self.max_crop_residues = max_crop_residues
         self.max_crop_rigids = max_crop_rigids
+        self.crop_max_protein_residues_range = (
+            tuple(crop_max_protein_residues_range)
+            if crop_max_protein_residues_range is not None else None
+        )
         self.pad_token_bucket = pad_token_bucket
         self.pad_rigid_bucket = pad_rigid_bucket
         self.samples_per_epoch = samples_per_epoch
@@ -535,16 +547,24 @@ class TrainingDataset(torch.utils.data.Dataset):
         priority_token_mask = _build_priority_token_mask(token_data, struct, interaction_residue_mask)
 
         if self.cropper is not None:
-            crop_size = self.max_crop_residues - task.max_added_tokens(token_data.shape[0])
-            if len(tokenized_data.tokens) > crop_size:
+            crop_size = (
+                None if self.max_crop_residues is None
+                else self.max_crop_residues - task.max_added_tokens(token_data.shape[0])
+            )
+            protein_cap = task.crop_max_protein_residues
+            if self.crop_max_protein_residues_range is not None:
+                lo, hi = self.crop_max_protein_residues_range
+                protein_cap = int(np.random.randint(int(lo), int(hi) + 1))
+            if crop_size is None or len(tokenized_data.tokens) > crop_size:
                 tokenized_data = self.cropper.crop(
                     tokenized_data,
                     max_tokens=crop_size,
+                    max_rigids=self.max_crop_rigids,
                     random=np.random,
                     chain_id=sample.chain_id,
                     interface_id=sample.interface_id,
                     priority_token_mask=priority_token_mask,
-                    max_protein_residues=task.crop_max_protein_residues,
+                    max_protein_residues=protein_cap,
                 )
 
         # if len(tokenized_data.tokens) == 0:
@@ -628,8 +648,9 @@ class ValidationDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         datasets,
-        max_crop_residues,
-        max_crop_rigids,
+        max_crop_residues=None,
+        max_crop_rigids=None,
+        crop_max_protein_residues_range=None,
         pad_token_bucket=None,
         pad_rigid_bucket=None,
         use_cropper=True,
@@ -650,6 +671,10 @@ class ValidationDataset(torch.utils.data.Dataset):
         self.datasets = datasets
         self.max_crop_residues = max_crop_residues
         self.max_crop_rigids = max_crop_rigids
+        self.crop_max_protein_residues_range = (
+            tuple(crop_max_protein_residues_range)
+            if crop_max_protein_residues_range is not None else None
+        )
         self.pad_token_bucket = pad_token_bucket
         self.pad_rigid_bucket = pad_rigid_bucket
         self.samples_per_epoch = samples_per_epoch
@@ -783,16 +808,24 @@ class ValidationDataset(torch.utils.data.Dataset):
         priority_token_mask = _build_priority_token_mask(token_data, struct, interaction_residue_mask)
 
         if self.cropper is not None:
-            crop_size = self.max_crop_residues - task.max_added_tokens(token_data.shape[0])
-            if len(tokenized_data.tokens) > crop_size:
+            crop_size = (
+                None if self.max_crop_residues is None
+                else self.max_crop_residues - task.max_added_tokens(token_data.shape[0])
+            )
+            protein_cap = task.crop_max_protein_residues
+            if self.crop_max_protein_residues_range is not None:
+                lo, hi = self.crop_max_protein_residues_range
+                protein_cap = int(np.random.randint(int(lo), int(hi) + 1))
+            if crop_size is None or len(tokenized_data.tokens) > crop_size:
                 tokenized_data = self.cropper.crop(
                     tokenized_data,
                     max_tokens=crop_size,
+                    max_rigids=self.max_crop_rigids,
                     random=np.random,
                     chain_id=sample.chain_id,
                     interface_id=sample.interface_id,
                     priority_token_mask=priority_token_mask,
-                    max_protein_residues=task.crop_max_protein_residues,
+                    max_protein_residues=protein_cap,
                 )
 
         if len(tokenized_data.tokens) == 0:

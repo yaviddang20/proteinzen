@@ -1,7 +1,7 @@
 _target_: proteinzen.data.datasets.datamodule.ValidationDataset
-max_crop_residues: 160
-max_crop_rigids: 512
 use_cropper: true
+pad_token_bucket: 32
+pad_rigid_bucket: 64
 datasets:
   - _target_: proteinzen.data.datasets.dataset.MMCIFDataset
     mode: val

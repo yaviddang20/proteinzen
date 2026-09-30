@@ -240,7 +240,7 @@ class Cropper:
     def crop(  # noqa: PLR0915
         self,
         data: Tokenized,
-        max_tokens: int,
+        max_tokens: Optional[int],
         random: np.random.RandomState,
         max_rigids: Optional[int] = None,
         chain_id: Optional[int] = None,
@@ -276,7 +276,7 @@ class Cropper:
             msg = "Only one of chain_id or interface_id can be provided."
             raise ValueError(msg)
 
-        if self.attempt_to_keep_full_binder_chain:
+        if self.attempt_to_keep_full_binder_chain and max_tokens is not None:
             assert max_tokens > self.full_binder_chain_cap, (
                 "if we want to try to keep a full binder chain, "
                 "make sure that we can accomedate the whole chain in the crop!"
@@ -401,7 +401,7 @@ class Cropper:
             if priority_indices:
                 priority_arr = token_data[np.isin(token_data["token_idx"], list(priority_indices))]
                 new_rig = int(np.sum(priority_arr["rigid_num"]))
-                if (len(priority_indices) <= (max_tokens - len(cropped))) and (
+                if (max_tokens is None or len(priority_indices) <= (max_tokens - len(cropped))) and (
                     max_rigids is None or (total_rigids + new_rig) <= max_rigids
                 ):
                     cropped.update(priority_indices)
@@ -478,7 +478,7 @@ class Cropper:
             new_rigids = np.sum(new_tokens["rigid_num"])
 
             # Stop if we exceed the max number of tokens or rigids
-            if (len(new_indices) > (max_tokens - len(cropped))) or (
+            if ((max_tokens is not None) and (len(new_indices) > (max_tokens - len(cropped)))) or (
                 (max_rigids is not None) and ((total_rigids + new_rigids) > max_rigids)
             ):
                 break
