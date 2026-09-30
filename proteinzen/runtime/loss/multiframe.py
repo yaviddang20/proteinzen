@@ -445,6 +445,16 @@ def multiframe_fm_loss_dense_batch(
 
     total_mask = rigids_mask * rigids_noising_mask
 
+    # Log-only diagnostic: rigids that were noised despite their residue's
+    # sequence identity being kept fixed (e.g. LigandConditionedGenerateProtein's
+    # interface_repack_rate, or MotifScaffolding's "repack" mode). Not used in
+    # any backprop'd loss -- purely a masked reduction over tensors already
+    # computed for the real losses below.
+    rigids_seq_noising_mask = rigids_data['rigids_seq_noising_mask']
+    repack_mask = total_mask * (~rigids_seq_noising_mask.bool())
+    num_repack_per_batch = repack_mask.long().sum(dim=-1).clip(min=1)
+    pred_repack_rot_vf_mse = None
+
     if upweight_atomic:
         rigid_is_atomized = inputs['rigids']['rigids_is_atom_mask'].float()
         atom_rigid_upweight = (1 - rigid_is_atomized) + 10 * (rigid_is_atomized)
@@ -468,6 +478,7 @@ def multiframe_fm_loss_dense_batch(
     ref_frame_trans = noised_rigids.get_trans()
     pred_frame_trans_se = torch.square(gt_frame_trans - pred_frame_trans).sum(dim=-1)
     pred_frame_trans_mse = (pred_frame_trans_se * total_mask).sum(-1) / num_noised_rigids_per_batch
+    pred_repack_trans_mse = (pred_frame_trans_se * repack_mask).sum(-1) / num_repack_per_batch
     ref_frame_trans_se = torch.square(gt_frame_trans - ref_frame_trans).sum(dim=-1)
     ref_frame_trans_mse = (ref_frame_trans_se * total_mask).sum(-1) / num_noised_rigids_per_batch
 
@@ -524,6 +535,11 @@ def multiframe_fm_loss_dense_batch(
         rot_vf_loss = rot_vf_loss * direct_rot_vf_loss_scale
         raw_rot_vf_loss = rot_vf_loss
         with torch.no_grad():
+            # Log-only: same raw per-rigid unscaled_rot_vf_loss, masked to repack
+            # rigids only, computed before it's collapsed by the general mask below.
+            pred_repack_rot_vf_mse = (
+                (unscaled_rot_vf_loss * repack_mask).sum(-1) / num_repack_per_batch
+            )
             unscaled_rot_vf_loss = torch.sum(unscaled_rot_vf_loss * rot_total_mask, dim=-1) / rot_num_noised
 
     elif direct_rot_vf_loss:
@@ -670,6 +686,8 @@ def multiframe_fm_loss_dense_batch(
         "unscaled_rot_vf_loss": unscaled_rot_vf_loss,
         "unscaled_trans_vf_loss": unscaled_trans_vf_loss,
         "pred_trans_mse": pred_frame_trans_mse,
+        "pred_repack_trans_mse": pred_repack_trans_mse,
+        "pred_repack_rot_vf_mse": pred_repack_rot_vf_mse,
         "pred_heavy_atoms_trans_mse": pred_heavy_trans_mse,
         "ref_trans_mse": ref_frame_trans_mse,
         "fafe": fafe,

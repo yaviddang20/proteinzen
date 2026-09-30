@@ -211,6 +211,7 @@ def process_rigid_features(
     pad_mask = torch.ones(len(rigid_data), dtype=torch.float)
     rigid_to_token = torch.tensor(rigid_to_token, dtype=torch.long)
     new_rigids_noising_mask = from_numpy(rigid_data['rigids_noising_mask'].copy()).bool()
+    new_rigids_seq_noising_mask = from_numpy(rigid_data['seq_noising_mask'].copy()).bool()
     rigids_seq_idx = from_numpy(rigid_to_seq_idx.copy()).long()
     rigids_num_real_axes = from_numpy(rigid_data['num_real_input_axes']).long()
 
@@ -232,6 +233,7 @@ def process_rigid_features(
         rigid_to_token = pad_dim(rigid_to_token, 0, pad_len)
         sidechain_idx = pad_dim(sidechain_idx, 0, pad_len)
         new_rigids_noising_mask = pad_dim(new_rigids_noising_mask, 0, pad_len, value=True)
+        new_rigids_seq_noising_mask = pad_dim(new_rigids_seq_noising_mask, 0, pad_len, value=True)
         rigids_seq_idx = pad_dim(rigids_seq_idx, 0, pad_len)
         rigids_num_real_axes = pad_dim(rigids_num_real_axes, 0, pad_len)
 
@@ -244,6 +246,7 @@ def process_rigid_features(
     return {
         "rigids_seq_idx": rigids_seq_idx,
         "rigids_noising_mask": new_rigids_noising_mask,
+        "rigids_seq_noising_mask": new_rigids_seq_noising_mask,
         "rigids_sidechain_idx": sidechain_idx.long(),
         "rigids_is_atom_mask": is_atom_mask,
         "rigids_ref_element": ref_element.long(),

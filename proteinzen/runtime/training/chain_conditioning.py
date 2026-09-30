@@ -8,6 +8,7 @@ import torch
 
 from proteinzen.boltz.data import const
 
+from .motif_scaffold import rigid_noise_to_atom_noise
 from .task import TrainingTask
 
 
@@ -197,6 +198,13 @@ class LigandConditionedGenerateProtein(_ChainConditioningBase):
 
     When ``interface_condition=False``, falls back to the base-class behaviour
     (randomly sample up to ``max_num_res`` ligand atoms as copy tokens).
+
+    ``interface_repack_rate`` (default 0.0, preserving prior behaviour): for each
+    selected interface residue, the probability it's put in "repack" mode instead
+    of fully fixed -- sequence identity stays fixed (as always) but the residue's
+    non-backbone rigids are noised too, so the model must re-place the sidechain
+    rather than copy it verbatim. Same convention as MotifScaffolding's "repack"
+    conditioning mode.
     """
     name: str = "ligand_conditioned_generate_protein"
 
@@ -205,6 +213,7 @@ class LigandConditionedGenerateProtein(_ChainConditioningBase):
         interface_condition: bool = True,
         max_num_interface_protein_res: int = 15,
         motif_is_unindexed: bool = True,
+        interface_repack_rate: float = 0.0,
         **kwargs,
     ):
         kwargs.setdefault("condition_mol_type", "NONPOLYMER")
@@ -212,6 +221,7 @@ class LigandConditionedGenerateProtein(_ChainConditioningBase):
         self.interface_condition = interface_condition
         self.max_num_interface_protein_res = max_num_interface_protein_res
         self.motif_is_unindexed = motif_is_unindexed
+        self.interface_repack_rate = interface_repack_rate
 
     def sample_t_and_mask(self, data):
         if not self.interface_condition:
@@ -303,8 +313,23 @@ class LigandConditionedGenerateProtein(_ChainConditioningBase):
                         res = residues[res_idx]
                         a_start = int(res["atom_idx"])
                         a_end = a_start + int(res["atom_num"])
-                        atom_noising_mask[a_start:a_end] = False
                         res_type_noising_mask[res_idx] = False
+                        do_repack = (
+                            self.interface_repack_rate > 0
+                            and res["is_standard"] and (res["name"] != "UNK")
+                            and np.random.rand() < self.interface_repack_rate
+                        )
+                        if do_repack:
+                            # Sequence identity stays fixed (res_type_noising_mask
+                            # already False above); only the non-backbone rigids are
+                            # noised, so the model must re-place the sidechain rather
+                            # than copy it verbatim. Same [False, True, True] pattern
+                            # as MotifScaffolding's "repack" conditioning mode.
+                            atom_noising_mask[a_start:a_end] = rigid_noise_to_atom_noise(
+                                res, atoms[a_start:a_end], [False, True, True]
+                            )
+                        else:
+                            atom_noising_mask[a_start:a_end] = False
 
             # ── 3. Seed interface for cropper ──
             if len(data.interfaces) > 0:

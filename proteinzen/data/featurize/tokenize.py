@@ -52,6 +52,7 @@ Rigid = [
     ("tensor7", np.dtype("7f4")),
     ("is_present", np.dtype("?")),
     ("rigids_noising_mask", np.dtype("?")),
+    ("seq_noising_mask", np.dtype("?")),
     ("num_real_input_axes", np.dtype("i1")),
 ]
 
@@ -153,6 +154,7 @@ class RigidData:
     is_present: bool
     rigids_noising_mask: bool
     num_real_input_axes: int
+    seq_noising_mask: bool = False
 
 
 def compute_frame(
@@ -835,7 +837,8 @@ class StructureTokenizer:
                 tensor7=rigid_tensor7[i],
                 is_present=rigid_mask[i],
                 rigids_noising_mask=noise_rigid,
-                num_real_input_axes=2
+                num_real_input_axes=2,
+                seq_noising_mask=noise_seq
             )
             ret_rigids.append(rigid)
             self.rigid_to_token[self.rigid_idx] = self.token_idx
