@@ -143,12 +143,21 @@ _UNK_RES_TYPE = 22  # const.token_ids["UNK"]
 # Ligand codes with a REAL crystal-sourced conformer available (verified directly
 # against the actual RCSB deposit -- not inferred from a filename convention; see
 # _scripts/preset_ligand_conformers/README.md for exact provenance/verification).
-# Only these two are backed by a file today -- --use-preset-conformer errors out
-# for any other code rather than silently falling back to the RDKit-generated
-# conformer, since that would defeat the point of asking for a verified pose.
+# --use-preset-conformer errors out for any other code rather than silently
+# falling back to the RDKit-generated conformer, since that would defeat the
+# point of asking for a verified pose.
+#   OQO/IAI: single unambiguous real bound pose (rare ligand codes), verified
+#     atom-for-atom against RFD3's own bundled example input files.
+#   FAD/SAM: common cofactors with a real, substantial rigid-ring/flexible-tail
+#     conformational split (no single dominant bound pose) -- the file here is
+#     the medoid of the largest cluster from a real diverse sample of PDB
+#     depositions, not a uniquely "correct" answer the way OQO/IAI are. See the
+#     README for the clustering method and why FAD/SAM needed it.
 PRESET_LIGAND_PDBS = {
     "OQO": Path(__file__).parent / "preset_ligand_conformers" / "OQO.pdb",
     "IAI": Path(__file__).parent / "preset_ligand_conformers" / "IAI.pdb",
+    "FAD": Path(__file__).parent / "preset_ligand_conformers" / "FAD.pdb",
+    "SAM": Path(__file__).parent / "preset_ligand_conformers" / "SAM.pdb",
 }
 
 
