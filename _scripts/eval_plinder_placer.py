@@ -28,12 +28,59 @@ from pathlib import Path
 
 import numpy as np
 from joblib import Parallel, delayed
+from rdkit import Chem, RDLogger
 from scipy import stats as scipy_stats
 from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from eval_plinder_pocket import _lig_rmsd_and_coords, pocket_rmsd_sym
 
 from proteinzen.boltz.data import const
+
+RDLogger.DisableLog("rdApp.*")
+
+_RD_BOND = {
+    const.bond_type_ids["SINGLE"]: Chem.BondType.SINGLE,
+    const.bond_type_ids["DOUBLE"]: Chem.BondType.DOUBLE,
+    const.bond_type_ids["TRIPLE"]: Chem.BondType.TRIPLE,
+    const.bond_type_ids["AROMATIC"]: Chem.BondType.AROMATIC,
+}
+
+
+def ligand_mol_from_struct(struct):
+    """RDKit template for the ligand from npz elements/bonds (our PDBs have no CONECT)."""
+    nonpolymer_id = const.chain_type_ids["NONPOLYMER"]
+    atom_rows, local_of_global = [], {}
+    for chain in struct.chains[struct.mask]:
+        if int(chain["mol_type"]) != nonpolymer_id:
+            continue
+        a0 = int(chain["atom_idx"])
+        for gi in range(a0, a0 + int(chain["atom_num"])):
+            atom = struct.atoms[gi]
+            if not atom["is_present"] or atom["element"] == 1:
+                continue
+            local_of_global[gi] = len(atom_rows)
+            atom_rows.append(int(atom["element"]))
+    if not atom_rows:
+        return None
+    mol = Chem.RWMol()
+    for z in atom_rows:
+        mol.AddAtom(Chem.Atom(z))
+    for bond in struct.bonds:
+        i, j = int(bond["atom_1"]), int(bond["atom_2"])
+        if i in local_of_global and j in local_of_global:
+            bt = _RD_BOND.get(int(bond["type"]), Chem.BondType.SINGLE)
+            mol.AddBond(local_of_global[i], local_of_global[j], bt)
+    mol = mol.GetMol()
+    try:
+        Chem.SanitizeMol(mol)
+    except Exception:
+        pass
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    mol.AddConformer(conf, assignId=True)
+    return mol
 from proteinzen.runtime.sampling.protein_pocket import (
     load_structure_from_npz,
     _crop_protein_to_pocket,
@@ -127,7 +174,8 @@ def parse_pdb_coords(pdb_path: str):
 # Per-sample evaluation
 # ============================================================
 
-def eval_sample(pdb_path: str, gt_prot_names: list, gt_prot: np.ndarray, gt_lig: np.ndarray):
+def eval_sample(pdb_path: str, gt_prot_names: list, gt_prot: np.ndarray, gt_lig: np.ndarray,
+                mol_template=None):
     gen_prot, gen_lig = parse_pdb_coords(pdb_path)
 
     if len(gen_prot) != len(gt_prot):
@@ -150,20 +198,27 @@ def eval_sample(pdb_path: str, gt_prot_names: list, gt_prot: np.ndarray, gt_lig:
     sc_rmsd = pos_rmsd(gt_prot[~is_bb], gen_prot_aligned[~is_bb]) if n_sc > 0 else float("nan")
 
     lig_rmsd = float("nan")
+    lig_conf_rmsd = float("nan")
     combined_rmsd = float("nan")
     if len(gt_lig) > 0 and len(gen_lig) == len(gt_lig):
         gen_lig_aligned = apply_transform(gen_lig, R, t)
-        lig_rmsd = pos_rmsd(gt_lig, gen_lig_aligned)
+        if mol_template is not None:
+            lig_rmsd = pocket_rmsd_sym(mol_template, gt_lig, gen_lig_aligned)
+            lig_conf_rmsd, _ = _lig_rmsd_and_coords(mol_template, gt_lig, gen_lig)
+        else:
+            lig_rmsd = pos_rmsd(gt_lig, gen_lig_aligned)
         if n_sc > 0:
             gt_combined  = np.concatenate([gt_prot[~is_bb],          gt_lig],          axis=0)
             gen_combined = np.concatenate([gen_prot_aligned[~is_bb],  gen_lig_aligned],  axis=0)
             combined_rmsd = pos_rmsd(gt_combined, gen_combined)
     elif len(gt_lig) > 0:
         lig_rmsd = float("inf")
+        lig_conf_rmsd = float("inf")
         combined_rmsd = float("inf")
 
     return {"ca_rmsd": ca_rmsd, "aa_rmsd": aa_rmsd, "sc_rmsd": sc_rmsd,
-            "lig_rmsd": lig_rmsd, "combined_rmsd": combined_rmsd,
+            "lig_rmsd": lig_rmsd, "lig_conf_rmsd": lig_conf_rmsd,
+            "combined_rmsd": combined_rmsd,
             "n_sc_atoms": n_sc, "n_lig_atoms": len(gt_lig)}
 
 
@@ -177,6 +232,7 @@ def _eval_system_job(system_id: str, pdb_paths: list, npz_path: str, max_protein
         struct = load_structure_from_npz(npz_path, include_h=False)
         struct = _crop_protein_to_pocket(struct, max_protein_residues)
         gt_prot_names, gt_prot, gt_lig = extract_gt_atoms(struct)
+        mol_template = ligand_mol_from_struct(struct)
     except Exception as e:
         return system_id, [], f"npz load error: {e}", None
 
@@ -185,7 +241,7 @@ def _eval_system_job(system_id: str, pdb_paths: list, npz_path: str, max_protein
     for idx, p in enumerate(sorted(pdb_paths)):
         pred_rmsd = pred_lig_rmsds.get(p.stem)
         try:
-            r = eval_sample(str(p), gt_prot_names, gt_prot, gt_lig)
+            r = eval_sample(str(p), gt_prot_names, gt_prot, gt_lig, mol_template)
             records.append({
                 "system_id": system_id,
                 "sample_idx": idx,
@@ -194,6 +250,7 @@ def _eval_system_job(system_id: str, pdb_paths: list, npz_path: str, max_protein
                 "aa_rmsd": r["aa_rmsd"],
                 "sc_rmsd": r["sc_rmsd"],
                 "lig_rmsd": r["lig_rmsd"],
+                "lig_conf_rmsd": r["lig_conf_rmsd"],
                 "combined_rmsd": r["combined_rmsd"],
                 "n_sc_atoms": r["n_sc_atoms"],
                 "n_lig_atoms": r["n_lig_atoms"],
@@ -212,6 +269,7 @@ def _eval_system_job(system_id: str, pdb_paths: list, npz_path: str, max_protein
                 "aa_rmsd": float("inf"),
                 "sc_rmsd": float("inf"),
                 "lig_rmsd": float("inf"),
+                "lig_conf_rmsd": float("inf"),
                 "combined_rmsd": float("inf"),
                 "n_sc_atoms": 0,
                 "n_lig_atoms": 0,
@@ -433,6 +491,7 @@ def main():
     all_aa   = [r["aa_rmsd"]       for r in all_records]
     all_sc   = [r["sc_rmsd"]       for r in all_records]
     all_lig  = [r["lig_rmsd"]      for r in all_records]
+    all_conf = [r.get("lig_conf_rmsd", float("nan")) for r in all_records]
     all_comb = [r["combined_rmsd"] for r in all_records]
 
     sys_min_ca    = _min_per_system(records_by_system, "ca_rmsd")
@@ -442,6 +501,8 @@ def main():
     sys_min_sc    = _min_per_system(records_by_system, "sc_rmsd")
     sys_mean_sc   = _mean_per_system(records_by_system, "sc_rmsd")
     sys_min_lig   = _min_per_system(records_by_system, "lig_rmsd")
+    sys_min_conf  = _min_per_system(records_by_system, "lig_conf_rmsd")
+    sys_mean_conf = _mean_per_system(records_by_system, "lig_conf_rmsd")
     sys_mean_lig  = _mean_per_system(records_by_system, "lig_rmsd")
     sys_min_comb  = _min_per_system(records_by_system, "combined_rmsd")
     sys_mean_comb = _mean_per_system(records_by_system, "combined_rmsd")
@@ -542,7 +603,8 @@ def main():
         slines.append(_sumline(f"COV lig < {d:.1f} Å", f"{cov(all_lig, d)*100:.1f}%"))
     slines += [
         _sumline("sc_rmsd  mean",  f"{mean_finite(all_sc):.3f} Å"),
-        _sumline("lig_rmsd mean",  f"{mean_finite(all_lig):.3f} Å"),
+        _sumline("lig_rmsd mean (placement, sym)", f"{mean_finite(all_lig):.3f} Å"),
+        _sumline("lig_conf_rmsd mean (conformer)", f"{mean_finite(all_conf):.3f} Å"),
         "",
         "Per-system best sample (min sc_rmsd)",
     ]
@@ -552,6 +614,7 @@ def main():
     slines += [
         _sumline("sc_rmsd  mean (best)",  f"{mean_finite(sys_min_sc):.3f} Å"),
         _sumline("lig_rmsd mean (best)",  f"{mean_finite(sys_min_lig):.3f} Å"),
+        _sumline("lig_conf_rmsd mean (best)", f"{mean_finite(sys_min_conf):.3f} Å"),
     ]
     if placer_out:
         slines += [
@@ -582,6 +645,7 @@ def main():
                 "aa_rmsd_mean":       mean_finite(all_aa),
                 "sc_rmsd_mean":       mean_finite(all_sc),
                 "lig_rmsd_mean":      mean_finite(all_lig),
+                "lig_conf_rmsd_mean": mean_finite(all_conf),
                 "combined_rmsd_mean": mean_finite(all_comb),
                 "cov_ca":   {f"{d:.1f}": cov(all_ca,   d) for d in deltas},
                 "cov_aa":   {f"{d:.1f}": cov(all_aa,   d) for d in deltas},
