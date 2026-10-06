@@ -30,6 +30,22 @@ _PRUNE_DIR_NAMES = {
 _PRUNE_DIR_PREFIXES = ("traj_", "gtalign_raw_", "_staged_")
 
 
+def find_checkpoint_dirs(outputs_dir: Path) -> list[Path]:
+    """Find every directory literally named 'checkpoints' under outputs_dir.
+    Prunes 'epoch_samples' (run_epoch_sample's periodic in-training sample
+    dumps, one subdir per epoch, each holding several PDBs -- can dwarf
+    everything else in a long training run) since checkpoints never live
+    inside it, same reasoning as find_sampled_checkpoints above."""
+    found = []
+    for dirpath, dirnames, _ in os.walk(outputs_dir):
+        if "checkpoints" in dirnames:
+            found.append(Path(dirpath) / "checkpoints")
+            dirnames.remove("checkpoints")  # nothing relevant nested inside it
+        if "epoch_samples" in dirnames:
+            dirnames.remove("epoch_samples")
+    return found
+
+
 def find_sampled_checkpoints(sampling_dir: Path) -> set[Path]:
     """Scan every run_config.yaml under sampling_dir (written by sample.py for each
     run) and collect the exact ckpt_path each one used. Prunes known-huge leaf
@@ -108,7 +124,7 @@ def main():
         print(f"Found {len(sampled_protected)} distinct checkpoint(s) referenced by "
               f"run_config.yaml files under {args.sampling_dir}")
 
-    ckpt_dirs = list(args.outputs_dir.rglob("checkpoints"))
+    ckpt_dirs = find_checkpoint_dirs(args.outputs_dir)
     print(f"Found {len(ckpt_dirs)} checkpoint directories")
     if args.dry_run:
         print("DRY RUN — nothing will be deleted\n")
