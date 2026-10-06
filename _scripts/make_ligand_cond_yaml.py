@@ -41,7 +41,14 @@ import yaml
 # ── built-in SMILES ──────────────────────────────────────────────────────────
 
 KNOWN_SMILES = {
-    "SAM": "C[S+](CC[C@@H]([NH3+])C(=O)[O-])[C@@H]1O[C@@H]([C@H](O)[C@@H]1O)n1cnc2c(N)ncnc12",
+    # Was missing the exocyclic C5' methylene between S+ and the ribose ring
+    # (26 heavy atoms instead of real SAM's 27 = C15N6O5S) -- confirmed via
+    # RDKit atom-count mismatch against _scripts/preset_ligand_conformers/SAM.pdb
+    # (27 atoms) while building the FAD/SAM external-baseline configs. Only
+    # matters for the non-preset-conformer path (_build_npz's
+    # Chem.MolFromSmiles branch) -- the preset-conformer path
+    # (_mol_from_preset_pdb) never touches this and was never affected.
+    "SAM": "C[S+](CCC(C(=O)[O-])[NH3+])CC1OC(n2cnc3c(N)ncnc23)C(O)C1O",
     "FAD": "Cc1cc2nc3c(=O)[nH]c(=O)nc3n(C[C@H](O)[C@H](O)[C@H](O)COP(=O)(O)OP(=O)(O)OC[C@H]3O[C@@H](n4cnc5c(N)ncnc54)[C@H](O)[C@@H]3O)c2cc1C",
     # NOTE: was "ICC(=O)N" (iodoacetamide) -- WRONG. The actual CCD ligand "IAI" is a
     # different, larger molecule. Corrected from ccd.pkl, the authoritative CCD/RDKit
