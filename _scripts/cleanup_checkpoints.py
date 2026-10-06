@@ -20,11 +20,30 @@ from pathlib import Path
 import yaml
 
 
+# Leaf content dirs that can hold huge numbers of files but never contain
+# run_config.yaml themselves -- pruned during the walk so this stays fast even
+# on a sampling/ tree with hundreds of thousands of sample/trajectory files.
+_PRUNE_DIR_NAMES = {
+    "samples", "traj", "metadata", "mpnn_refold", "refold_inputs", "refold_outputs",
+    "per_sample", "ligand_npz", "renders", "conformer_mols", "first_conformer_mols",
+}
+_PRUNE_DIR_PREFIXES = ("traj_", "gtalign_raw_", "_staged_")
+
+
 def find_sampled_checkpoints(sampling_dir: Path) -> set[Path]:
     """Scan every run_config.yaml under sampling_dir (written by sample.py for each
-    run) and collect the exact ckpt_path each one used."""
+    run) and collect the exact ckpt_path each one used. Prunes known-huge leaf
+    content directories during the walk instead of a plain rglob, which would
+    otherwise stat every sample/trajectory file just to check its name."""
     protected = set()
-    for cfg_path in sampling_dir.rglob("run_config.yaml"):
+    for dirpath, dirnames, filenames in os.walk(sampling_dir):
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in _PRUNE_DIR_NAMES and not d.startswith(_PRUNE_DIR_PREFIXES)
+        ]
+        if "run_config.yaml" not in filenames:
+            continue
+        cfg_path = Path(dirpath) / "run_config.yaml"
         try:
             cfg = yaml.safe_load(cfg_path.read_text())
         except Exception as e:
