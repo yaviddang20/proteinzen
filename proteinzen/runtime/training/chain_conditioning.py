@@ -199,12 +199,25 @@ class LigandConditionedGenerateProtein(_ChainConditioningBase):
     When ``interface_condition=False``, falls back to the base-class behaviour
     (randomly sample up to ``max_num_res`` ligand atoms as copy tokens).
 
-    ``interface_repack_rate`` (default 0.0, preserving prior behaviour): for each
-    selected interface residue, the probability it's put in "repack" mode instead
-    of fully fixed -- sequence identity stays fixed (as always) but the residue's
-    non-backbone rigids are noised too, so the model must re-place the sidechain
-    rather than copy it verbatim. Same convention as MotifScaffolding's "repack"
-    conditioning mode.
+    Each selected interface residue independently lands in exactly one of three
+    mutually exclusive modes (a single draw per residue, so they can never
+    overlap):
+
+    - fully fixed (default, remaining probability mass): sequence identity and
+      every rigid stay fixed -- the residue is given verbatim.
+    - ``interface_repack_rate``: sequence identity stays fixed, but the
+      residue's non-backbone rigids are noised too, so the model must
+      re-place the sidechain rather than copy it verbatim. Same convention as
+      MotifScaffolding's "repack" conditioning mode.
+    - ``interface_seq_repack_rate``: the mirror image -- every rigid (backbone
+      and sidechain) stays fixed exactly as given, but the residue's sequence
+      identity is noised, so the model must predict which amino acid belongs
+      there from the fixed 3D context alone. Consumed by the existing
+      ``seq_losses_dense_batch`` sequence loss via ``seq_noising_mask``; no
+      new loss plumbing needed for this mode.
+
+    ``interface_repack_rate + interface_seq_repack_rate`` must not exceed 1.0;
+    the remainder is the fully-fixed probability.
     """
     name: str = "ligand_conditioned_generate_protein"
 
@@ -214,14 +227,21 @@ class LigandConditionedGenerateProtein(_ChainConditioningBase):
         max_num_interface_protein_res: int = 15,
         motif_is_unindexed: bool = True,
         interface_repack_rate: float = 0.0,
+        interface_seq_repack_rate: float = 0.0,
         **kwargs,
     ):
         kwargs.setdefault("condition_mol_type", "NONPOLYMER")
         super().__init__(**kwargs)
+        assert interface_repack_rate + interface_seq_repack_rate <= 1.0, (
+            "interface_repack_rate + interface_seq_repack_rate must not exceed "
+            "1.0 -- they're mutually exclusive modes drawn from a single "
+            "per-residue roll, with the remainder going to fully-fixed."
+        )
         self.interface_condition = interface_condition
         self.max_num_interface_protein_res = max_num_interface_protein_res
         self.motif_is_unindexed = motif_is_unindexed
         self.interface_repack_rate = interface_repack_rate
+        self.interface_seq_repack_rate = interface_seq_repack_rate
 
     def sample_t_and_mask(self, data):
         if not self.interface_condition:
@@ -313,22 +333,40 @@ class LigandConditionedGenerateProtein(_ChainConditioningBase):
                         res = residues[res_idx]
                         a_start = int(res["atom_idx"])
                         a_end = a_start + int(res["atom_num"])
-                        res_type_noising_mask[res_idx] = False
+                        is_standard_aa = bool(res["is_standard"]) and (res["name"] != "UNK")
+
+                        # Single draw -> exactly one of three mutually exclusive
+                        # modes, never both repack and seq_repack at once.
+                        draw = np.random.rand()
                         do_repack = (
-                            self.interface_repack_rate > 0
-                            and res["is_standard"] and (res["name"] != "UNK")
-                            and np.random.rand() < self.interface_repack_rate
+                            is_standard_aa and self.interface_repack_rate > 0
+                            and draw < self.interface_repack_rate
                         )
-                        if do_repack:
-                            # Sequence identity stays fixed (res_type_noising_mask
-                            # already False above); only the non-backbone rigids are
-                            # noised, so the model must re-place the sidechain rather
-                            # than copy it verbatim. Same [False, True, True] pattern
-                            # as MotifScaffolding's "repack" conditioning mode.
+                        do_seq_repack = (
+                            not do_repack and is_standard_aa
+                            and self.interface_seq_repack_rate > 0
+                            and draw < self.interface_repack_rate + self.interface_seq_repack_rate
+                        )
+
+                        if do_seq_repack:
+                            # Mirror image of repack: every rigid (backbone and
+                            # sidechain) stays fixed exactly as given, but sequence
+                            # identity is noised -- the model must predict the
+                            # residue type from the fixed 3D context alone.
+                            res_type_noising_mask[res_idx] = True
+                            atom_noising_mask[a_start:a_end] = False
+                        elif do_repack:
+                            # Sequence identity stays fixed; only the non-backbone
+                            # rigids are noised, so the model must re-place the
+                            # sidechain rather than copy it verbatim. Same
+                            # [False, True, True] pattern as MotifScaffolding's
+                            # "repack" conditioning mode.
+                            res_type_noising_mask[res_idx] = False
                             atom_noising_mask[a_start:a_end] = rigid_noise_to_atom_noise(
                                 res, atoms[a_start:a_end], [False, True, True]
                             )
                         else:
+                            res_type_noising_mask[res_idx] = False
                             atom_noising_mask[a_start:a_end] = False
 
             # ── 3. Seed interface for cropper ──
