@@ -64,6 +64,14 @@ TokenBond = [
 
 IDENTITY_TENSOR7 = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
+# Cache for standard_residue_to_frames: frame_atom_ids depends only on
+# res_name (via cg.coarse_grain_sidechain_axes, a fixed static table, and the
+# constant bb_frame), so it is identical across every call for the same
+# res_name. Memoizing avoids rebuilding the same small list of np.arrays
+# (via convert_atom_str_to_tuple string parsing) for every residue of a
+# protein, every protein in every batch.
+_FRAME_ATOM_IDS_CACHE: dict = {}
+
 RES_TO_AA = {}
 for i, aa in enumerate(rc.resnames):
     RES_TO_AA[const.token_ids[aa]] = i
@@ -260,10 +268,16 @@ def standard_residue_to_frames(residue, atoms):
     frame_atom_names = [bb_frame, frame2, frame3]
     # figure out which frames are resolved enough for us to model
     # this is a little roundabout because the atom ids are stored as arrays of 4 ints
-    frame_atom_ids = [
-        np.array([convert_atom_str_to_tuple(c) for c in atom_set])  # shape (3, 4)
-        for atom_set in frame_atom_names
-    ]
+    # frame_atom_ids depends only on res_name (bb_frame is constant, frame2/frame3
+    # come from the static cg.coarse_grain_sidechain_axes[res_name] table), so it's
+    # identical for every residue of this res_name -- memoize it.
+    frame_atom_ids = _FRAME_ATOM_IDS_CACHE.get(res_name)
+    if frame_atom_ids is None:
+        frame_atom_ids = [
+            np.array([convert_atom_str_to_tuple(c) for c in atom_set])  # shape (3, 4)
+            for atom_set in frame_atom_names
+        ]
+        _FRAME_ATOM_IDS_CACHE[res_name] = frame_atom_ids
     atom_ids = atoms["name"]  # shape of (n_atom, 4)
 
     rigid_mask = []
