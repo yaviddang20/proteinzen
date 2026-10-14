@@ -1667,6 +1667,10 @@ class FramepairUpdate(nn.Module):
         else:
             self.framepair_ffn = None
 
+    # NOT compiled: @torch.compile here causes a reproducible CUDA illegal
+    # memory access during backward on resumed training (bisected on
+    # ggpu4-04 to this function alone, see session notes). Confirmed the
+    # ~20-24% speedup from compiling it is not safe.
     def _broadcast_pairs(
         self,
         z,

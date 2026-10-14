@@ -779,7 +779,6 @@ class BiomoleculeModule(L.LightningModule):
 
     def _shared_step(self, batch, return_outputs=False, skip_prealign=False):
 
-        print(f"[R{self.global_rank}] ENTER _shared_step", flush=True)
         corrupter = self.corrupter
         if self.t_sched is not None:
             t = batch['t']
@@ -806,9 +805,7 @@ class BiomoleculeModule(L.LightningModule):
             batch['trans_t'] = batch['t']
             batch['rot_t'] = batch['t']
 
-        print(f"[R{self.global_rank}] BEFORE corrupt", flush=True)
         batch = corrupter.corrupt_dense_batch(batch, self.identity_rot_noise, skip_prealign=skip_prealign)
-        print(f"[R{self.global_rank}] AFTER corrupt", flush=True)
 
         if self.seq_noise_schedule:
             t = batch['t']  # [B, 1]
@@ -827,32 +824,33 @@ class BiomoleculeModule(L.LightningModule):
 
         # self-conditioning (optional)
         self_conditioning = None
-        print(f"[R{self.global_rank}] BEFORE self_condition", flush=True)
         self_folding = None
         if (
             self.model.self_conditioning
             and np.random.uniform() < self.self_condition_rate
         ):
             with torch.no_grad():
-                self_conditioning = self.model(batch)
+                self_conditioning = self.model(batch, compute_motif_idx=False)
                 if self.apply_self_folding:
                     pred_seq_batch = self._generate_folding_batch(
                         batch, self_conditioning["pred_seq"]
                     )
-                    self_folding = self.model(pred_seq_batch)
-        print(f"[R{self.global_rank}] AFTER self_condition", flush=True)
+                    self_folding = self.model(pred_seq_batch, compute_motif_idx=False)
 
         outputs = self.model(batch, self_conditioning, self_folding)
-        print(f"[R{self.global_rank}] AFTER model", flush=True)
         loss_dict = self._loss_step(batch, outputs)
-        print(f"[R{self.global_rank}] AFTER loss", flush=True)
         if return_outputs:
             return loss_dict, batch, outputs
         return loss_dict
 
     
     def training_step(self, batch, batch_idx):
-        print(f"[R{self.global_rank}] ENTER training_step epoch={self.current_epoch} batch={batch_idx}", flush=True)
+        if os.environ.get("CORRECTNESS_CHECK_TAG") and not getattr(self, "_correctness_seed_set", False):
+            self._correctness_seed_set = True
+            torch.manual_seed(1234)
+            torch.cuda.manual_seed_all(1234)
+            np.random.seed(1234)
+            torch.use_deterministic_algorithms(True, warn_only=True)
         if self.global_step > 0:
             if self.ema is not None:
                 self.ema.update_parameters(self.model)
@@ -864,26 +862,21 @@ class BiomoleculeModule(L.LightningModule):
         has_sequential = any(t.name == 'mol_sequential_scaffolding' for t in batch['task'])
 
 
-        print(f"[R{self.global_rank}] BEFORE _shared_step", flush=True)
         if not has_sequential:
             loss_dict = self._shared_step(batch)
         else:
             loss_dict = self._sequential_step(batch)
-        print(f"[R{self.global_rank}] AFTER _shared_step", flush=True)
 
         # Stash AFTER corruption so rigids_1 has centered coords (same as val epoch_sample,
         # which gets centered rigids_1 via the shallow batch.copy() in validation_step).
         if batch_idx == 0:
             self._epoch_sample_train_batch = _detach_cpu_batch(batch)
 
-        print(f"[R{self.global_rank}] BEFORE _log_losses", flush=True)
         self._log_losses(loss_dict, batch, stage="train")
-        print(f"[R{self.global_rank}] AFTER _log_losses", flush=True)
 
         optimizer = self.optimizers()
         lr = optimizer.param_groups[0]['lr']
         self.log("lr", lr, prog_bar=True, logger=True, on_step=True, on_epoch=False, batch_size=1)
-        print(f"[R{self.global_rank}] RETURN LOSS", flush=True)
         return loss_dict["loss"].mean()
 
     def _corrupt_batch(self, batch):
@@ -970,7 +963,22 @@ class BiomoleculeModule(L.LightningModule):
             batch_t["t"] = torch.full((*batch_t["t"].shape,), t_val, device=device)
 
             if write_pdbs:
+                _correctness_tag = os.environ.get("CORRECTNESS_CHECK_TAG")
+                if _correctness_tag:
+                    torch.manual_seed(1234)
+                    torch.cuda.manual_seed_all(1234)
+                    np.random.seed(1234)
+                    torch.use_deterministic_algorithms(True, warn_only=True)
                 loss_dict, batch_out, outputs = self._shared_step(batch_t, return_outputs=True, skip_prealign=True)
+                if _correctness_tag:
+                    torch.save(
+                        {
+                            'denoised_rigids': outputs['denoised_rigids'].to_tensor_7(),
+                            'pred_seq': outputs['pred_seq'],
+                            'input_rigids_1': batch_t['rigids']['rigids_1'],
+                        },
+                        f"/mnt/scratch/user/daviyang/restore_logs/correctness_{_correctness_tag}_val_t{t_val}.pt",
+                    )
                 pdb_data = self._collect_val_pdb_data(batch_out, outputs, t_val, n_samples=B)
                 del batch_out, outputs
                 torch.cuda.empty_cache()
@@ -1595,7 +1603,6 @@ class BiomoleculeModule(L.LightningModule):
 
 
     def _loss_step(self, inputs, outputs):
-        print(f"[R{self.global_rank}] ENTER _loss_step", flush=True)
         token_seq = inputs['token']['seq']
         seq_weight = self.seq_weight.to(token_seq.device)
         rigids_seq_idx = inputs['rigids']['rigids_seq_idx']
@@ -1636,7 +1643,6 @@ class BiomoleculeModule(L.LightningModule):
                 trans=aligned_trans,
             )
 
-        print(f"[R{self.global_rank}] BEFORE multiframe loss", flush=True)
         frame_fm_loss_dict = multiframe_fm_loss_dense_batch(
             inputs, outputs, sep_rot_loss=not self.learnable_noise_schedule, # use_euclidean_for_rots=self.use_euclidean_for_rots,
             t_norm_clip=0.9,
@@ -1656,7 +1662,6 @@ class BiomoleculeModule(L.LightningModule):
             brownian_rot_path=self.use_brownian_rot_path_loss,
             # stabilize_high_t_loss=self.use_stabilized_t_loss
         )
-        print(f"[R{self.global_rank}] AFTER multiframe loss", flush=True)
 
         frame_vf_loss = (
             frame_fm_loss_dict["raw_trans_vf_loss"] +
@@ -1797,8 +1802,6 @@ class BiomoleculeModule(L.LightningModule):
         loss_dict.update(atomic_loss_dict)
         # loss_dict.update(loss_by_task)
 
-        
-        print(f"[R{self.global_rank}] EXIT _loss_step", flush=True)
         return loss_dict
 
 
@@ -1823,6 +1826,14 @@ class BiomoleculeModule(L.LightningModule):
             )
 
             # print("grad norm", total_norm)
+
+            _correctness_tag = os.environ.get("CORRECTNESS_CHECK_TAG")
+            if _correctness_tag and not getattr(self, "_correctness_grad_dumped", False):
+                self._correctness_grad_dumped = True
+                torch.save(
+                    norm_dict,
+                    f"/mnt/scratch/user/daviyang/restore_logs/correctness_{_correctness_tag}_train_grads.pt",
+                )
 
             if hasattr(self.model, 'bond_rotation_head'):
                 head_norms = [
