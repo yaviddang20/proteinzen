@@ -16,6 +16,41 @@ logger = logging.getLogger(__name__)
 # Loaded lookup-table files, keyed by absolute cache path.
 _LOAD_CACHE_MEMO: Dict[str, Dict[str, torch.Tensor]] = {}
 
+# Default on-disk directory for cached SO(3)/IGSO(3) lookup-table precomputes
+# (SampleIGSO3/SampleUSO3's dlog_igso3/pdf_igso3/cdf_igso3 expansion tables).
+#
+# This MUST be an absolute path. All call sites previously passed a relative
+# path (".cache"), which resolves against the process's current working
+# directory at construction time. Since model/corrupter construction happens
+# via hydra_zen's config auto-instantiation -- which runs *before*
+# `os.chdir()` into Hydra's per-run timestamped output directory in
+# train.py's `main()` -- and since Lightning's DDPStrategy subprocess launcher
+# re-execs the whole script as a child process whose cwd *is* already that
+# post-chdir directory, the effective cache location was inconsistent across
+# the parent/child processes of a single launch and across separate launches
+# with different Hydra run dirs (e.g. every ad hoc debug/test invocation).
+# Net effect: the cache silently missed on most real launches, so this
+# several-second-to-several-minute (CPU-contention dependent) precompute
+# reran from scratch on every single process start. Making the directory
+# absolute removes any dependence on cwd/chdir timing.
+#
+# The cache filename already encodes every parameter that affects its
+# contents (so3_type, sigma_grid min/max/count, l_max, num_omega,
+# omega_exponent -- see `BaseSampleSO3._get_cache_name`), so this directory
+# can safely be shared across configs/processes without a content collision.
+#
+# Override with the PROTEINZEN_SO3_CACHE_DIR env var if a different location
+# is desired (e.g. to isolate a given worktree/experiment's cache).
+_DEFAULT_SO3_CACHE_DIR = "/mnt/scratch/user/daviyang/proteinzen_cache/so3_lookup_gpu0"
+
+
+def default_so3_cache_dir() -> str:
+    """Return the absolute, persistent cache directory for SO(3) lookup tables.
+
+    See `_DEFAULT_SO3_CACHE_DIR` above for why this must be absolute.
+    """
+    return os.environ.get("PROTEINZEN_SO3_CACHE_DIR", _DEFAULT_SO3_CACHE_DIR)
+
 
 def scale_rotmat(
     rotation_matrix: torch.Tensor, scalar: torch.Tensor, tol: float = 1e-7

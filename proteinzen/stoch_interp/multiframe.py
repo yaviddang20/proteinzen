@@ -239,7 +239,7 @@ class MultiSE3Interpolant:
     def igso3(self):
         if self._igso3 is None:
             sigma_grid = torch.linspace(0.1, 1.5, 1000)
-            self._igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=".cache")
+            self._igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=so3_utils.default_so3_cache_dir())
         return self._igso3
 
     def set_device(self, device):

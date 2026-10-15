@@ -1184,8 +1184,8 @@ class IpaDenoiser(nn.Module):
 
         # Main trunk
         curr_rigids_tensor_7 = curr_rigids.to_tensor_7()
+        token_rigids = ru.Rigid.from_tensor_7(rigids_to_nodes(curr_rigids_tensor_7))
         for b in range(self.num_blocks):
-            token_rigids = ru.Rigid.from_tensor_7(rigids_to_nodes(curr_rigids_tensor_7))
             if self.use_conditioned_ipa:
                 ipa_embed = self.trunk[f'ipa_{b}'](
                     s=node_embed,
@@ -1521,7 +1521,11 @@ def apply_bond_rotations(trans, rot_bonds, frag_a, angles, num_rot_bonds):
     if max_bonds == 0:
         return trans
 
-    updated = trans.clone()
+    # NOTE: no .clone() needed here -- every update below is the out-of-place
+    # `updated = updated + (...)` pattern, which never mutates `trans`'s storage
+    # in place, so aliasing `updated` to `trans` is safe and avoids a redundant
+    # (B, N, 3) allocation + copy on every call.
+    updated = trans
     ba_idx = torch.arange(B, device=trans.device)
 
     for b_idx in range(max_bonds):

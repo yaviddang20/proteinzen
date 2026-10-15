@@ -260,10 +260,16 @@ class EulerIntegrator(Integrator):
         pred_trans_1 = pred_rigids.get_trans()
         pred_rotmats_1 = pred_rigids.get_rots().get_rot_mats()
 
+        # computed once and shared below: clean_traj_point and prot_traj_point both store
+        # the same denoiser_out["pred_seq"] on CPU, so avoid issuing two separate
+        # device-to-host transfers (and the sync each one forces) for the same tensor,
+        # every single integration step.
+        pred_seq_cpu = denoiser_out["pred_seq"].detach().cpu()
+
         clean_traj_point = (
             pred_trans_1,
             pred_rotmats_1,
-            denoiser_out["pred_seq"].detach().cpu(),
+            pred_seq_cpu,
         )
 
         trans_t_2 = self.diffeq.trans_step(
@@ -287,7 +293,7 @@ class EulerIntegrator(Integrator):
         prot_traj_point = (
             trans_t_2,
             rotmats_t_2,
-            denoiser_out["pred_seq"].detach().cpu(),
+            pred_seq_cpu,
         )
 
         return denoiser_out, prot_traj_point, clean_traj_point
@@ -308,7 +314,7 @@ class PnPIntegrator(Integrator):
         self.pnp_cycles = pnp_cycles
         self.pnp_cutoff = pnp_cutoff
         sigma_grid = torch.linspace(0.1, 1.5, 1000)
-        self._igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=".cache")
+        self._igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=so3_utils.default_so3_cache_dir())
         self.use_aligned_noise = use_aligned_noise
 
     def _corrupt_trans(self, trans_1, trans_0, t, rigids_mask, diffuse_mask):

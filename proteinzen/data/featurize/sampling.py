@@ -206,7 +206,7 @@ class SampleTemplateTokenizer:
         self.rigid_idx = 0
 
         sigma_grid = torch.linspace(0.1, 1.5, 1000)
-        self.igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=".cache")
+        self.igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=so3_utils.default_so3_cache_dir())
 
     def brownian_sigma_t(self, t):
         sigma_max = 1.5
