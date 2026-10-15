@@ -6,6 +6,8 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --time=48:00:00
 #SBATCH --partition=pod
+#SBATCH --account=ucsf_pod
+#SBATCH --qos=pod
 #SBATCH --gres=gpu:nvidia_h200:8
 
 eval "$(micromamba shell hook --shell bash)"
