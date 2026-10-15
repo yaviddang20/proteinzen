@@ -283,3 +283,60 @@ GPU2 confirmed idle (0 MiB) after cleanup via PID-scoped kill (`pgrep -f
 _autoopt_gpu2_stress_tokenrigids | xargs kill -9`), not `fuser -k`.
 
 This candidate is now fully verified and committed. No further action needed on this branch.
+
+
+## Follow-up investigation (2026-10-14, later) -- `index_embedder`/`node_init` zero-computation, investigated, NOT implemented
+
+Followed up on the earlier flag in this report ("Small, not-yet-attempted idea" above) about
+`disable_absolute_res_idx=True` (set in every real launch config, confirmed in
+`isolated_sc_test_gpu2.sh`) making the `index_embedder`/`node_init` term in
+`Embedder._gen_node_features` always zero.
+
+**Code (`proteinzen/model/denoiser.py`, around line 454):**
+```python
+node_seq_idx_embed = self.index_embedder(seq_idx)
+if self.disable_absolute_res_idx:
+    node_seq_idx_embed = node_seq_idx_embed * 0
+node_init = self.node_init(node_seq_idx_embed) * (~is_unindexed_mask[..., None])
+```
+- `self.index_embedder = fn.partial(get_index_embedding, embed_size=index_embed_size)` -- a
+  sine/cosine positional embedding function (`torch.sin`/`torch.cos` over an arange, not a
+  lookup table), computed from `seq_idx` and then immediately zeroed out.
+- `self.node_init = Linear(index_embed_size, self.c_s, bias=False)` -- confirmed **bias-free**
+  (`bias=False` at the constructor, line 289).
+
+**Confirmed: genuinely always exactly zero when `disable_absolute_res_idx=True`.** `0.0 * x ==
+0.0` is exact in IEEE float (fp32/fp16/bf16, no NaN/Inf inputs here) regardless of
+`self.index_embedder`'s output, and a bias-free `Linear` applied to an all-zero input is an exact
+zero matmul (`0 @ W == 0`, exactly, for any finite `W`) -- no approximation involved, and the
+subsequent `* (~is_unindexed_mask[..., None])` boolean mask multiply can't change an exact zero
+into anything else either. So the "always-zero" claim from the earlier flag is correct, not a
+mistaken lead.
+
+**But the computation is genuinely trivial -- measured, not assumed.** Microbenchmarked the
+exact code path (`get_index_embedding` + zero-out + bias-free `Linear` matmul) on GPU2 against a
+short-circuit (`torch.zeros(...)` of the same shape/dtype/device) at the real launch config's
+shapes (`c_s=768`, `index_embed_size=256` default/unoverridden, batch=3, N=256 tokens matching
+`crop128_256`):
+- Full (current) path: **0.168 ms/iter**
+- Short-circuit (skip) path: **0.008 ms/iter**
+- Savings: **~0.16 ms per call**
+
+`_gen_node_features` (and this code inside it) is called once per `Embedder` forward -- not
+per-trunk-block, and not multiplied by `num_blocks=12` the way the `token_rigids` dedup above
+was. Measured training throughput in this same session's stress tests is ~0.4 it/s, i.e. ~2.5s
+per optimizer step (`accumulate_grad_batches=3`); even comparing against a single micro-batch's
+forward+backward alone (almost certainly hundreds of ms, given the 12-block IPA/triangle-
+attention trunk), ~0.16ms is on the order of **0.01-0.05% of step time** -- several orders of
+magnitude below anything that would show up in wall-clock throughput, and almost certainly
+smaller than this GPU/CUDA stack's own measured run-to-run noise floor documented elsewhere in
+this report.
+
+**Decision: investigated, confirmed correct, NOT implemented.** This is exactly the "trivial,
+not worth the complexity" case the task briefing anticipated. Skipping a mathematically-zero
+~0.16ms computation is real but immaterial, and even a trivially-correct short-circuit edit adds
+review/merge-conflict surface to a hot file (`denoiser.py`) that three other agents touched
+tonight, for a saving that will not be distinguishable from noise in any wall-clock comparison.
+No code change made; repo left at `0f1b900` with no diff. GPU2 confirmed idle (0 MiB) throughout
+(no training process launched for this investigation -- a pure CPU-side read + a standalone
+microbenchmark script, not using the shared training launch infrastructure).
