@@ -379,7 +379,18 @@ def main():
                 # and a cache older than the PDB it's keyed by (sample.py's filenames are
                 # purely positional, so a later run can reuse an earlier run's exact
                 # filenames) is treated as not-cached and recomputed instead of trusted.
-                if args.aggregate_only or _cache_is_complete(cached):
+                # mpnn_missing: a cache written before LigandMPNN was available (or before
+                # --ligandmpnn-script pointed anywhere real) has no lmpnn_seqs at all --
+                # _cache_is_complete's schema-version stamp doesn't catch this (the schema
+                # didn't change, MPNN just wasn't run), so without this check a sample would
+                # be reported as "done" forever with 0% MPNN success instead of ever being
+                # (re)sent through _run_one. This only forces the missing piece: _run_one's
+                # run_refolding/_run_ligandmpnn calls each have their own on-disk cache
+                # (pred_dir.exists() / fasta_path.exists()), so the already-done boltz2
+                # refold is still skipped -- only the actual LigandMPNN generation (+ its
+                # own refolds) runs fresh.
+                mpnn_missing = run_mpnn and "lmpnn_seqs" not in cached
+                if args.aggregate_only or (_cache_is_complete(cached) and not mpnn_missing):
                     if stale and args.aggregate_only:
                         print(f"  WARNING: {cache_path.name} predates {pdb_path.name} -- "
                               f"stale cache from an earlier/different run, reporting anyway.")

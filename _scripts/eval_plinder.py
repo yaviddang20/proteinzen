@@ -1085,13 +1085,26 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
             _env = {**os.environ, "SLURM_NTASKS": "1", "SLURM_JOB_NUM_NODES": "1",
                     "BOLTZ_CACHE": "/weights/boltz2",
                     "MODEL_OPT_JIT_ROOT": str(_KIT_OUT / "boltz2" / "jit")}
-            subprocess.run(cmd, check=True, timeout=600, env=_env)
+            subprocess.run(cmd, check=True, timeout=600, env=_env, capture_output=True, text=True)
         except subprocess.CalledProcessError as e:
-            return {"plddt": float("nan"), "iptm": float("nan"), "ca_rmsd": float("nan"),
-                    "aa_rmsd": float("nan"), "lig_rmsd": float("nan"),
-                    "lig_displacement": float("nan"), "prot_plddt": float("nan"), "lig_plddt": float("nan"),
-                    "min_ipae": float("nan"),
-                    "boltz_error": (e.stderr.decode() if e.stderr else str(e))[-200:]}
+            # The kit's apptainer-wrapped boltz2 worker has been observed exiting
+            # non-zero (e.g. rc=3) on otherwise-successful predictions -- the same rc
+            # shows up inside pred_worker.log's own "ok=1 failed=0 rc=3" line on known-
+            # good runs. check=True can't tell that apart from a real crash, so don't
+            # trust the exit code alone: if the expected output actually landed on disk,
+            # treat it as success and fall through to the normal cif-parsing path below.
+            produced = list((pred_dir / "by_seed" / sample_id / "s0").glob("*_model_0.cif")) \
+                if (pred_dir / "by_seed" / sample_id).exists() else []
+            if not produced:
+                print(f"  [boltz2-refold] {sample_id} returncode={e.returncode}\n"
+                      f"STDOUT:{(e.stdout or '')[-2000:]}\nSTDERR:{(e.stderr or '')[-2000:]}")
+                return {"plddt": float("nan"), "iptm": float("nan"), "ca_rmsd": float("nan"),
+                        "aa_rmsd": float("nan"), "lig_rmsd": float("nan"),
+                        "lig_displacement": float("nan"), "prot_plddt": float("nan"), "lig_plddt": float("nan"),
+                        "min_ipae": float("nan"),
+                        "boltz_error": f"returncode={e.returncode} stderr:{(e.stderr or '')[-800:]}"}
+            print(f"  [boltz2-refold] {sample_id} returncode={e.returncode} but output exists -- "
+                  f"treating as success (worker exit code is not a reliable success signal)")
         except subprocess.TimeoutExpired:
             return {"plddt": float("nan"), "iptm": float("nan"), "ca_rmsd": float("nan"),
                     "aa_rmsd": float("nan"), "lig_rmsd": float("nan"),
@@ -1143,8 +1156,10 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
                     gen_lig_rot = _apply_kabsch(gen_lig, R, p_mean, q_mean)
                     lig_rmsd = _lig_correspondence_rmsd(smiles, refold_lig, gen_lig_rot)
                     lig_displacement = float(np.linalg.norm(gen_lig_rot.mean(0) - refold_lig.mean(0)))
-        except Exception:
-            pass
+        except Exception as e:
+            import traceback
+            print(f"  [rmsd-compute] {sample_id} failed: {e}")
+            traceback.print_exc()
 
     return {"plddt": plddt, "iptm": iptm, "ca_rmsd": ca_rmsd, "aa_rmsd": aa_rmsd, "lig_rmsd": lig_rmsd,
             "lig_displacement": lig_displacement, "prot_plddt": prot_plddt, "lig_plddt": lig_plddt,
