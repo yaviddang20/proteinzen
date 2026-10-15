@@ -197,15 +197,6 @@ class ModelForwardWrapper(abc.ABC):
             if isinstance(value, torch.Tensor) and value.requires_grad:
                 model_outputs[key] = value.detach()
 
-        print({
-            key: value.nan_to_num().norm(dim=-1).mean()
-            for key, value in scores_and_vfs.items()
-        })
-        print({
-            key: value.nan_to_num().norm(dim=-1).var()
-            for key, value in scores_and_vfs.items()
-        })
-
         return scores_and_vfs, model_outputs
 
 
