@@ -1184,8 +1184,8 @@ class IpaDenoiser(nn.Module):
 
         # Main trunk
         curr_rigids_tensor_7 = curr_rigids.to_tensor_7()
+        token_rigids = ru.Rigid.from_tensor_7(rigids_to_nodes(curr_rigids_tensor_7))
         for b in range(self.num_blocks):
-            token_rigids = ru.Rigid.from_tensor_7(rigids_to_nodes(curr_rigids_tensor_7))
             if self.use_conditioned_ipa:
                 ipa_embed = self.trunk[f'ipa_{b}'](
                     s=node_embed,
