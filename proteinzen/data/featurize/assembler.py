@@ -16,9 +16,38 @@ from proteinzen.boltz.data.pad import pad_dim
 from proteinzen.data.featurize.tokenize import Tokenized
 
 
+def _compute_seq_index(token_data) -> list:
+    """Compute per-token `seq_index`.
+
+    All tokens belonging to the same (non-unindexed) residue index share the same
+    seq_index; "unindexed" tokens (e.g. de novo residues in motif scaffolding) always
+    get a fresh index of their own.
+
+    This exact O(n_tokens) state machine was previously duplicated, byte-for-byte, in
+    both `process_token_features` and `process_rigid_features` (both called back-to-back
+    on the same `data.tokens` from `featurize()`). Factored out here and computed once.
+    """
+    seq_index_ref = {}
+    curr_seq_idx = 0
+    seq_index = []
+    for token in token_data:
+        res_idx = token['res_idx']
+        if token['is_unindexed']:
+            seq_index.append(curr_seq_idx)
+            curr_seq_idx += 1
+        elif res_idx not in seq_index_ref:
+            seq_index_ref[res_idx] = curr_seq_idx
+            seq_index.append(curr_seq_idx)
+            curr_seq_idx += 1
+        else:
+            seq_index.append(seq_index_ref[res_idx])
+    return seq_index
+
+
 def process_token_features(
     data: Tokenized,
     max_tokens: Optional[int] = None,
+    seq_index: Optional[list] = None,
 ) -> dict[str, Tensor]:
     """Get the token features.
 
@@ -39,9 +68,9 @@ def process_token_features(
     token_data = data.tokens
     token_bonds = data.bonds
 
-    seq_index_ref = {}
-    curr_seq_idx = 0
-    seq_index = []
+    if seq_index is None:
+        seq_index = _compute_seq_index(token_data)
+
     res_index = []
     max_res_idx = token_data['res_idx'].max()
 
@@ -50,18 +79,10 @@ def process_token_features(
     for _, token in enumerate(token_data):
         res_idx = token['res_idx']
         if token['is_unindexed']:
-            seq_index.append(curr_seq_idx)
-            curr_seq_idx += 1
             res_index.append(
                 max(*res_index, max_res_idx) + 1
             )
-        elif res_idx not in seq_index_ref:
-            seq_index_ref[res_idx] = curr_seq_idx
-            seq_index.append(curr_seq_idx)
-            curr_seq_idx += 1
-            res_index.append(res_idx)
         else:
-            seq_index.append(seq_index_ref[res_idx])
             res_index.append(res_idx)
 
         token_to_rep_rigid.append(rigid_idx)
@@ -155,6 +176,7 @@ def process_rigid_features(
     data: Tokenized,
     rigids_per_window_queries: int = 16,
     max_rigids: Optional[int] = None,
+    seq_index: Optional[list] = None,
 ) -> dict[str, Tensor]:
     """Get the rigid features.
 
@@ -179,20 +201,8 @@ def process_rigid_features(
     rigid_to_token = []
     rigid_to_seq_idx = []
 
-    seq_index_ref = {}
-    curr_seq_idx = 0
-    seq_index = []
-    for _, token in enumerate(token_data):
-        res_idx = token['res_idx']
-        if token['is_unindexed']:
-            seq_index.append(curr_seq_idx)
-            curr_seq_idx += 1
-        elif res_idx not in seq_index_ref:
-            seq_index_ref[res_idx] = curr_seq_idx
-            seq_index.append(curr_seq_idx)
-            curr_seq_idx += 1
-        else:
-            seq_index.append(seq_index_ref[res_idx])
+    if seq_index is None:
+        seq_index = _compute_seq_index(token_data)
     token_to_seq_idx = np.array(seq_index)
 
     for token_id, token in enumerate(token_data):
@@ -271,14 +281,17 @@ def featurize(
     max_rigids: Optional[int] = None,
     rigids_per_window_queries: int = 16,
 ):
+    seq_index = _compute_seq_index(data.tokens)
     token_features = process_token_features(
         data,
-        max_tokens
+        max_tokens,
+        seq_index=seq_index,
     )
     rigid_features = process_rigid_features(
         data,
         rigids_per_window_queries,
-        max_rigids
+        max_rigids,
+        seq_index=seq_index,
     )
     return {
         "t": task_data['t'],

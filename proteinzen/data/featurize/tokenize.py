@@ -727,6 +727,32 @@ def generate_copy_structure(
     return copy_struct, struct_new, new_task_data
 
 
+@fn.lru_cache(maxsize=None)
+def _cg_idx_maps_for_residue(res_name: str):
+    """ Compute the atom-name <-> coarse-grain-rigid index maps for a standard residue type.
+
+    This is a pure function of `res_name` (one of ~20 standard amino acid names), so it is
+    memoized here: without caching, `_get_standard_protein_residue_data` recomputed this
+    (including several O(n) `list.index()` scans) once per residue token, for every residue
+    of every training sample. Caching collapses that down to one computation per residue type.
+    """
+    atom_name_to_cg_idx = {}
+    cg_idx_to_atom_idx = {0: [], 1: [], 2: []}
+    atom_order = rc.restype_name_to_atom14_names[res_name]
+    for atom_name in ['N', 'CA', 'C', 'O', 'CB']:
+        atom_name_to_cg_idx[atom_name] = 0
+        if atom_name == 'CB' and res_name == "GLY":
+            continue
+        cg_idx_to_atom_idx[0].append(atom_order.index(atom_name))
+    for atom_name in cg.coarse_grain_sidechain_groups[res_name][2]:
+        atom_name_to_cg_idx[atom_name] = 1
+        cg_idx_to_atom_idx[1].append(atom_order.index(atom_name))
+    for atom_name in cg.coarse_grain_sidechain_groups[res_name][3]:
+        atom_name_to_cg_idx[atom_name] = 2
+        cg_idx_to_atom_idx[2].append(atom_order.index(atom_name))
+    return atom_name_to_cg_idx, cg_idx_to_atom_idx
+
+
 class StructureTokenizer:
     """ A class object for tokenization, mainly to help code organization"""
     def __init__(
@@ -805,20 +831,8 @@ class StructureTokenizer:
         )
 
         # compute a mapping for which rigids correspond to which atoms
-        atom_name_to_cg_idx = {}
-        cg_idx_to_atom_idx = {0: [], 1: [], 2: []}
-        atom_order = rc.restype_name_to_atom14_names[res["name"]]
-        for atom_name in ['N', 'CA', 'C', 'O', 'CB']:
-            atom_name_to_cg_idx[atom_name] = 0
-            if atom_name == 'CB' and res["name"] == "GLY":
-                continue
-            cg_idx_to_atom_idx[0].append(atom_order.index(atom_name))
-        for atom_name in cg.coarse_grain_sidechain_groups[res["name"]][2]:
-            atom_name_to_cg_idx[atom_name] = 1
-            cg_idx_to_atom_idx[1].append(atom_order.index(atom_name))
-        for atom_name in cg.coarse_grain_sidechain_groups[res["name"]][3]:
-            atom_name_to_cg_idx[atom_name] = 2
-            cg_idx_to_atom_idx[2].append(atom_order.index(atom_name))
+        # (memoized: this only depends on res["name"], not on this particular residue instance)
+        atom_name_to_cg_idx, cg_idx_to_atom_idx = _cg_idx_maps_for_residue(str(res["name"]))
         # update the global atom_to_rigid mapping
         for i, atom in enumerate(atoms):
             atom_name = atom['name']
