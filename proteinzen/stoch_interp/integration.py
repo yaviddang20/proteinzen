@@ -308,7 +308,7 @@ class PnPIntegrator(Integrator):
         self.pnp_cycles = pnp_cycles
         self.pnp_cutoff = pnp_cutoff
         sigma_grid = torch.linspace(0.1, 1.5, 1000)
-        self._igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=".cache")
+        self._igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=so3_utils.default_so3_cache_dir())
         self.use_aligned_noise = use_aligned_noise
 
     def _corrupt_trans(self, trans_1, trans_0, t, rigids_mask, diffuse_mask):

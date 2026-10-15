@@ -78,7 +78,7 @@ class UnconditionalSamplingFromSMILES(SamplingTask):
 
     def igso3(self):
         sigma_grid = torch.linspace(0.1, 1.5, 1000)
-        _igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=".cache")
+        _igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=so3_utils.default_so3_cache_dir())
         return _igso3 
 
     def sample_data(self):
@@ -144,7 +144,7 @@ class UnconditionalSamplingFromMol(SamplingTask):
 
     def igso3(self):
         sigma_grid = torch.linspace(0.1, 1.5, 1000)
-        _igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=".cache")
+        _igso3 = so3_utils.SampleIGSO3(1000, sigma_grid, cache_dir=so3_utils.default_so3_cache_dir())
         return _igso3 
 
     def sample_data(self):
