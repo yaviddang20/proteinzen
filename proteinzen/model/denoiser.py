@@ -600,12 +600,19 @@ class Embedder(nn.Module):
             rigids_noising_mask,
             rigids_is_atomized_mask,
             token_bonds,
+            sc_rigids=None,
+            sf_rigids=None,
             rigids_lap_pe=None,
             cross_type_mask=None,
         ):
-        # Everything in this method is independent of sc_rigids/sf_rigids, so its
-        # result can be computed once and reused across the self-conditioning and
-        # main forward passes when they share the same batch (see _forward_part_b).
+        # NOTE: this is NOT actually independent of sc_rigids/sf_rigids -- they
+        # feed edge_embed via pair_embedder below. A prior refactor (Oct 14,
+        # commit d40c0e0) hardcoded these to None here, assuming independence,
+        # which silently dropped the self-conditioning/self-folding signal from
+        # edge_embed every forward pass. Reverted on 2026-10-16 pending the
+        # user's own verification. If this ever needs to be made genuinely
+        # cacheable again, the edge_embed computation below must be split out,
+        # not just the sc_rigids/sf_rigids args ignored.
 
         # build the indexing matrices
         n_batch = rigids.shape[0]
@@ -638,8 +645,8 @@ class Embedder(nn.Module):
             token_is_unindexed_mask,
             token_is_copy_mask,
             token_hotspot_type,
-            sc_rigids=None,
-            sf_rigids=None
+            sc_rigids=sc_rigids,
+            sf_rigids=sf_rigids
         )
         node_init = node_data['node_init']
         t_embed = self.timestep_embedder(t)
@@ -673,8 +680,8 @@ class Embedder(nn.Module):
 
         rigids_inputs = {
             "rigids_t": ru.Rigid.from_tensor_7(rigids),
-            "sc_rigids": None,
-            "sf_rigids": None,
+            "sc_rigids": sc_rigids if sc_rigids is not None else None,
+            "sf_rigids": sf_rigids if sf_rigids is not None else None,
             "rigids_init": rigids_init,
             "rigids_mask": rigids_mask,
             "rigids_token_uid": rigids_token_uid,
@@ -895,6 +902,8 @@ class Embedder(nn.Module):
             rigids_noising_mask=rigids_noising_mask,
             rigids_is_atomized_mask=rigids_is_atomized_mask,
             token_bonds=token_bonds,
+            sc_rigids=sc_rigids,
+            sf_rigids=sf_rigids,
             rigids_lap_pe=rigids_lap_pe,
             cross_type_mask=cross_type_mask,
         )
@@ -1184,8 +1193,8 @@ class IpaDenoiser(nn.Module):
 
         # Main trunk
         curr_rigids_tensor_7 = curr_rigids.to_tensor_7()
-        token_rigids = ru.Rigid.from_tensor_7(rigids_to_nodes(curr_rigids_tensor_7))
         for b in range(self.num_blocks):
+            token_rigids = ru.Rigid.from_tensor_7(rigids_to_nodes(curr_rigids_tensor_7))
             if self.use_conditioned_ipa:
                 ipa_embed = self.trunk[f'ipa_{b}'](
                     s=node_embed,
@@ -1521,11 +1530,7 @@ def apply_bond_rotations(trans, rot_bonds, frag_a, angles, num_rot_bonds):
     if max_bonds == 0:
         return trans
 
-    # NOTE: no .clone() needed here -- every update below is the out-of-place
-    # `updated = updated + (...)` pattern, which never mutates `trans`'s storage
-    # in place, so aliasing `updated` to `trans` is safe and avoids a redundant
-    # (B, N, 3) allocation + copy on every call.
-    updated = trans
+    updated = trans.clone()
     ba_idx = torch.arange(B, device=trans.device)
 
     for b_idx in range(max_bonds):
@@ -1817,9 +1822,15 @@ class IpaMultiRigidDenoiser(nn.Module):
             cross_type_mask = data.get('cross_type_mask')
 
             if embedder_part_a_override is not None:
+                # NOTE: this override assumes part_a is sc_rigids/sf_rigids-independent,
+                # which is no longer true after the 2026-10-16 revert (see _forward_part_a).
+                # Unused anywhere in the codebase as of this fix -- flagging in case it
+                # ever gets wired up for real.
                 embedder_part_a = embedder_part_a_override
             else:
-                embedder_part_a = self.embedder._forward_part_a(**self._embedder_part_a_kwargs(data))
+                embedder_part_a = self.embedder._forward_part_a(
+                    **self._embedder_part_a_kwargs(data), sc_rigids=sc_rigids, sf_rigids=sf_rigids
+                )
             input_feats = self.embedder._forward_part_b(
                 embedder_part_a, sc_rigids=sc_rigids, sf_rigids=sf_rigids
             )
