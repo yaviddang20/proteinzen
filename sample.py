@@ -128,45 +128,6 @@ def main(sampler,
     print(ckpt_path)
     zen_cfg['ckpt_path'] = ckpt_path
 
-    config_path = os.path.join(
-        run_dir,
-        f"lightning_logs/version_{version_num}/config.yaml"
-    )
-    if not os.path.exists(config_path):
-        print(f"config.yaml not found in version dir, defaulting to .hydra/config.yaml")
-        config_path = os.path.join(run_dir, ".hydra", "config.yaml")
-    model_cfg = load_from_yaml(config_path)
-    model = instantiate(model_cfg['model'])
-
-    # Progressive sequence commit (Integrator.unmask_seq): opt-in via +unmask_seq=true.
-    # Off by default so existing sampling runs are unchanged. NOTE the direction: this
-    # commit schedule reveals MORE sequence as t rises, while lmodule.seq_noise_schedule
-    # in TRAINING reveals LESS as t rises (lmod.py _shared_step), so enabling it does not
-    # reproduce the training-time sequence visibility -- treat it as an experiment.
-    unmask_seq = bool(zen_cfg.get('unmask_seq', False))
-    legacy_lmodule_cfg = zen_cfg.get('lmodule') or {}
-    if legacy_lmodule_cfg.get('seq_noise_schedule') and not unmask_seq:
-        print(
-            "WARNING: +lmodule.seq_noise_schedule has NO effect in sample.py (it is only read "
-            "by the training module). Pass +unmask_seq=true to enable progressive sequence "
-            "commit at sampling."
-        )
-    integrator_extra_kwargs = {"unmask_seq": True} if unmask_seq else {}
-
-    # create sampling module
-    def integrator_init(model):
-        return integrator(
-            wrapped_model=model_wrapper(model),
-            diffeq=diffeq,
-            **integrator_extra_kwargs,
-        )
-    model = BiomoleculeSamplingModule(
-        model,
-        integrator_init=integrator_init,
-        run_cfg=zen_cfg,
-        strict_weight_loading=zen_cfg.get('strict_weight_loading', True),
-    )
-
     # make output directories
     os.makedirs(zen_cfg['out_dir'], exist_ok=True)
     zen_cfg['samples_dir'] = os.path.join(
@@ -174,6 +135,20 @@ def main(sampler,
     )
     traj_dir = os.path.join(zen_cfg['out_dir'], "traj")
 
+    # record run params (moved before the early-return below so it always runs)
+    shutil.copy(
+        zen_cfg['sampler']['tasks_yaml'],
+        os.path.join(zen_cfg['out_dir'], "tasks_config.yaml")
+    )
+    zen_cfg_obj = omegaconf.OmegaConf.create(zen_cfg)
+    save_as_yaml(
+        zen_cfg_obj,
+        os.path.join(zen_cfg['out_dir'], "run_config.yaml"),
+        resolve=True
+    )
+
+    # Deficit check runs before model instantiation so we can skip loading the
+    # checkpoint entirely when nothing's left to sample.
     overwrite = zen_cfg.get('overwrite', False)
     if not overwrite:
         os.makedirs(zen_cfg['samples_dir'], exist_ok=True)
@@ -244,6 +219,12 @@ def main(sampler,
         if getattr(sampler, "batch_sampler", None) is not None:
             from proteinzen.runtime.sampling.dispatcher import TaskBatchSampler
             sampler.batch_sampler = TaskBatchSampler(dispatcher, sampler.batch_size)
+
+        # Every rank trimmed from the same manifest, so this is consistent across ranks.
+        if len(dispatcher.batches) == 0:
+            log.info("Nothing left to sample (every requested sample already exists "
+                     "on disk) -- skipping model instantiation/checkpoint load entirely.")
+            return
     else:
         # Same DDP hazard as above: Lightning re-execs this whole script once per
         # GPU rank, so without gating, every rank would independently rmtree/mkdir
@@ -293,18 +274,44 @@ def main(sampler,
                         f"(marker: {clear_done_path})"
                     )
 
-    # record run params
-    shutil.copy(
-        zen_cfg['sampler']['tasks_yaml'],
-        os.path.join(zen_cfg['out_dir'], "tasks_config.yaml")
+    config_path = os.path.join(
+        run_dir,
+        f"lightning_logs/version_{version_num}/config.yaml"
     )
-    zen_cfg_obj = omegaconf.OmegaConf.create(zen_cfg)
-    save_as_yaml(
-        zen_cfg_obj,
-        os.path.join(zen_cfg['out_dir'], "run_config.yaml"),
-        resolve=True
-    )
+    if not os.path.exists(config_path):
+        print(f"config.yaml not found in version dir, defaulting to .hydra/config.yaml")
+        config_path = os.path.join(run_dir, ".hydra", "config.yaml")
+    model_cfg = load_from_yaml(config_path)
+    model = instantiate(model_cfg['model'])
 
+    # Progressive sequence commit (Integrator.unmask_seq): opt-in via +unmask_seq=true.
+    # Off by default so existing sampling runs are unchanged. NOTE the direction: this
+    # commit schedule reveals MORE sequence as t rises, while lmodule.seq_noise_schedule
+    # in TRAINING reveals LESS as t rises (lmod.py _shared_step), so enabling it does not
+    # reproduce the training-time sequence visibility -- treat it as an experiment.
+    unmask_seq = bool(zen_cfg.get('unmask_seq', False))
+    legacy_lmodule_cfg = zen_cfg.get('lmodule') or {}
+    if legacy_lmodule_cfg.get('seq_noise_schedule') and not unmask_seq:
+        print(
+            "WARNING: +lmodule.seq_noise_schedule has NO effect in sample.py (it is only read "
+            "by the training module). Pass +unmask_seq=true to enable progressive sequence "
+            "commit at sampling."
+        )
+    integrator_extra_kwargs = {"unmask_seq": True} if unmask_seq else {}
+
+    # create sampling module
+    def integrator_init(model):
+        return integrator(
+            wrapped_model=model_wrapper(model),
+            diffeq=diffeq,
+            **integrator_extra_kwargs,
+        )
+    model = BiomoleculeSamplingModule(
+        model,
+        integrator_init=integrator_init,
+        run_cfg=zen_cfg,
+        strict_weight_loading=zen_cfg.get('strict_weight_loading', True),
+    )
 
     exp = Experiment(
         model=model,

@@ -214,7 +214,6 @@ def _build_npz(smiles: str, n_prot_res: int, seed: int, preset_pdb_path: Path = 
         mol = Chem.AddHs(mol)
         AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
         AllChem.MMFFOptimizeMolecule(mol)
-        mol = AllChem.RemoveHs(mol)
 
     conf = mol.GetConformer()
     n_lig = mol.GetNumAtoms()
@@ -381,8 +380,6 @@ def main():
                              "(default: 128 -- see --min-prot-res).")
     parser.add_argument("--trans-std", type=float, default=16.0,
                         help="Translation noise std for protein backbone (default: 16.0)")
-    parser.add_argument("--include-h", action="store_true",
-                        help="Include hydrogen atoms")
     parser.add_argument("--npz-dir", type=Path, default=None,
                         help="Directory to save ligand NPZ files (default: <out-yaml parent>/ligand_npz)")
     parser.add_argument("--use-preset-conformer", action="store_true",
@@ -436,7 +433,7 @@ def main():
                 "npz_path": str(npz_path.resolve()),
                 "num_samples": args.num_samples,
                 "trans_std": args.trans_std,
-                "include_h": args.include_h,
+                "include_h": True,
                 "min_protein_residues": args.min_prot_res,
                 "max_protein_residues": args.max_prot_res,
             })

@@ -72,7 +72,7 @@ class Experiment:
 
         best_checkpointer = ModelCheckpoint(
             filename="best",
-            monitor="val/composite_pred_trans_mse",
+            monitor="val/composite_frame_vf_loss",
             mode="min",
             save_top_k=1,
             save_last=False,

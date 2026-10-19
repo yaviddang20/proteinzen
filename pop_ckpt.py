@@ -1,8 +1,15 @@
+import argparse
 import torch
 from pathlib import Path
 
-# ckpt = torch.load(f"{Path(__file__).parent}/proteinzen_weights/motif_scaffolding_model/lightning_logs/version_0/checkpoints/epoch=3278-step=780000.ckpt", map_location="cpu", weights_only=False)
-ckpt_path = Path(f"{Path(__file__).parent}/outputs/geom_identityRot_256_conformer_3std_bondlength/train/lightning_logs/version_29/checkpoints/last.ckpt")
+parser = argparse.ArgumentParser(
+    description="Strip optimizer/scheduler state from a checkpoint so it can be used "
+                "as a fresh warm_start. Writes to {ckpt_path.parent}/{ckpt_path.stem}_no_opt.ckpt"
+)
+parser.add_argument("ckpt_path", type=Path, help="Path to the source .ckpt file")
+args = parser.parse_args()
+
+ckpt_path = args.ckpt_path
 ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 ckpt.pop("optimizer_states", None)
 ckpt.pop("lr_schedulers", None)
@@ -12,5 +19,6 @@ ckpt["optimizer_states"] = []
 ckpt["lr_schedulers"] = []
 ckpt["epoch"] = 0
 ckpt["global_step"] = 0
-torch.save(ckpt, f"{ckpt_path.parent}/{ckpt_path.stem}_no_opt.ckpt")
-print(f"Finished saving checkpoint to {ckpt_path.parent}/{ckpt_path.stem}_no_opt.ckpt")
+out_path = ckpt_path.parent / f"{ckpt_path.stem}_no_opt.ckpt"
+torch.save(ckpt, out_path)
+print(f"Finished saving checkpoint to {out_path}")
