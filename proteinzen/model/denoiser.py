@@ -6,6 +6,8 @@ import torch.nn.functional as F
 import copy
 import functools as fn
 
+from proteinzen.model.modules.common import compile_supported
+
 from scipy.optimize import linear_sum_assignment
 
 from proteinzen.boltz.data import const
@@ -99,6 +101,7 @@ def batched_mask_select(data, mask, no_batch_dims):
     return data[mask].view(*batched_mask_dims, *data.shape[no_batch_dims:])
 
 
+@torch.compile(disable=not compile_supported)
 def gather_helper(tensor, token_gather_idx):
     new_dims = tensor.dim() - token_gather_idx.dim()
     idx_expand = token_gather_idx.view(
@@ -113,6 +116,21 @@ def gather_helper(tensor, token_gather_idx):
         idx_expand
     )
 
+
+def detach_embedder_part_a(part_a):
+    """Detaches every tensor/Rigid in an Embedder part_a dict (recursing into
+    nested dicts like `rigids_data`), leaving callables/ints/None untouched."""
+    detached = {}
+    for key, value in part_a.items():
+        if isinstance(value, torch.Tensor):
+            detached[key] = value.detach()
+        elif isinstance(value, ru.Rigid):
+            detached[key] = value.detach()
+        elif isinstance(value, dict):
+            detached[key] = detach_embedder_part_a(value)
+        else:
+            detached[key] = value
+    return detached
 
 
 class TorsionAngles(nn.Module):
@@ -463,6 +481,7 @@ class Embedder(nn.Module):
             "node_sf_rigids": node_sf_rigids,
         }
 
+    @torch.compile(disable=not compile_supported)
     def _gen_rigid_features(
         self,
         node_init,
@@ -470,7 +489,7 @@ class Embedder(nn.Module):
         rigids_charge,
         rigids_chirality,
         rigids_num_real_axes,
-        t,
+        t_embed,
         rigids_token_uid,
         rigids_idx,
         rigids_is_atomized_mask,
@@ -481,7 +500,7 @@ class Embedder(nn.Module):
 
         rigids_init = self.rigid_init(nodes_to_rigids(node_init))
         if self.predict_time:
-            time_embed = self.rigid_time_embed(self.timestep_embedder(t))
+            time_embed = self.rigid_time_embed(t_embed)
             # Fixed (non-noised) rigids are always at t=0 — zero out their time embedding
             if rigids_noising_mask is not None:
                 time_embed = time_embed * rigids_noising_mask[..., None]
@@ -554,7 +573,7 @@ class Embedder(nn.Module):
         return padded_data
 
 
-    def forward(
+    def _forward_part_a(
             self,
             *,
             token_mask,
@@ -586,6 +605,14 @@ class Embedder(nn.Module):
             rigids_lap_pe=None,
             cross_type_mask=None,
         ):
+        # NOTE: this is NOT actually independent of sc_rigids/sf_rigids -- they
+        # feed edge_embed via pair_embedder below. A prior refactor (Oct 14,
+        # commit d40c0e0) hardcoded these to None here, assuming independence,
+        # which silently dropped the self-conditioning/self-folding signal from
+        # edge_embed every forward pass. Reverted on 2026-10-16 pending the
+        # user's own verification. If this ever needs to be made genuinely
+        # cacheable again, the edge_embed computation below must be split out,
+        # not just the sc_rigids/sf_rigids args ignored.
 
         # build the indexing matrices
         n_batch = rigids.shape[0]
@@ -622,6 +649,7 @@ class Embedder(nn.Module):
             sf_rigids=sf_rigids
         )
         node_init = node_data['node_init']
+        t_embed = self.timestep_embedder(t)
 
         edge_embed = self.pair_embedder(
             node_data['node_rigids'],
@@ -642,7 +670,7 @@ class Embedder(nn.Module):
             rigids_charge,
             rigids_chirality,
             rigids_num_real_axes,
-            t,
+            t_embed,
             rigids_token_uid,
             rigids_idx,
             rigids_is_atomized_mask,
@@ -694,8 +722,50 @@ class Embedder(nn.Module):
             rigid_cross_type_mask=rigids_noising_mask_padded.bool() if cross_type_mask is not None else None,
         )
 
+        return {
+            "node_init": node_init,
+            "edge_embed": edge_embed,
+            "t_embed": t_embed,
+            "rigids_init": rigids_init,
+            "rigids_token_uid": rigids_token_uid,
+            "rigids_mask": rigids_mask,
+            "to_queries": to_queries,
+            "to_keys": to_keys,
+            "to_pairs": to_pairs,
+            "framepair_init": framepair_init,
+            "n_padding": n_padding,
+            "node_embed": node_embed,
+            "rigids_embed": rigids_embed,
+            "framepair_embed": framepair_embed,
+            "rigids_data": rigids_data,
+        }
+
+    def _forward_part_b(self, part_a, sc_rigids=None, sf_rigids=None):
+        node_init = part_a["node_init"]
+        edge_embed = part_a["edge_embed"]
+        t_embed = part_a["t_embed"]
+        rigids_init = part_a["rigids_init"]
+        rigids_token_uid = part_a["rigids_token_uid"]
+        rigids_mask = part_a["rigids_mask"]
+        to_queries = part_a["to_queries"]
+        to_keys = part_a["to_keys"]
+        to_pairs = part_a["to_pairs"]
+        framepair_init = part_a["framepair_init"]
+        n_padding = part_a["n_padding"]
+        node_embed = part_a["node_embed"]
+        rigids_embed = part_a["rigids_embed"]
+        framepair_embed = part_a["framepair_embed"]
+        rigids_data = part_a["rigids_data"]
+
+        # pad the real (per-call) sc_rigids/sf_rigids separately, since part_a
+        # always pads with None for these (they don't affect part_a's result)
+        scsf_padded = self._pad_rigid_features(
+            {"sc_rigids": sc_rigids, "sf_rigids": sf_rigids},
+            n_padding,
+        )
+
         if self.use_sc_rigid_transformer:
-            sc_rigids = rigids_data['sc_rigids']
+            sc_rigids = scsf_padded['sc_rigids']
             if sc_rigids is not None:
                 sc_framepair_init = self.sc_framepair_init(
                     sc_rigids,
@@ -727,7 +797,7 @@ class Embedder(nn.Module):
             framepair_embed = self.framepair_adaln(framepair_embed, sc_framepair_embed)
 
         if self.use_self_folding:
-            sf_rigids = rigids_data['sf_rigids']
+            sf_rigids = scsf_padded['sf_rigids']
             if sf_rigids is not None:
                 sf_framepair_init = self.sf_framepair_init(
                     sf_rigids,
@@ -762,7 +832,7 @@ class Embedder(nn.Module):
             "node_init": node_init,
             "node_embed": node_embed,
             "edge_embed": edge_embed,
-            "time_condition_embed": self.time_condition_embed(self.timestep_embedder(t)),
+            "time_condition_embed": self.time_condition_embed(t_embed),
             "rigids_embed": rigids_embed,
             "framepair_embed": framepair_embed,
             "framepair_init": framepair_init,
@@ -772,8 +842,72 @@ class Embedder(nn.Module):
             "n_padding": n_padding,
         }
         ret.update(rigids_data)
+        ret.update(scsf_padded)
 
         return ret
+
+    def forward(
+            self,
+            *,
+            token_mask,
+            token_seq,
+            token_seq_idx,
+            token_seq_noising_mask,
+            token_seq_mask,
+            token_asym_id,
+            token_entity_id,
+            # token_is_atomized_mask,
+            token_is_unindexed_mask,
+            token_is_copy_mask,
+            token_hotspot_type,
+            token_gather_idx,
+            t,
+            rigids,
+            rigids_element,
+            rigids_charge,
+            rigids_chirality,
+            rigids_num_real_axes,
+            rigids_token_uid,
+            rigids_idx,
+            rigids_mask,
+            rigids_noising_mask,
+            rigids_is_atomized_mask,
+            token_bonds,
+            sc_rigids=None,
+            sf_rigids=None,
+            rigids_lap_pe=None,
+            cross_type_mask=None,
+        ):
+        part_a = self._forward_part_a(
+            token_mask=token_mask,
+            token_seq=token_seq,
+            token_seq_idx=token_seq_idx,
+            token_seq_noising_mask=token_seq_noising_mask,
+            token_seq_mask=token_seq_mask,
+            token_asym_id=token_asym_id,
+            token_entity_id=token_entity_id,
+            token_is_unindexed_mask=token_is_unindexed_mask,
+            token_is_copy_mask=token_is_copy_mask,
+            token_hotspot_type=token_hotspot_type,
+            token_gather_idx=token_gather_idx,
+            t=t,
+            rigids=rigids,
+            rigids_element=rigids_element,
+            rigids_charge=rigids_charge,
+            rigids_chirality=rigids_chirality,
+            rigids_num_real_axes=rigids_num_real_axes,
+            rigids_token_uid=rigids_token_uid,
+            rigids_idx=rigids_idx,
+            rigids_mask=rigids_mask,
+            rigids_noising_mask=rigids_noising_mask,
+            rigids_is_atomized_mask=rigids_is_atomized_mask,
+            token_bonds=token_bonds,
+            sc_rigids=sc_rigids,
+            sf_rigids=sf_rigids,
+            rigids_lap_pe=rigids_lap_pe,
+            cross_type_mask=cross_type_mask,
+        )
+        return self._forward_part_b(part_a, sc_rigids=sc_rigids, sf_rigids=sf_rigids)
 
 class IpaDenoiser(nn.Module):
     def __init__(self,
@@ -1058,8 +1192,8 @@ class IpaDenoiser(nn.Module):
             pred_rot_vf = None
 
         # Main trunk
+        curr_rigids_tensor_7 = curr_rigids.to_tensor_7()
         for b in range(self.num_blocks):
-            curr_rigids_tensor_7 = curr_rigids.to_tensor_7()
             token_rigids = ru.Rigid.from_tensor_7(rigids_to_nodes(curr_rigids_tensor_7))
             if self.use_conditioned_ipa:
                 ipa_embed = self.trunk[f'ipa_{b}'](
@@ -1179,7 +1313,9 @@ class IpaDenoiser(nn.Module):
             curr_rigids = curr_rigids[..., :-input_feats['n_padding']]
         curr_rigids = self.unscale_rigids(curr_rigids)
 
-        _, psi_pred = self.torsion_pred(node_embed)
+        # torsion_pred/psi has no consumers anywhere in the codebase (verified);
+        # keeping the module for checkpoint state_dict compatibility, skipping the call.
+        psi_pred = None
         model_out = {
             'psi': psi_pred,
             'final_rigids': curr_rigids,
@@ -1625,7 +1761,50 @@ class IpaMultiRigidDenoiser(nn.Module):
         if use_bond_rotation:
             self.bond_rotation_head = BondRotationHead(c_s)
 
-    def forward(self, data, self_condition=None, self_folding=None, sanitize_motif_idx=False):
+    def _embedder_part_a_kwargs(self, data):
+        token_data = data['token']
+        rigids_data = data['rigids']
+        return dict(
+            token_mask=token_data['token_mask'],
+            token_seq_idx=(
+                token_data['residue_idx'] if self.use_residue_indexing
+                else  token_data['token_seq_idx']),
+            token_seq=token_data['res_type'],
+            token_seq_mask=token_data['token_mask'],
+            token_seq_noising_mask=token_data['seq_noising_mask'],
+            token_asym_id=token_data['asym_id'],
+            token_entity_id=token_data['entity_id'],
+            token_is_unindexed_mask=token_data['token_is_unindexed_mask'],
+            token_is_copy_mask=token_data['token_is_copy_mask'],
+            token_hotspot_type=token_data['hotspot_type'],
+            token_gather_idx=token_data['token_to_rep_rigid'],
+            t=data['t'],
+            rigids=rigids_data['rigids_t'],
+            rigids_element=rigids_data['rigids_ref_element'],
+            rigids_charge=rigids_data['rigids_ref_charge'],
+            rigids_chirality=rigids_data['rigids_ref_chirality'],
+            rigids_num_real_axes=rigids_data['rigids_num_real_axes'],
+            rigids_token_uid=rigids_data['rigids_to_token'],
+            rigids_idx=rigids_data['rigids_sidechain_idx'],
+            rigids_mask=rigids_data['rigids_mask'],
+            rigids_is_atomized_mask=rigids_data['rigids_is_atom_mask'],
+            rigids_noising_mask=rigids_data['rigids_noising_mask'],
+            token_bonds=token_data['token_bonds'],
+            rigids_lap_pe=rigids_data.get('rigids_lap_pe'),
+            cross_type_mask=data.get('cross_type_mask'),
+        )
+
+    def compute_embedder_part_a(self, data):
+        """Computes the sc_rigids/sf_rigids-independent portion of the embedder.
+
+        Exposed so callers (e.g. the self-conditioning training step) can compute
+        this once and reuse it across multiple forward() calls that share the same
+        `data`, instead of recomputing it from scratch each time.
+        """
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_amp):
+            return self.embedder._forward_part_a(**self._embedder_part_a_kwargs(data))
+
+    def forward(self, data, self_condition=None, self_folding=None, sanitize_motif_idx=False, compute_motif_idx=True, embedder_part_a_override=None):
         token_data = data['token']
         rigids_data = data['rigids']
 
@@ -1642,37 +1821,18 @@ class IpaMultiRigidDenoiser(nn.Module):
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.use_amp):
             cross_type_mask = data.get('cross_type_mask')
 
-            input_feats = self.embedder(
-                token_mask=token_data['token_mask'],
-                token_seq_idx=(
-                    token_data['residue_idx'] if self.use_residue_indexing
-                    else  token_data['token_seq_idx']),
-                token_seq=token_data['res_type'],
-                token_seq_mask=token_data['token_mask'],
-                token_seq_noising_mask=token_data['seq_noising_mask'],
-                token_asym_id=token_data['asym_id'],
-                token_entity_id=token_data['entity_id'],
-                # token_is_atomized_mask=token_data['token_is_atomized_mask'],
-                token_is_unindexed_mask=token_data['token_is_unindexed_mask'],
-                token_is_copy_mask=token_data['token_is_copy_mask'],
-                token_hotspot_type=token_data['hotspot_type'],
-                token_gather_idx=token_data['token_to_rep_rigid'],
-                t=data['t'],
-                rigids=rigids_data['rigids_t'],
-                rigids_element=rigids_data['rigids_ref_element'],
-                rigids_charge=rigids_data['rigids_ref_charge'],
-                rigids_chirality=rigids_data['rigids_ref_chirality'],
-                rigids_num_real_axes=rigids_data['rigids_num_real_axes'],
-                rigids_token_uid=rigids_data['rigids_to_token'],
-                rigids_idx=rigids_data['rigids_sidechain_idx'],
-                rigids_mask=rigids_data['rigids_mask'],
-                rigids_is_atomized_mask=rigids_data['rigids_is_atom_mask'],
-                rigids_noising_mask=rigids_data['rigids_noising_mask'],
-                token_bonds=token_data['token_bonds'],
-                sc_rigids=sc_rigids,
-                sf_rigids=sf_rigids,
-                rigids_lap_pe=rigids_data.get('rigids_lap_pe'),
-                cross_type_mask=cross_type_mask,
+            if embedder_part_a_override is not None:
+                # NOTE: this override assumes part_a is sc_rigids/sf_rigids-independent,
+                # which is no longer true after the 2026-10-16 revert (see _forward_part_a).
+                # Unused anywhere in the codebase as of this fix -- flagging in case it
+                # ever gets wired up for real.
+                embedder_part_a = embedder_part_a_override
+            else:
+                embedder_part_a = self.embedder._forward_part_a(
+                    **self._embedder_part_a_kwargs(data), sc_rigids=sc_rigids, sf_rigids=sf_rigids
+                )
+            input_feats = self.embedder._forward_part_b(
+                embedder_part_a, sc_rigids=sc_rigids, sf_rigids=sf_rigids
             )
 
             input_feats['condition_embed'] = input_feats['time_condition_embed']
@@ -1726,7 +1886,8 @@ class IpaMultiRigidDenoiser(nn.Module):
         seq_noising_mask = token_data['seq_noising_mask']
         pred_seq = pred_seq * seq_noising_mask + token_data['seq'] * (~seq_noising_mask)
 
-        if rigids_out.to_tensor_7().isnan().any() or pred_seq.isnan().any():
+        rigids_out_tensor_7 = rigids_out.to_tensor_7()
+        if rigids_out_tensor_7.isnan().any() or pred_seq.isnan().any():
             task_names = data.get('task')
             print(f"caught a nan in forward, task(s): {task_names}")
             raise SamplingDivergedError(f"NaN in forward for task(s): {task_names}")
@@ -1785,8 +1946,9 @@ class IpaMultiRigidDenoiser(nn.Module):
             pred_rot_vf = None
         ret['pred_rot_vf'] = pred_rot_vf
 
-        with torch.no_grad():
-            token_rigids = gather_helper(rigids_out.to_tensor_7(), token_data['token_to_rep_rigid'])
+        if compute_motif_idx:
+          with torch.no_grad():
+            token_rigids = gather_helper(rigids_out_tensor_7, token_data['token_to_rep_rigid'])
             token_rigids = ru.Rigid.from_tensor_7(token_rigids)
 
             # TODO: this should probably be a scatter instead of a gather

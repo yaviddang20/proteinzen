@@ -926,6 +926,8 @@ class BiomoleculeDataModule(L.LightningDataModule):
             batch_size=self.batch_size,
             collate_fn=collate_fn,
             shuffle=shuffle,
+            pin_memory=True,
+            persistent_workers=self.num_workers > 0,
         )
         return dataloader
 
@@ -944,6 +946,8 @@ class BiomoleculeDataModule(L.LightningDataModule):
             batch_size=self.batch_size,
             collate_fn=collate,
             num_workers=self.num_workers,
+            pin_memory=True,
+            persistent_workers=self.num_workers > 0,
         )
 
 

@@ -1,7 +1,7 @@
 """ Assemble input features to proteinzen from Tokenized objects """
 import random
 from typing import Optional
-from dataclasses import asdict
+from dataclasses import fields, is_dataclass
 
 import numpy as np
 import os
@@ -342,6 +342,13 @@ def featurize(
 #     }
 
 
+def _asdict_shallow(obj):
+    """Like dataclasses.asdict, but never deep-copies leaf values (e.g. numpy arrays)."""
+    if is_dataclass(obj):
+        return {f.name: _asdict_shallow(getattr(obj, f.name)) for f in fields(obj)}
+    return obj
+
+
 def collate(data_list):
     def pad(data, token_max_len, rigids_max_len):
         padded_data = {
@@ -431,7 +438,7 @@ def collate(data_list):
     if 'record_id' in data_list[0]:
         batched_data_list['record_id'] = [data['record_id'] for data in data_list]
     if 'input_data' in data_list[0]:
-        batched_data_list['input_data'] = [asdict(data['input_data']) for data in data_list]
+        batched_data_list['input_data'] = [_asdict_shallow(data['input_data']) for data in data_list]
 
     # Handle rotatable bond data (variable-length per sample)
     if 'rot_bonds' in data_list[0]:

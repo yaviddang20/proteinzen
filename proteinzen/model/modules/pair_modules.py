@@ -611,19 +611,21 @@ class ConditionedPairUpdate(nn.Module):
         else:
             mask_bias = (edge_mask[..., :, None, None, :].float() - 1) * self.inf
 
+        edge_bias_permuted = permute_final_dims(edge_bias, (2, 0, 1))
+
         z = edge_embed
         if cross_type_mask is not None:
             z = z.masked_fill(cross_type_mask[..., None], 0.0)
         z = z + self.trig_attn_start(
             z,
-            edge_bias=permute_final_dims(edge_bias, (2, 0, 1)),
+            edge_bias=edge_bias_permuted,
             mask_bias=mask_bias
         )
         if cross_type_mask is not None:
             z = z.masked_fill(cross_type_mask[..., None], 0.0)
         z = z + self.trig_attn_end(
             z,
-            edge_bias=permute_final_dims(edge_bias, (2, 0, 1)),
+            edge_bias=edge_bias_permuted,
             mask_bias=mask_bias
         )
         z = self._wrapup(node_embed, z)

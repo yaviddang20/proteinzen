@@ -52,8 +52,8 @@ Rigid = [
     ("tensor7", np.dtype("7f4")),
     ("is_present", np.dtype("?")),
     ("rigids_noising_mask", np.dtype("?")),
-    ("seq_noising_mask", np.dtype("?")),
     ("num_real_input_axes", np.dtype("i1")),
+    ("seq_noising_mask", np.dtype("?")),
 ]
 
 TokenBond = [
@@ -713,6 +713,25 @@ def generate_copy_structure(
     return copy_struct, struct_new, new_task_data
 
 
+@fn.lru_cache(maxsize=None)
+def _get_cg_atom_idx_mapping(res_name):
+    atom_name_to_cg_idx = {}
+    cg_idx_to_atom_idx = {0: [], 1: [], 2: []}
+    atom_order = rc.restype_name_to_atom14_names[res_name]
+    for atom_name in ['N', 'CA', 'C', 'O', 'CB']:
+        atom_name_to_cg_idx[atom_name] = 0
+        if atom_name == 'CB' and res_name == "GLY":
+            continue
+        cg_idx_to_atom_idx[0].append(atom_order.index(atom_name))
+    for atom_name in cg.coarse_grain_sidechain_groups[res_name][2]:
+        atom_name_to_cg_idx[atom_name] = 1
+        cg_idx_to_atom_idx[1].append(atom_order.index(atom_name))
+    for atom_name in cg.coarse_grain_sidechain_groups[res_name][3]:
+        atom_name_to_cg_idx[atom_name] = 2
+        cg_idx_to_atom_idx[2].append(atom_order.index(atom_name))
+    return atom_name_to_cg_idx, cg_idx_to_atom_idx
+
+
 class StructureTokenizer:
     """ A class object for tokenization, mainly to help code organization"""
     def __init__(
@@ -756,10 +775,6 @@ class StructureTokenizer:
         # Token is present if centers are
         is_present = res["is_present"]
 
-        # If protein, compute frame, only used for templates
-        rigid_tensor7 = np.stack([IDENTITY_TENSOR7.copy() for _ in range(3)], axis=0)
-        rigid_mask = np.zeros(3, dtype=bool)
-
         # Get frame atoms
         atoms = self.struct.atoms[atom_start:atom_end]
         atom_noising_mask = self.task_data['atom_noising_mask']
@@ -791,20 +806,7 @@ class StructureTokenizer:
         )
 
         # compute a mapping for which rigids correspond to which atoms
-        atom_name_to_cg_idx = {}
-        cg_idx_to_atom_idx = {0: [], 1: [], 2: []}
-        atom_order = rc.restype_name_to_atom14_names[res["name"]]
-        for atom_name in ['N', 'CA', 'C', 'O', 'CB']:
-            atom_name_to_cg_idx[atom_name] = 0
-            if atom_name == 'CB' and res["name"] == "GLY":
-                continue
-            cg_idx_to_atom_idx[0].append(atom_order.index(atom_name))
-        for atom_name in cg.coarse_grain_sidechain_groups[res["name"]][2]:
-            atom_name_to_cg_idx[atom_name] = 1
-            cg_idx_to_atom_idx[1].append(atom_order.index(atom_name))
-        for atom_name in cg.coarse_grain_sidechain_groups[res["name"]][3]:
-            atom_name_to_cg_idx[atom_name] = 2
-            cg_idx_to_atom_idx[2].append(atom_order.index(atom_name))
+        atom_name_to_cg_idx, cg_idx_to_atom_idx = _get_cg_atom_idx_mapping(res["name"])
         # update the global atom_to_rigid mapping
         for i, atom in enumerate(atoms):
             atom_name = atom['name']

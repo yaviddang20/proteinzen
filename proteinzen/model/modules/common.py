@@ -1,6 +1,7 @@
+import os
 import torch
 
-torch._dynamo.config.cache_size_limit = 16
+torch._dynamo.config.cache_size_limit = 64
 
 try:
     cuda_major, cuda_minor = torch.cuda.get_device_capability(device=None)

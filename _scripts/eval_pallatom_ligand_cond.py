@@ -66,7 +66,8 @@ import numpy as np
 from tqdm.auto import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent))
-from eval_plinder import KNOWN_SMILES, _GPU_SUFFIX, eval_ligand_cond_sample  # noqa: E402
+from eval_plinder import (KNOWN_SMILES, _GPU_SUFFIX, eval_ligand_cond_sample,  # noqa: E402
+                          eval_ligand_cond_samples_batch)
 
 RAW_SUCCESS_KEYS = [("fold_success", "fold_success"),
                     ("pocket_success", "pocket_success"),
@@ -97,8 +98,21 @@ COMPLEXA_MPNN_KEYS = [("complexa_success", "complexa_success_mpnn")]
 CACHE_SCHEMA_VERSION = 5
 
 
-def _cache_is_complete(r: dict) -> bool:
-    return r.get("_cache_schema_version") == CACHE_SCHEMA_VERSION
+def _cache_is_complete(r: dict, refold_output_dir: Path = None, sample_id: str = None) -> bool:
+    """Schema-version match alone isn't enough -- a failed boltz2 call still
+    writes a full-schema NaN result instead of raising. Also checks
+    boltz_error/nolig_boltz_error, and (if refold_output_dir/sample_id given)
+    that a *_model_0.cif actually exists on disk."""
+    if r.get("_cache_schema_version") != CACHE_SCHEMA_VERSION:
+        return False
+    if r.get("boltz_error") or r.get("nolig_boltz_error"):
+        return False
+    if refold_output_dir is not None and sample_id is not None:
+        pred_dir = refold_output_dir / sample_id / "by_seed" / sample_id / "s0"
+        has_cif = pred_dir.exists() and any(pred_dir.glob("*_model_0.cif"))
+        if not has_cif:
+            return False
+    return True
 
 
 def _cache_is_stale(cache_path: Path, pdb_path: Path) -> bool:
@@ -246,6 +260,24 @@ def main():
                              "make_ligand_cond_yaml.py was actually run with) -- no need "
                              "to repeat the ligand list here.")
     parser.add_argument("--boltz-cache", type=Path, default=None)
+    parser.add_argument("--boltz-batch-size", type=int, default=None,
+                        help="Opt-in Boltz2 batching (this fork only, see "
+                             "uplifting-biomolecular-modeling/boltz2/BATCHING.md): batch "
+                             "this many LigandMPNN-redesigned sequences' refolds into one "
+                             "boltz2_kit call instead of one call per sequence. Only "
+                             "affects the per-sequence refold loop inside eval_plinder.py's "
+                             "_run_mpnn_case (the --mpnn-n-seqs sequences for one structure "
+                             "share smiles/gen_ca/gen_lig, so they're the natural batch "
+                             "unit here); the raw-sample fold/fold_nolig refolds are each "
+                             "already a single input and are unaffected either way. Default "
+                             "None (unset) runs the exact unbatched per-sequence loop, "
+                             "unchanged. Experimental -- see BATCHING.md's own caveats "
+                             "(fast mode + single GPU only, not yet validated with MSAs/"
+                             "ligands/templates beyond what this script itself uses).")
+    parser.add_argument("--boltz-batch-max-pad", type=float, default=None,
+                        help="Passed through as BOLTZ_BATCH_MAX_PAD when --boltz-batch-size "
+                             "is set (see BATCHING.md). Default None leaves the fork's own "
+                             "default (1.25) in place.")
     parser.add_argument("--contact-cutoff", type=float, default=4.0)
     _repo_root = Path(__file__).parent.parent
     _default_ligandmpnn = str(_repo_root / "LigandMPNN" / "run.py")
@@ -274,11 +306,40 @@ def main():
                              "ran strictly single-GPU regardless of node size.")
     args = parser.parse_args()
 
+    # Set before any GPU worker processes are spawned below so they inherit it --
+    # eval_plinder.py's _run_mpnn_case reads BOLTZ_BATCH_SIZE directly from the
+    # environment (see run_pallatom_ligand_cond.sh's boltz_batch_size variable).
+    if args.boltz_batch_size is not None:
+        import os as _os
+        _os.environ["BOLTZ_BATCH_SIZE"] = str(args.boltz_batch_size)
+        if args.boltz_batch_max_pad is not None:
+            _os.environ["BOLTZ_BATCH_MAX_PAD"] = str(args.boltz_batch_max_pad)
+        print(f"[eval_pallatom] Boltz2 batching enabled: BOLTZ_BATCH_SIZE="
+              f"{args.boltz_batch_size}" + (f" BOLTZ_BATCH_MAX_PAD={args.boltz_batch_max_pad}"
+              if args.boltz_batch_max_pad is not None else ""))
+
     args.samples_dir = args.samples_dir or (args.out_dir / "samples")
     args.out_dir.mkdir(parents=True, exist_ok=True)
     refold_input_dir = args.out_dir / "refold_inputs"
     refold_output_dir = args.out_dir / "refold_outputs"
     per_sample_dir = args.out_dir / "per_sample"
+
+    if args.overwrite:
+        import shutil
+        for subdir in ["refold_inputs", "refold_outputs", "mpnn_refold", "per_sample",
+                       "aligned_pocket", "aligned_lig"]:
+            p = args.out_dir / subdir
+            if p.exists():
+                try:
+                    shutil.rmtree(p)
+                except OSError as e:
+                    print(f"  WARNING: could not fully clear {p} ({e}) -- continuing anyway.")
+        for f in ["results.json", "summary.txt"]:
+            p = args.out_dir / f
+            if p.exists():
+                p.unlink()
+        print(f"--overwrite: cleared eval artifacts in {args.out_dir}")
+
     per_sample_dir.mkdir(exist_ok=True)
 
     by_code: dict[str, list[Path]] = {}
@@ -328,31 +389,39 @@ def main():
         to avoid invalidating existing caches for every other caller of this script."""
         return f"{code}__{pdb_path.stem}" if args.per_ligand_dirs else pdb_path.stem
 
-    def _run_one(pdb_path, code, smiles, gpu_id):
-        """Runs on a specific GPU (pinned via CUDA_VISIBLE_DEVICES, which run_refolding's
-        subprocess.run(..., env=_env) call -- env built from os.environ -- forwards through
-        to the boltz2_kit apptainer container, same as eval_plinder.py's own multi-GPU path).
-        force=args.overwrite: --overwrite means a COMPLETE redo, including re-running
-        Boltz/LigandMPNN. Without it, eval_ligand_cond_sample still only re-derives metrics
-        from whatever Boltz/LigandMPNN output already exists on disk -- run_refolding/
-        _run_ligandmpnn independently skip the actual subprocess calls unless force=True."""
+    def _run_batch(batch_items, gpu_id):
+        """Runs a list of (pdb_path, code, smiles) on a specific GPU. Batches
+        their fold/fold_nolig/lmpnn refolds into one boltz2_kit call via
+        eval_ligand_cond_samples_batch when args.boltz_batch_size is set and
+        len(batch_items) > 1. Returns (code, result_dict) tuples, same order."""
         import os as _os
         _os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-        r = eval_ligand_cond_sample(
-            pdb_path=pdb_path, smiles=smiles,
-            refold_input_dir=refold_input_dir, refold_output_dir=refold_output_dir,
+        items = [(pdb_path, smiles, _cache_id(code, pdb_path)) for pdb_path, code, smiles in batch_items]
+        results = eval_ligand_cond_samples_batch(
+            items, refold_input_dir=refold_input_dir, refold_output_dir=refold_output_dir,
             boltz_cache=args.boltz_cache, run_pb=False, skip_fold=False,
             contact_cutoff=args.contact_cutoff,
             ligandmpnn_script=args.ligandmpnn_script if run_mpnn else None,
             mpnn_n_seqs=args.mpnn_n_seqs, mpnn_cutoff=args.mpnn_cutoff,
             force=args.overwrite, skip_nolig=True,
-            sample_id=_cache_id(code, pdb_path),
+            batch_size=args.boltz_batch_size, batch_max_pad=args.boltz_batch_max_pad,
         )
-        r["ligand_code"] = code
-        r["_cache_schema_version"] = CACHE_SCHEMA_VERSION
-        cache_path = per_sample_dir / f"{_cache_id(code, pdb_path)}.json"
-        cache_path.write_text(json.dumps(r, indent=2, default=str))
-        return r
+        if len(results) != len(batch_items):
+            raise RuntimeError(
+                f"eval_ligand_cond_samples_batch returned {len(results)} results for "
+                f"{len(batch_items)} input items -- refusing to silently zip-truncate. "
+                f"Items: {[_cache_id(code, pdb_path) for pdb_path, code, smiles in batch_items]}"
+            )
+        out = []
+        for (pdb_path, code, smiles), r in zip(batch_items, results):
+            r["ligand_code"] = code
+            r["_cache_schema_version"] = CACHE_SCHEMA_VERSION
+            cache_path = per_sample_dir / f"{_cache_id(code, pdb_path)}.json"
+            tmp_path = cache_path.with_suffix(f".json.tmp{_os.getpid()}")
+            tmp_path.write_text(json.dumps(r, indent=2, default=str))
+            tmp_path.replace(cache_path)
+            out.append((code, r))
+        return out
 
     results_by_code: dict[str, list[dict]] = {}
     todo: list[tuple] = []  # (pdb_path, code, smiles)
@@ -370,20 +439,38 @@ def main():
             r = None
             stale = cache_path.exists() and _cache_is_stale(cache_path, pdb_path)
             if not args.overwrite and cache_path.exists() and not (stale and not args.aggregate_only):
-                cached = json.loads(cache_path.read_text())
-                # aggregate_only never triggers a (re)compute, even for a stale cache --
-                # it means "just report on whatever's on disk" (though we still flag it
-                # below so a stale number isn't silently mistaken for current). Otherwise,
-                # a cache missing a currently-expected field (see REQUIRED_RAW_KEYS) is
-                # auto-backfilled below rather than silently reported as a metric failure,
-                # and a cache older than the PDB it's keyed by (sample.py's filenames are
-                # purely positional, so a later run can reuse an earlier run's exact
-                # filenames) is treated as not-cached and recomputed instead of trusted.
-                if args.aggregate_only or _cache_is_complete(cached):
-                    if stale and args.aggregate_only:
-                        print(f"  WARNING: {cache_path.name} predates {pdb_path.name} -- "
-                              f"stale cache from an earlier/different run, reporting anyway.")
-                    r = cached
+                try:
+                    cached = json.loads(cache_path.read_text())
+                except json.JSONDecodeError:
+                    print(f"  WARNING: {cache_path.name} is corrupt JSON -- treating as "
+                          f"not-cached and recomputing.")
+                    cached = None
+                if cached is not None:
+                    # aggregate_only never triggers a (re)compute, even for a stale cache --
+                    # it means "just report on whatever's on disk" (though we still flag it
+                    # below so a stale number isn't silently mistaken for current). A cache
+                    # older than the PDB it's keyed by (sample.py's filenames are purely
+                    # positional, so a later run can reuse an earlier run's exact filenames)
+                    # is treated as not-cached and recomputed instead of trusted.
+                    # mpnn_missing: no lmpnn_seqs at all, OR it ran but every refold's
+                    # stats came back NaN (same failure class as boltz_error, just with
+                    # no error field of its own on the aggregate).
+                    lmpnn_all_nan = (
+                        run_mpnn and cached.get("lmpnn_seqs")
+                        and not any(
+                            np.isfinite(cached.get(k, float("nan")))
+                            for k in ("lmpnn_ca_rmsd_best", "lmpnn_plddt_best", "lmpnn_iptm_best")
+                        )
+                    )
+                    mpnn_missing = (run_mpnn and "lmpnn_seqs" not in cached) or lmpnn_all_nan
+                    _complete = _cache_is_complete(
+                        cached, refold_output_dir=refold_output_dir, sample_id=_cache_id(code, pdb_path)
+                    )
+                    if args.aggregate_only or (_complete and not mpnn_missing):
+                        if stale and args.aggregate_only:
+                            print(f"  WARNING: {cache_path.name} predates {pdb_path.name} -- "
+                                  f"stale cache from an earlier/different run, reporting anyway.")
+                        r = cached
             if r is None:
                 if args.aggregate_only:
                     continue
@@ -394,14 +481,29 @@ def main():
                 results_by_code[code].append(r)
 
     if todo:
-        print(f"Evaluating {len(todo)} not-yet-cached sample(s) on {num_gpus} GPU(s)")
+        boltz_bsz = args.boltz_batch_size or 1
+        print(f"Evaluating {len(todo)} not-yet-cached sample(s) on {num_gpus} GPU(s)"
+              + (f", Boltz2 batch size {boltz_bsz}" if boltz_bsz > 1 else ""))
         if num_gpus <= 1:
-            for pdb_path, code, smiles in tqdm(todo, desc="eval"):
-                r = _run_one(pdb_path, code, smiles, gpu_id=0)
-                r.update(compute_success(r))
-                results_by_code[code].append(r)
+            with tqdm(total=len(todo), desc="eval") as pbar:
+                for i in range(0, len(todo), boltz_bsz):
+                    chunk = todo[i:i + boltz_bsz]
+                    try:
+                        chunk_results = _run_batch(chunk, gpu_id=0)
+                    except Exception as e:
+                        print(f"  ERROR in chunk starting at {chunk[0][0].name}: {e}")
+                        chunk_results = [
+                            (code, {"sample_id": pdb_path.stem, "pdb_path": str(pdb_path),
+                                    "ligand_code": code, "error": str(e), "ca_rmsd": float("nan")})
+                            for pdb_path, code, smiles in chunk
+                        ]
+                    for code, r in chunk_results:
+                        r.update(compute_success(r))
+                        results_by_code[code].append(r)
+                    pbar.update(len(chunk))
         else:
             import multiprocessing as _mp
+            import queue as _queue
 
             work_queue = _mp.Queue()
             result_queue = _mp.Queue()
@@ -410,29 +512,61 @@ def main():
             for _ in range(num_gpus):  # one sentinel per worker
                 work_queue.put(None)
 
-            def _worker(gpu_id, work_q, result_q):
+            def _worker(gpu_id, work_q, result_q, batch_size):
                 while True:
                     item = work_q.get()
                     if item is None:
                         break
-                    pdb_path, code, smiles = item
+                    batch = [item]
+                    # Opportunistically drain up to batch_size-1 more WITHOUT blocking,
+                    # so a backlog gets batched -- never waits around to fill one.
+                    while len(batch) < batch_size:
+                        try:
+                            item = work_q.get_nowait()
+                        except _queue.Empty:
+                            break
+                        if item is None:
+                            work_q.put(None)  # let the next worker (or this one) still see it
+                            break
+                        batch.append(item)
                     try:
-                        r = _run_one(pdb_path, code, smiles, gpu_id)
+                        for code, r in _run_batch(batch, gpu_id):
+                            result_q.put((code, r))
                     except Exception as e:
-                        r = {"sample_id": pdb_path.stem, "pdb_path": str(pdb_path),
-                             "ligand_code": code, "error": str(e),
-                             "ca_rmsd": float("nan")}
-                        print(f"  ERROR {pdb_path.name}: {e}")
-                    result_q.put((code, r))
+                        for pdb_path, code, smiles in batch:
+                            r = {"sample_id": pdb_path.stem, "pdb_path": str(pdb_path),
+                                 "ligand_code": code, "error": str(e), "ca_rmsd": float("nan")}
+                            print(f"  ERROR {pdb_path.name}: {e}")
+                            result_q.put((code, r))
 
-            procs = [_mp.Process(target=_worker, args=(i, work_queue, result_queue), daemon=True)
+            procs = [_mp.Process(target=_worker, args=(i, work_queue, result_queue, boltz_bsz), daemon=True)
                      for i in range(num_gpus)]
             for p in procs:
                 p.start()
-            for _ in tqdm(range(len(todo)), desc="eval"):
-                code, r = result_queue.get()
-                r.update(compute_success(r))
-                results_by_code[code].append(r)
+            # Poll with a timeout rather than block forever -- a worker that's
+            # OOM-killed/segfaults/preempted mid-batch never calls result_q.put.
+            received = 0
+            with tqdm(total=len(todo), desc="eval") as pbar:
+                while received < len(todo):
+                    try:
+                        code, r = result_queue.get(timeout=30)
+                    except _queue.Empty:
+                        dead = [p for p in procs if not p.is_alive() and p.exitcode != 0]
+                        if dead:
+                            raise RuntimeError(
+                                f"{len(dead)} worker process(es) exited abnormally "
+                                f"(exitcodes {[p.exitcode for p in dead]}) with "
+                                f"{len(todo) - received}/{len(todo)} result(s) still "
+                                f"outstanding -- at least one in-flight batch was lost "
+                                f"when its worker died (OOM-kill/segfault/preemption), "
+                                f"not a hang. Re-run with overwrite=False to retry only "
+                                f"what's genuinely missing/incomplete."
+                            )
+                        continue
+                    r.update(compute_success(r))
+                    results_by_code[code].append(r)
+                    received += 1
+                    pbar.update(1)
             for p in procs:
                 p.join()
 

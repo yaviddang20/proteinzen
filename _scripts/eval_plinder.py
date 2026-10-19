@@ -1050,54 +1050,54 @@ def _lig_correspondence_rmsd(smiles, coords_a: np.ndarray, coords_b: np.ndarray)
     return min(pos_rmsd(coords_a, coords_b[p]) for p in perms)
 
 
-def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
-                  sample_id, boltz_cache, gen_lig=None, gen_prot_by_res=None, force=False):
-    """force=True bypasses the pred_dir.exists() cache and always re-runs `boltz predict`,
-    even if a prediction is already on disk. Default False preserves existing behavior for
-    every caller that doesn't pass this explicitly."""
-    import yaml as _yaml
-    refold_input_dir.mkdir(parents=True, exist_ok=True)
-    refold_output_dir.mkdir(parents=True, exist_ok=True)
+_NAN_FOLD_RESULT = {"plddt": float("nan"), "iptm": float("nan"), "ca_rmsd": float("nan"),
+                    "aa_rmsd": float("nan"), "lig_rmsd": float("nan"),
+                    "lig_displacement": float("nan"), "prot_plddt": float("nan"), "lig_plddt": float("nan"),
+                    "min_ipae": float("nan")}
 
-    boltz_input: dict = {"sequences": [{"protein": {"id": "A", "sequence": sequence, "msa": "empty"}}]}
-    if smiles:
-        boltz_input["sequences"].append({"ligand": {"id": "B", "smiles": smiles}})
 
-    input_yaml = refold_input_dir / f"{sample_id}.yaml"
-    out_dir = refold_output_dir / sample_id
+def _invoke_boltz2(input_path, out_dir, label, timeout=600, extra_env=None):
+    """Runs the boltz2_kit apptainer container once against `input_path` -- a
+    single yaml file/Path, or a list of them for a batched call (the kit's
+    --input takes nargs="+", so multiple exact file paths work directly, no
+    directory needed). `label` is only used for log messages. Returns None on
+    success (including the kit's known-benign nonzero exit with output
+    actually on disk -- see comment below), or an error string on a real
+    failure."""
+    gpu_config = _pick_kit_gpu_config()
+    input_paths = input_path if isinstance(input_path, list) else [input_path]
+    cmd = [
+        "apptainer", "run", "--nv",
+        "--bind", f"{_KIT_WEIGHTS / 'boltz2'}:/weights/boltz2",
+        "--bind", f"{_KIT_OUT / 'boltz2' / 'out'}:/kit/boltz2/out",
+        "--bind", "/mnt/scratch/user/daviyang",
+        str(_KIT_ROOT / "boltz2.sif"),
+        "pred", "--config", gpu_config, "--mode", "fast",
+        "--input", *[str(p) for p in input_paths], "--out_dir", str(out_dir),
+    ]
+    try:
+        _env = {**os.environ, "SLURM_NTASKS": "1", "SLURM_JOB_NUM_NODES": "1",
+                "BOLTZ_CACHE": "/weights/boltz2",
+                "MODEL_OPT_JIT_ROOT": str(_KIT_OUT / "boltz2" / "jit"),
+                **(extra_env or {})}
+        subprocess.run(cmd, check=True, timeout=timeout, env=_env, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        # This kit can exit nonzero (e.g. rc=3) on an otherwise-successful
+        # prediction -- caller must check disk, not trust this alone.
+        print(f"  [boltz2-refold] {label} returncode={e.returncode}\n"
+              f"STDOUT:{(e.stdout or '')[-2000:]}\nSTDERR:{(e.stderr or '')[-2000:]}")
+        return (f"returncode={e.returncode} "
+                f"stdout:{(e.stdout or '')[-600:]} stderr:{(e.stderr or '')[-600:]}")
+    except subprocess.TimeoutExpired:
+        return "timeout"
+    return None
+
+
+def _read_refold_result(sample_id, out_dir, gen_ca, smiles, gen_lig=None, gen_prot_by_res=None):
+    """Reads whatever boltz2 output already landed under out_dir/sample_id (from
+    either a single-item or a batched run) and computes plddt/iptm/rmsd metrics.
+    Returns the NaN-filled result dict if nothing usable is on disk."""
     pred_dir = out_dir / "by_seed" / sample_id / "s0"
-
-    if force or not pred_dir.exists():
-        input_yaml.write_text(_yaml.dump(boltz_input, default_flow_style=False))
-        # boltz_cache is unused here -- the kit's weights are pinned/baked in via
-        # BOLTZ_CACHE below, not a per-call --cache flag like stock boltz had.
-        gpu_config = _pick_kit_gpu_config()
-        cmd = [
-            "apptainer", "run", "--nv",
-            "--bind", f"{_KIT_WEIGHTS / 'boltz2'}:/weights/boltz2",
-            "--bind", f"{_KIT_OUT / 'boltz2' / 'out'}:/kit/boltz2/out",
-            "--bind", "/mnt/scratch/user/daviyang",
-            str(_KIT_ROOT / "boltz2.sif"),
-            "pred", "--config", gpu_config, "--mode", "fast",
-            "--input", str(input_yaml), "--out_dir", str(out_dir),
-        ]
-        try:
-            _env = {**os.environ, "SLURM_NTASKS": "1", "SLURM_JOB_NUM_NODES": "1",
-                    "BOLTZ_CACHE": "/weights/boltz2",
-                    "MODEL_OPT_JIT_ROOT": str(_KIT_OUT / "boltz2" / "jit")}
-            subprocess.run(cmd, check=True, timeout=600, env=_env)
-        except subprocess.CalledProcessError as e:
-            return {"plddt": float("nan"), "iptm": float("nan"), "ca_rmsd": float("nan"),
-                    "aa_rmsd": float("nan"), "lig_rmsd": float("nan"),
-                    "lig_displacement": float("nan"), "prot_plddt": float("nan"), "lig_plddt": float("nan"),
-                    "min_ipae": float("nan"),
-                    "boltz_error": (e.stderr.decode() if e.stderr else str(e))[-200:]}
-        except subprocess.TimeoutExpired:
-            return {"plddt": float("nan"), "iptm": float("nan"), "ca_rmsd": float("nan"),
-                    "aa_rmsd": float("nan"), "lig_rmsd": float("nan"),
-                    "lig_displacement": float("nan"), "prot_plddt": float("nan"), "lig_plddt": float("nan"),
-                    "min_ipae": float("nan"),
-                    "boltz_error": "timeout"}
     conf_files = sorted(pred_dir.glob("confidence_*_model_0.json"))
     plddt, iptm = float("nan"), float("nan")
     if conf_files:
@@ -1143,12 +1143,145 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
                     gen_lig_rot = _apply_kabsch(gen_lig, R, p_mean, q_mean)
                     lig_rmsd = _lig_correspondence_rmsd(smiles, refold_lig, gen_lig_rot)
                     lig_displacement = float(np.linalg.norm(gen_lig_rot.mean(0) - refold_lig.mean(0)))
-        except Exception:
-            pass
+        except Exception as e:
+            import traceback
+            print(f"  [rmsd-compute] {sample_id} failed: {e}")
+            traceback.print_exc()
 
     return {"plddt": plddt, "iptm": iptm, "ca_rmsd": ca_rmsd, "aa_rmsd": aa_rmsd, "lig_rmsd": lig_rmsd,
             "lig_displacement": lig_displacement, "prot_plddt": prot_plddt, "lig_plddt": lig_plddt,
             "min_ipae": min_ipae}
+
+
+def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
+                  sample_id, boltz_cache, gen_lig=None, gen_prot_by_res=None, force=False):
+    """force=True bypasses the pred_dir.exists() cache and always re-runs `boltz predict`,
+    even if a prediction is already on disk. Default False preserves existing behavior for
+    every caller that doesn't pass this explicitly."""
+    import yaml as _yaml
+    refold_input_dir.mkdir(parents=True, exist_ok=True)
+    refold_output_dir.mkdir(parents=True, exist_ok=True)
+
+    boltz_input: dict = {"sequences": [{"protein": {"id": "A", "sequence": sequence, "msa": "empty"}}]}
+    if smiles:
+        boltz_input["sequences"].append({"ligand": {"id": "B", "smiles": smiles}})
+
+    input_yaml = refold_input_dir / f"{sample_id}.yaml"
+    out_dir = refold_output_dir / sample_id
+    pred_dir = out_dir / "by_seed" / sample_id / "s0"
+
+    if force or not pred_dir.exists():
+        # boltz_cache is unused here -- the kit's weights are pinned/baked in via
+        # BOLTZ_CACHE below, not a per-call --cache flag like stock boltz had.
+        input_yaml.write_text(_yaml.dump(boltz_input, default_flow_style=False))
+        err = _invoke_boltz2(input_yaml, out_dir, label=sample_id)
+        if err is not None:
+            produced = list(pred_dir.glob("*_model_0.cif")) if pred_dir.exists() else []
+            if not produced:
+                return {**_NAN_FOLD_RESULT, "boltz_error": err}
+            print(f"  [boltz2-refold] {sample_id} had a nonzero exit but output exists -- "
+                  f"treating as success (worker exit code is not a reliable success signal)")
+    return _read_refold_result(sample_id, out_dir, gen_ca, smiles, gen_lig, gen_prot_by_res)
+
+
+def run_refolding_batch(items, refold_input_dir, refold_output_dir, boltz_cache,
+                         batch_size=None, batch_max_pad=None, force=False):
+    """Batched sibling of run_refolding: runs the boltz2_kit ONCE against several
+    inputs at once (via the fork's BOLTZ_BATCH_SIZE opt-in batching, see
+    uplifting-biomolecular-modeling/boltz2/BATCHING.md), instead of once per item.
+
+    `items` is a list of dicts, each with the same per-sample fields run_refolding
+    takes individually: sequence, smiles, gen_ca, sample_id, gen_lig (optional),
+    gen_prot_by_res (optional). Returns a list of result dicts, same order and same
+    shape as calling run_refolding once per item.
+
+    batch_size=None (or <=1) degenerates to one apptainer call per item -- i.e. the
+    exact same behavior as looping run_refolding, just routed through this function.
+    This is intentional so callers can switch to this function unconditionally and
+    control batching purely via the batch_size argument (itself normally threaded
+    through from the BOLTZ_BATCH_SIZE env var -- see eval_pallatom_ligand_cond.py's
+    --boltz-batch-size)."""
+    import yaml as _yaml
+    refold_input_dir.mkdir(parents=True, exist_ok=True)
+    refold_output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not batch_size or batch_size <= 1:
+        return [
+            run_refolding(
+                sequence=it["sequence"], smiles=it.get("smiles"), gen_ca=it["gen_ca"],
+                refold_input_dir=refold_input_dir, refold_output_dir=refold_output_dir,
+                sample_id=it["sample_id"], boltz_cache=boltz_cache,
+                gen_lig=it.get("gen_lig"), gen_prot_by_res=it.get("gen_prot_by_res"), force=force,
+            )
+            for it in items
+        ]
+
+    pred_dirs = {
+        it["sample_id"]: refold_output_dir / it["sample_id"] / "by_seed" / it["sample_id"] / "s0"
+        for it in items
+    }
+    needs_run = [it for it in items if force or not pred_dirs[it["sample_id"]].exists()]
+
+    if needs_run:
+        try:
+            input_paths = []
+            for it in needs_run:
+                boltz_input: dict = {
+                    "sequences": [{"protein": {"id": "A", "sequence": it["sequence"], "msa": "empty"}}]
+                }
+                if it.get("smiles"):
+                    boltz_input["sequences"].append({"ligand": {"id": "B", "smiles": it["smiles"]}})
+                p = refold_input_dir / f"{it['sample_id']}.yaml"
+                p.write_text(_yaml.dump(boltz_input, default_flow_style=False))
+                input_paths.append(p)
+            extra_env = {"BOLTZ_BATCH_SIZE": str(batch_size)}
+            if batch_max_pad:
+                extra_env["BOLTZ_BATCH_MAX_PAD"] = str(batch_max_pad)
+            err = _invoke_boltz2(
+                input_paths, refold_output_dir,
+                label=f"batch of {len(needs_run)}",
+                timeout=max(600, 300 * len(needs_run)),
+                extra_env=extra_env,
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return [{**_NAN_FOLD_RESULT,
+                     "boltz_error": f"unexpected exception building/running batch: {e}"}
+                    for _ in items]
+        if err is not None:
+            any_produced = any(pred_dirs[it["sample_id"]].glob("*_model_0.cif")
+                                if pred_dirs[it["sample_id"]].exists() else []
+                                for it in needs_run)
+            if not any_produced:
+                return [{**_NAN_FOLD_RESULT, "boltz_error": err} for _ in items]
+            print(f"  [boltz2-refold] batch of {len(needs_run)} had a nonzero exit but at least "
+                  f"some output exists -- checking each item's own output on disk below "
+                  f"(worker exit code is not a reliable per-item success signal)")
+
+        # A clean (rc=0) batch exit can still silently produce no output for
+        # specific items -- flag those explicitly rather than an unexplained NaN.
+        missing = [it for it in needs_run
+                   if not (pred_dirs[it["sample_id"]].exists()
+                           and any(pred_dirs[it["sample_id"]].glob("*_model_0.cif")))]
+        if missing:
+            print(f"  [boltz2-refold] batch of {len(needs_run)} exited cleanly but produced no "
+                  f"output for {len(missing)} item(s): "
+                  f"{[it['sample_id'] for it in missing]}")
+
+    missing_sids = {it["sample_id"] for it in missing} if needs_run and missing else set()
+    return [
+        {**_NAN_FOLD_RESULT,
+         "boltz_error": "batch call exited cleanly (no exception) but produced no output "
+                         "for this item specifically -- see run_refolding_batch's own stdout "
+                         "around this batch for the sample_id list"}
+        if it["sample_id"] in missing_sids else
+        _read_refold_result(
+            it["sample_id"], refold_output_dir / it["sample_id"], it["gen_ca"], it.get("smiles"),
+            it.get("gen_lig"), it.get("gen_prot_by_res"),
+        )
+        for it in items
+    ]
 
 
 def _parse_mpnn_fasta(fasta_path: Path) -> list[str]:
@@ -1209,12 +1342,53 @@ def run_ligandmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, ligandmpnn_script
                            fixed_residues=fixed_residues, force=force)
 
 
+def _aggregate_mpnn_results(seqs, results, tag):
+    """Shared tail of _run_mpnn_case: turns a list of per-seq boltz2 refold result
+    dicts (any mix of computed-here or precomputed-by-a-batch-caller) into the
+    {tag}_* summary dict (best/mean across seqs). Factored out so both the
+    normal per-sample path and eval_ligand_cond_samples_batch's precomputed-lmpnn
+    path share the exact same aggregation logic."""
+    carmsds  = [r["ca_rmsd"]  for r in results if np.isfinite(r.get("ca_rmsd",  float("nan")))]
+    aarmsds  = [r["aa_rmsd"]  for r in results if np.isfinite(r.get("aa_rmsd",  float("nan")))]
+    ligrmsds = [r["lig_rmsd"] for r in results if np.isfinite(r.get("lig_rmsd", float("nan")))]
+    plddts   = [r["plddt"]    for r in results if np.isfinite(r.get("plddt",    float("nan")))]
+    iptms    = [r["iptm"]     for r in results if np.isfinite(r.get("iptm",     float("nan")))]
+    ligdisps   = [r["lig_displacement"] for r in results if np.isfinite(r.get("lig_displacement", float("nan")))]
+    protplddts = [r["prot_plddt"]       for r in results if np.isfinite(r.get("prot_plddt",       float("nan")))]
+    ligplddts  = [r["lig_plddt"]        for r in results if np.isfinite(r.get("lig_plddt",        float("nan")))]
+    minipaes   = [r["min_ipae"]         for r in results if np.isfinite(r.get("min_ipae",         float("nan")))]
+    errors = [f"{tag}{i}: {r['boltz_error']}" for i, r in enumerate(results) if r.get("boltz_error")]
+    return {
+        f"{tag}_seqs":          seqs,
+        f"{tag}_errors":        errors,
+        f"{tag}_ca_rmsd_best":  min(carmsds)              if carmsds  else float("nan"),
+        f"{tag}_ca_rmsd_mean":  float(np.mean(carmsds))   if carmsds  else float("nan"),
+        f"{tag}_aa_rmsd_best":  min(aarmsds)              if aarmsds  else float("nan"),
+        f"{tag}_aa_rmsd_mean":  float(np.mean(aarmsds))   if aarmsds  else float("nan"),
+        f"{tag}_lig_rmsd_best": min(ligrmsds)             if ligrmsds else float("nan"),
+        f"{tag}_lig_rmsd_mean": float(np.mean(ligrmsds))  if ligrmsds else float("nan"),
+        f"{tag}_plddt_best":    max(plddts)                if plddts   else float("nan"),
+        f"{tag}_plddt_mean":    float(np.mean(plddts))    if plddts   else float("nan"),
+        f"{tag}_iptm_best":     max(iptms)                 if iptms    else float("nan"),
+        f"{tag}_iptm_mean":     float(np.mean(iptms))     if iptms    else float("nan"),
+        f"{tag}_lig_displacement_best": min(ligdisps)            if ligdisps   else float("nan"),
+        f"{tag}_lig_displacement_mean": float(np.mean(ligdisps)) if ligdisps   else float("nan"),
+        f"{tag}_prot_plddt_best":       max(protplddts)          if protplddts else float("nan"),
+        f"{tag}_prot_plddt_mean":       float(np.mean(protplddts)) if protplddts else float("nan"),
+        f"{tag}_lig_plddt_best":        max(ligplddts)           if ligplddts  else float("nan"),
+        f"{tag}_lig_plddt_mean":        float(np.mean(ligplddts)) if ligplddts else float("nan"),
+        f"{tag}_min_ipae_best":         min(minipaes)            if minipaes   else float("nan"),
+        f"{tag}_min_ipae_mean":         float(np.mean(minipaes)) if minipaes   else float("nan"),
+    }
+
+
 def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_dir,
                             boltz_cache, run_pb, skip_fold, contact_cutoff=4.0,
                             mpnn_script=None, ligandmpnn_script=None,
                             mpnn_n_seqs=3, mpnn_refold_dir=None, pb_cache=None,
                             mpnn_cutoff=None, force=False, skip_nolig=False,
-                            sample_id=None):
+                            sample_id=None, _precomputed_fold=None,
+                            _precomputed_fold_nolig=None, _precomputed_lmpnn=None):
     """mpnn_cutoff: None (default) preserves the original behavior -- LigandMPNN
     redesigns the full sequence, no fixed residues. Pass a distance in Angstroms
     (e.g. 6.0) to instead fix residues within that cutoff of the ligand and let
@@ -1240,7 +1414,14 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
     eval_pallatom_ligand_cond.py's --per-ligand-dirs, where an external tool's own output
     naming doesn't include the ligand code -- Complexa's OQO and IAI directories were
     found to use byte-identical filenames) must pass a collision-free id explicitly, or
-    every refold/MPNN cache in this function silently collides across populations."""
+    every refold/MPNN cache in this function silently collides across populations.
+
+    _precomputed_fold / _precomputed_fold_nolig / _precomputed_lmpnn: internal
+    use by eval_ligand_cond_samples_batch, which runs fold/fold_nolig/lmpnn
+    refolds for a whole batch of samples in one combined boltz2_kit call, then
+    passes the already-computed results in here per sample. _precomputed_lmpnn
+    is a (seqs, results) tuple. None (default) preserves the exact
+    original behavior for every other caller."""
     sid = sample_id if sample_id is not None else pdb_path.stem
     (prot_all, prot_ca, resnames, lig_coords, lig_elements, _,
      prot_by_res, prot_res_keys) = parse_pdb_ligand_cond(str(pdb_path))
@@ -1267,6 +1448,9 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
     if skip_fold or not sequence:
         fold        = _nan_fold.copy()
         fold_nolig  = _nan_fold.copy()
+    elif _precomputed_fold is not None:
+        fold = _precomputed_fold
+        fold_nolig = _precomputed_fold_nolig if _precomputed_fold_nolig is not None else _nan_fold.copy()
     else:
         fold = run_refolding(
             sequence=sequence, smiles=smiles, gen_ca=prot_ca,
@@ -1286,47 +1470,36 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
     fold_nolig = {f"nolig_{k}": v for k, v in fold_nolig.items()}
 
     def _run_mpnn_case(seqs, refold_smiles, tag, base_dir):
-        results = []
-        for i, seq in enumerate(seqs):
-            fold_i = run_refolding(
-                sequence=seq, smiles=refold_smiles, gen_ca=prot_ca,
-                refold_input_dir=base_dir / "refold_inputs",
+        # Opt-in batching: if BOLTZ_BATCH_SIZE (int, >1) is set, these seqs' refolds
+        # -- same smiles/gen_ca/gen_lig/gen_prot_by_res, only the sequence differs --
+        # go through one boltz2_kit call instead of one per seq. Unset/<=1 (the
+        # default) falls through to the exact original per-seq loop behavior.
+        _batch_size = int(os.environ.get("BOLTZ_BATCH_SIZE", "0") or "0")
+        if _batch_size > 1 and len(seqs) > 1:
+            items = [
+                {"sequence": seq, "smiles": refold_smiles, "gen_ca": prot_ca,
+                 "sample_id": f"{sid}_{tag}{i}", "gen_lig": gen_lig, "gen_prot_by_res": prot_by_res}
+                for i, seq in enumerate(seqs)
+            ]
+            results = run_refolding_batch(
+                items, refold_input_dir=base_dir / "refold_inputs",
                 refold_output_dir=base_dir / "refold_outputs",
-                sample_id=f"{sid}_{tag}{i}",
-                boltz_cache=boltz_cache,
-                gen_lig=gen_lig, gen_prot_by_res=prot_by_res, force=force,
+                boltz_cache=boltz_cache, batch_size=_batch_size,
+                batch_max_pad=os.environ.get("BOLTZ_BATCH_MAX_PAD"), force=force,
             )
-            results.append(fold_i)
-        carmsds  = [r["ca_rmsd"]  for r in results if np.isfinite(r.get("ca_rmsd",  float("nan")))]
-        aarmsds  = [r["aa_rmsd"]  for r in results if np.isfinite(r.get("aa_rmsd",  float("nan")))]
-        ligrmsds = [r["lig_rmsd"] for r in results if np.isfinite(r.get("lig_rmsd", float("nan")))]
-        plddts   = [r["plddt"]    for r in results if np.isfinite(r.get("plddt",    float("nan")))]
-        iptms    = [r["iptm"]     for r in results if np.isfinite(r.get("iptm",     float("nan")))]
-        ligdisps   = [r["lig_displacement"] for r in results if np.isfinite(r.get("lig_displacement", float("nan")))]
-        protplddts = [r["prot_plddt"]       for r in results if np.isfinite(r.get("prot_plddt",       float("nan")))]
-        ligplddts  = [r["lig_plddt"]        for r in results if np.isfinite(r.get("lig_plddt",        float("nan")))]
-        minipaes   = [r["min_ipae"]         for r in results if np.isfinite(r.get("min_ipae",         float("nan")))]
-        return {
-            f"{tag}_seqs":          seqs,
-            f"{tag}_ca_rmsd_best":  min(carmsds)              if carmsds  else float("nan"),
-            f"{tag}_ca_rmsd_mean":  float(np.mean(carmsds))   if carmsds  else float("nan"),
-            f"{tag}_aa_rmsd_best":  min(aarmsds)              if aarmsds  else float("nan"),
-            f"{tag}_aa_rmsd_mean":  float(np.mean(aarmsds))   if aarmsds  else float("nan"),
-            f"{tag}_lig_rmsd_best": min(ligrmsds)             if ligrmsds else float("nan"),
-            f"{tag}_lig_rmsd_mean": float(np.mean(ligrmsds))  if ligrmsds else float("nan"),
-            f"{tag}_plddt_best":    max(plddts)                if plddts   else float("nan"),
-            f"{tag}_plddt_mean":    float(np.mean(plddts))    if plddts   else float("nan"),
-            f"{tag}_iptm_best":     max(iptms)                 if iptms    else float("nan"),
-            f"{tag}_iptm_mean":     float(np.mean(iptms))     if iptms    else float("nan"),
-            f"{tag}_lig_displacement_best": min(ligdisps)            if ligdisps   else float("nan"),
-            f"{tag}_lig_displacement_mean": float(np.mean(ligdisps)) if ligdisps   else float("nan"),
-            f"{tag}_prot_plddt_best":       max(protplddts)          if protplddts else float("nan"),
-            f"{tag}_prot_plddt_mean":       float(np.mean(protplddts)) if protplddts else float("nan"),
-            f"{tag}_lig_plddt_best":        max(ligplddts)           if ligplddts  else float("nan"),
-            f"{tag}_lig_plddt_mean":        float(np.mean(ligplddts)) if ligplddts else float("nan"),
-            f"{tag}_min_ipae_best":         min(minipaes)            if minipaes   else float("nan"),
-            f"{tag}_min_ipae_mean":         float(np.mean(minipaes)) if minipaes   else float("nan"),
-        }
+        else:
+            results = []
+            for i, seq in enumerate(seqs):
+                fold_i = run_refolding(
+                    sequence=seq, smiles=refold_smiles, gen_ca=prot_ca,
+                    refold_input_dir=base_dir / "refold_inputs",
+                    refold_output_dir=base_dir / "refold_outputs",
+                    sample_id=f"{sid}_{tag}{i}",
+                    boltz_cache=boltz_cache,
+                    gen_lig=gen_lig, gen_prot_by_res=prot_by_res, force=force,
+                )
+                results.append(fold_i)
+        return _aggregate_mpnn_results(seqs, results, tag)
 
     pmpnn_metrics, lmpnn_metrics = {}, {}
     if not skip_fold and len(prot_ca) > 0:
@@ -1338,7 +1511,14 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
                 pmpnn_metrics = _run_mpnn_case(seqs, None, "pmpnn", base / sid / "pmpnn_refold")
             except Exception as e:
                 print(f"  ProteinMPNN error {pdb_path.name}: {e}")
-        if ligandmpnn_script and Path(ligandmpnn_script).exists():
+        if _precomputed_lmpnn is not None:
+            # eval_ligand_cond_samples_batch already ran LigandMPNN AND the
+            # boltz2 refolds for these seqs, combined into the SAME batch call
+            # as every other sample's fold/fold_nolig/lmpnn refolds -- just
+            # aggregate what it already computed.
+            _seqs, _results = _precomputed_lmpnn
+            lmpnn_metrics = _aggregate_mpnn_results(_seqs, _results, "lmpnn")
+        elif ligandmpnn_script and Path(ligandmpnn_script).exists():
             try:
                 # Opt-in only (mpnn_cutoff is None by default): Pallatom-Ligand protocol
                 # of fixing pocket residues (within mpnn_cutoff of the ligand) and letting
@@ -1368,6 +1548,131 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
         **pmpnn_metrics,
         **lmpnn_metrics,
     }
+
+
+def eval_ligand_cond_samples_batch(items, refold_input_dir, refold_output_dir,
+                                    boltz_cache, run_pb, skip_fold, contact_cutoff=4.0,
+                                    ligandmpnn_script=None, mpnn_n_seqs=3, mpnn_cutoff=None,
+                                    force=False, skip_nolig=False, batch_size=None,
+                                    batch_max_pad=None, pb_cache=None, mpnn_refold_dir=None):
+    """Batched sibling of eval_ligand_cond_sample: evaluates several DIFFERENT
+    generated structures together, combining every item's raw fold, fold_nolig
+    (unless skip_nolig), and LigandMPNN-redesigned-sequence refolds into ONE
+    combined run_refolding_batch call. LigandMPNN generation itself still runs
+    per item (cheap, on-disk cached) to get the sequences for that combined
+    call. Everything else runs via eval_ligand_cond_sample's
+    _precomputed_fold/_precomputed_fold_nolig/_precomputed_lmpnn params.
+
+    items: list of (pdb_path, smiles, sample_id) tuples.
+    Returns: list of result dicts, one per item, same shape eval_ligand_cond_sample
+    returns for a single item. batch_size<=1 (or no items) just loops
+    eval_ligand_cond_sample per item -- i.e. the exact unbatched behavior."""
+    if not items:
+        return []
+    if skip_fold or not batch_size or batch_size <= 1:
+        return [
+            eval_ligand_cond_sample(
+                pdb_path=pdb_path, smiles=smiles, refold_input_dir=refold_input_dir,
+                refold_output_dir=refold_output_dir, boltz_cache=boltz_cache,
+                run_pb=run_pb, skip_fold=skip_fold, contact_cutoff=contact_cutoff,
+                ligandmpnn_script=ligandmpnn_script, mpnn_n_seqs=mpnn_n_seqs,
+                mpnn_cutoff=mpnn_cutoff, force=force, skip_nolig=skip_nolig,
+                sample_id=sid, pb_cache=pb_cache, mpnn_refold_dir=mpnn_refold_dir,
+            )
+            for pdb_path, smiles, sid in items
+        ]
+
+    run_lmpnn = bool(ligandmpnn_script and Path(ligandmpnn_script).exists())
+
+    prepared = []
+    for pdb_path, smiles, sid in items:
+        (_, prot_ca, resnames, lig_coords, lig_elements, _,
+         prot_by_res, prot_res_keys) = parse_pdb_ligand_cond(str(pdb_path))
+        sequence = resnames_to_seq(resnames)
+        if len(lig_coords) > 0:
+            heavy_mask = np.array([e.strip().upper() != "H" for e in lig_elements])
+            gen_lig = lig_coords[heavy_mask].astype(np.float64) if heavy_mask.any() else None
+        else:
+            gen_lig = None
+        prepared.append(dict(pdb_path=pdb_path, smiles=smiles, sid=sid, sequence=sequence,
+                              prot_ca=prot_ca, prot_by_res=prot_by_res, prot_res_keys=prot_res_keys,
+                              lig_coords=lig_coords, gen_lig=gen_lig, lmpnn_seqs=[]))
+
+    fold_items = [p for p in prepared if p["sequence"]]
+
+    if run_lmpnn:
+        base_default = refold_output_dir.parent / "mpnn_refold"
+        for p in fold_items:
+            if len(p["prot_ca"]) == 0:
+                continue
+            base = mpnn_refold_dir or base_default
+            try:
+                fixed_residues = (
+                    pocket_fixed_residues(p["prot_by_res"], p["prot_res_keys"], p["lig_coords"],
+                                           cutoff=mpnn_cutoff)
+                    if mpnn_cutoff is not None else ""
+                )
+                p["lmpnn_seqs"] = run_ligandmpnn(
+                    p["pdb_path"], base / p["sid"] / "ligandmpnn", mpnn_n_seqs, ligandmpnn_script,
+                    fixed_residues=fixed_residues, force=force,
+                )
+            except Exception as e:
+                print(f"  LigandMPNN error {p['pdb_path'].name}: {e}")
+
+    combined_inputs = []
+    if fold_items:
+        combined_inputs += [
+            {"sequence": p["sequence"], "smiles": p["smiles"], "gen_ca": p["prot_ca"],
+             "sample_id": p["sid"], "gen_lig": p["gen_lig"], "gen_prot_by_res": p["prot_by_res"]}
+            for p in fold_items
+        ]
+        if not skip_nolig:
+            combined_inputs += [
+                {"sequence": p["sequence"], "smiles": None, "gen_ca": p["prot_ca"],
+                 "sample_id": f"{p['sid']}_nolig", "gen_lig": None, "gen_prot_by_res": p["prot_by_res"]}
+                for p in fold_items
+            ]
+        for p in fold_items:
+            combined_inputs += [
+                {"sequence": seq, "smiles": p["smiles"], "gen_ca": p["prot_ca"],
+                 "sample_id": f"{p['sid']}_lmpnn{i}", "gen_lig": p["gen_lig"],
+                 "gen_prot_by_res": p["prot_by_res"]}
+                for i, seq in enumerate(p["lmpnn_seqs"])
+            ]
+
+    results_by_sid = {}
+    if combined_inputs:
+        combined_results = run_refolding_batch(
+            combined_inputs, refold_input_dir, refold_output_dir, boltz_cache,
+            batch_size=batch_size, batch_max_pad=batch_max_pad, force=force,
+        )
+        results_by_sid = {inp["sample_id"]: r for inp, r in zip(combined_inputs, combined_results)}
+
+    return [
+        eval_ligand_cond_sample(
+            pdb_path=p["pdb_path"], smiles=p["smiles"], refold_input_dir=refold_input_dir,
+            refold_output_dir=refold_output_dir, boltz_cache=boltz_cache,
+            run_pb=run_pb, skip_fold=skip_fold, contact_cutoff=contact_cutoff,
+            ligandmpnn_script=ligandmpnn_script, mpnn_n_seqs=mpnn_n_seqs,
+            mpnn_cutoff=mpnn_cutoff, force=force, skip_nolig=skip_nolig,
+            sample_id=p["sid"], pb_cache=pb_cache, mpnn_refold_dir=mpnn_refold_dir,
+            _precomputed_fold=results_by_sid.get(p["sid"]),
+            _precomputed_fold_nolig=results_by_sid.get(f"{p['sid']}_nolig"),
+            _precomputed_lmpnn=(
+                (p["lmpnn_seqs"], [results_by_sid[f"{p['sid']}_lmpnn{i}"] for i in range(len(p["lmpnn_seqs"]))])
+                if run_lmpnn else None
+            ),
+        ) if p["sequence"] else
+        eval_ligand_cond_sample(
+            pdb_path=p["pdb_path"], smiles=p["smiles"], refold_input_dir=refold_input_dir,
+            refold_output_dir=refold_output_dir, boltz_cache=boltz_cache,
+            run_pb=run_pb, skip_fold=skip_fold, contact_cutoff=contact_cutoff,
+            ligandmpnn_script=ligandmpnn_script, mpnn_n_seqs=mpnn_n_seqs,
+            mpnn_cutoff=mpnn_cutoff, force=force, skip_nolig=skip_nolig,
+            sample_id=p["sid"], pb_cache=pb_cache, mpnn_refold_dir=mpnn_refold_dir,
+        )
+        for p in prepared
+    ]
 
 
 def _finite(vals):
