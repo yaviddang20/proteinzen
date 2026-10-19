@@ -3,8 +3,9 @@
 #SBATCH --output=output_%j.log
 #SBATCH --error=error_%j.log
 #SBATCH --ntasks=1
-#SBATCH --time=48:00:00
-#SBATCH --gres=gpu:nvidia_h200_nvl:4
+#SBATCH --time=96:00:00
+#SBATCH --gres=gpu:nvidia_h200:4
+#SBATCH --cpus-per-task=160
 #SBATCH --account=ucsf_kortemme
 #SBATCH --partition=large_gpu
 #SBATCH --qos=kortemme_lab_qos
