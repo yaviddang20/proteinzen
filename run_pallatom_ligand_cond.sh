@@ -3,10 +3,12 @@ source $dir/env_vars.sh
 eval "$(micromamba shell hook --shell bash)"
 micromamba activate $ENV_NAME
 
-model_name=binder_zen_geom_plinder_pocket_rosetta_repack_ligand_cond_no_prealign_seq_noise
-version_num=1752118
-checkpoint_stem='epoch=2826-step=306500'
+model_name=binder_zen_geom_plinder_pocket_rosetta_repack_ligand_cond_no_prealign_no_h_crop128_256
+version_num=2143739
+checkpoint_stem='epoch=1205-step=135000'
 trans_std=16.0
+overwrite_sample=false
+overwrite_eval=false
 
 # use_preset_conformers: toggle between the original RDKit-generated-conformer
 # run (all 8 Pallatom-Ligand ligands) and a real-crystal-sourced-conformer run
@@ -64,12 +66,18 @@ python ${REPO_ROOT}/sample.py \
     integrator=euler \
     diffeq=base_euler_ode \
     save_traj=true \
-    +unmask_seq=true \
-    overwrite=false \
+    +unmask_seq=false \
+    overwrite=${overwrite_sample} \
     "checkpoint_stem='${checkpoint_stem}'"
 
 # 3) Pallatom-style eval: Boltz2 single-sequence refold, chemically-valid-correspondence
 #    ligand RMSD, ligand centroid displacement, protein/ligand pLDDT split, success
 #    fractions overall and per ligand code. Writes into the SAME out_dir as samples/.
-python ${REPO_ROOT}/_scripts/eval_pallatom_ligand_cond.py \
-    --out-dir ${out_dir}
+if [ "$overwrite_eval" = "true" ]; then
+    python "${REPO_ROOT}/_scripts/eval_pallatom_ligand_cond.py" \
+        --out-dir "${out_dir}" \
+        --overwrite
+else
+    python "${REPO_ROOT}/_scripts/eval_pallatom_ligand_cond.py" \
+        --out-dir "${out_dir}"
+fi
