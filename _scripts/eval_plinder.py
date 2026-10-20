@@ -90,7 +90,12 @@ except ImportError:
     HAS_POSEBUSTERS = False
 
 KNOWN_SMILES = {
-    "SAM": "C[S+](CC[C@@H]([NH3+])C(=O)[O-])[C@@H]1O[C@@H]([C@H](O)[C@@H]1O)n1cnc2c(N)ncnc12",
+    # Was missing the exocyclic C5' methylene between S+ and the ribose ring
+    # (26 heavy atoms instead of real SAM's 27 = C15N6O5S). Kept in sync with
+    # the fixed entry in make_ligand_cond_yaml.py -- if SAM ever diverges
+    # between the two files again, refolded ligands can never match the
+    # generated ligand's atom count, silently zeroing out SAM's success rate.
+    "SAM": "C[S+](CCC(C(=O)[O-])[NH3+])CC1OC(n2cnc3c(N)ncnc23)C(O)C1O",
     "FAD": "Cc1cc2nc3c(=O)[nH]c(=O)nc3n(C[C@H](O)[C@H](O)[C@H](O)COP(=O)(O)OP(=O)(O)OC[C@H]3O[C@@H](n4cnc5c(N)ncnc54)[C@H](O)[C@@H]3O)c2cc1C",
     "NAD": "NC(=O)c1ccc[n+](C2OC(COP(=O)(O)OP(=O)(O)OCC3OC(C(O)C3O)n3cnc4c(N)ncnc34)C(O)C2O)c1",
     "ATP": "Nc1ncnc2n(cnc12)[C@@H]1O[C@H](COP(=O)(O)OP(=O)(O)OP(=O)(O))[C@@H](O)[C@H]1O",
