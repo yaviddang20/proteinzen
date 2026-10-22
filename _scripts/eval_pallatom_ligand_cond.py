@@ -408,6 +408,14 @@ def main():
             skip_nolig=True,
             batch_size=len(items) or 1, batch_max_pad=args.boltz_batch_max_pad,
             real_batch_size=args.boltz_batch_size,
+            # run_ligandmpnn_batch's "_batch_ligandmpnn" control files
+            # (pdb_path_multi.json/fixed_residues_multi.json) are shared, not
+            # per-call -- without a GPU-specific subdir here, every concurrent
+            # shard's subprocess races on the SAME two files, so most shards'
+            # LigandMPNN calls silently redesign a different (stale/overwritten)
+            # shard's items instead of their own. Isolate each shard's working
+            # dir by gpu_id to eliminate the race.
+            mpnn_refold_dir=refold_output_dir.parent / "mpnn_refold" / f"gpu{gpu_id}",
         )
         if len(results) != len(batch_items):
             raise RuntimeError(
