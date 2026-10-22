@@ -1071,6 +1071,18 @@ def _invoke_boltz2(input_path, out_dir, label, timeout=600, extra_env=None):
     failure."""
     gpu_config = _pick_kit_gpu_config()
     input_paths = input_path if isinstance(input_path, list) else [input_path]
+    # Must be absolute: apptainer's default `run` entrypoint (unlike `exec`
+    # with an explicit shell cd) does not reliably resolve relative --input/
+    # --out_dir paths against the caller's cwd -- a relative path here makes
+    # the kit's items_from_yamls() raise FileNotFoundError/ValueError with
+    # just the bare path as its message, surfacing as the cryptic
+    # "[boltz2-opt] NOT ACTIVE: inputs: <path>" with predictions=0 ok=0
+    # failed=0 rc=2, every sample silently NaN'd out rather than erroring
+    # loudly. Confirmed by trial: identical relative-path calls that worked
+    # earlier in a session later failed the same way with no code change --
+    # resolving to absolute fixed it reliably.
+    input_paths = [Path(p).resolve() for p in input_paths]
+    out_dir = Path(out_dir).resolve()
     cmd = [
         "apptainer", "run", "--nv",
         "--bind", f"{_KIT_WEIGHTS / 'boltz2'}:/weights/boltz2",
@@ -1190,10 +1202,12 @@ def run_refolding(sequence, smiles, gen_ca, refold_input_dir, refold_output_dir,
 
 
 def run_refolding_batch(items, refold_input_dir, refold_output_dir, boltz_cache,
-                         batch_size=None, batch_max_pad=None, force=False):
+                         batch_size=None, batch_max_pad=None, force=False,
+                         real_batch_size=None):
     """Batched sibling of run_refolding: runs the boltz2_kit ONCE against several
-    inputs at once (via the fork's BOLTZ_BATCH_SIZE opt-in batching, see
-    uplifting-biomolecular-modeling/boltz2/BATCHING.md), instead of once per item.
+    inputs at once instead of once per item, by handing the kit's `--input` a
+    whole list of yaml paths in one apptainer call. The model loads exactly once
+    for the whole group, regardless of how many items are in it.
 
     `items` is a list of dicts, each with the same per-sample fields run_refolding
     takes individually: sequence, smiles, gen_ca, sample_id, gen_lig (optional),
@@ -1202,10 +1216,22 @@ def run_refolding_batch(items, refold_input_dir, refold_output_dir, boltz_cache,
 
     batch_size=None (or <=1) degenerates to one apptainer call per item -- i.e. the
     exact same behavior as looping run_refolding, just routed through this function.
-    This is intentional so callers can switch to this function unconditionally and
-    control batching purely via the batch_size argument (itself normally threaded
-    through from the BOLTZ_BATCH_SIZE env var -- see eval_pallatom_ligand_cond.py's
-    --boltz-batch-size)."""
+    Any other value just gates whether grouping happens at all here -- every item
+    in `items` goes into the ONE apptainer call either way; this function does not
+    sub-chunk.
+
+    real_batch_size is a SEPARATE, independent knob from batch_size: it is the
+    fork's own opt-in BOLTZ_BATCH_SIZE tensor-level batching (several DIFFERENT
+    inputs padded to one shape and run through the model in the same step -- see
+    uplifting-biomolecular-modeling/boltz2/BATCHING.md). Default None pins
+    BOLTZ_BATCH_SIZE=1, i.e. the kit's own documented "unset or 1 runs upstream's
+    one-input-per-step loop, unchanged" -- every item in the group still shares
+    one model load/apptainer call, but is predicted one-at-a-time within it,
+    identical math to the fully unbatched per-item loop. BATCHING.md explicitly
+    flags this feature as untested with ligands, templates, or MSAs; every caller
+    in this codebase evaluates ligand-conditioned structures, so real_batch_size
+    should stay unset (the default) unless validated separately via
+    tools/boltz2_batching/validate.sh on inputs like ours."""
     import yaml as _yaml
     refold_input_dir.mkdir(parents=True, exist_ok=True)
     refold_output_dir.mkdir(parents=True, exist_ok=True)
@@ -1239,7 +1265,7 @@ def run_refolding_batch(items, refold_input_dir, refold_output_dir, boltz_cache,
                 p = refold_input_dir / f"{it['sample_id']}.yaml"
                 p.write_text(_yaml.dump(boltz_input, default_flow_style=False))
                 input_paths.append(p)
-            extra_env = {"BOLTZ_BATCH_SIZE": str(batch_size)}
+            extra_env = {"BOLTZ_BATCH_SIZE": str(real_batch_size or 1)}
             if batch_max_pad:
                 extra_env["BOLTZ_BATCH_MAX_PAD"] = str(batch_max_pad)
             err = _invoke_boltz2(
@@ -1559,19 +1585,28 @@ def eval_ligand_cond_samples_batch(items, refold_input_dir, refold_output_dir,
                                     boltz_cache, run_pb, skip_fold, contact_cutoff=4.0,
                                     ligandmpnn_script=None, mpnn_n_seqs=3, mpnn_cutoff=None,
                                     force=False, skip_nolig=False, batch_size=None,
-                                    batch_max_pad=None, pb_cache=None, mpnn_refold_dir=None):
+                                    batch_max_pad=None, pb_cache=None, mpnn_refold_dir=None,
+                                    real_batch_size=None):
     """Batched sibling of eval_ligand_cond_sample: evaluates several DIFFERENT
     generated structures together, combining every item's raw fold, fold_nolig
     (unless skip_nolig), and LigandMPNN-redesigned-sequence refolds into ONE
-    combined run_refolding_batch call. LigandMPNN generation itself still runs
-    per item (cheap, on-disk cached) to get the sequences for that combined
-    call. Everything else runs via eval_ligand_cond_sample's
+    combined run_refolding_batch call -- one apptainer/model-load for the whole
+    group, not one per item. LigandMPNN generation itself still runs per item
+    (cheap, on-disk cached) to get the sequences for that combined call.
+    Everything else runs via eval_ligand_cond_sample's
     _precomputed_fold/_precomputed_fold_nolig/_precomputed_lmpnn params.
 
     items: list of (pdb_path, smiles, sample_id) tuples.
     Returns: list of result dicts, one per item, same shape eval_ligand_cond_sample
     returns for a single item. batch_size<=1 (or no items) just loops
-    eval_ligand_cond_sample per item -- i.e. the exact unbatched behavior."""
+    eval_ligand_cond_sample per item -- i.e. the exact unbatched behavior.
+
+    real_batch_size: passed straight through to run_refolding_batch -- the fork's
+    own experimental tensor-level BOLTZ_BATCH_SIZE batching, independent of
+    batch_size (which only controls whether/that everything here is grouped into
+    one apptainer call). Default None keeps that experimental path off (see
+    run_refolding_batch's docstring for why: untested with ligands, which is all
+    this function ever evaluates)."""
     if not items:
         return []
     if skip_fold or not batch_size or batch_size <= 1:
@@ -1650,6 +1685,7 @@ def eval_ligand_cond_samples_batch(items, refold_input_dir, refold_output_dir,
         combined_results = run_refolding_batch(
             combined_inputs, refold_input_dir, refold_output_dir, boltz_cache,
             batch_size=batch_size, batch_max_pad=batch_max_pad, force=force,
+            real_batch_size=real_batch_size,
         )
         results_by_sid = {inp["sample_id"]: r for inp, r in zip(combined_inputs, combined_results)}
 

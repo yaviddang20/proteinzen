@@ -261,19 +261,19 @@ def main():
                              "to repeat the ligand list here.")
     parser.add_argument("--boltz-cache", type=Path, default=None)
     parser.add_argument("--boltz-batch-size", type=int, default=None,
-                        help="Opt-in Boltz2 batching (this fork only, see "
-                             "uplifting-biomolecular-modeling/boltz2/BATCHING.md): batch "
-                             "this many LigandMPNN-redesigned sequences' refolds into one "
-                             "boltz2_kit call instead of one call per sequence. Only "
-                             "affects the per-sequence refold loop inside eval_plinder.py's "
-                             "_run_mpnn_case (the --mpnn-n-seqs sequences for one structure "
-                             "share smiles/gen_ca/gen_lig, so they're the natural batch "
-                             "unit here); the raw-sample fold/fold_nolig refolds are each "
-                             "already a single input and are unaffected either way. Default "
-                             "None (unset) runs the exact unbatched per-sequence loop, "
-                             "unchanged. Experimental -- see BATCHING.md's own caveats "
-                             "(fast mode + single GPU only, not yet validated with MSAs/"
-                             "ligands/templates beyond what this script itself uses).")
+                        help="Opt-in to the fork's EXPERIMENTAL same-step tensor batching "
+                             "(uplifting-biomolecular-modeling/boltz2/BATCHING.md's "
+                             "BOLTZ_BATCH_SIZE): several different inputs padded to one shape "
+                             "and run through the model in the same step, for extra "
+                             "throughput beyond just avoiding repeated model loads (every "
+                             "worker already groups its whole GPU shard into one combined "
+                             "boltz2_kit call regardless of this flag -- one model load per "
+                             "GPU, always). Default None pins BOLTZ_BATCH_SIZE=1 (upstream's "
+                             "unchanged one-input-per-step loop -- the safe default, since "
+                             "BATCHING.md explicitly flags this feature as untested with "
+                             "ligands, and every structure this script evaluates has one). "
+                             "Only raise this after running "
+                             "tools/boltz2_batching/validate.sh on inputs like ours.")
     parser.add_argument("--boltz-batch-max-pad", type=float, default=None,
                         help="Passed through as BOLTZ_BATCH_MAX_PAD when --boltz-batch-size "
                              "is set (see BATCHING.md). Default None leaves the fork's own "
@@ -308,13 +308,15 @@ def main():
 
     # Set before any GPU worker processes are spawned below so they inherit it --
     # eval_plinder.py's _run_mpnn_case reads BOLTZ_BATCH_SIZE directly from the
-    # environment (see run_pallatom_ligand_cond.sh's boltz_batch_size variable).
+    # environment as its own fallback toggle, for any caller that doesn't reach
+    # this script's own combined-batch path below. This is the EXPERIMENTAL
+    # tensor-batching knob -- see run_refolding_batch's docstring.
     if args.boltz_batch_size is not None:
         import os as _os
         _os.environ["BOLTZ_BATCH_SIZE"] = str(args.boltz_batch_size)
         if args.boltz_batch_max_pad is not None:
             _os.environ["BOLTZ_BATCH_MAX_PAD"] = str(args.boltz_batch_max_pad)
-        print(f"[eval_pallatom] Boltz2 batching enabled: BOLTZ_BATCH_SIZE="
+        print(f"[eval_pallatom] Boltz2 EXPERIMENTAL tensor batching enabled: BOLTZ_BATCH_SIZE="
               f"{args.boltz_batch_size}" + (f" BOLTZ_BATCH_MAX_PAD={args.boltz_batch_max_pad}"
               if args.boltz_batch_max_pad is not None else ""))
 
@@ -390,21 +392,23 @@ def main():
         return f"{code}__{pdb_path.stem}" if args.per_ligand_dirs else pdb_path.stem
 
     def _run_batch(batch_items, gpu_id):
-        """Runs a list of (pdb_path, code, smiles) on a specific GPU. Batches
-        their fold/fold_nolig/lmpnn refolds into one boltz2_kit call via
-        eval_ligand_cond_samples_batch when args.boltz_batch_size is set and
-        len(batch_items) > 1. Returns (code, result_dict) tuples, same order."""
+        """Runs a list of (pdb_path, code, smiles) on a specific GPU. Groups
+        every item's fold/lmpnn refolds into ONE combined boltz2_kit call via
+        eval_ligand_cond_samples_batch -- one model load for the whole list,
+        not one per item. Returns (code, result_dict) tuples, same order."""
         import os as _os
         _os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         items = [(pdb_path, smiles, _cache_id(code, pdb_path)) for pdb_path, code, smiles in batch_items]
         results = eval_ligand_cond_samples_batch(
-            items, refold_input_dir=refold_input_dir, refold_output_dir=refold_output_dir,
+            items, refold_input_dir=refold_input_dir,
+            refold_output_dir=refold_output_dir,
             boltz_cache=args.boltz_cache, run_pb=False, skip_fold=False,
             contact_cutoff=args.contact_cutoff,
             ligandmpnn_script=args.ligandmpnn_script if run_mpnn else None,
             mpnn_n_seqs=args.mpnn_n_seqs, mpnn_cutoff=args.mpnn_cutoff,
             force=args.overwrite, skip_nolig=True,
-            batch_size=args.boltz_batch_size, batch_max_pad=args.boltz_batch_max_pad,
+            batch_size=len(items) or 1, batch_max_pad=args.boltz_batch_max_pad,
+            real_batch_size=args.boltz_batch_size,
         )
         if len(results) != len(batch_items):
             raise RuntimeError(
@@ -481,70 +485,56 @@ def main():
                 results_by_code[code].append(r)
 
     if todo:
-        boltz_bsz = args.boltz_batch_size or 1
-        print(f"Evaluating {len(todo)} not-yet-cached sample(s) on {num_gpus} GPU(s)"
-              + (f", Boltz2 batch size {boltz_bsz}" if boltz_bsz > 1 else ""))
+        print(f"Evaluating {len(todo)} not-yet-cached sample(s) on {num_gpus} GPU(s), "
+              f"one combined boltz2_kit call per GPU shard"
+              + (f" (BOLTZ_BATCH_SIZE={args.boltz_batch_size})" if args.boltz_batch_size else ""))
         if num_gpus <= 1:
-            with tqdm(total=len(todo), desc="eval") as pbar:
-                for i in range(0, len(todo), boltz_bsz):
-                    chunk = todo[i:i + boltz_bsz]
-                    try:
-                        chunk_results = _run_batch(chunk, gpu_id=0)
-                    except Exception as e:
-                        print(f"  ERROR in chunk starting at {chunk[0][0].name}: {e}")
-                        chunk_results = [
-                            (code, {"sample_id": pdb_path.stem, "pdb_path": str(pdb_path),
-                                    "ligand_code": code, "error": str(e), "ca_rmsd": float("nan")})
-                            for pdb_path, code, smiles in chunk
-                        ]
-                    for code, r in chunk_results:
-                        r.update(compute_success(r))
-                        results_by_code[code].append(r)
-                    pbar.update(len(chunk))
+            try:
+                chunk_results = _run_batch(todo, gpu_id=0)
+            except Exception as e:
+                print(f"  ERROR in shard: {e}")
+                chunk_results = [
+                    (code, {"sample_id": pdb_path.stem, "pdb_path": str(pdb_path),
+                            "ligand_code": code, "error": str(e), "ca_rmsd": float("nan")})
+                    for pdb_path, code, smiles in todo
+                ]
+            for code, r in chunk_results:
+                r.update(compute_success(r))
+                results_by_code[code].append(r)
         else:
             import multiprocessing as _mp
             import queue as _queue
 
-            work_queue = _mp.Queue()
+            # Static per-GPU division, not a shared queue: each worker gets its
+            # own fixed shard up front and makes its own (one, or a few if
+            # --boltz-batch-size caps the group) combined boltz2_kit call(s) for
+            # the whole shard -- avoiding repeated model loads is the actual
+            # bottleneck here, not load-balancing across GPUs, so there's no
+            # dynamic work-stealing between shards.
+            shards = [todo[i::num_gpus] for i in range(num_gpus)]
+            shards = [s for s in shards if s]  # drop empty shards (len(todo) < num_gpus)
+
             result_queue = _mp.Queue()
-            for item in todo:
-                work_queue.put(item)
-            for _ in range(num_gpus):  # one sentinel per worker
-                work_queue.put(None)
 
-            def _worker(gpu_id, work_q, result_q, batch_size):
-                while True:
-                    item = work_q.get()
-                    if item is None:
-                        break
-                    batch = [item]
-                    # Opportunistically drain up to batch_size-1 more WITHOUT blocking,
-                    # so a backlog gets batched -- never waits around to fill one.
-                    while len(batch) < batch_size:
-                        try:
-                            item = work_q.get_nowait()
-                        except _queue.Empty:
-                            break
-                        if item is None:
-                            work_q.put(None)  # let the next worker (or this one) still see it
-                            break
-                        batch.append(item)
-                    try:
-                        for code, r in _run_batch(batch, gpu_id):
-                            result_q.put((code, r))
-                    except Exception as e:
-                        for pdb_path, code, smiles in batch:
-                            r = {"sample_id": pdb_path.stem, "pdb_path": str(pdb_path),
-                                 "ligand_code": code, "error": str(e), "ca_rmsd": float("nan")}
-                            print(f"  ERROR {pdb_path.name}: {e}")
-                            result_q.put((code, r))
+            def _worker(gpu_id, shard, result_q):
+                try:
+                    for code, r in _run_batch(shard, gpu_id):
+                        result_q.put((code, r))
+                except Exception as e:
+                    for pdb_path, code, smiles in shard:
+                        r = {"sample_id": pdb_path.stem, "pdb_path": str(pdb_path),
+                             "ligand_code": code, "error": str(e), "ca_rmsd": float("nan")}
+                        print(f"  ERROR {pdb_path.name}: {e}")
+                        result_q.put((code, r))
 
-            procs = [_mp.Process(target=_worker, args=(i, work_queue, result_queue, boltz_bsz), daemon=True)
-                     for i in range(num_gpus)]
+            procs = [_mp.Process(target=_worker, args=(i, shard, result_queue), daemon=True)
+                     for i, shard in enumerate(shards)]
             for p in procs:
                 p.start()
             # Poll with a timeout rather than block forever -- a worker that's
-            # OOM-killed/segfaults/preempted mid-batch never calls result_q.put.
+            # OOM-killed/segfaults/preempted mid-shard never calls result_q.put.
+            # Progress arrives in big jumps (a whole shard's worth at once), not
+            # smoothly per item, since each shard is one combined call.
             received = 0
             with tqdm(total=len(todo), desc="eval") as pbar:
                 while received < len(todo):
@@ -557,9 +547,9 @@ def main():
                                 f"{len(dead)} worker process(es) exited abnormally "
                                 f"(exitcodes {[p.exitcode for p in dead]}) with "
                                 f"{len(todo) - received}/{len(todo)} result(s) still "
-                                f"outstanding -- at least one in-flight batch was lost "
-                                f"when its worker died (OOM-kill/segfault/preemption), "
-                                f"not a hang. Re-run with overwrite=False to retry only "
+                                f"outstanding -- at least one shard was lost when its "
+                                f"worker died (OOM-kill/segfault/preemption), not a "
+                                f"hang. Re-run with overwrite=False to retry only "
                                 f"what's genuinely missing/incomplete."
                             )
                         continue
