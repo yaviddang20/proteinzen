@@ -158,6 +158,14 @@ class ModelForwardWrapper(abc.ABC):
         if self.compute_scores:
             base_rot_score = self.rot_vf_to_rot_score(rot_time, base_rot_vf, pred_rotmats_1, rotmats_t)
             base_trans_score = self.trans_vf_to_trans_score(trans_time, base_trans_vf, trans_t)
+            # TEMP CHPC-ONLY FIX (not in git, see conversation 2026-10-21):
+            # both conversions blow up as t->1 (trans via /(1-t), rot via a
+            # cot(.../(1-t)) pole in _get_rot_score_prefactor), which produced
+            # tensor(4.8e8) then NaN mid-sampling on euler_sde_t400. Clamp to
+            # bound the trajectory until a proper fix is decided and committed.
+            SCORE_CLIP = 1e4
+            base_rot_score = base_rot_score.clamp(min=-SCORE_CLIP, max=SCORE_CLIP)
+            base_trans_score = base_trans_score.clamp(min=-SCORE_CLIP, max=SCORE_CLIP)
             scores_and_vfs.update({
                 "base_rot_score": base_rot_score.detach(),
                 "base_trans_score": base_trans_score.detach()

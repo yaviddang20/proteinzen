@@ -1083,31 +1083,69 @@ def _invoke_boltz2(input_path, out_dir, label, timeout=600, extra_env=None):
     # resolving to absolute fixed it reliably.
     input_paths = [Path(p).resolve() for p in input_paths]
     out_dir = Path(out_dir).resolve()
+    # TEMP CHPC-ONLY FIX (not in git, see conversation 2026-10-21): apptainer's
+    # default  mounts the HOST's real /tmp and /dev/shm straight into the
+    # container (no --contain here). Multiple concurrent containers on the
+    # same node were colliding on both. Give every call its own unique
+    # host-side dirs for both.
+    import tempfile as _tempfile
+    _call_tmp = _tempfile.mkdtemp(prefix=f"boltz2_call_{os.getpid()}_")
+    _call_shm = _tempfile.mkdtemp(prefix=f"boltz2_shm_{os.getpid()}_")
     cmd = [
         "apptainer", "run", "--nv",
         "--bind", f"{_KIT_WEIGHTS / 'boltz2'}:/weights/boltz2",
         "--bind", f"{_KIT_OUT / 'boltz2' / 'out'}:/kit/boltz2/out",
         "--bind", "/mnt/scratch/user/daviyang",
+        "--bind", f"{_call_tmp}:/tmp",
+        "--bind", f"{_call_shm}:/dev/shm",
         str(_KIT_ROOT / "boltz2.sif"),
         "pred", "--config", gpu_config, "--mode", "fast",
         "--input", *[str(p) for p in input_paths], "--out_dir", str(out_dir),
     ]
     try:
+      try:
         _env = {**os.environ, "SLURM_NTASKS": "1", "SLURM_JOB_NUM_NODES": "1",
                 "BOLTZ_CACHE": "/weights/boltz2",
                 "MODEL_OPT_JIT_ROOT": str(_KIT_OUT / "boltz2" / "jit"),
                 **(extra_env or {})}
         subprocess.run(cmd, check=True, timeout=timeout, env=_env, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
+      except subprocess.CalledProcessError as e:
         # This kit can exit nonzero (e.g. rc=3) on an otherwise-successful
         # prediction -- caller must check disk, not trust this alone.
-        print(f"  [boltz2-refold] {label} returncode={e.returncode}\n"
-              f"STDOUT:{(e.stdout or '')[-2000:]}\nSTDERR:{(e.stderr or '')[-2000:]}")
-        return (f"returncode={e.returncode} "
-                f"stdout:{(e.stdout or '')[-600:]} stderr:{(e.stderr or '')[-600:]}")
-    except subprocess.TimeoutExpired:
+        # TEMP CHPC-ONLY (see conversation 2026-10-21): dump FULL untruncated
+        # stdout+stderr to a file (hundreds of repetitive "[boltz2-opt] LEVER
+        # name=..." lines used to fill the old last-2000-chars tail entirely,
+        # pushing the real error out before it ever printed), and print/return
+        # only the non-LEVER lines plus a pointer to that file.
+        import time as _time
+        _dump_dir = Path('/mnt/scratch/user/daviyang/proteinzen/external_baselines/boltz2_error_dumps')
+        _dump_dir.mkdir(parents=True, exist_ok=True)
+        _dump_path = _dump_dir / f"{label.replace(' ', '_')}_{int(_time.time()*1000)}.log"
+        _dump_path.write_text(
+            f"CMD: {cmd}\n\nSTDOUT:\n{e.stdout or ''}\n\nSTDERR:\n{e.stderr or ''}"
+        )
+
+        def _non_lever(text):
+            return '\n'.join(
+                ln for ln in (text or '').splitlines()
+                if '[boltz2-opt] LEVER' not in ln
+            )
+
+        stdout_signal = _non_lever(e.stdout)[-3000:]
+        stderr_signal = _non_lever(e.stderr)[-3000:]
+        print(f"  [boltz2-refold] {label} returncode={e.returncode} "
+              f"(full output: {_dump_path})\n"
+              f"STDOUT (LEVER lines filtered):{stdout_signal}\n"
+              f"STDERR (LEVER lines filtered):{stderr_signal}")
+        return (f"returncode={e.returncode} dump={_dump_path} "
+                f"stdout:{stdout_signal[-600:]} stderr:{stderr_signal[-600:]}")
+      except subprocess.TimeoutExpired:
         return "timeout"
-    return None
+      return None
+    finally:
+        import shutil as _shutil
+        _shutil.rmtree(_call_tmp, ignore_errors=True)
+        _shutil.rmtree(_call_shm, ignore_errors=True)
 
 
 def _read_refold_result(sample_id, out_dir, gen_ca, smiles, gen_lig=None, gen_prot_by_res=None):
@@ -1274,12 +1312,49 @@ def run_refolding_batch(items, refold_input_dir, refold_output_dir, boltz_cache,
             extra_env = {"BOLTZ_BATCH_SIZE": str(real_batch_size or 1)}
             if batch_max_pad:
                 extra_env["BOLTZ_BATCH_MAX_PAD"] = str(batch_max_pad)
-            err = _invoke_boltz2(
-                input_paths, refold_output_dir,
-                label=f"batch of {len(needs_run)}",
-                timeout=max(600, 300 * len(needs_run)),
-                extra_env=extra_env,
-            )
+            # TEMP CHPC-ONLY FIX (not in git, see conversation 2026-10-21):
+            # ACTUAL ROOT CAUSE of the all-or-nothing concurrent-call failures
+            # -- every concurrent call used to share refold_output_dir as its
+            # --out_dir. The kit has no --tag flag; it derives a FIXED
+            # tag="pred" and workdir=<out_dir>/_kit from --out_dir alone
+            # (opt/boltz2_opt/worker.py's run(), stack.py's stage()/
+            # write_batch()/run_worker()). With a shared out_dir, every
+            # concurrent container reads/writes the SAME _kit/batch_pred.json
+            # and staged bz_worker.py with zero locking -- whichever write
+            # landed last won, and the loser's own worker subprocess ran
+            # against the WRONG batch content (confirmed directly: a dump
+            # showed GPU3's own --input list captured in its CMD, but its
+            # stdout's PHASE lines were for GPU2's items), producing zero
+            # output for ALL of the loser's own items. /tmp and /dev/shm
+            # isolation above never touched this -- _kit lives under
+            # --out_dir, bound via the catch-all /mnt/scratch/user/daviyang
+            # bind, nowhere near /tmp or /dev/shm. Fix: give every call its
+            # own private --out_dir (so its own _kit/tag/batch file can never
+            # collide with a concurrent call's), then move each item's
+            # by_seed/<sample_id> result subtree into the real shared
+            # refold_output_dir afterward, since _read_refold_result and
+            # everything downstream expect results there.
+            import tempfile as _tempfile
+            import shutil as _shutil
+            _call_out_dir = Path(_tempfile.mkdtemp(dir=refold_output_dir, prefix="_call_"))
+            try:
+                err = _invoke_boltz2(
+                    input_paths, _call_out_dir,
+                    label=f"batch of {len(needs_run)}",
+                    timeout=max(600, 300 * len(needs_run)),
+                    extra_env=extra_env,
+                )
+                for it in needs_run:
+                    sid = it["sample_id"]
+                    src = _call_out_dir / "by_seed" / sid
+                    if src.exists():
+                        dst = refold_output_dir / "by_seed" / sid
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        if dst.exists():
+                            _shutil.rmtree(dst)
+                        _shutil.move(str(src), str(dst))
+            finally:
+                _shutil.rmtree(_call_out_dir, ignore_errors=True)
         except Exception as e:
             import traceback
             traceback.print_exc()

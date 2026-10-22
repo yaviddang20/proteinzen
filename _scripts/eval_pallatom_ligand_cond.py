@@ -391,11 +391,9 @@ def main():
         to avoid invalidating existing caches for every other caller of this script."""
         return f"{code}__{pdb_path.stem}" if args.per_ligand_dirs else pdb_path.stem
 
-    def _run_batch(batch_items, gpu_id):
-        """Runs a list of (pdb_path, code, smiles) on a specific GPU. Groups
-        every item's fold/lmpnn refolds into ONE combined boltz2_kit call via
-        eval_ligand_cond_samples_batch -- one model load for the whole list,
-        not one per item. Returns (code, result_dict) tuples, same order."""
+    def _run_batch_once(batch_items, gpu_id, force_override=None):
+        """Single combined boltz2_kit call for batch_items on gpu_id -- no retry.
+        Returns (code, result_dict) tuples, same order as batch_items."""
         import os as _os
         _os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         items = [(pdb_path, smiles, _cache_id(code, pdb_path)) for pdb_path, code, smiles in batch_items]
@@ -406,7 +404,8 @@ def main():
             contact_cutoff=args.contact_cutoff,
             ligandmpnn_script=args.ligandmpnn_script if run_mpnn else None,
             mpnn_n_seqs=args.mpnn_n_seqs, mpnn_cutoff=args.mpnn_cutoff,
-            force=args.overwrite, skip_nolig=True,
+            force=args.overwrite if force_override is None else force_override,
+            skip_nolig=True,
             batch_size=len(items) or 1, batch_max_pad=args.boltz_batch_max_pad,
             real_batch_size=args.boltz_batch_size,
         )
@@ -416,15 +415,33 @@ def main():
                 f"{len(batch_items)} input items -- refusing to silently zip-truncate. "
                 f"Items: {[_cache_id(code, pdb_path) for pdb_path, code, smiles in batch_items]}"
             )
-        out = []
-        for (pdb_path, code, smiles), r in zip(batch_items, results):
+        return list(zip([code for _, code, _ in batch_items], results))
+
+    def _run_batch(batch_items, gpu_id):
+        """Runs a list of (pdb_path, code, smiles) on a specific GPU via ONE
+        combined boltz2_kit call -- one model load for the whole shard, not
+        one per item. Returns (code, result_dict) tuples, same order.
+
+        No chunking/retry here: the real root cause of the earlier flaky
+        all-items-failed-at-once behavior was a shared --out_dir collision
+        in _invoke_boltz2/run_refolding_batch (now fixed with a per-call
+        unique out_dir), not batch size. See [[project_eval_plinder]]."""
+        import os as _os
+
+        def _write_cache(pdb_path, code, r):
+            cid = _cache_id(code, pdb_path)
             r["ligand_code"] = code
             r["_cache_schema_version"] = CACHE_SCHEMA_VERSION
-            cache_path = per_sample_dir / f"{_cache_id(code, pdb_path)}.json"
+            cache_path = per_sample_dir / f"{cid}.json"
             tmp_path = cache_path.with_suffix(f".json.tmp{_os.getpid()}")
             tmp_path.write_text(json.dumps(r, indent=2, default=str))
             tmp_path.replace(cache_path)
-            out.append((code, r))
+
+        pairs = _run_batch_once(batch_items, gpu_id)
+        out = []
+        for (pdb_path, code, smiles), (code2, r) in zip(batch_items, pairs):
+            _write_cache(pdb_path, code, r)
+            out.append((code2, r))
         return out
 
     results_by_code: dict[str, list[dict]] = {}
