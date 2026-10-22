@@ -1247,8 +1247,14 @@ def run_refolding_batch(items, refold_input_dir, refold_output_dir, boltz_cache,
             for it in items
         ]
 
+    # All items in a batched call share ONE --out_dir (refold_output_dir itself,
+    # not a per-item subdirectory -- see the _invoke_boltz2 call below), so the
+    # kit writes every item flat under refold_output_dir/by_seed/<sample_id>/s0,
+    # not refold_output_dir/<sample_id>/by_seed/<sample_id>/s0 (that nested form
+    # is only correct for run_refolding's single-item path, which passes
+    # out_dir=refold_output_dir/sample_id as ITS OWN distinct --out_dir).
     pred_dirs = {
-        it["sample_id"]: refold_output_dir / it["sample_id"] / "by_seed" / it["sample_id"] / "s0"
+        it["sample_id"]: refold_output_dir / "by_seed" / it["sample_id"] / "s0"
         for it in items
     }
     needs_run = [it for it in items if force or not pred_dirs[it["sample_id"]].exists()]
@@ -1308,7 +1314,7 @@ def run_refolding_batch(items, refold_input_dir, refold_output_dir, boltz_cache,
                          "around this batch for the sample_id list"}
         if it["sample_id"] in missing_sids else
         _read_refold_result(
-            it["sample_id"], refold_output_dir / it["sample_id"], it["gen_ca"], it.get("smiles"),
+            it["sample_id"], refold_output_dir, it["gen_ca"], it.get("smiles"),
             it.get("gen_lig"), it.get("gen_prot_by_res"),
         )
         for it in items
