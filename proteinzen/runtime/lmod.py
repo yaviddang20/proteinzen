@@ -1318,7 +1318,7 @@ class BiomoleculeModule(L.LightningModule):
 
         diffeq = BaseEulerODEStep() if self.epoch_sample_diffeq == "euler_ode" else BaseEulerSDEStep()
         integrator = EulerIntegrator(
-            wrapped_model=BaseModelForward(model),
+            wrapped_model=BaseModelForward(model, compute_scores=self.epoch_sample_diffeq == "euler_sde"),
             diffeq=diffeq,
             no_rot_sampling=not self.use_rot_vf_loss,
             unmask_seq=self.seq_noise_schedule,
