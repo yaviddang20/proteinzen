@@ -816,8 +816,13 @@ class BiomoleculeModule(L.LightningModule):
         with torch.no_grad():
             self_pred = self.model(batch_hat, compute_motif_idx=False)
 
-        trans_1_hat = self_pred['denoised_rigids'].get_trans()
-        rotmats_1_hat = self_pred['denoised_rigids'].get_rots().get_rot_mats()
+        # the model's own prediction is only meaningful (trained/supervised) at
+        # diffused positions -- fixed/non-diffused positions (e.g. a fixed ligand)
+        # are masked out of the loss, so the model's output there is untrained
+        # garbage. Keep those pinned to the true rigids_1, same as corrupt_dense_batch
+        # already does for the normal (non-bootstrapped) path.
+        trans_1_hat = torch.where(diffuse_mask[..., None], self_pred['denoised_rigids'].get_trans(), trans_1)
+        rotmats_1_hat = torch.where(diffuse_mask[..., None, None], self_pred['denoised_rigids'].get_rots().get_rot_mats(), rotmats_1)
 
         rigids_t_tilde = corrupter.corrupt_rigids_at_t(
             trans_1_hat, trans_0, rotmats_1_hat, rotmats_0, t, rigids_mask, diffuse_mask
