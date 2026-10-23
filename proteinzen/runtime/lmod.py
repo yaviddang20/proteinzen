@@ -37,7 +37,7 @@ from proteinzen.data.write.pdb import to_pdb
 from proteinzen.model.utils import gather_helper, SamplingDivergedError
 from proteinzen.model.denoiser_v2 import MonotonicIncreasingFn
 from proteinzen.stoch_interp.integration import Integrator, EulerIntegrator
-from proteinzen.stoch_interp.diffeq import BaseEulerODEStep
+from proteinzen.stoch_interp.diffeq import BaseEulerODEStep, BaseEulerSDEStep
 from proteinzen.stoch_interp.model_wrapper import BaseModelForward
 from proteinzen.stoch_interp import so3_utils
 from proteinzen.stoch_interp.multiframe import align_structures
@@ -520,6 +520,7 @@ class BiomoleculeModule(L.LightningModule):
                  epoch_sample_every_n_epochs=5,
                  epoch_sample_num_steps=100,
                  epoch_sample_traj_npz=False,
+                 epoch_sample_diffeq="euler_ode",
                  seq_noise_schedule=False,
                  # use_stabilized_high_t_loss=False
                  lora_config=None,
@@ -611,6 +612,9 @@ class BiomoleculeModule(L.LightningModule):
         self.epoch_sample_every_n_epochs = epoch_sample_every_n_epochs
         self.epoch_sample_num_steps = epoch_sample_num_steps
         self.epoch_sample_traj_npz = epoch_sample_traj_npz
+        if epoch_sample_diffeq not in ("euler_ode", "euler_sde"):
+            raise ValueError(f"epoch_sample_diffeq must be 'euler_ode' or 'euler_sde', got {epoch_sample_diffeq!r}")
+        self.epoch_sample_diffeq = epoch_sample_diffeq
         self.seq_noise_schedule = seq_noise_schedule
         self._epoch_sample_train_batch = None
         self._epoch_sample_val_batch = None
@@ -1312,13 +1316,16 @@ class BiomoleculeModule(L.LightningModule):
 
         initial_seq_noising_mask = batch['token']['seq_noising_mask'].clone()
 
+        diffeq = BaseEulerODEStep() if self.epoch_sample_diffeq == "euler_ode" else BaseEulerSDEStep()
         integrator = EulerIntegrator(
             wrapped_model=BaseModelForward(model),
-            diffeq=BaseEulerODEStep(),
+            diffeq=diffeq,
             no_rot_sampling=not self.use_rot_vf_loss,
             unmask_seq=self.seq_noise_schedule,
         )
-        ts = torch.linspace(0.0, 1.0, self.epoch_sample_num_steps + 1)
+        # clamp away from t=1.0 -- found to work better, and avoids the (1-t)
+        # division blowups the rest of the codebase already clamps t_max=0.99 for.
+        ts = torch.linspace(0.0, 0.99, self.epoch_sample_num_steps + 1)
         clean_traj, prot_traj, final_denoiser_out = integrator.sample(batch, ts)
         final_rigids = final_denoiser_out['denoised_rigids']
 
