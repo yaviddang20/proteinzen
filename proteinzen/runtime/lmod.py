@@ -783,12 +783,16 @@ class BiomoleculeModule(L.LightningModule):
 
     def _self_interpolate_rigids_t(self, batch, dt=0.02):
         """Rebuild rigids_t using the model's own (no-grad) prediction of the clean
-        structure from t_hat=min(t+dt, 0.99), in place of the true rigids_1, so the
-        model is trained on inputs closer to what it actually sees at inference time
-        (where rigids_t is always built from its own prior prediction, never from
-        ground truth). Only the model's input (rigids_t/trans_t/rotmats_t) changes --
-        loss targets (rigids_1, gt_rot_vf, etc) are untouched, so the main forward
-        pass is still supervised against the true clean structure."""
+        structure from t_prev=max(t-dt, 0.01) -- an earlier, noisier point on the
+        SAME trajectory -- in place of the true rigids_1, so the model is trained
+        on inputs closer to what it actually sees at inference time. At inference,
+        x_t is always produced by stepping forward from an earlier x_{t-dt} using
+        the model's prediction made AT that earlier state -- never from a later,
+        cleaner state, since that information doesn't exist yet during a real
+        forward integration pass. Only the model's input (rigids_t/trans_t/
+        rotmats_t) changes -- loss targets (rigids_1, gt_rot_vf, etc) are
+        untouched, so the main forward pass is still supervised against the true
+        clean structure."""
         corrupter = self.corrupter
         rigids_data = batch['rigids']
         rigids_mask = rigids_data['rigids_mask']
@@ -800,21 +804,21 @@ class BiomoleculeModule(L.LightningModule):
         trans_0, rotmats_0 = rigids_0.get_trans(), rigids_0.get_rots().get_rot_mats()
 
         t = batch['trans_t']
-        t_hat = torch.clamp(t + dt, max=0.99)
+        t_prev = torch.clamp(t - dt, min=0.01)
 
-        rigids_t_hat = corrupter.corrupt_rigids_at_t(
-            trans_1, trans_0, rotmats_1, rotmats_0, t_hat, rigids_mask, diffuse_mask
+        rigids_t_prev = corrupter.corrupt_rigids_at_t(
+            trans_1, trans_0, rotmats_1, rotmats_0, t_prev, rigids_mask, diffuse_mask
         )
-        batch_hat = batch.copy()
-        batch_hat['rigids'] = dict(rigids_data)
-        batch_hat['rigids']['rigids_t'] = rigids_t_hat.to_tensor_7()
-        batch_hat['rigids']['trans_t'] = rigids_t_hat.get_trans()
-        batch_hat['rigids']['rotmats_t'] = rigids_t_hat.get_rots().get_rot_mats()
-        batch_hat['trans_t'] = t_hat
-        batch_hat['rot_t'] = t_hat
+        batch_prev = batch.copy()
+        batch_prev['rigids'] = dict(rigids_data)
+        batch_prev['rigids']['rigids_t'] = rigids_t_prev.to_tensor_7()
+        batch_prev['rigids']['trans_t'] = rigids_t_prev.get_trans()
+        batch_prev['rigids']['rotmats_t'] = rigids_t_prev.get_rots().get_rot_mats()
+        batch_prev['trans_t'] = t_prev
+        batch_prev['rot_t'] = t_prev
 
         with torch.no_grad():
-            self_pred = self.model(batch_hat, compute_motif_idx=False)
+            self_pred = self.model(batch_prev, compute_motif_idx=False)
 
         # the model's own prediction is only meaningful (trained/supervised) at
         # diffused positions -- fixed/non-diffused positions (e.g. a fixed ligand)
