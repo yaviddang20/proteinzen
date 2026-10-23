@@ -335,6 +335,21 @@ class MultiSE3Interpolant:
 
         return _rots_diffuse_mask(rotmats_t, rotmats_1, diffuse_mask), rot_vf, score_scaling, g_t, E_dlog_igso3, E_dlog_igso3_sq
 
+    def corrupt_rigids_at_t(self, trans_1, trans_0, rotmats_1, rotmats_0, t, rigids_mask, diffuse_mask):
+        """Build rigids_t at an arbitrary t from given trans_1/rotmats_1 (not necessarily the
+        true ground truth -- e.g. a model's own self-predicted clean structure) and a shared
+        noise draw trans_0/rotmats_0, reusing the same corruption formulas as corrupt_dense_batch.
+        Returns a Rigid only -- does not touch loss-target quantities (gt_rot_vf, etc)."""
+        trans_t = self._corrupt_trans(trans_1, trans_0, t, rigids_mask, diffuse_mask)
+        rotmats_t, _, _, _, _, _ = self._corrupt_rotmats(rotmats_1, rotmats_0, t, rigids_mask, diffuse_mask)
+        rotvecs_t = so3_utils.rotmat_to_rotvec(rotmats_t)
+        angle_t = torch.linalg.vector_norm(rotvecs_t + 1e-8, dim=-1)
+        axis_t = F.normalize(rotvecs_t, dim=-1)
+        rotquats_t = torch.cat([
+            torch.cos(angle_t / 2)[..., None], torch.sin(angle_t / 2)[..., None] * axis_t
+        ], dim=-1)
+        return ru.Rigid(rots=ru.Rotation(quats=rotquats_t), trans=trans_t)
+
     # @torch.no_grad()
     def corrupt_dense_batch(self, batch, identity_rot_noise=False, skip_prealign=False):
         token_data = batch["token"]
