@@ -176,6 +176,7 @@ def contig_str_to_struct(
     res_type_noising_mask = []
     res_is_unindexed_mask = []
     res_hotspot_type = []
+    res_rasa_bin = []
     token_entity_ids = []
     chain_data = {}
 
@@ -188,6 +189,7 @@ def contig_str_to_struct(
             redesign_seq = metadata['noise_seq']
             redesign_bb = metadata['noise_bb']
             hotspot_type = metadata['hotspot_type']
+            rasa_bin = metadata.get('rasa_bin', 0)
 
             is_motif_residue = metadata['is_motif']
             is_unindexed_residue = (metadata['res_index'] == -1)
@@ -228,6 +230,7 @@ def contig_str_to_struct(
             atom_noising_mask.extend(_atom_noising_mask)
             res_is_unindexed_mask.append(is_unindexed_residue)
             res_hotspot_type.append(hotspot_type)
+            res_rasa_bin.append(rasa_bin)
             token_entity_ids.append(token_entity_id)
 
             contig_internal_idx += 1
@@ -269,9 +272,10 @@ def contig_str_to_struct(
     atom_noising_mask = np.array(atom_noising_mask)
     res_is_unindexed_mask = np.array(res_is_unindexed_mask)
     res_hotspot_type = np.array(res_hotspot_type)
+    res_rasa_bin = np.array(res_rasa_bin)
     token_entity_ids = np.array(token_entity_ids)
 
-    return struct, atom_noising_mask, res_type_noising_mask, res_is_unindexed_mask, res_hotspot_type, token_entity_ids
+    return struct, atom_noising_mask, res_type_noising_mask, res_is_unindexed_mask, res_hotspot_type, res_rasa_bin, token_entity_ids
 
 
 class ReferenceChain(Biomolecule):
@@ -285,6 +289,8 @@ class ReferenceChain(Biomolecule):
         unindexed_contigs=None,
         hotspot_contigs=None,
         antihotspot_contigs=None,
+        bury_contigs=None,
+        expose_contigs=None,
         repack=False
     ):
         self.chain_name = chain_name
@@ -331,6 +337,19 @@ class ReferenceChain(Biomolecule):
         overspecified_hotspot_type = set(hotspot_residues).intersection(antihotspot_residues)
         assert len(overspecified_hotspot_type) == 0, f"you've designated {overspecified_hotspot_type} as both hotspots and antihotspots!"
 
+        if bury_contigs is not None:
+            bury_residues = expand_contigs(bury_contigs, residues_per_chain)
+        else:
+            bury_residues = []
+
+        if expose_contigs is not None:
+            expose_residues = expand_contigs(expose_contigs, residues_per_chain)
+        else:
+            expose_residues = []
+
+        overspecified_rasa = set(bury_residues).intersection(expose_residues)
+        assert len(overspecified_rasa) == 0, f"you've designated {overspecified_rasa} as both buried and exposed!"
+
         pdb_residues = expand_contigs(pdb_contigs, residues_per_chain)
         inferred_frag_idx = infer_frag_index(pdb_residues)
 
@@ -350,12 +369,20 @@ class ReferenceChain(Biomolecule):
             else:
                 hotspot_type = 0
 
+            if res_key in bury_residues:
+                rasa_bin = 1
+            elif res_key in expose_residues:
+                rasa_bin = 3
+            else:
+                rasa_bin = 0
+
             self.residue_metadata[res_key] = {
                 'is_motif': is_motif,
                 'res_index': res_index,
                 'noise_seq': res_key in redesign_seq_residues,
                 'noise_bb': False,
                 'hotspot_type': hotspot_type,
+                'rasa_bin': rasa_bin,
                 'repack': repack if not is_motif else False,
                 'entity_id': entity_id
             }
@@ -366,6 +393,7 @@ class ReferenceChain(Biomolecule):
             self.res_type_noising_mask,
             self.res_is_unindexed_mask,
             self.res_hotspot_type,
+            self.res_rasa_bin,
             self.residue_entity_ids
         ) = contig_str_to_struct(
             self.structure,
@@ -381,6 +409,7 @@ class ReferenceChain(Biomolecule):
             "res_type_noising_mask": self.res_type_noising_mask.copy(),
             "res_is_unindexed_mask": self.res_is_unindexed_mask.copy(),
             "res_hotspot_type": self.res_hotspot_type.copy(),
+            "res_rasa_bin": self.res_rasa_bin.copy(),
             "residue_entity_ids": self.residue_entity_ids.copy(),
         }
 
@@ -457,6 +486,7 @@ class PartiallyNoisedChain(Biomolecule):
                 'noise_seq': True,
                 'noise_bb': True,
                 'hotspot_type': 0,
+                'rasa_bin': 0,
                 'repack': False,
                 'entity_id': 0
             }
@@ -467,6 +497,7 @@ class PartiallyNoisedChain(Biomolecule):
             self.res_type_noising_mask,
             self.res_is_unindexed_mask,
             self.res_hotspot_type,
+            self.res_rasa_bin,
             self.residue_entity_ids
         ) = contig_str_to_struct(
             self.structure,
@@ -482,5 +513,6 @@ class PartiallyNoisedChain(Biomolecule):
             "res_type_noising_mask": self.res_type_noising_mask.copy(),
             "res_is_unindexed_mask": self.res_is_unindexed_mask.copy(),
             "res_hotspot_type": self.res_hotspot_type.copy(),
+            "res_rasa_bin": self.res_rasa_bin.copy(),
             "residue_entity_ids": self.residue_entity_ids.copy(),
         }

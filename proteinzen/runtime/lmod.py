@@ -526,6 +526,7 @@ class BiomoleculeModule(L.LightningModule):
                  lora_config=None,
                  self_interpolate_rate=0.0,
                  self_interpolate_dt=0.02,
+                 rasa_dropout_rate=0.0,
     ):
         super().__init__()
         self._log = logging.getLogger(__name__)
@@ -542,6 +543,7 @@ class BiomoleculeModule(L.LightningModule):
         self.self_condition_rate = self_condition_rate
         self.self_interpolate_rate = self_interpolate_rate
         self.self_interpolate_dt = self_interpolate_dt
+        self.rasa_dropout_rate = rasa_dropout_rate
         self.bond_rotation_head_only = bond_rotation_head_only
         self.scale_bond_length_loss = scale_bond_length_loss
         self.scale_bond_angle_loss = scale_bond_angle_loss
@@ -869,6 +871,13 @@ class BiomoleculeModule(L.LightningModule):
             batch['rot_t'] = batch['t']
 
         batch = corrupter.corrupt_dense_batch(batch, self.identity_rot_noise, skip_prealign=skip_prealign)
+
+        if (
+            self.rasa_dropout_rate > 0
+            and 'rasa_bin' in batch['token']
+            and np.random.uniform() < self.rasa_dropout_rate
+        ):
+            batch['token']['rasa_bin'] = torch.zeros_like(batch['token']['rasa_bin'])
 
         if (
             self.self_interpolate_rate > 0

@@ -114,6 +114,7 @@ dependencies:
       - fonttools==4.58.4
       - frozendict==2.4.6
       - frozenlist==1.7.0
+      - freesasa==2.2.1
       - fsspec==2025.5.1
       - gemmi==0.6.7
       - geomstats==2.8.0

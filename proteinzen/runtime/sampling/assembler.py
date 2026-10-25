@@ -85,6 +85,7 @@ class ChainAssembly:
             "res_type_noising_mask": [],
             "res_is_unindexed_mask": [],
             "res_hotspot_type": [],
+            "res_rasa_bin": [],
             "residue_entity_ids": []
         }
 
@@ -135,10 +136,17 @@ class ChainAssembly:
             else:
                 task_masks['res_hotspot_type'].append(np.zeros(res_is_unindexed_mask.shape))
 
+            if "res_rasa_bin" in chain_data:
+                res_rasa_bin = chain_data['res_rasa_bin']
+                task_masks['res_rasa_bin'].append(res_rasa_bin)
+            else:
+                task_masks['res_rasa_bin'].append(np.zeros(res_is_unindexed_mask.shape))
+
         task_masks['atom_noising_mask'] = np.concatenate(task_masks['atom_noising_mask'], axis=-1)
         task_masks['res_type_noising_mask'] = np.concatenate(task_masks['res_type_noising_mask'], axis=-1)
         task_masks['residue_is_unindexed_mask'] = np.concatenate(task_masks['res_is_unindexed_mask'], axis=-1)
         task_masks['res_hotspot_type'] = np.concatenate(task_masks['res_hotspot_type'], axis=-1)
+        task_masks['res_rasa_bin'] = np.concatenate(task_masks['res_rasa_bin'], axis=-1)
         task_masks['residue_entity_ids'] = np.concatenate(task_masks['residue_entity_ids'], axis=-1)
 
         for key in struct_keys:

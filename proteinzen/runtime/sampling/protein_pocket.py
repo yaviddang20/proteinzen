@@ -305,6 +305,7 @@ class ProteinPocketConditionedSampling(SamplingTask):
             "res_type_noising_mask": res_type_noising_mask,
             "residue_is_unindexed_mask": np.zeros(n_residues, dtype=bool),
             "res_hotspot_type": np.zeros(n_residues, dtype=int),
+            "res_rasa_bin": np.zeros(n_residues, dtype=int),
             "residue_entity_ids": residue_entity_ids,
             "t": 0.0,
         }
@@ -433,6 +434,7 @@ class PocketPLACERSampling(SamplingTask):
             "res_type_noising_mask": np.zeros(n_residues, dtype=bool),
             "residue_is_unindexed_mask": np.zeros(n_residues, dtype=bool),
             "res_hotspot_type": np.zeros(n_residues, dtype=int),
+            "res_rasa_bin": np.zeros(n_residues, dtype=int),
             "residue_entity_ids": residue_entity_ids,
             "copy_atomized_residue_mask": copy_atomized_residue_mask,
             "t": 0.0,
@@ -562,6 +564,7 @@ class LigandPocketConditionedSampling(SamplingTask):
                 "res_type_noising_mask": res_type_noising_mask,
                 "residue_is_unindexed_mask": np.zeros(n_residues, dtype=bool),
                 "res_hotspot_type": np.zeros(n_residues, dtype=int),
+                "res_rasa_bin": np.zeros(n_residues, dtype=int),
                 "residue_entity_ids": residue_entity_ids,
                 "t": 0.0,
             }

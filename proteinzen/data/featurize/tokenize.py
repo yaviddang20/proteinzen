@@ -39,6 +39,7 @@ Token = [
     ("is_atomized", np.dtype("?")),
     ("seq_noising_mask", np.dtype("?")),
     ("hotspot_type", np.dtype("i1")),
+    ("rasa_bin", np.dtype("i1")),
 ]
 
 Rigid = [
@@ -137,6 +138,7 @@ class TokenData:
     is_atomized: bool
     seq_noising_mask: bool
     hotspot_type: int
+    rasa_bin: int
 
 
 @dataclass
@@ -696,6 +698,18 @@ def generate_copy_structure(
             res_copied_indices,
             None
         )
+    if 'res_rasa_bin' in task_data:
+        new_task_data['res_rasa_bin'] = extract_mask(
+            task_data['res_rasa_bin'],
+            res_copied_indices,
+            None
+        )
+    if 'atom_rasa_bin' in task_data:
+        new_task_data['atom_rasa_bin'] = extract_mask(
+            task_data['atom_rasa_bin'],
+            atom_copied_indices,
+            None
+        )
     new_task_data['atom_noising_mask'] = extract_mask(
         task_data['atom_noising_mask'],
         atom_copied_indices,
@@ -765,7 +779,8 @@ class StructureTokenizer:
         res,
         noise_seq,
         hotspot_type,
-        entity_id
+        entity_id,
+        rasa_bin=0,
     ):
         # Get atom indices
         atom_start = res["atom_idx"]
@@ -802,7 +817,8 @@ class StructureTokenizer:
             is_unindexed=False,
             is_atomized=False,
             seq_noising_mask=noise_seq,
-            hotspot_type=hotspot_type
+            hotspot_type=hotspot_type,
+            rasa_bin=rasa_bin
         )
 
         # compute a mapping for which rigids correspond to which atoms
@@ -855,7 +871,10 @@ class StructureTokenizer:
         res,
         hotspot_type,
         entity_id,
+        atom_rasa_bin=None,
     ):
+        if atom_rasa_bin is None:
+            atom_rasa_bin = np.zeros(res["atom_num"], dtype=np.int8)
         token_idx = self.token_idx
         rigid_idx = self.rigid_idx
         atom_to_rigid = self.atom_to_rigid
@@ -913,7 +932,8 @@ class StructureTokenizer:
                 is_unindexed=False,
                 is_atomized=True,
                 seq_noising_mask=False,
-                hotspot_type=hotspot_type
+                hotspot_type=hotspot_type,
+                rasa_bin=int(atom_rasa_bin[i])
             )
             ret_tokens.append(token)
 
@@ -978,6 +998,17 @@ class StructureTokenizer:
                 else:
                     res_hotspot_type = 0
 
+                if "res_rasa_bin" in self.task_data:
+                    res_rasa_bin = self.task_data['res_rasa_bin'][res_start + i]
+                else:
+                    res_rasa_bin = 0
+                atom_start_i = res["atom_idx"]
+                atom_end_i = atom_start_i + res["atom_num"]
+                if "atom_rasa_bin" in self.task_data:
+                    res_atom_rasa_bin = self.task_data['atom_rasa_bin'][atom_start_i:atom_end_i]
+                else:
+                    res_atom_rasa_bin = np.zeros(res["atom_num"], dtype=np.int8)
+
                 is_unindexed_motif = self.task_data['is_unindexed_residue_mask'][res_start + i]
                 is_indexed_motif = self.task_data['is_indexed_residue_mask'][res_start + i]
                 is_atomized = self.task_data['is_atomized_residue_mask'][res_start + i]
@@ -991,7 +1022,8 @@ class StructureTokenizer:
                             chain, res,
                             noise_seq=res_type_noising_mask[res_start + i],
                             hotspot_type=res_hotspot_type,
-                            entity_id=entity_id
+                            entity_id=entity_id,
+                            rasa_bin=res_rasa_bin,
                         )
 
                         token = replace(
@@ -1013,7 +1045,8 @@ class StructureTokenizer:
 
                         tokens, rigids = self._get_nonstandard_residue_data(
                             chain, res, hotspot_type=res_hotspot_type,
-                            entity_id=entity_id
+                            entity_id=entity_id,
+                            atom_rasa_bin=res_atom_rasa_bin,
                         )
 
                         tokens_new = []
@@ -1033,7 +1066,8 @@ class StructureTokenizer:
                 else:
                     ret_tokens, ret_rigids = self._get_nonstandard_residue_data(
                         chain, res, hotspot_type=res_hotspot_type,
-                        entity_id=entity_id
+                        entity_id=entity_id,
+                        atom_rasa_bin=res_atom_rasa_bin,
                     )
                     if is_atomized:
                         ret_tokens = [replace(t, is_copy=True) for t in ret_tokens]
@@ -1134,6 +1168,10 @@ def tokenize_structure(  # noqa: C901, PLR0915
         new_task_data['is_indexed_residue_mask'] = task_data['copy_indexed_residue_mask']
         if 'res_hotspot_type' in task_data:
             new_task_data['res_hotspot_type'] = task_data['res_hotspot_type']
+        if 'res_rasa_bin' in task_data:
+            new_task_data['res_rasa_bin'] = task_data['res_rasa_bin']
+        if 'atom_rasa_bin' in task_data:
+            new_task_data['atom_rasa_bin'] = task_data['atom_rasa_bin']
         new_task_data['atom_noising_mask'] = task_data['atom_noising_mask']
 
         # add entity ids

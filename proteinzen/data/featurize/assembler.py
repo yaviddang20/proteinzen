@@ -80,6 +80,7 @@ def process_token_features(
     mol_type = from_numpy(token_data["mol_type"].copy()).long()
     res_type = from_numpy(token_data["res_type"].copy()).long()
     hotspot_type = from_numpy(token_data["hotspot_type"].copy()).long()
+    rasa_bin = from_numpy(token_data["rasa_bin"].copy()).long()
     token_to_rep_rigid = torch.as_tensor(token_to_rep_rigid).long()
     seq_index = torch.as_tensor(seq_index, dtype=torch.long)
 
@@ -122,6 +123,7 @@ def process_token_features(
             mol_type = pad_dim(mol_type, 0, pad_len)
             res_type = pad_dim(res_type, 0, pad_len)
             hotspot_type = pad_dim(hotspot_type, 0, pad_len)
+            rasa_bin = pad_dim(rasa_bin, 0, pad_len)
             pad_mask = pad_dim(pad_mask, 0, pad_len)
             resolved_mask = pad_dim(resolved_mask, 0, pad_len)
             token_to_rep_rigid = pad_dim(token_to_rep_rigid, 0, pad_len)
@@ -137,6 +139,7 @@ def process_token_features(
         "mol_type": mol_type,
         "res_type": res_type,
         "hotspot_type": hotspot_type,
+        "rasa_bin": rasa_bin,
         "token_to_rep_rigid": token_to_rep_rigid,
         "token_bonds": bonds.long(),
         "token_pad_mask": pad_mask,

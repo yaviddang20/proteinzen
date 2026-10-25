@@ -38,6 +38,11 @@ from tqdm import tqdm
 from mmcif import parse_mmcif
 
 from proteinzen.boltz.data import const
+from proteinzen.data.featurize.sasa import (
+    compute_atom_rasa_bins,
+    compute_atom_sasa,
+    compute_residue_rasa_bins,
+)
 from rdkit.Chem import AllChem
 from proteinzen.boltz.data.types import (
     AffinityInfo,
@@ -1137,10 +1142,23 @@ def process_system(
                 if cdist(present_coords, alpha_spheres).min() < 4.0:
                     pocket_residue_mask[r] = True
 
+    try:
+        atom_sasa = compute_atom_sasa(structure)
+        residue_rasa_bin = compute_residue_rasa_bins(structure, atom_sasa)
+        atom_rasa_bin = compute_atom_rasa_bins(structure, atom_sasa)
+    except Exception:
+        traceback.print_exc()
+        atom_sasa = np.full(len(structure.atoms), np.nan, dtype=np.float32)
+        residue_rasa_bin = np.zeros(len(structure.residues), dtype=np.int8)
+        atom_rasa_bin = np.zeros(len(structure.atoms), dtype=np.int8)
+
     save_dict = asdict(structure)
     save_dict.update(rot_bond_data)
     save_dict['interaction_residue_mask'] = interaction_residue_mask
     save_dict['pocket_residue_mask'] = pocket_residue_mask
+    save_dict['atom_sasa'] = atom_sasa.astype(np.float32)
+    save_dict['residue_rasa_bin'] = residue_rasa_bin.astype(np.int8)
+    save_dict['atom_rasa_bin'] = atom_rasa_bin.astype(np.int8)
     np.savez_compressed(struct_path, **save_dict)
 
     record_dict = asdict(record)

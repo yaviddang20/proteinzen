@@ -257,6 +257,7 @@ class Embedder(nn.Module):
                  disable_absolute_res_idx=False,
                  embed_token_is_copy_mask=False,
                  embed_hotspot_type=False,
+                 embed_rasa_bin=False,
                  embed_rigids_num_real_axes=False,
                  patch_unit_vec_bug=False,
                  patch_rel_quat_bug=False,
@@ -300,6 +301,11 @@ class Embedder(nn.Module):
             self.node_hotspot_type_embed = nn.Embedding(3, c_s)
         else:
             self.node_hotspot_type_embed = None
+        if embed_rasa_bin:
+            self.node_rasa_bin_embed = nn.Embedding(4, c_s)
+            nn.init.zeros_(self.node_rasa_bin_embed.weight)
+        else:
+            self.node_rasa_bin_embed = None
 
 
         self.rigid_init = Linear(self.c_s, c_frame, bias=False)
@@ -432,6 +438,7 @@ class Embedder(nn.Module):
         is_unindexed_mask,
         is_copy_mask,
         token_hotspot_type,
+        token_rasa_bin,
         # is_atomized_mask,
         sc_rigids=None,
         sf_rigids=None
@@ -473,6 +480,9 @@ class Embedder(nn.Module):
 
         if self.node_hotspot_type_embed:
             node_init = node_init + self.node_hotspot_type_embed(token_hotspot_type.long())
+
+        if self.node_rasa_bin_embed:
+            node_init = node_init + self.node_rasa_bin_embed(token_rasa_bin.long())
 
         return {
             "node_init": node_init,
@@ -587,6 +597,7 @@ class Embedder(nn.Module):
             token_is_unindexed_mask,
             token_is_copy_mask,
             token_hotspot_type,
+            token_rasa_bin,
             token_gather_idx,
             t,
             rigids,
@@ -645,6 +656,7 @@ class Embedder(nn.Module):
             token_is_unindexed_mask,
             token_is_copy_mask,
             token_hotspot_type,
+            token_rasa_bin,
             sc_rigids=sc_rigids,
             sf_rigids=sf_rigids
         )
@@ -860,6 +872,7 @@ class Embedder(nn.Module):
             token_is_unindexed_mask,
             token_is_copy_mask,
             token_hotspot_type,
+            token_rasa_bin,
             token_gather_idx,
             t,
             rigids,
@@ -889,6 +902,7 @@ class Embedder(nn.Module):
             token_is_unindexed_mask=token_is_unindexed_mask,
             token_is_copy_mask=token_is_copy_mask,
             token_hotspot_type=token_hotspot_type,
+            token_rasa_bin=token_rasa_bin,
             token_gather_idx=token_gather_idx,
             t=t,
             rigids=rigids,
@@ -1620,6 +1634,7 @@ class IpaMultiRigidDenoiser(nn.Module):
                  add_same_chain_feature=False,
                  disable_absolute_res_idx=False,
                  embed_hotspot_type=False,
+                 embed_rasa_bin=False,
                  embed_rigids_num_real_axes=False,
                  embed_token_is_copy_mask=False,
                  embed_rigids_noising_mask=False,
@@ -1722,6 +1737,7 @@ class IpaMultiRigidDenoiser(nn.Module):
             add_same_chain_feature=add_same_chain_feature,
             disable_absolute_res_idx=disable_absolute_res_idx,
             embed_hotspot_type=embed_hotspot_type,
+            embed_rasa_bin=embed_rasa_bin,
             embed_token_is_copy_mask=embed_token_is_copy_mask,
             embed_rigids_num_real_axes=embed_rigids_num_real_axes,
             embed_rigids_noising_mask=embed_rigids_noising_mask,
@@ -1777,6 +1793,7 @@ class IpaMultiRigidDenoiser(nn.Module):
             token_is_unindexed_mask=token_data['token_is_unindexed_mask'],
             token_is_copy_mask=token_data['token_is_copy_mask'],
             token_hotspot_type=token_data['hotspot_type'],
+            token_rasa_bin=token_data['rasa_bin'],
             token_gather_idx=token_data['token_to_rep_rigid'],
             t=data['t'],
             rigids=rigids_data['rigids_t'],

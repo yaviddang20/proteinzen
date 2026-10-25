@@ -248,7 +248,8 @@ class SampleTemplateTokenizer:
             is_unindexed=False,
             is_atomized=False,
             seq_noising_mask=True,
-            hotspot_type=0  # TODO: fix this
+            hotspot_type=0,  # TODO: fix this
+            rasa_bin=0
         )
         self.token_data.append(astuple(token))
 
@@ -290,10 +291,12 @@ class SampleTemplateTokenizer:
         res_type_noising_mask = self.task_masks['res_type_noising_mask']
         residue_is_unindexed_mask = self.task_masks['residue_is_unindexed_mask']
         res_hotspot_type = self.task_masks['res_hotspot_type']
+        res_rasa_bin = self.task_masks['res_rasa_bin']
 
         is_unindexed = residue_is_unindexed_mask[res_arr_ptr]
         noise_seq = res_type_noising_mask[res_arr_ptr]
         hotspot_type = res_hotspot_type[res_arr_ptr]
+        rasa_bin = res_rasa_bin[res_arr_ptr]
 
         atoms = self.struct.atoms[atom_start_ptr:atom_end_ptr]
         rigid_tensor7, rigid_mask, dummy_rigid_idx = standard_residue_to_frames(
@@ -319,7 +322,8 @@ class SampleTemplateTokenizer:
             is_unindexed=bool(is_unindexed),
             is_atomized=False,
             seq_noising_mask=bool(noise_seq),
-            hotspot_type=int(hotspot_type)
+            hotspot_type=int(hotspot_type),
+            rasa_bin=int(rasa_bin)
         )
         self.token_data.append(astuple(token))
 
@@ -430,7 +434,8 @@ class SampleTemplateTokenizer:
                 is_unindexed=False,
                 is_atomized=True,
                 seq_noising_mask=False,
-                hotspot_type=0  # TODO: fix this
+                hotspot_type=0,  # TODO: fix this
+                rasa_bin=0
             )
             self.token_data.append(astuple(token))
 
@@ -639,6 +644,7 @@ def sample_noise_from_struct_template(  # noqa: C901, PLR0915
             "res_type_noising_mask": np.ones(n_residues, dtype=bool),
             "residue_is_unindexed_mask": np.zeros(n_residues, dtype=bool),
             "res_hotspot_type": np.zeros(n_residues, dtype=int),
+            "res_rasa_bin": np.zeros(n_residues, dtype=int),
             "residue_entity_ids": residue_entity_ids,
             "t": 0.0,
         }

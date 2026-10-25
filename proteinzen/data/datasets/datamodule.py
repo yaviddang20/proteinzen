@@ -222,7 +222,12 @@ def load_input(record: Record, data_dir, include_h: bool = False):
         mask=structure["mask"],
     )
 
+    atom_rasa_bin = structure['atom_rasa_bin'] if 'atom_rasa_bin' in structure else None
+    residue_rasa_bin = structure['residue_rasa_bin'] if 'residue_rasa_bin' in structure else None
+
     if not include_h:
+        if atom_rasa_bin is not None:
+            atom_rasa_bin = atom_rasa_bin[atoms['element'] != 1]
         struct = strip_h_from_structure(struct)
 
     rot_bond_data = None
@@ -242,7 +247,7 @@ def load_input(record: Record, data_dir, include_h: bool = False):
     interaction_residue_mask = structure['interaction_residue_mask'] if 'interaction_residue_mask' in structure else None
     pocket_residue_mask = structure['pocket_residue_mask'] if 'pocket_residue_mask' in structure else None
 
-    return struct, rot_bond_data, interaction_residue_mask, pocket_residue_mask
+    return struct, rot_bond_data, interaction_residue_mask, pocket_residue_mask, residue_rasa_bin, atom_rasa_bin
 
 
 def _bucket_pad_sizes(tokenized_data, max_tokens, max_rigids,
@@ -460,7 +465,7 @@ class TrainingDataset(torch.utils.data.Dataset):
             sample.chain_id = None
         task = task_sampler.sample_task()
 
-        struct, rot_bond_data, interaction_residue_mask, pocket_residue_mask = load_input(sample.record, Path(dataset.data_dir), include_h=self.include_h)
+        struct, rot_bond_data, interaction_residue_mask, pocket_residue_mask, residue_rasa_bin, atom_rasa_bin = load_input(sample.record, Path(dataset.data_dir), include_h=self.include_h)
 
         # Skip structures where a PROTEIN chain contains nucleotide residues
         _nuc_names = {'DA', 'DC', 'DG', 'DT', 'A', 'G', 'C', 'U'}
@@ -510,6 +515,10 @@ class TrainingDataset(torch.utils.data.Dataset):
                 struct = apply_sidechain_ensemble(struct, auth_seq_map, substitution)
 
         task_data = task.sample_t_and_mask(struct)
+        if residue_rasa_bin is not None:
+            task_data['res_rasa_bin'] = residue_rasa_bin
+        if atom_rasa_bin is not None:
+            task_data['atom_rasa_bin'] = atom_rasa_bin
 
         if self.gate_low_quality_t and sample.record.system_pass_validation_criteria is False:
             task_data["t"] = 0.5 + task_data["t"] / 2
@@ -734,7 +743,7 @@ class ValidationDataset(torch.utils.data.Dataset):
         sample = self.samples[idx]
         task = task_sampler.sample_task()
 
-        struct, rot_bond_data, interaction_residue_mask, pocket_residue_mask = load_input(sample.record, Path(dataset.data_dir), include_h=self.include_h)
+        struct, rot_bond_data, interaction_residue_mask, pocket_residue_mask, residue_rasa_bin, atom_rasa_bin = load_input(sample.record, Path(dataset.data_dir), include_h=self.include_h)
 
         _nuc_names = {'DA', 'DC', 'DG', 'DT', 'A', 'G', 'C', 'U'}
         _protein_id = const.chain_type_ids["PROTEIN"]
@@ -774,6 +783,10 @@ class ValidationDataset(torch.utils.data.Dataset):
             struct = mask_nonstandard_residues(struct)
 
         task_data = task.sample_t_and_mask(struct)
+        if residue_rasa_bin is not None:
+            task_data['res_rasa_bin'] = residue_rasa_bin
+        if atom_rasa_bin is not None:
+            task_data['atom_rasa_bin'] = atom_rasa_bin
 
         token_data, rigid_data, token_bonds = tokenize_structure(
             struct,
