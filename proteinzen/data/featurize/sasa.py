@@ -125,16 +125,22 @@ def compute_residue_rasa_bins(struct: Structure, atom_sasa: np.ndarray) -> np.nd
     return rasa_bin_from_fraction(rasa)
 
 
+PROBE_RADIUS = 1.4  # freesasa's default solvent probe radius (water), Angstrom
+
+
 def compute_atom_rasa_bins(struct: Structure, atom_sasa: np.ndarray) -> np.ndarray:
     """Per-ATOM RASA bin, shape (n_atoms,) -- for ligand/atomized tokens,
     which have no residue-level reference max ASA. Normalizes each atom's
-    SASA by its own isolated-sphere max (4*pi*r^2) from its VdW radius.
+    SASA by its own isolated-sphere max: Shrake-Rupley SASA is the surface
+    traced by the solvent probe rolled over the atom's VdW surface, so the
+    max achievable SASA for an isolated atom is 4*pi*(r_vdw + r_probe)^2,
+    not 4*pi*r_vdw^2.
     """
     radii = np.asarray(const.vdw_radii, dtype=np.float32)
     elements = struct.atoms["element"].astype(np.int64)
     valid_element = (elements >= 1) & (elements <= len(radii))
     r = np.where(valid_element, radii[np.clip(elements - 1, 0, len(radii) - 1)], np.nan)
-    max_sasa = 4.0 * np.pi * r ** 2
+    max_sasa = 4.0 * np.pi * (r + PROBE_RADIUS) ** 2
     with np.errstate(invalid="ignore", divide="ignore"):
         rasa = atom_sasa / max_sasa
     return rasa_bin_from_fraction(rasa)
