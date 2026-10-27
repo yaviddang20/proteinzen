@@ -2697,10 +2697,8 @@ class PDBWriter(BasePredictionWriter):
             json.dump(samples_metadata, fp)
         self.samples_metadata.update(samples_metadata)
 
-        for traj_entry in traj_list:
-            _write_traj(traj_entry)
-        # results = p_tqdm.p_map(_write_traj, traj_list, num_cpus=8)
-        # print(results)
+        if len(traj_list) > 0:
+            p_tqdm.p_map(_write_traj, traj_list, num_cpus=min(8, len(traj_list)), disable=True)
 
         os.chdir(pwd)
 
