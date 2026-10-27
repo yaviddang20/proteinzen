@@ -998,10 +998,12 @@ class StructureTokenizer:
                 else:
                     res_hotspot_type = 0
 
-                if "res_rasa_bin" in self.task_data:
-                    res_rasa_bin = self.task_data['res_rasa_bin'][res_start + i]
-                else:
-                    res_rasa_bin = 0
+                # Protein-residue RASA conditioning is intentionally disabled: the
+                # only live use case (ligand-pocket generation) never has a real
+                # protein structure to compute this from at sample time, so training
+                # on it teaches the model a signal it can never consistently use.
+                # Ligand/atomized atom_rasa_bin below is unaffected.
+                res_rasa_bin = 0
                 atom_start_i = res["atom_idx"]
                 atom_end_i = atom_start_i + res["atom_num"]
                 if "atom_rasa_bin" in self.task_data:
