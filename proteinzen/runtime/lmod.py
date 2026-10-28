@@ -19,7 +19,7 @@ import tree
 import lightning as L
 from lightning.pytorch.callbacks import BasePredictionWriter
 import sys
-import p_tqdm
+import multiprocessing as mp
 
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from proteinzen.boltz.data import const
@@ -2698,7 +2698,13 @@ class PDBWriter(BasePredictionWriter):
         self.samples_metadata.update(samples_metadata)
 
         if len(traj_list) > 0:
-            p_tqdm.p_map(_write_traj, traj_list, num_cpus=min(8, len(traj_list)), disable=True)
+            # forkserver, not the default fork: this runs inside a live DDP rank
+            # (CUDA + NCCL already initialized, NCCL watchdog thread running), and
+            # plain fork() can inherit a lock frozen mid-acquisition by one of those
+            # background threads, deadlocking the worker forever. forkserver's
+            # helper is a freshly exec'd process, so it never inherits that state.
+            with mp.get_context("forkserver").Pool(processes=min(8, len(traj_list))) as pool:
+                pool.map(_write_traj, traj_list)
 
         os.chdir(pwd)
 
