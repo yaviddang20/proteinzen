@@ -50,6 +50,31 @@ _BOLTZ_BIN   = str(_MAMBA_ROOT / "envs" / "boltz" / "bin" / "boltz")  # unused n
 # something else still imports this name.
 _MPNN_PYTHON = str(_MAMBA_ROOT / "envs" / "mpnn"  / "bin" / "python")
 
+# LASErMPNN (polizzilab/LASErMPNN) -- a second ligand-conditioned sequence-design
+# option alongside LigandMPNN. Invoked as `python -m LASErMPNN.run_batch_inference`
+# with cwd=_LASER_REPO_PARENT (the PARENT of the LASErMPNN/ clone, since it's a
+# module), unlike LigandMPNN's run.py which is invoked directly with cwd=its own dir.
+_LASER_PYTHON       = str(_MAMBA_ROOT / "envs" / "lasermpnn" / "bin" / "python")
+_LASER_REPO_PARENT  = Path("/mnt/scratch/user/daviyang/proteinzen")
+_LASER_WEIGHTS      = _LASER_REPO_PARENT / "LASErMPNN" / "model_weights" / "laser_weights_0p1A_nothing_heldout.pt"
+
+# PottsMPNN-adapted-LigandMPNN (Foster Birnbaum's ligand-conditioned extension of
+# KeatingLab/PottsMPNN) -- a THIRD ligand-conditioned sequence-design option,
+# alongside LigandMPNN and LASErMPNN. Unlike those two (one subprocess call directly
+# invoking the tool's own CLI script), this one is invoked via a small dedicated
+# worker (run_pottsmpnn_batch.py, next to this file) that loads the checkpoint ONCE
+# for a whole batch of items -- still a subprocess, in its own "pottsmpnn" conda env
+# (a different torch/omegaconf pin than whatever env runs this eval script), same
+# env-isolation reason LigandMPNN/LASErMPNN each get their own subprocess instead of
+# running in-process. Generation follows the paper's actual two-stage protocol
+# (Birnbaum & Keating, "Beyond native sequence recovery..."): autoregressive decoding
+# (ProteinMPNN-style, temperature=0.1) for N diverse candidates, then a
+# deterministic-ish Potts-energy local-optimization (ICM) refinement sweep on each --
+# validated against an 80-structure test run on CHPC before this integration existed.
+_POTTS_PYTHON            = str(_MAMBA_ROOT / "envs" / "pottsmpnn" / "bin" / "python")
+_POTTS_GEN_SCRIPT        = str(Path(__file__).parent / "run_pottsmpnn_batch.py")
+_POTTS_FORK_DIR_DEFAULT  = "/mnt/scratch/user/daviyang/proteinzen/pottsmpnn_ligand_check/LigandMPNN"
+
 # Anthropic's optimized Boltz-2 (github.com/anthropics/uplifting-biomolecular-modeling),
 # same single-sequence YAML input format as stock Boltz, same output filenames
 # (confidence_*_model_0.json / *_model_0.cif / pae_*_model_0.npz), just a different
@@ -837,22 +862,67 @@ def parse_pdb_ligand_cond(pdb_path: str):
             prot_by_res, prot_res_keys)
 
 
-def pocket_fixed_residues(prot_by_res: list[dict], prot_res_keys: list, lig_coords: np.ndarray,
-                          cutoff: float = 6.0) -> str:
-    """LigandMPNN --fixed_residues string ("A12 A13 B2 ...") for residues with any
-    atom within `cutoff` of any ligand atom -- the Pallatom-Ligand paper's protocol:
-    fix pocket residues, let LigandMPNN redesign everything else."""
+def _pocket_fixed_keys(prot_by_res: list[dict], prot_res_keys: list, lig_coords: np.ndarray,
+                       cutoff: float = 6.0) -> set:
+    """Shared distance-to-ligand calc behind both pocket_fixed_residues (LigandMPNN's
+    --fixed_residues token-string format) and write_fix_beta_pdb (LASErMPNN's
+    --fix_beta B-factor-column format) -- same underlying "fix pocket residues
+    within `cutoff` of the ligand, let the MPNN redesign everything else" protocol,
+    just a different on-disk encoding of which residues are fixed. Returns the set
+    of (chain, resnum) keys (aligned with prot_res_keys) within `cutoff` of any
+    ligand atom."""
+    fixed: set = set()
     if len(lig_coords) == 0:
-        return ""
-    tokens = []
-    for res_atoms, (chain, resnum) in zip(prot_by_res, prot_res_keys):
+        return fixed
+    for res_atoms, key in zip(prot_by_res, prot_res_keys):
         if not res_atoms:
             continue
         res_coords = np.array(list(res_atoms.values()))
         min_dist = np.linalg.norm(res_coords[:, None, :] - lig_coords[None, :, :], axis=-1).min()
         if min_dist <= cutoff:
-            tokens.append(f"{chain}{resnum}")
-    return " ".join(tokens)
+            fixed.add(key)
+    return fixed
+
+
+def pocket_fixed_residues(prot_by_res: list[dict], prot_res_keys: list, lig_coords: np.ndarray,
+                          cutoff: float = 6.0) -> str:
+    """LigandMPNN --fixed_residues string ("A12 A13 B2 ...") for residues with any
+    atom within `cutoff` of any ligand atom -- the Pallatom-Ligand paper's protocol:
+    fix pocket residues, let LigandMPNN redesign everything else."""
+    fixed = _pocket_fixed_keys(prot_by_res, prot_res_keys, lig_coords, cutoff=cutoff)
+    if not fixed:
+        return ""
+    return " ".join(f"{chain}{resnum}" for chain, resnum in prot_res_keys if (chain, resnum) in fixed)
+
+
+def write_fix_beta_pdb(pdb_path, fixed_keys: set, out_path) -> None:
+    """Write a copy of pdb_path with the B-factor column set to 1.00 for protein
+    ATOM records whose (chain, resnum) is in fixed_keys (kept FIXED: sequence and
+    rotamer unchanged), 0.00 for every other protein residue (DESIGNED) -- the
+    on-disk encoding LASErMPNN's --fix_beta flag reads (verified directly against
+    LASErMPNN/run_inference.py's ProteinComplexData: a residue is fixed iff
+    np.isclose(max(atom B-factors in that residue), 1.0), so every atom in a
+    residue should agree -- not just CA -- to avoid relying on a "max" tie-break).
+    This is the LASErMPNN analog of pocket_fixed_residues' token string, built
+    from the exact same fixed_keys set (see _pocket_fixed_keys) so both MPNN
+    variants fix identical pocket residues for the same sample/cutoff.
+    HETATM (ligand) lines are left untouched. Standard fixed-column PDB format
+    (occupancy cols 55-60 / 0-idx [54:60), B-factor cols 61-66 / 0-idx [60:66)),
+    verified against this pipeline's own generated PDBs before relying on it."""
+    out_path = Path(out_path)
+    with open(pdb_path) as fh:
+        lines = fh.readlines()
+    new_lines = []
+    for line in lines:
+        rec = line[:6].rstrip()
+        if rec == "ATOM" and len(line) >= 66:
+            chain = line[21]
+            resnum = line[22:26].strip()
+            beta = 1.00 if (chain, resnum) in fixed_keys else 0.00
+            line = line[:60] + f"{beta:6.2f}" + line[66:]
+        new_lines.append(line)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("".join(new_lines))
 
 
 _AA3TO1 = {
@@ -1454,6 +1524,381 @@ def run_ligandmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, ligandmpnn_script
                            fixed_residues=fixed_residues, force=force)
 
 
+def run_ligandmpnn_batch(items, out_dir: Path, n_seqs: int, ligandmpnn_script: str,
+                          fixed_residues_by_sid: dict | None = None,
+                          force: bool = False) -> dict:
+    """Batched sibling of run_ligandmpnn -- loads the LigandMPNN checkpoint ONCE
+    (via --pdb_path_multi/--fixed_residues_multi, both natively supported by
+    LigandMPNN/run.py) for the whole group instead of one subprocess (and one
+    torch.load of the checkpoint from disk) per item. Same one-model-load
+    sharding idea as run_refolding_batch's Boltz2 fix -- per-sample reload
+    overhead, not GPU compute, was the actual bottleneck (confirmed live:
+    torch.cuda.is_available() is True and nvidia-smi shows real, if brief, per-
+    call GPU bursts -- the cost is 800x redundant checkpoint-from-disk loads).
+
+    items: list of (pdb_path, sid) tuples. sid must be unique across the whole
+    call. fixed_residues_by_sid: optional {sid: fixed_residues_str}.
+
+    Each item's PDB is symlinked into out_dir/inputs/<sid>.pdb (NOT left at its
+    own basename) before calling run.py, since LigandMPNN names its output
+    fasta after the input file's OWN basename (run.py: name = pdb path's
+    basename minus extension) -- different ligand codes' baseline outputs have
+    been observed to reuse identical basenames (e.g. Complexa's OQO/IAI), which
+    would silently collide in a shared --out_folder/seqs/<basename>.fa. Keying
+    the symlink name by sid instead makes every item's output path unambiguous.
+
+    Returns {sid: [seq, ...]} -- same per-item sequence list run_ligandmpnn
+    already returns for a single item. Already-cached items (fasta on disk,
+    not force) are read back without rerunning the model at all."""
+    if not items:
+        return {}
+    out_dir = Path(out_dir).resolve()
+    inputs_dir = out_dir / "inputs"
+    seqs_dir = out_dir / "seqs"
+    inputs_dir.mkdir(parents=True, exist_ok=True)
+    seqs_dir.mkdir(parents=True, exist_ok=True)
+
+    links_by_sid = {}
+    todo = []
+    for pdb_path, sid in items:
+        link = inputs_dir / f"{sid}.pdb"
+        if not link.exists():
+            link.symlink_to(Path(pdb_path).resolve())
+        links_by_sid[sid] = link
+        if force or not (seqs_dir / f"{sid}.fa").exists():
+            todo.append((link, sid))
+
+    if todo:
+        pdb_multi = {str(link): "" for link, _ in todo}
+        fixed_multi = {str(link): (fixed_residues_by_sid or {}).get(sid, "") for link, sid in todo}
+        pdb_multi_path = out_dir / "pdb_path_multi.json"
+        fixed_multi_path = out_dir / "fixed_residues_multi.json"
+        pdb_multi_path.write_text(json.dumps(pdb_multi))
+        fixed_multi_path.write_text(json.dumps(fixed_multi))
+        cmd = [_MPNN_PYTHON, ligandmpnn_script,
+               "--model_type", "ligand_mpnn",
+               "--pdb_path_multi", str(pdb_multi_path),
+               "--fixed_residues_multi", str(fixed_multi_path),
+               "--out_folder", str(out_dir),
+               "--number_of_batches", str(n_seqs),
+               "--temperature", "0.1",
+               "--batch_size", "1",
+               "--verbose", "0"]
+        # No check=True: LigandMPNN writes each item's seqs/<sid>.fa as it
+        # finishes that item in its internal loop, so a crash partway through
+        # (one bad structure, OOM, timeout) still leaves earlier items' output
+        # on disk. Read back whatever's actually there (disk truth) instead of
+        # discarding the whole shard's results on a nonzero exit -- same
+        # philosophy as the Boltz2 harness checking real .cif absence over the
+        # kit's own self-reported ok/failed tally.
+        try:
+            proc = subprocess.run(cmd, timeout=max(600, 10 * len(todo)),
+                                   cwd=str(Path(ligandmpnn_script).parent),
+                                   capture_output=True, text=True)
+            if proc.returncode != 0:
+                print(f"  LigandMPNN batch rc={proc.returncode} ({len(todo)} item(s)) -- "
+                      f"reading back whatever completed before the failure:\n{proc.stderr[-2000:]}")
+        except subprocess.TimeoutExpired:
+            print(f"  LigandMPNN batch timed out ({len(todo)} item(s)) -- "
+                  f"reading back whatever completed before the timeout")
+
+    return {
+        sid: _parse_mpnn_fasta(seqs_dir / f"{sid}.fa")[:n_seqs]
+        for _, sid in items
+    }
+
+
+_LASER_HEADER_RE = re.compile(r'^>(.*)_design_(\d+)_segment_\S*_chain_(\S+)\s')
+
+
+def _parse_lasermpnn_fasta_multi(fasta_path: Path) -> dict:
+    """Parse LASErMPNN's designs.fasta into {pdb_code: [seq, ...]} ordered by
+    design index, per pdb_code.
+
+    IMPORTANT: despite run_batch_inference.py writing each design's PDB file into
+    a PER-INPUT subdirectory (output_pdb_directory / file.stem / f"design_{i}.pdb"),
+    the fasta output is a single FLAT file shared across every input in the whole
+    call: `with open(output_pdb_directory / 'designs.fasta', 'a') as fasta_out`
+    (verified directly against run_inference()'s source, not assumed from the PDB
+    output's per-input layout). Each record's header embeds the pdb_code (our sid)
+    as everything before the first "_design_": '>{pdb_code}_design_{idx}_segment_
+    {seg}_chain_{c} score={score}', sequence on the next line.
+
+    Only protein chains ever get a record: run_batch_inference.py tries
+    `chain.select("name CA").getSequence()` per chain of the output structure and
+    silently skips any chain where that raises (the ligand chain's atoms are named
+    C1/C2/... etc, never "CA") -- so for this task's single-protein-chain binder
+    samples this is exactly one record per design. If a design has multiple protein
+    chains, their sequences are concatenated in chain-name order rather than
+    silently dropping any of them (not expected for this task, but handled). The
+    segment name is typically empty for a single-segment chain (giving
+    "..._segment__chain_A...", a double underscore) -- \\S* (not \\S+) in the regex
+    allows that; an earlier \\S+ version silently matched zero records."""
+    if not Path(fasta_path).exists():
+        return {}
+    by_code: dict = defaultdict(lambda: defaultdict(dict))
+    header = None
+    with open(fasta_path) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if line.startswith(">"):
+                header = line
+                continue
+            if header is not None:
+                m = _LASER_HEADER_RE.match(header)
+                if m:
+                    code, idx, chain = m.group(1), int(m.group(2)), m.group(3)
+                    by_code[code][idx][chain] = line.strip()
+            header = None
+    return {
+        code: ["".join(chains[c] for c in sorted(chains.keys()))
+               for idx, chains in sorted(idx_map.items())]
+        for code, idx_map in by_code.items()
+    }
+
+
+def _write_lasermpnn_fasta_multi(fasta_path: Path, seqs_by_code: dict) -> None:
+    """Rewrite designs.fasta in the format _parse_lasermpnn_fasta_multi expects,
+    from an in-memory {pdb_code: [seq, ...]} mapping. Used by run_lasermpnn_batch
+    to restore sids that a narrower run_batch_inference.py invocation would
+    otherwise silently discard from disk (see that function's docstring for why).
+    Score/segment are nulled out since this is a cache-preservation rewrite, not a
+    fresh design -- only the fields _parse_lasermpnn_fasta_multi actually reads
+    (pdb_code, design index, chain, sequence) need to round-trip correctly."""
+    lines = []
+    for code, seqs in seqs_by_code.items():
+        for i, seq in enumerate(seqs):
+            lines.append(f">{code}_design_{i}_segment__chain_A score=nan\n{seq}\n")
+    fasta_path.write_text("".join(lines))
+
+
+def run_lasermpnn_batch(items, out_dir: Path, n_seqs: int, lasermpnn_script: str,
+                        fixed_keys_by_sid: dict | None = None,
+                        force: bool = False, device: str = "cuda:0",
+                        sequence_temp: float = 0.1) -> dict:
+    """Batched sibling of run_ligandmpnn_batch, adapted to LASErMPNN -- loads the
+    LASErMPNN checkpoint ONCE for the whole group via run_batch_inference.py's own
+    .txt-file-of-paths input mode (analogous to LigandMPNN's --pdb_path_multi).
+
+    Key differences from run_ligandmpnn_batch's pattern (same non-strict-exit-code
+    "read back whatever's on disk" philosophy otherwise):
+      - LASErMPNN's fixed/designed split is encoded in the B-FACTOR COLUMN of the
+        input PDB itself (--fix_beta), not a --fixed_residues token string, so each
+        item's input must be MATERIALIZED as a B-factor-modified copy (via
+        write_fix_beta_pdb) under out_dir/inputs/<sid>.pdb -- a plain symlink to the
+        original sample (as LigandMPNN uses) won't work here, since the file
+        CONTENT (not just its path) differs per item.
+      - Output is a single FLAT out_dir/designs.fasta SHARED across every item in
+        the call, keyed by pdb_code (=sid) in each record's header -- see
+        _parse_lasermpnn_fasta_multi's docstring. This also means
+        run_inference() DELETES then recreates that file at the start of every
+        separate python-process invocation of run_batch_inference.py (see its
+        "Delete old fasta file if it exists" step) -- it has no notion of
+        accumulating across invocations, only within one. So a narrower later
+        invocation (different todo set) would silently discard any OTHER sid's
+        previously-cached entries from disk. This function re-merges and rewrites
+        the union back to disk after every subprocess call (via
+        _write_lasermpnn_fasta_multi) specifically to survive that, so
+        force=False caching still works correctly across SEPARATE calls to this
+        function (e.g. a later, separate run of this eval script), not just within
+        one combined call.
+      - sequence_temp defaults to 0.1, NOT run_batch_inference.py's own CLI default
+        of unset/None. LASErMPNN's sample() takes an ARGMAX (no sampling at all) when
+        sequence_sample_temperature is None (verified in utils/model.py) -- passing
+        None here would make every one of the n_seqs designs per structure nearly
+        identical (decoding-order randomization is the only remaining source of
+        variation), silently collapsing a best-of-N comparison into a best-of-1 one.
+        0.1 matches LigandMPNN's own hardcoded --temperature 0.1 in _run_ligandmpnn,
+        so both tools sample at the same nominal temperature for a fair comparison.
+
+    items: list of (pdb_path, sid, prot_by_res, prot_res_keys, lig_coords) tuples.
+    sid must be unique across the whole call. fixed_keys_by_sid: optional
+    {sid: set_of_(chain,resnum)_fixed_keys} (see _pocket_fixed_keys) -- a missing
+    or None entry for a given sid means "no fixed residues" (full redesign).
+
+    Returns {sid: [seq, ...]} -- same shape run_ligandmpnn_batch returns.
+    Already-cached items (>= n_seqs sequences already on disk for that sid, and
+    not force) are read back without rerunning the model at all."""
+    if not items:
+        return {}
+    out_dir = Path(out_dir).resolve()
+    inputs_dir = out_dir / "inputs"
+    inputs_dir.mkdir(parents=True, exist_ok=True)
+    fasta_path = out_dir / "designs.fasta"
+
+    cached = {} if force else _parse_lasermpnn_fasta_multi(fasta_path)
+
+    paths_by_sid = {}
+    todo = []
+    for pdb_path, sid, prot_by_res, prot_res_keys, lig_coords in items:
+        fixed_keys = (fixed_keys_by_sid or {}).get(sid) or set()
+        fixed_path = inputs_dir / f"{sid}.pdb"
+        paths_by_sid[sid] = fixed_path
+        if force or len(cached.get(sid, [])) < n_seqs:
+            # (Re)materialize whenever queued to run -- cheap, and keeps the
+            # on-disk input in sync if the pocket cutoff changed since any
+            # earlier partial run left a stale inputs/<sid>.pdb behind.
+            write_fix_beta_pdb(pdb_path, fixed_keys, fixed_path)
+            todo.append(sid)
+
+    if todo:
+        manifest_path = out_dir / "lasermpnn_inputs.txt"
+        manifest_path.write_text("\n".join(str(paths_by_sid[sid]) for sid in todo) + "\n")
+        cmd = [_LASER_PYTHON, "-m", "LASErMPNN.run_batch_inference",
+               str(manifest_path), str(out_dir), str(n_seqs),
+               "--device", device,
+               "--fix_beta",
+               "--output_fasta_only",
+               "--sequence_temp", str(sequence_temp),
+               "--model_weights_path", str(_LASER_WEIGHTS),
+               "--silent"]
+        env = dict(os.environ)
+        env.setdefault("OMP_NUM_THREADS", "16")
+        env.setdefault("OPENBLAS_NUM_THREADS", "16")
+        env.setdefault("MKL_NUM_THREADS", "16")
+        # No check=True, same "read back whatever's on disk" philosophy as
+        # run_ligandmpnn_batch: a crash partway through (one bad structure, OOM,
+        # timeout) still leaves earlier items' records on disk.
+        try:
+            proc = subprocess.run(cmd, timeout=max(600, 30 * len(todo)),
+                                   cwd=str(_LASER_REPO_PARENT),
+                                   capture_output=True, text=True, env=env)
+            if proc.returncode != 0:
+                print(f"  LASErMPNN batch rc={proc.returncode} ({len(todo)} item(s)) -- "
+                      f"reading back whatever completed before the failure:\n{proc.stderr[-2000:]}")
+        except subprocess.TimeoutExpired:
+            print(f"  LASErMPNN batch timed out ({len(todo)} item(s)) -- "
+                  f"reading back whatever completed before the timeout")
+
+        fresh = _parse_lasermpnn_fasta_multi(fasta_path)
+        merged = dict(cached)
+        merged.update(fresh)
+        if set(cached) - set(fresh):
+            # This invocation's manifest didn't cover every sid 'cached' had on
+            # disk before the subprocess ran (which just deleted/recreated the
+            # file with ONLY today's todo's results) -- rewrite the union back to
+            # disk so those other sids survive for a future, separate invocation.
+            _write_lasermpnn_fasta_multi(fasta_path, merged)
+        cached = merged
+
+    return {sid: cached.get(sid, [])[:n_seqs] for pdb_path, sid, *_rest in items}
+
+
+def run_lasermpnn(pdb_path: Path, out_dir: Path, n_seqs: int, lasermpnn_script: str,
+                  fixed_keys: set | None = None, force: bool = False,
+                  device: str = "cuda:0", sequence_temp: float = 0.1) -> list[str]:
+    """Single-item convenience wrapper around run_lasermpnn_batch (every real
+    caller in this file uses the batch form directly) -- kept for symmetry with
+    run_ligandmpnn, and so eval_ligand_cond_sample's non-batch code path (used
+    when a caller invokes it directly rather than through
+    eval_ligand_cond_samples_batch) can still exercise LASErMPNN."""
+    sid = Path(pdb_path).stem
+    result = run_lasermpnn_batch(
+        [(pdb_path, sid, None, None, None)], out_dir, n_seqs, lasermpnn_script,
+        fixed_keys_by_sid={sid: fixed_keys or set()}, force=force, device=device,
+        sequence_temp=sequence_temp,
+    )
+    return result.get(sid, [])
+
+
+def run_pottsmpnn_batch(items, out_dir: Path, n_seqs: int, checkpoint_path: str,
+                        fork_dir: str | None = None,
+                        fixed_keys_by_sid: dict | None = None,
+                        force: bool = False, temperature: float = 0.1,
+                        refine_temp: float = 0.0001, max_sweeps: int = 30) -> dict:
+    """Batched sibling of run_ligandmpnn_batch/run_lasermpnn_batch, for the
+    PottsMPNN-adapted-LigandMPNN checkpoint -- loads the model ONCE for the whole
+    group via run_pottsmpnn_batch.py's own --items-json control file (analogous to
+    LigandMPNN's --pdb_path_multi / LASErMPNN's manifest.txt). Output is a single
+    out_dir/potts_seqs.json keyed by sid, read back directly -- no fasta parsing
+    needed, the worker writes exactly the shape this function returns.
+
+    items: list of (pdb_path, sid, prot_by_res, prot_res_keys, lig_coords) tuples,
+    same shape run_lasermpnn_batch takes (only pdb_path/sid are actually used here).
+    fixed_keys_by_sid: optional {sid: set_of_(chain,resnum)_fixed_keys} (see
+    _pocket_fixed_keys) -- a missing or None entry means "no fixed residues" (full
+    redesign).
+
+    Returns {sid: [seq, ...]} -- same shape run_ligandmpnn_batch/run_lasermpnn_batch
+    return. Already-cached items (>= n_seqs sequences already on disk for that sid,
+    and not force) are read back without rerunning the model at all."""
+    if not items:
+        return {}
+    out_dir = Path(out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_json = out_dir / "potts_seqs.json"
+
+    cached = {}
+    if not force and out_json.exists():
+        try:
+            cached = json.loads(out_json.read_text())
+        except json.JSONDecodeError:
+            cached = {}
+
+    todo_items = []
+    for pdb_path, sid, *_rest in items:
+        if force or len(cached.get(sid, [])) < n_seqs:
+            fixed_keys = (fixed_keys_by_sid or {}).get(sid) or set()
+            todo_items.append({
+                "sid": sid, "pdb_path": str(pdb_path),
+                "fixed_residues": [[str(c), str(r)] for c, r in sorted(fixed_keys)],
+            })
+
+    if todo_items:
+        items_json_path = out_dir / "potts_items.json"
+        items_json_path.write_text(json.dumps(todo_items))
+        cmd = [_POTTS_PYTHON, _POTTS_GEN_SCRIPT,
+               "--items-json", str(items_json_path),
+               "--out-json", str(out_json),
+               "--checkpoint", checkpoint_path,
+               "--fork-dir", fork_dir or _POTTS_FORK_DIR_DEFAULT,
+               "--n-seqs", str(n_seqs),
+               "--temperature", str(temperature),
+               "--refine-temp", str(refine_temp),
+               "--max-sweeps", str(max_sweeps)]
+        env = dict(os.environ)
+        env.setdefault("OMP_NUM_THREADS", "16")
+        env.setdefault("OPENBLAS_NUM_THREADS", "16")
+        env.setdefault("MKL_NUM_THREADS", "16")
+        # No check=True, same "read back whatever's on disk" philosophy as
+        # run_ligandmpnn_batch/run_lasermpnn_batch: a crash partway through (one bad
+        # structure, OOM, timeout) still leaves earlier items' results on disk --
+        # the worker merges with and rewrites out_json as it goes, not just at the end.
+        try:
+            proc = subprocess.run(cmd, timeout=max(600, 60 * len(todo_items)),
+                                   capture_output=True, text=True, env=env)
+            if proc.returncode != 0:
+                print(f"  PottsMPNN batch rc={proc.returncode} ({len(todo_items)} item(s)) -- "
+                      f"reading back whatever completed before the failure:\n{proc.stderr[-2000:]}")
+        except subprocess.TimeoutExpired:
+            print(f"  PottsMPNN batch timed out ({len(todo_items)} item(s)) -- "
+                  f"reading back whatever completed before the timeout")
+
+        if out_json.exists():
+            try:
+                cached = json.loads(out_json.read_text())
+            except json.JSONDecodeError:
+                pass
+
+    return {sid: cached.get(sid, [])[:n_seqs] for pdb_path, sid, *_rest in items}
+
+
+def run_pottsmpnn(pdb_path: Path, out_dir: Path, n_seqs: int, checkpoint_path: str,
+                  fork_dir: str | None = None, fixed_keys: set | None = None,
+                  force: bool = False, temperature: float = 0.1,
+                  refine_temp: float = 0.0001, max_sweeps: int = 30) -> list[str]:
+    """Single-item convenience wrapper around run_pottsmpnn_batch -- same symmetry
+    reason as run_lasermpnn, so eval_ligand_cond_sample's non-batch code path can
+    still exercise PottsMPNN."""
+    sid = Path(pdb_path).stem
+    result = run_pottsmpnn_batch(
+        [(pdb_path, sid, None, None, None)], out_dir, n_seqs, checkpoint_path,
+        fork_dir=fork_dir, fixed_keys_by_sid={sid: fixed_keys or set()}, force=force,
+        temperature=temperature, refine_temp=refine_temp, max_sweeps=max_sweeps,
+    )
+    return result.get(sid, [])
+
+
 def _aggregate_mpnn_results(seqs, results, tag):
     """Shared tail of _run_mpnn_case: turns a list of per-seq boltz2 refold result
     dicts (any mix of computed-here or precomputed-by-a-batch-caller) into the
@@ -1496,11 +1941,13 @@ def _aggregate_mpnn_results(seqs, results, tag):
 
 def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_dir,
                             boltz_cache, run_pb, skip_fold, contact_cutoff=4.0,
-                            mpnn_script=None, ligandmpnn_script=None,
+                            mpnn_script=None, ligandmpnn_script=None, lasermpnn_script=None,
+                            pottsmpnn_checkpoint=None, pottsmpnn_fork_dir=None,
                             mpnn_n_seqs=3, mpnn_refold_dir=None, pb_cache=None,
                             mpnn_cutoff=None, force=False, skip_nolig=False,
                             sample_id=None, _precomputed_fold=None,
-                            _precomputed_fold_nolig=None, _precomputed_lmpnn=None):
+                            _precomputed_fold_nolig=None, _precomputed_lmpnn=None,
+                            _precomputed_lasermpnn=None, _precomputed_pottsmpnn=None):
     """mpnn_cutoff: None (default) preserves the original behavior -- LigandMPNN
     redesigns the full sequence, no fixed residues. Pass a distance in Angstroms
     (e.g. 6.0) to instead fix residues within that cutoff of the ligand and let
@@ -1528,12 +1975,13 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
     found to use byte-identical filenames) must pass a collision-free id explicitly, or
     every refold/MPNN cache in this function silently collides across populations.
 
-    _precomputed_fold / _precomputed_fold_nolig / _precomputed_lmpnn: internal
-    use by eval_ligand_cond_samples_batch, which runs fold/fold_nolig/lmpnn
-    refolds for a whole batch of samples in one combined boltz2_kit call, then
-    passes the already-computed results in here per sample. _precomputed_lmpnn
-    is a (seqs, results) tuple. None (default) preserves the exact
-    original behavior for every other caller."""
+    _precomputed_fold / _precomputed_fold_nolig / _precomputed_lmpnn / _precomputed_lasermpnn /
+    _precomputed_pottsmpnn: internal use by eval_ligand_cond_samples_batch, which runs
+    fold/fold_nolig/lmpnn/lasermpnn/pottsmpnn refolds for a whole batch of samples in one
+    combined boltz2_kit call, then passes the already-computed results in here per sample.
+    _precomputed_lmpnn, _precomputed_lasermpnn, and _precomputed_pottsmpnn are each a
+    (seqs, results) tuple. None (default) preserves the exact original behavior for every
+    other caller."""
     sid = sample_id if sample_id is not None else pdb_path.stem
     (prot_all, prot_ca, resnames, lig_coords, lig_elements, _,
      prot_by_res, prot_res_keys) = parse_pdb_ligand_cond(str(pdb_path))
@@ -1613,7 +2061,7 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
                 results.append(fold_i)
         return _aggregate_mpnn_results(seqs, results, tag)
 
-    pmpnn_metrics, lmpnn_metrics = {}, {}
+    pmpnn_metrics, lmpnn_metrics, lasermpnn_metrics, pottsmpnn_metrics = {}, {}, {}, {}
     if not skip_fold and len(prot_ca) > 0:
         base = mpnn_refold_dir or refold_output_dir.parent / "mpnn_refold"
         if mpnn_script and Path(mpnn_script).exists():
@@ -1645,6 +2093,40 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
                 lmpnn_metrics = _run_mpnn_case(seqs, smiles, "lmpnn", base / sid / "lmpnn_refold")
             except Exception as e:
                 print(f"  LigandMPNN error {pdb_path.name}: {e}")
+        if _precomputed_lasermpnn is not None:
+            # Same precomputed-by-the-batch-caller shortcut as _precomputed_lmpnn.
+            _seqs, _results = _precomputed_lasermpnn
+            lasermpnn_metrics = _aggregate_mpnn_results(_seqs, _results, "lasermpnn")
+        elif lasermpnn_script and Path(lasermpnn_script).exists():
+            try:
+                # Same pocket-fixed protocol as the LigandMPNN branch above, just
+                # encoded as a (chain, resnum) key set for write_fix_beta_pdb's
+                # B-factor-column mechanism instead of a token string.
+                fixed_keys = (
+                    _pocket_fixed_keys(prot_by_res, prot_res_keys, lig_coords, cutoff=mpnn_cutoff)
+                    if mpnn_cutoff is not None else set()
+                )
+                seqs = run_lasermpnn(pdb_path, base / sid / "lasermpnn", mpnn_n_seqs, lasermpnn_script,
+                                     fixed_keys=fixed_keys, force=force)
+                lasermpnn_metrics = _run_mpnn_case(seqs, smiles, "lasermpnn", base / sid / "lasermpnn_refold")
+            except Exception as e:
+                print(f"  LASErMPNN error {pdb_path.name}: {e}")
+        if _precomputed_pottsmpnn is not None:
+            # Same precomputed-by-the-batch-caller shortcut as _precomputed_lmpnn.
+            _seqs, _results = _precomputed_pottsmpnn
+            pottsmpnn_metrics = _aggregate_mpnn_results(_seqs, _results, "potts")
+        elif pottsmpnn_checkpoint and Path(pottsmpnn_checkpoint).exists():
+            try:
+                # Same pocket-fixed protocol as the LigandMPNN/LASErMPNN branches above.
+                fixed_keys = (
+                    _pocket_fixed_keys(prot_by_res, prot_res_keys, lig_coords, cutoff=mpnn_cutoff)
+                    if mpnn_cutoff is not None else set()
+                )
+                seqs = run_pottsmpnn(pdb_path, base / sid / "pottsmpnn", mpnn_n_seqs, pottsmpnn_checkpoint,
+                                     fork_dir=pottsmpnn_fork_dir, fixed_keys=fixed_keys, force=force)
+                pottsmpnn_metrics = _run_mpnn_case(seqs, smiles, "potts", base / sid / "pottsmpnn_refold")
+            except Exception as e:
+                print(f"  PottsMPNN error {pdb_path.name}: {e}")
 
     return {
         "sample_id": pdb_path.stem,
@@ -1659,25 +2141,38 @@ def eval_ligand_cond_sample(pdb_path, smiles, refold_input_dir, refold_output_di
         **fold_nolig,
         **pmpnn_metrics,
         **lmpnn_metrics,
+        **lasermpnn_metrics,
+        **pottsmpnn_metrics,
     }
 
 
 def eval_ligand_cond_samples_batch(items, refold_input_dir, refold_output_dir,
                                     boltz_cache, run_pb, skip_fold, contact_cutoff=4.0,
-                                    ligandmpnn_script=None, mpnn_n_seqs=3, mpnn_cutoff=None,
+                                    ligandmpnn_script=None, lasermpnn_script=None,
+                                    pottsmpnn_checkpoint=None, pottsmpnn_fork_dir=None,
+                                    mpnn_n_seqs=3, mpnn_cutoff=None,
                                     force=False, skip_nolig=False, batch_size=None,
                                     batch_max_pad=None, pb_cache=None, mpnn_refold_dir=None,
                                     real_batch_size=None):
     """Batched sibling of eval_ligand_cond_sample: evaluates several DIFFERENT
     generated structures together, combining every item's raw fold, fold_nolig
-    (unless skip_nolig), and LigandMPNN-redesigned-sequence refolds into ONE
-    combined run_refolding_batch call -- one apptainer/model-load for the whole
-    group, not one per item. LigandMPNN generation itself still runs per item
-    (cheap, on-disk cached) to get the sequences for that combined call.
-    Everything else runs via eval_ligand_cond_sample's
-    _precomputed_fold/_precomputed_fold_nolig/_precomputed_lmpnn params.
+    (unless skip_nolig), LigandMPNN-redesigned-sequence, and LASErMPNN-redesigned-
+    sequence refolds into ONE combined run_refolding_batch call -- one apptainer/
+    model-load for the whole group, not one per item. LigandMPNN/LASErMPNN
+    generation itself still runs per item-group (one combined call per tool, each
+    loading its own checkpoint once, on-disk cached) to get the sequences for that
+    combined refold call. Everything else runs via eval_ligand_cond_sample's
+    _precomputed_fold/_precomputed_fold_nolig/_precomputed_lmpnn/
+    _precomputed_lasermpnn params.
 
     items: list of (pdb_path, smiles, sample_id) tuples.
+    lasermpnn_script: path to LASErMPNN's run_batch_inference.py. None (default)
+    skips the LASErMPNN variant entirely -- mirrors ligandmpnn_script's own
+    None-skips convention. pottsmpnn_checkpoint: path to the PottsMPNN-adapted-
+    LigandMPNN checkpoint; None (default) skips that variant the same way.
+    mpnn_n_seqs/mpnn_cutoff are shared across all three tools (same cutoff, same
+    n_seqs) so they're compared at identical settings rather than needing separate
+    flags that could silently drift apart.
     Returns: list of result dicts, one per item, same shape eval_ligand_cond_sample
     returns for a single item. batch_size<=1 (or no items) just loops
     eval_ligand_cond_sample per item -- i.e. the exact unbatched behavior.
@@ -1696,7 +2191,9 @@ def eval_ligand_cond_samples_batch(items, refold_input_dir, refold_output_dir,
                 pdb_path=pdb_path, smiles=smiles, refold_input_dir=refold_input_dir,
                 refold_output_dir=refold_output_dir, boltz_cache=boltz_cache,
                 run_pb=run_pb, skip_fold=skip_fold, contact_cutoff=contact_cutoff,
-                ligandmpnn_script=ligandmpnn_script, mpnn_n_seqs=mpnn_n_seqs,
+                ligandmpnn_script=ligandmpnn_script, lasermpnn_script=lasermpnn_script,
+                pottsmpnn_checkpoint=pottsmpnn_checkpoint, pottsmpnn_fork_dir=pottsmpnn_fork_dir,
+                mpnn_n_seqs=mpnn_n_seqs,
                 mpnn_cutoff=mpnn_cutoff, force=force, skip_nolig=skip_nolig,
                 sample_id=sid, pb_cache=pb_cache, mpnn_refold_dir=mpnn_refold_dir,
             )
@@ -1704,6 +2201,8 @@ def eval_ligand_cond_samples_batch(items, refold_input_dir, refold_output_dir,
         ]
 
     run_lmpnn = bool(ligandmpnn_script and Path(ligandmpnn_script).exists())
+    run_laser = bool(lasermpnn_script and Path(lasermpnn_script).exists())
+    run_potts = bool(pottsmpnn_checkpoint and Path(pottsmpnn_checkpoint).exists())
 
     prepared = []
     for pdb_path, smiles, sid in items:
@@ -1717,28 +2216,84 @@ def eval_ligand_cond_samples_batch(items, refold_input_dir, refold_output_dir,
             gen_lig = None
         prepared.append(dict(pdb_path=pdb_path, smiles=smiles, sid=sid, sequence=sequence,
                               prot_ca=prot_ca, prot_by_res=prot_by_res, prot_res_keys=prot_res_keys,
-                              lig_coords=lig_coords, gen_lig=gen_lig, lmpnn_seqs=[]))
+                              lig_coords=lig_coords, gen_lig=gen_lig, lmpnn_seqs=[], lasermpnn_seqs=[],
+                              potts_seqs=[]))
 
     fold_items = [p for p in prepared if p["sequence"]]
 
     if run_lmpnn:
         base_default = refold_output_dir.parent / "mpnn_refold"
-        for p in fold_items:
-            if len(p["prot_ca"]) == 0:
-                continue
-            base = mpnn_refold_dir or base_default
-            try:
-                fixed_residues = (
-                    pocket_fixed_residues(p["prot_by_res"], p["prot_res_keys"], p["lig_coords"],
-                                           cutoff=mpnn_cutoff)
-                    if mpnn_cutoff is not None else ""
-                )
-                p["lmpnn_seqs"] = run_ligandmpnn(
-                    p["pdb_path"], base / p["sid"] / "ligandmpnn", mpnn_n_seqs, ligandmpnn_script,
-                    fixed_residues=fixed_residues, force=force,
-                )
-            except Exception as e:
-                print(f"  LigandMPNN error {p['pdb_path'].name}: {e}")
+        base = mpnn_refold_dir or base_default
+        lmpnn_items = [p for p in fold_items if len(p["prot_ca"]) > 0]
+        fixed_residues_by_sid = {
+            p["sid"]: (
+                pocket_fixed_residues(p["prot_by_res"], p["prot_res_keys"], p["lig_coords"],
+                                       cutoff=mpnn_cutoff)
+                if mpnn_cutoff is not None else ""
+            )
+            for p in lmpnn_items
+        }
+        try:
+            seqs_by_sid = run_ligandmpnn_batch(
+                [(p["pdb_path"], p["sid"]) for p in lmpnn_items],
+                base / "_batch_ligandmpnn", mpnn_n_seqs, ligandmpnn_script,
+                fixed_residues_by_sid=fixed_residues_by_sid, force=force,
+            )
+        except Exception as e:
+            print(f"  LigandMPNN batch error: {e}")
+            seqs_by_sid = {}
+        for p in lmpnn_items:
+            p["lmpnn_seqs"] = seqs_by_sid.get(p["sid"], [])
+
+    if run_laser:
+        base_default = refold_output_dir.parent / "mpnn_refold"
+        base = mpnn_refold_dir or base_default
+        laser_items = [p for p in fold_items if len(p["prot_ca"]) > 0]
+        fixed_keys_by_sid = {
+            p["sid"]: (
+                _pocket_fixed_keys(p["prot_by_res"], p["prot_res_keys"], p["lig_coords"],
+                                   cutoff=mpnn_cutoff)
+                if mpnn_cutoff is not None else set()
+            )
+            for p in laser_items
+        }
+        try:
+            seqs_by_sid = run_lasermpnn_batch(
+                [(p["pdb_path"], p["sid"], p["prot_by_res"], p["prot_res_keys"], p["lig_coords"])
+                 for p in laser_items],
+                base / "_batch_lasermpnn", mpnn_n_seqs, lasermpnn_script,
+                fixed_keys_by_sid=fixed_keys_by_sid, force=force,
+            )
+        except Exception as e:
+            print(f"  LASErMPNN batch error: {e}")
+            seqs_by_sid = {}
+        for p in laser_items:
+            p["lasermpnn_seqs"] = seqs_by_sid.get(p["sid"], [])
+
+    if run_potts:
+        base_default = refold_output_dir.parent / "mpnn_refold"
+        base = mpnn_refold_dir or base_default
+        potts_items = [p for p in fold_items if len(p["prot_ca"]) > 0]
+        fixed_keys_by_sid = {
+            p["sid"]: (
+                _pocket_fixed_keys(p["prot_by_res"], p["prot_res_keys"], p["lig_coords"],
+                                   cutoff=mpnn_cutoff)
+                if mpnn_cutoff is not None else set()
+            )
+            for p in potts_items
+        }
+        try:
+            seqs_by_sid = run_pottsmpnn_batch(
+                [(p["pdb_path"], p["sid"], p["prot_by_res"], p["prot_res_keys"], p["lig_coords"])
+                 for p in potts_items],
+                base / "_batch_pottsmpnn", mpnn_n_seqs, pottsmpnn_checkpoint,
+                fork_dir=pottsmpnn_fork_dir, fixed_keys_by_sid=fixed_keys_by_sid, force=force,
+            )
+        except Exception as e:
+            print(f"  PottsMPNN batch error: {e}")
+            seqs_by_sid = {}
+        for p in potts_items:
+            p["potts_seqs"] = seqs_by_sid.get(p["sid"], [])
 
     combined_inputs = []
     if fold_items:
@@ -1760,6 +2315,20 @@ def eval_ligand_cond_samples_batch(items, refold_input_dir, refold_output_dir,
                  "gen_prot_by_res": p["prot_by_res"]}
                 for i, seq in enumerate(p["lmpnn_seqs"])
             ]
+        for p in fold_items:
+            combined_inputs += [
+                {"sequence": seq, "smiles": p["smiles"], "gen_ca": p["prot_ca"],
+                 "sample_id": f"{p['sid']}_lasermpnn{i}", "gen_lig": p["gen_lig"],
+                 "gen_prot_by_res": p["prot_by_res"]}
+                for i, seq in enumerate(p["lasermpnn_seqs"])
+            ]
+        for p in fold_items:
+            combined_inputs += [
+                {"sequence": seq, "smiles": p["smiles"], "gen_ca": p["prot_ca"],
+                 "sample_id": f"{p['sid']}_potts{i}", "gen_lig": p["gen_lig"],
+                 "gen_prot_by_res": p["prot_by_res"]}
+                for i, seq in enumerate(p["potts_seqs"])
+            ]
 
     results_by_sid = {}
     if combined_inputs:
@@ -1775,7 +2344,9 @@ def eval_ligand_cond_samples_batch(items, refold_input_dir, refold_output_dir,
             pdb_path=p["pdb_path"], smiles=p["smiles"], refold_input_dir=refold_input_dir,
             refold_output_dir=refold_output_dir, boltz_cache=boltz_cache,
             run_pb=run_pb, skip_fold=skip_fold, contact_cutoff=contact_cutoff,
-            ligandmpnn_script=ligandmpnn_script, mpnn_n_seqs=mpnn_n_seqs,
+            ligandmpnn_script=ligandmpnn_script, lasermpnn_script=lasermpnn_script,
+            pottsmpnn_checkpoint=pottsmpnn_checkpoint, pottsmpnn_fork_dir=pottsmpnn_fork_dir,
+            mpnn_n_seqs=mpnn_n_seqs,
             mpnn_cutoff=mpnn_cutoff, force=force, skip_nolig=skip_nolig,
             sample_id=p["sid"], pb_cache=pb_cache, mpnn_refold_dir=mpnn_refold_dir,
             _precomputed_fold=results_by_sid.get(p["sid"]),
@@ -1784,12 +2355,24 @@ def eval_ligand_cond_samples_batch(items, refold_input_dir, refold_output_dir,
                 (p["lmpnn_seqs"], [results_by_sid[f"{p['sid']}_lmpnn{i}"] for i in range(len(p["lmpnn_seqs"]))])
                 if run_lmpnn else None
             ),
+            _precomputed_lasermpnn=(
+                (p["lasermpnn_seqs"],
+                 [results_by_sid[f"{p['sid']}_lasermpnn{i}"] for i in range(len(p["lasermpnn_seqs"]))])
+                if run_laser else None
+            ),
+            _precomputed_pottsmpnn=(
+                (p["potts_seqs"],
+                 [results_by_sid[f"{p['sid']}_potts{i}"] for i in range(len(p["potts_seqs"]))])
+                if run_potts else None
+            ),
         ) if p["sequence"] else
         eval_ligand_cond_sample(
             pdb_path=p["pdb_path"], smiles=p["smiles"], refold_input_dir=refold_input_dir,
             refold_output_dir=refold_output_dir, boltz_cache=boltz_cache,
             run_pb=run_pb, skip_fold=skip_fold, contact_cutoff=contact_cutoff,
-            ligandmpnn_script=ligandmpnn_script, mpnn_n_seqs=mpnn_n_seqs,
+            ligandmpnn_script=ligandmpnn_script, lasermpnn_script=lasermpnn_script,
+            pottsmpnn_checkpoint=pottsmpnn_checkpoint, pottsmpnn_fork_dir=pottsmpnn_fork_dir,
+            mpnn_n_seqs=mpnn_n_seqs,
             mpnn_cutoff=mpnn_cutoff, force=force, skip_nolig=skip_nolig,
             sample_id=p["sid"], pb_cache=pb_cache, mpnn_refold_dir=mpnn_refold_dir,
         )

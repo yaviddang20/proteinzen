@@ -75,11 +75,21 @@ RAW_SUCCESS_KEYS = [("fold_success", "fold_success"),
 MPNN_SUCCESS_KEYS = [("fold_success", "fold_success_mpnn"),
                      ("pocket_success", "pocket_success_mpnn"),
                      ("pose_success", "pose_success_mpnn")]
+LASERMPNN_SUCCESS_KEYS = [("fold_success", "fold_success_lasermpnn"),
+                          ("pocket_success", "pocket_success_lasermpnn"),
+                          ("pose_success", "pose_success_lasermpnn")]
+POTTS_SUCCESS_KEYS = [("fold_success", "fold_success_potts"),
+                      ("pocket_success", "pocket_success_potts"),
+                      ("pose_success", "pose_success_potts")]
 
 RFD3_RAW_KEYS = [("rfd3_success", "rfd3_success")]
 RFD3_MPNN_KEYS = [("rfd3_success", "rfd3_success_mpnn")]
+RFD3_LASERMPNN_KEYS = [("rfd3_success", "rfd3_success_lasermpnn")]
+RFD3_POTTS_KEYS = [("rfd3_success", "rfd3_success_potts")]
 COMPLEXA_RAW_KEYS = [("complexa_success", "complexa_success")]
 COMPLEXA_MPNN_KEYS = [("complexa_success", "complexa_success_mpnn")]
+COMPLEXA_LASERMPNN_KEYS = [("complexa_success", "complexa_success_lasermpnn")]
+COMPLEXA_POTTS_KEYS = [("complexa_success", "complexa_success_potts")]
 
 # Bump this whenever a code change could alter the *value* of an already-cached field
 # for samples cached under an earlier version -- not just when a new field is added.
@@ -98,21 +108,20 @@ COMPLEXA_MPNN_KEYS = [("complexa_success", "complexa_success_mpnn")]
 CACHE_SCHEMA_VERSION = 5
 
 
-def _cache_is_complete(r: dict, refold_output_dir: Path = None, sample_id: str = None) -> bool:
-    """Schema-version match alone isn't enough -- a failed boltz2 call still
-    writes a full-schema NaN result instead of raising. Also checks
-    boltz_error/nolig_boltz_error, and (if refold_output_dir/sample_id given)
-    that a *_model_0.cif actually exists on disk."""
+def _raw_eval_done(r: dict) -> bool:
+    """True if the cached raw-sequence eval (schema-version match, no boltz_error) already
+    has a real result. No on-disk CIF-existence check -- run_refolding/run_refolding_batch
+    already have their OWN correct on-disk cache (keyed by sample_id, checked right before
+    actually invoking boltz2) and skip recomputing anything already on disk, regardless of
+    what this function decides. This only decides whether eval_pallatom_ligand_cond.py's own
+    per_sample JSON summary can be reused as-is instead of being rebuilt -- rebuilding is
+    cheap (it just re-derives the summary from each tool's own cache), not a redundant GPU
+    recompute, so there's no need for this check to independently re-verify files on disk."""
     if r.get("_cache_schema_version") != CACHE_SCHEMA_VERSION:
         return False
     if r.get("boltz_error") or r.get("nolig_boltz_error"):
         return False
-    if refold_output_dir is not None and sample_id is not None:
-        pred_dir = refold_output_dir / sample_id / "by_seed" / sample_id / "s0"
-        has_cif = pred_dir.exists() and any(pred_dir.glob("*_model_0.cif"))
-        if not has_cif:
-            return False
-    return True
+    return _finite(r.get("ca_rmsd"))
 
 
 def _cache_is_stale(cache_path: Path, pdb_path: Path) -> bool:
@@ -121,8 +130,9 @@ def _cache_is_stale(cache_path: Path, pdb_path: Path) -> bool:
     or run id), so a later run using the same batch/GPU-sharding parameters can reuse the
     exact same filenames as an earlier, unrelated run. A leftover per-sample cache entry
     from that earlier run then silently looks like a valid, complete cache hit for the
-    new PDB's content -- _cache_is_complete only checks schema version, not whether the
-    cache actually corresponds to the file it's keyed by. mtime comparison catches this."""
+    new PDB's content -- _raw_eval_done only checks schema version/error fields, not
+    whether the cache actually corresponds to the file it's keyed by. mtime comparison
+    catches this."""
     try:
         return cache_path.stat().st_mtime < pdb_path.stat().st_mtime
     except OSError:
@@ -201,6 +211,38 @@ def compute_success(r: dict) -> dict:
         )
         out["complexa_success_mpnn"] = _complexa_success(
             r.get("lmpnn_ca_rmsd_best"), r.get("lmpnn_lig_rmsd_best"), r.get("lmpnn_min_ipae_best"),
+        )
+
+    if "lasermpnn_ca_rmsd_best" in r:
+        fold_l, pocket_l, pose_l = _success_flags(
+            r.get("lasermpnn_ca_rmsd_best"), r.get("lasermpnn_prot_plddt_best"),
+            r.get("lasermpnn_lig_displacement_best"), r.get("lasermpnn_lig_plddt_best"),
+            r.get("lasermpnn_lig_rmsd_best"),
+        )
+        out.update({"fold_success_lasermpnn": fold_l, "pocket_success_lasermpnn": pocket_l,
+                    "pose_success_lasermpnn": pose_l})
+        out["rfd3_success_lasermpnn"] = _rfd3_success(
+            r.get("lasermpnn_ca_rmsd_best"), r.get("lasermpnn_lig_rmsd_best"),
+            r.get("lasermpnn_min_ipae_best"), r.get("lasermpnn_iptm_best"),
+        )
+        out["complexa_success_lasermpnn"] = _complexa_success(
+            r.get("lasermpnn_ca_rmsd_best"), r.get("lasermpnn_lig_rmsd_best"), r.get("lasermpnn_min_ipae_best"),
+        )
+
+    if "potts_ca_rmsd_best" in r:
+        fold_p, pocket_p, pose_p = _success_flags(
+            r.get("potts_ca_rmsd_best"), r.get("potts_prot_plddt_best"),
+            r.get("potts_lig_displacement_best"), r.get("potts_lig_plddt_best"),
+            r.get("potts_lig_rmsd_best"),
+        )
+        out.update({"fold_success_potts": fold_p, "pocket_success_potts": pocket_p,
+                    "pose_success_potts": pose_p})
+        out["rfd3_success_potts"] = _rfd3_success(
+            r.get("potts_ca_rmsd_best"), r.get("potts_lig_rmsd_best"),
+            r.get("potts_min_ipae_best"), r.get("potts_iptm_best"),
+        )
+        out["complexa_success_potts"] = _complexa_success(
+            r.get("potts_ca_rmsd_best"), r.get("potts_lig_rmsd_best"), r.get("potts_min_ipae_best"),
         )
     return out
 
@@ -287,12 +329,40 @@ def main():
                              "empty string or nonexistent path to skip the +MPNN variant "
                              "entirely and only report the raw generated-sequence success rates.")
     parser.add_argument("--mpnn-n-seqs", type=int, default=1,
-                        help="Sequences designed by LigandMPNN per structure (default: 1, "
-                             "matching the paper's protocol of exactly one designed "
-                             "sequence -- not a best-of-N pick).")
+                        help="Sequences designed by LigandMPNN, LASErMPNN, AND PottsMPNN per "
+                             "structure (default: 1, matching the paper's protocol of exactly "
+                             "one designed sequence -- not a best-of-N pick). Shared across "
+                             "all three tools so a best-of-N comparison is always "
+                             "apples-to-apples at the same N; there's no --lasermpnn-n-seqs or "
+                             "--pottsmpnn-n-seqs.")
     parser.add_argument("--mpnn-cutoff", type=float, default=6.0,
                         help="Distance (A) defining pocket residues that stay fixed during "
-                             "LigandMPNN redesign (default: 6.0, matches the paper).")
+                             "LigandMPNN, LASErMPNN, AND PottsMPNN redesign (default: 6.0, "
+                             "matches the paper). Shared across all three tools for the same "
+                             "apples-to-apples reason as --mpnn-n-seqs.")
+    _example_lasermpnn = str(Path("/mnt/scratch/user/daviyang/proteinzen/LASErMPNN/run_batch_inference.py"))
+    parser.add_argument("--lasermpnn-script", type=str, default="",
+                        help="Path to LASErMPNN's run_batch_inference.py, used for the same "
+                             f"pocket-fixed redesign protocol as --ligandmpnn-script, but via "
+                             "LASErMPNN's own --fix_beta B-factor-column mechanism instead of "
+                             "a --fixed_residues token string. Off by default -- pass the path "
+                             f"explicitly (e.g. {_example_lasermpnn}) to enable the "
+                             "+LASErMPNN variant.")
+    _example_potts_ckpt = "/mnt/scratch/user/daviyang/proteinzen/pottsmpnn_ligand_check/ligandmpnn_potts_v3.pt"
+    parser.add_argument("--pottsmpnn-checkpoint", type=str, default="",
+                        help="Path to the PottsMPNN-adapted-LigandMPNN checkpoint, used for "
+                             "the same pocket-fixed redesign protocol as --ligandmpnn-script, "
+                             "but via the paper's own two-stage protocol (autoregressive "
+                             "decode for --mpnn-n-seqs candidates, then Potts-energy ICM "
+                             "refinement on each) instead of a single forward pass. Off by "
+                             f"default -- pass the path explicitly (e.g. {_example_potts_ckpt}) "
+                             "to enable the +PottsMPNN variant.")
+    parser.add_argument("--pottsmpnn-fork-dir", type=str, default="",
+                        help="Directory containing the PottsMPNN-adapted-LigandMPNN fork's "
+                             "model_utils.py/ligandmpnn_utils.py/etab_utils.py and "
+                             "model_params/ligandmpnn_v_32_010_25.pt. Only read when "
+                             "--pottsmpnn-checkpoint is set; empty (default) falls back to "
+                             "eval_plinder.py's own _POTTS_FORK_DIR_DEFAULT.")
     parser.add_argument("--overwrite", action="store_true", default=False)
     parser.add_argument("--aggregate-only", action="store_true", default=False,
                         help="Skip evaluating any not-yet-cached samples; just aggregate what's cached.")
@@ -374,7 +444,15 @@ def main():
     run_mpnn = bool(args.ligandmpnn_script and Path(args.ligandmpnn_script).exists())
     if not run_mpnn:
         print(f"Note: LigandMPNN script not found at {args.ligandmpnn_script!r} -- "
-              f"only raw generated-sequence success rates will be reported.")
+              f"the +MPNN variant will not be reported.")
+    run_lasermpnn = bool(args.lasermpnn_script and Path(args.lasermpnn_script).exists())
+    if not run_lasermpnn:
+        print(f"Note: LASErMPNN script not found at {args.lasermpnn_script!r} -- "
+              f"the +LASErMPNN variant will not be reported.")
+    run_potts = bool(args.pottsmpnn_checkpoint and Path(args.pottsmpnn_checkpoint).exists())
+    if not run_potts:
+        print(f"Note: PottsMPNN checkpoint not found at {args.pottsmpnn_checkpoint!r} -- "
+              f"the +PottsMPNN variant will not be reported.")
 
     import torch as _torch
     num_gpus = args.num_gpus or max(_torch.cuda.device_count(), 1)
@@ -403,6 +481,9 @@ def main():
             boltz_cache=args.boltz_cache, run_pb=False, skip_fold=False,
             contact_cutoff=args.contact_cutoff,
             ligandmpnn_script=args.ligandmpnn_script if run_mpnn else None,
+            lasermpnn_script=args.lasermpnn_script if run_lasermpnn else None,
+            pottsmpnn_checkpoint=args.pottsmpnn_checkpoint if run_potts else None,
+            pottsmpnn_fork_dir=args.pottsmpnn_fork_dir or None,
             mpnn_n_seqs=args.mpnn_n_seqs, mpnn_cutoff=args.mpnn_cutoff,
             force=args.overwrite if force_override is None else force_override,
             skip_nolig=True,
@@ -481,21 +562,26 @@ def main():
                     # older than the PDB it's keyed by (sample.py's filenames are purely
                     # positional, so a later run can reuse an earlier run's exact filenames)
                     # is treated as not-cached and recomputed instead of trusted.
-                    # mpnn_missing: no lmpnn_seqs at all, OR it ran but every refold's
-                    # stats came back NaN (same failure class as boltz_error, just with
-                    # no error field of its own on the aggregate).
-                    lmpnn_all_nan = (
-                        run_mpnn and cached.get("lmpnn_seqs")
-                        and not any(
-                            np.isfinite(cached.get(k, float("nan")))
-                            for k in ("lmpnn_ca_rmsd_best", "lmpnn_plddt_best", "lmpnn_iptm_best")
+                    # *_missing: fewer than mpnn_n_seqs sequences cached (covers both "not run
+                    # yet at all" and "mpnn_n_seqs was raised since the cache was written"),
+                    # OR it ran but every refold's stats came back NaN (same failure class as
+                    # boltz_error, just with no error field of its own on the aggregate).
+                    # Each tool's own run_*_batch already has its own on-disk cache and will
+                    # only (re)do the sequences actually missing -- not a fresh, from-scratch
+                    # redesign -- so re-queueing here is cheap even when only one tool is stale.
+                    def _redesign_missing(tag: str, enabled: bool) -> bool:
+                        seqs = cached.get(f"{tag}_seqs", [])
+                        all_nan = bool(seqs) and not any(
+                            np.isfinite(cached.get(f"{tag}_{k}", float("nan")))
+                            for k in ("ca_rmsd_best", "plddt_best", "iptm_best")
                         )
-                    )
-                    mpnn_missing = (run_mpnn and "lmpnn_seqs" not in cached) or lmpnn_all_nan
-                    _complete = _cache_is_complete(
-                        cached, refold_output_dir=refold_output_dir, sample_id=_cache_id(code, pdb_path)
-                    )
-                    if args.aggregate_only or (_complete and not mpnn_missing):
+                        return enabled and (len(seqs) < args.mpnn_n_seqs or all_nan)
+
+                    mpnn_missing = _redesign_missing("lmpnn", run_mpnn)
+                    lasermpnn_missing = _redesign_missing("lasermpnn", run_lasermpnn)
+                    potts_missing = _redesign_missing("potts", run_potts)
+                    if args.aggregate_only or (_raw_eval_done(cached) and not mpnn_missing
+                                               and not lasermpnn_missing and not potts_missing):
                         if stale and args.aggregate_only:
                             print(f"  WARNING: {cache_path.name} predates {pdb_path.name} -- "
                                   f"stale cache from an earlier/different run, reporting anyway.")
@@ -589,11 +675,14 @@ def main():
     (args.out_dir / "results.json").write_text(json.dumps(all_results, indent=2, default=str))
 
     benchmarks = [
-        ("PALLATOM-LIGAND (Wang et al. 2026): fold/pocket/pose, AF3 in the paper", RAW_SUCCESS_KEYS, MPNN_SUCCESS_KEYS),
+        ("PALLATOM-LIGAND (Wang et al. 2026): fold/pocket/pose, AF3 in the paper",
+         RAW_SUCCESS_KEYS, MPNN_SUCCESS_KEYS, LASERMPNN_SUCCESS_KEYS, POTTS_SUCCESS_KEYS),
         ("RFDIFFUSION3 (Butcher et al. 2025): backbone_RMSD<1.5A & lig_RMSD<5A & "
-         "min_chain_pair_PAE<1.5 & iPTM>0.8, AF3 in the paper", RFD3_RAW_KEYS, RFD3_MPNN_KEYS),
+         "min_chain_pair_PAE<1.5 & iPTM>0.8, AF3 in the paper",
+         RFD3_RAW_KEYS, RFD3_MPNN_KEYS, RFD3_LASERMPNN_KEYS, RFD3_POTTS_KEYS),
         ("PROTEINA-COMPLEXA (Didi et al. 2026): min_ipAE<2 & binder_RMSD<2A & "
-         "lig_RMSD<5A, RF3 in the paper", COMPLEXA_RAW_KEYS, COMPLEXA_MPNN_KEYS),
+         "lig_RMSD<5A, RF3 in the paper",
+         COMPLEXA_RAW_KEYS, COMPLEXA_MPNN_KEYS, COMPLEXA_LASERMPNN_KEYS, COMPLEXA_POTTS_KEYS),
     ]
 
     report = [
@@ -604,7 +693,7 @@ def main():
         "=" * 70,
         "",
     ]
-    for label, raw_keys, mpnn_keys in benchmarks:
+    for label, raw_keys, mpnn_keys, lasermpnn_keys, potts_keys in benchmarks:
         report.append(f"### {label}")
         report.append("")
         report.append("--- RAW (model's own generated sequence, no redesign) ---")
@@ -627,6 +716,30 @@ def main():
                 if not code_results:
                     continue
                 report.extend(_report_per_ligand(code_results, code, mpnn_keys))
+            report.append("")
+
+        if run_lasermpnn:
+            report.append(f"--- +LASErMPNN (LASErMPNN redesign of non-pocket residues via "
+                          f"--fix_beta, {args.mpnn_cutoff:.0f}A cutoff) ---")
+            report.append("")
+            report.extend(_report_overall(results_by_code, "OVERALL", lasermpnn_keys))
+            report.append("")
+            for code, code_results in results_by_code.items():
+                if not code_results:
+                    continue
+                report.extend(_report_per_ligand(code_results, code, lasermpnn_keys))
+            report.append("")
+
+        if run_potts:
+            report.append(f"--- +PottsMPNN (autoregressive sample + Potts-energy ICM refine "
+                          f"of non-pocket residues, {args.mpnn_cutoff:.0f}A cutoff) ---")
+            report.append("")
+            report.extend(_report_overall(results_by_code, "OVERALL", potts_keys))
+            report.append("")
+            for code, code_results in results_by_code.items():
+                if not code_results:
+                    continue
+                report.extend(_report_per_ligand(code_results, code, potts_keys))
             report.append("")
         report.append("")
 
