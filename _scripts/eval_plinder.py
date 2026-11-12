@@ -1329,17 +1329,16 @@ def run_refolding_batch(items, refold_input_dir, refold_output_dir, boltz_cache,
     sub-chunk.
 
     real_batch_size is a SEPARATE, independent knob from batch_size: it is the
-    fork's own opt-in BOLTZ_BATCH_SIZE tensor-level batching (several DIFFERENT
-    inputs padded to one shape and run through the model in the same step -- see
-    uplifting-biomolecular-modeling/boltz2/BATCHING.md). Default None pins
-    BOLTZ_BATCH_SIZE=1, i.e. the kit's own documented "unset or 1 runs upstream's
-    one-input-per-step loop, unchanged" -- every item in the group still shares
-    one model load/apptainer call, but is predicted one-at-a-time within it,
-    identical math to the fully unbatched per-item loop. BATCHING.md explicitly
-    flags this feature as untested with ligands, templates, or MSAs; every caller
-    in this codebase evaluates ligand-conditioned structures, so real_batch_size
-    should stay unset (the default) unless validated separately via
-    tools/boltz2_batching/validate.sh on inputs like ours."""
+    fork's BOLTZ_BATCH_SIZE tensor-level batching (several DIFFERENT inputs
+    padded to one shape and run through the model in the same step -- see
+    uplifting-biomolecular-modeling/boltz2/BATCHING.md). eval_pallatom_ligand_cond.py's
+    --boltz-batch-size defaults to 64 here, validated separately (outside this
+    repo) as safe/correct on ligand-containing inputs like ours. Passing 1
+    (or leaving real_batch_size unset when calling this function directly)
+    falls back to upstream's documented "unset or 1 runs the one-input-per-step
+    loop, unchanged" -- every item in the group still shares one model
+    load/apptainer call, but is predicted one-at-a-time within it, identical
+    math to the fully unbatched per-item loop."""
     import yaml as _yaml
     refold_input_dir.mkdir(parents=True, exist_ok=True)
     refold_output_dir.mkdir(parents=True, exist_ok=True)

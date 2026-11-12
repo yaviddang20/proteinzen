@@ -302,20 +302,18 @@ def main():
                              "make_ligand_cond_yaml.py was actually run with) -- no need "
                              "to repeat the ligand list here.")
     parser.add_argument("--boltz-cache", type=Path, default=None)
-    parser.add_argument("--boltz-batch-size", type=int, default=None,
-                        help="Opt-in to the fork's EXPERIMENTAL same-step tensor batching "
+    parser.add_argument("--boltz-batch-size", type=int, default=64,
+                        help="The fork's same-step tensor batching "
                              "(uplifting-biomolecular-modeling/boltz2/BATCHING.md's "
                              "BOLTZ_BATCH_SIZE): several different inputs padded to one shape "
                              "and run through the model in the same step, for extra "
                              "throughput beyond just avoiding repeated model loads (every "
                              "worker already groups its whole GPU shard into one combined "
                              "boltz2_kit call regardless of this flag -- one model load per "
-                             "GPU, always). Default None pins BOLTZ_BATCH_SIZE=1 (upstream's "
-                             "unchanged one-input-per-step loop -- the safe default, since "
-                             "BATCHING.md explicitly flags this feature as untested with "
-                             "ligands, and every structure this script evaluates has one). "
-                             "Only raise this after running "
-                             "tools/boltz2_batching/validate.sh on inputs like ours.")
+                             "GPU, always). Default 64, validated separately (outside this "
+                             "repo) as safe/correct on ligand-containing inputs like ours -- "
+                             "pass 1 to fall back to upstream's unchanged one-input-per-step "
+                             "loop.")
     parser.add_argument("--boltz-batch-max-pad", type=float, default=None,
                         help="Passed through as BOLTZ_BATCH_MAX_PAD when --boltz-batch-size "
                              "is set (see BATCHING.md). Default None leaves the fork's own "
@@ -379,14 +377,14 @@ def main():
     # Set before any GPU worker processes are spawned below so they inherit it --
     # eval_plinder.py's _run_mpnn_case reads BOLTZ_BATCH_SIZE directly from the
     # environment as its own fallback toggle, for any caller that doesn't reach
-    # this script's own combined-batch path below. This is the EXPERIMENTAL
+    # this script's own combined-batch path below. This is the same-step
     # tensor-batching knob -- see run_refolding_batch's docstring.
     if args.boltz_batch_size is not None:
         import os as _os
         _os.environ["BOLTZ_BATCH_SIZE"] = str(args.boltz_batch_size)
         if args.boltz_batch_max_pad is not None:
             _os.environ["BOLTZ_BATCH_MAX_PAD"] = str(args.boltz_batch_max_pad)
-        print(f"[eval_pallatom] Boltz2 EXPERIMENTAL tensor batching enabled: BOLTZ_BATCH_SIZE="
+        print(f"[eval_pallatom] Boltz2 tensor batching: BOLTZ_BATCH_SIZE="
               f"{args.boltz_batch_size}" + (f" BOLTZ_BATCH_MAX_PAD={args.boltz_batch_max_pad}"
               if args.boltz_batch_max_pad is not None else ""))
 
